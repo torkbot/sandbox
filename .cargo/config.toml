@@ -1,0 +1,2 @@
+[env]
+KRUN_INIT_BINARY_PATH = { value = "crates/sandbox-init/init-placeholder.bin", relative = true }

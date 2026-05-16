@@ -4,6 +4,7 @@ members = [
     "crates/sandbox-init",
     "crates/sandbox-node",
 ]
+exclude = ["deps/libkrun"]
 resolver = "2"
 
 [workspace.package]

@@ -5,7 +5,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dependencies]
+krun-devices = { path = "../../deps/libkrun/src/devices", default-features = false }
+libc = "0.2"
+
 [lib]
 crate-type = ["rlib"]
-
-[dependencies]

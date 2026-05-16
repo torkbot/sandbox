@@ -4,6 +4,7 @@
 //! libkrun boundary, host services, and guest-control protocol types.
 
 pub mod control;
+pub mod vfs;
 
 /// A configured microVM that has not yet been started.
 #[derive(Debug, Clone)]
