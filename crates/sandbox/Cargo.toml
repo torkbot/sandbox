@@ -6,8 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-krun-devices = { path = "../../deps/libkrun/src/devices", default-features = false }
-krun = { package = "libkrun", path = "../../deps/libkrun/src/libkrun", default-features = false }
+krun-devices = { path = "../../deps/libkrun/src/devices", default-features = false, features = ["blk"] }
+krun = { package = "libkrun", path = "../../deps/libkrun/src/libkrun", default-features = false, features = ["blk"] }
 libc = "0.2"
 
 [lib]
