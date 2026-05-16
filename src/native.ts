@@ -66,6 +66,10 @@ function nativeModuleName(): string {
     return "index.darwin-arm64.node";
   }
 
+  if (process.platform === "linux" && process.arch === "x64") {
+    return "index.linux-x64-gnu.node";
+  }
+
   throw new Error(
     `unsupported native sandbox target: ${process.platform}-${process.arch}`,
   );
