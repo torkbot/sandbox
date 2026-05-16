@@ -1,0 +1,3 @@
+[submodule "deps/libkrun"]
+	path = deps/libkrun
+	url = https://github.com/torkbot/libkrun.git

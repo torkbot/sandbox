@@ -1,0 +1,26 @@
+{
+  "name": "@torkbot/sandbox",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsgo --project tsconfig.build.json --pretty",
+    "check:rust": "cargo check --workspace",
+    "test:e2e": "node ./tests/e2e/run.ts",
+    "typecheck": "tsgo --noEmit --pretty"
+  },
+  "devDependencies": {
+    "@types/node": "^24.12.0",
+    "@typescript/native-preview": "7.0.0-dev.20260423.1",
+    "typescript": "^5.9.0"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}

@@ -1,0 +1,192 @@
+# Testing Strategy
+
+## Goal
+
+Sandbox needs integration-style tests that objectively prove the runtime properties we care about: a statically linked host artifact can boot a libkrun microVM, configure a guest with our init, enforce host-side policy, intercept HTTP, mount immutable and writable filesystems, and provide a reliable host/guest control channel.
+
+The test suite should produce artifacts that are easy to inspect after failure: host logs, guest console logs, control-channel transcripts, proxy traces, filesystem snapshots, and platform-link/signing reports.
+
+## Test Tiers
+
+### Tier 0: Build And Static Artifact Checks
+
+Runs on every developer machine.
+
+Evidence:
+
+- `cargo check --workspace` passes.
+- the host binary or native module links without `libkrun` or `libkrunfw` dynamic dependencies.
+- the guest init binary is statically linked.
+- packaged kernel/initramfs/rootfs artifacts are content-addressed and reproducible from the same build-time inputs.
+
+Platform checks:
+
+- Linux: use `ldd`, `readelf`, or `objdump` to reject unexpected dynamic dependencies.
+- macOS: use `otool -L` to reject unexpected dynamic dependencies and `codesign -dv --entitlements :-` to verify HVF entitlements on the final executable.
+
+### Tier 1: Host-Only Service Simulation
+
+Runs without a hypervisor.
+
+Evidence:
+
+- HTTP policy hooks receive normalized request metadata and can allow, deny, and rewrite headers.
+- protected network ranges are blocked before forwarding.
+- SQLite-backed mount operations persist through a supplied connected database handle and replay into the same tree after restart.
+- virtual filesystem callbacks are deterministic and return expected metadata, directory entries, and file contents.
+- mounted filesystems are inspectable from JavaScript with the same `stat` / `list` / `read` shape exposed to the host runtime.
+- the `Transport` adapter preserves message order, close behavior, and backpressure.
+
+These tests should use fake packet/filesystem/control clients so policy semantics are stable even when libkrun is not available.
+
+### Tier 2: Single-VM Smoke Test
+
+Runs only when the host supports KVM or HVF and the signing/build prerequisites are present.
+
+Fixture:
+
+- prebuilt rootfs fixture produced before the VM test starts.
+- guest init from `crates/sandbox-init`.
+- host control socket connected over vsock.
+
+Evidence:
+
+- guest boots and sends `init.ready` over the control transport.
+- host sends a command and receives an acknowledged response.
+- guest sees the expected kernel command line and mounted root.
+- guest shutdown is clean and host observes the exit status.
+
+### Tier 3: Filesystem E2E
+
+Runs with a real VM.
+
+Fixture:
+
+- immutable read-only root, initially from extracted Docker rootfs and eventually from EROFS.
+- writable mount backed by a connected SQLite database handle.
+- virtual procfs-like mount implemented by host callbacks.
+
+Evidence:
+
+- guest cannot write to the root mount.
+- guest can create, read, rename, and delete files under a SQLite-backed mount.
+- host database state reflects guest mutations without opaque block-device state.
+- after VM restart, SQLite-backed mount contents persist and the immutable root hash is unchanged.
+- virtual files show host-generated contents and directory metadata.
+- JavaScript can inspect the mounted virtual and SQLite-backed filesystems through stable mount handles without entering the guest.
+
+### Tier 3b: Rootfs Shaping E2E
+
+Runs with a real VM in an explicit writable-overlay mode.
+
+Evidence:
+
+- immutable root mode remains the default.
+- writable-overlay mode allows incremental guest operations to modify root contents.
+- `vm.rootfs.snapshot({ format: "erofs" })` produces EROFS artifact bytes.
+- the snapshot report includes a stable digest.
+- a subsequent VM can boot from the produced artifact as a read-only root.
+
+### Tier 4: Network And HTTP Policy E2E
+
+Runs with a real VM and host proxy.
+
+Fixture:
+
+- guest CA trust injected by init.
+- guest HTTP client and HTTPS client.
+- host test origin server.
+- blocked host/private-range endpoints.
+
+Evidence:
+
+- HTTPS request succeeds only through the host interception layer.
+- Node.js policy sees method, URL, destination IP, headers, and TLS metadata.
+- allowed requests reach the test origin with expected header rewrites.
+- denied requests fail with a deterministic guest-visible error.
+- requests to protected host, loopback, link-local, and configured private ranges are blocked.
+- DNS policy is observable in the proxy trace.
+
+### Tier 5: libkrun Fork Contract Tests
+
+Runs against `deps/libkrun` or the pinned submodule.
+
+Evidence:
+
+- static Rust integration builds without binding to the C API.
+- the Node module uses the `napi-rs` boundary for native hand-off rather than shelling out or passing large data through ad hoc subprocess protocols.
+- networking does not require a sidecar daemon; any required network component is native to the static artifact or explicitly fails the contract test.
+- fd-taking variants work for sockets owned by the Sandbox host runtime.
+- path-taking variants still work where they are intentionally used for external processes.
+- any vhost-user filesystem patch is covered by a booting VM test.
+
+### Tier 6: macOS HVF Packaging Test
+
+Runs on macOS only.
+
+Evidence:
+
+- the final executable or native module that opens Hypervisor.framework is signed.
+- the signature contains the HVF entitlement.
+- a smoke VM boots under the signed artifact.
+- the same artifact fails the entitlement check if signing is skipped, proving the test is meaningful.
+
+## Test Harness Shape
+
+Use a TypeScript e2e runner as the orchestration layer because the public library is Node-facing and policy hooks are TypeScript. Run it directly on Node.js 24+ using the built-in type-stripping support, matching the neighboring TorkBot repositories. The runner should call Rust binaries or native bindings as implementation details and collect structured evidence into `test-results/e2e/<run-id>/`.
+
+Each e2e test should emit:
+
+- `manifest.json`: host platform, git commit, artifact hashes, selected test fixture, and capability checks.
+- `host.log`: host runtime logs.
+- `guest-console.log`: guest console output.
+- `control.jsonl`: host/guest control-channel transcript.
+- `proxy.jsonl`: HTTP proxy observations and decisions.
+- `fs.json`: filesystem assertions and database state summaries.
+- `linkage.json`: static-link and signing verification.
+
+## Capability Detection
+
+The runner should skip, not fail, tests whose host prerequisites are absent. It must still fail if a prerequisite is present but the runtime cannot use it.
+
+Detected capabilities:
+
+- Docker or compatible CLI for build-time rootfs fixture generation.
+- Linux KVM access.
+- macOS HVF access.
+- macOS codesign availability and entitlement verification.
+- EROFS tooling once EROFS image generation lands.
+
+## Success Criteria By Project Goal
+
+- Spawn microVMs from Node.js: Node e2e creates a VM, receives readiness, sends commands, and shuts down cleanly.
+- Custom init: guest init performs setup, reports readiness, and supervises a test workload.
+- Static linking: linkage report shows no dynamic `libkrun` or `libkrunfw` dependency.
+- Immutable root: root hash remains stable and guest root writes fail.
+- Rootfs shaping: explicit writable-overlay mode can capture deltas and publish a new EROFS rootfs artifact.
+- SQLite-backed mounts: guest writes persist through the supplied connected database handle and survive VM restart when that handle is durable. The API must also accept a connected `:memory:` handle for tests, and multiple mounts may share one handle using distinct mount names.
+- Virtual filesystem: guest reads host-generated files and metadata through a mounted virtual tree.
+- HTTP interception: TLS traffic is intercepted with guest-trusted CA, policy hooks run in Node.js, headers are modified, and forwarding is transparent.
+- Network policy: protected host and private ranges are blocked with deterministic evidence.
+- Host/guest transport: bidirectional messages preserve ordering, errors, and close semantics.
+- macOS support: HVF entitlement signing is verified and a signed artifact boots.
+
+## First Implementation Slice
+
+1. Add the e2e runner with capability detection and result-directory creation.
+2. Add host-only tests for `Transport`, HTTP policy, and SQLite-backed mount persistence.
+3. Add build-time Docker export/extract rootfs fixture generation.
+4. Add the first boot smoke test with guest `init.ready`.
+5. Add static-link and macOS entitlement checks as soon as a host artifact exists.
+
+## Initial Scenario Files
+
+The first executable scenario files live under `tests/e2e/scenarios/` as `.test.ts` files. They intentionally describe the desired Node.js developer experience before the implementation exists:
+
+- `boot-smoke.test.ts`: boots a VM, waits for `init.ready`, sends a control command, and checks command output.
+- `filesystem.test.ts`: boots with an immutable root, SQLite-backed writable mount, and host-backed virtual filesystem using the same `stat` / `list` / `read` shape as TorkBot plugin filesystems.
+- `rootfs-shaping.test.ts`: opts into writable root overlay mode, runs incremental guest commands, and snapshots the result as an EROFS artifact.
+- `http-policy.test.ts`: injects CA trust, intercepts HTTPS, runs Node policy hooks, rewrites headers, and blocks protected destinations.
+- `linkage-and-signing.test.ts`: verifies static linkage, absence of dynamic libkrun/libkrunfw dependencies, and macOS HVF entitlement signing.
+
+These tests are expected to fail until the runtime exists. A failing test is useful when the failure points at the next missing runtime boundary; a passing placeholder is not.
