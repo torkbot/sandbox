@@ -47,6 +47,9 @@ jobs:
       - name: Check Rust workspace
         run: cargo check --workspace
 
+      - name: Test Rust workspace
+        run: npm run test:rust
+
       - name: Build native module
         run: npm run build:native
 

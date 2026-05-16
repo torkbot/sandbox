@@ -120,3 +120,71 @@ fn stat(inode: u64, mode: u32, size: u64) -> bindings::stat64 {
     stat.st_size = size as _;
     stat
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    #[derive(Default)]
+    struct FixtureFs;
+
+    impl HostVirtualFileSystem for FixtureFs {
+        fn lookup(&self, parent: VirtualInode, name: &CStr) -> io::Result<VirtioFsEntry> {
+            assert_eq!(u64::from(parent), 1);
+            assert_eq!(name.to_str().unwrap(), "status.json");
+            Ok(virtual_file_entry(2, 19))
+        }
+
+        fn getattr(
+            &self,
+            inode: VirtualInode,
+        ) -> io::Result<(bindings::stat64, Duration)> {
+            assert_eq!(u64::from(inode), 2);
+            Ok((virtual_file_entry(2, 19).attr, Duration::from_secs(1)))
+        }
+    }
+
+    #[test]
+    fn virtual_file_entry_uses_regular_read_only_metadata() {
+        let entry = virtual_file_entry(42, 99);
+        let mode = entry.attr.st_mode as libc::mode_t;
+
+        assert_eq!(entry.inode, 42);
+        assert_eq!(entry.attr.st_ino, 42);
+        assert_eq!(entry.attr.st_size, 99);
+        assert_eq!(mode & libc::S_IFMT, libc::S_IFREG);
+        assert_eq!(mode & 0o777, 0o444);
+    }
+
+    #[test]
+    fn virtual_directory_entry_uses_directory_read_only_metadata() {
+        let entry = virtual_directory_entry(7);
+        let mode = entry.attr.st_mode as libc::mode_t;
+
+        assert_eq!(entry.inode, 7);
+        assert_eq!(entry.attr.st_ino, 7);
+        assert_eq!(mode & libc::S_IFMT, libc::S_IFDIR);
+        assert_eq!(mode & 0o777, 0o555);
+    }
+
+    #[test]
+    fn adapter_delegates_lookup_and_getattr_to_host_filesystem() {
+        let adapter = VirtualFsAdapter::new(Arc::new(FixtureFs));
+        let ctx = VirtioFsContext {
+            uid: 1_000,
+            gid: 1_000,
+            pid: 123,
+        };
+        let name = CString::new("status.json").unwrap();
+
+        let entry = adapter
+            .lookup(ctx, VirtualInode::from(1), name.as_c_str())
+            .unwrap();
+        assert_eq!(entry.inode, 2);
+
+        let (attr, timeout) = adapter.getattr(ctx, VirtualInode::from(2), None).unwrap();
+        assert_eq!(attr.st_size, 19);
+        assert_eq!(timeout, Duration::from_secs(1));
+    }
+}

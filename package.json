@@ -14,6 +14,7 @@
     "build:native": "napi build --platform --release --manifest-path crates/sandbox-node/Cargo.toml",
     "check:rust": "cargo check --workspace",
     "test:e2e": "node ./tests/e2e/run.ts",
+    "test:rust": "cargo test --workspace",
     "typecheck": "tsgo --noEmit --pretty"
   },
   "devDependencies": {
