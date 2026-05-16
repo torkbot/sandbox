@@ -51,6 +51,35 @@ test("spawnSandbox rejects relative mount paths before runtime launch", async ()
   );
 });
 
+test("spawnSandbox rejects duplicate mount paths before runtime launch", async () => {
+  const fileSystem = {
+    async stat() {
+      throw new Error("not reached");
+    },
+    async list() {
+      throw new Error("not reached");
+    },
+    async read() {
+      throw new Error("not reached");
+    },
+  };
+
+  await assert.rejects(
+    spawnSandbox({
+      kernel: projectKernel(),
+      init: projectInit(),
+      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
+        format: "erofs",
+      }),
+      mounts: [
+        { kind: "virtual-fs", path: "/sandbox", fileSystem },
+        { kind: "virtual-fs", path: "/sandbox", fileSystem },
+      ],
+    }),
+    /invalid spawnSandbox options: duplicate mount path: \/sandbox/,
+  );
+});
+
 test("spawnSandbox rejects unsupported init crates before runtime launch", async () => {
   await assert.rejects(
     spawnSandbox({

@@ -5,6 +5,7 @@
 
 pub mod control;
 pub mod config;
+pub mod mounts;
 pub mod runtime;
 pub mod vfs;
 

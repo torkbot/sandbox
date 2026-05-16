@@ -138,6 +138,8 @@ impl MicroVmSpec {
             .into_iter()
             .map(MountSpec::parse)
             .collect::<Result<Vec<_>, _>>()?;
+        crate::mounts::MountTable::plan(&mounts)
+            .map_err(|error| SpecError::new(error.to_string()))?;
 
         let network = input.network_http.map(|http| NetworkSpec {
             http: Some(HttpSpec {
