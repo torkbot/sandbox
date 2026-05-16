@@ -1,3 +1,5 @@
+crates/sandbox-node/*.node
+crates/sandbox-node/index.d.ts
 node_modules/
 test-results/
 target/

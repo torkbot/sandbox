@@ -1,3 +1,5 @@
+import { loadNativeBinding } from "./native.ts";
+
 export interface Transport<TIncoming = unknown, TOutgoing = unknown> {
   readonly incoming: AsyncIterable<TIncoming>;
   send(message: TOutgoing): Promise<void>;
@@ -241,7 +243,8 @@ export function virtualFsMount(path: string, fileSystem: SandboxVirtualFileSyste
 }
 
 export async function spawnSandbox(_options: SandboxOptions): Promise<SandboxVm> {
-  throw new Error("spawnSandbox is not implemented yet");
+  await loadNativeBinding().spawnSandbox({ name: _options.name });
+  throw new Error("native spawnSandbox returned before SandboxVm adaptation was implemented");
 }
 
 export interface SandboxArtifactInspectionOptions {
@@ -260,7 +263,18 @@ export interface SandboxArtifactInspection {
 }
 
 export async function inspectSandboxArtifact(
-  _options: SandboxArtifactInspectionOptions,
+  options: SandboxArtifactInspectionOptions,
 ): Promise<SandboxArtifactInspection> {
-  throw new Error("inspectSandboxArtifact is not implemented yet");
+  const inspection = await loadNativeBinding().inspectSandboxArtifact({
+    expectedStatic: options.expectedStatic,
+  });
+
+  return {
+    staticLinkage: { ok: inspection.staticLinkageOk },
+    dynamicLibraries: [],
+    codesign: {
+      valid: false,
+      entitlements: {},
+    },
+  };
 }

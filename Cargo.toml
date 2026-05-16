@@ -2,6 +2,7 @@
 members = [
     "crates/sandbox",
     "crates/sandbox-init",
+    "crates/sandbox-node",
 ]
 resolver = "2"
 

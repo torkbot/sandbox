@@ -10,12 +10,14 @@
     }
   },
   "scripts": {
-    "build": "tsgo --project tsconfig.build.json --pretty",
+    "build": "npm run build:native && tsgo --project tsconfig.build.json --pretty",
+    "build:native": "napi build --platform --release --manifest-path crates/sandbox-node/Cargo.toml",
     "check:rust": "cargo check --workspace",
     "test:e2e": "node ./tests/e2e/run.ts",
     "typecheck": "tsgo --noEmit --pretty"
   },
   "devDependencies": {
+    "@napi-rs/cli": "^3.6.2",
     "@types/node": "^24.12.0",
     "@typescript/native-preview": "7.0.0-dev.20260423.1",
     "typescript": "^5.9.0"
