@@ -12,6 +12,12 @@ export type NativeSpawnSandboxOptions = {
   readonly memory?: {
     readonly mib?: number;
   };
+  readonly kernel: {
+    readonly format?: "auto" | "raw" | "elf" | "pe-gz" | "image-gz" | "image-zstd";
+  };
+  readonly init: {
+    readonly crateName: "sandbox-init";
+  };
   readonly rootfs: {
     readonly path: string;
     readonly readonly?: boolean;

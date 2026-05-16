@@ -24,6 +24,16 @@ pub struct NativeMemoryOptions {
 }
 
 #[napi(object)]
+pub struct NativeKernelOptions {
+    pub format: Option<String>,
+}
+
+#[napi(object)]
+pub struct NativeInitOptions {
+    pub crate_name: String,
+}
+
+#[napi(object)]
 pub struct NativeRootfsOptions {
     pub path: String,
     pub readonly: Option<bool>,
@@ -57,6 +67,8 @@ pub struct NativeSpawnSandboxOptions {
     pub name: Option<String>,
     pub cpu: Option<NativeCpuOptions>,
     pub memory: Option<NativeMemoryOptions>,
+    pub kernel: NativeKernelOptions,
+    pub init: NativeInitOptions,
     pub rootfs: NativeRootfsOptions,
     pub rootfs_overlay: Option<NativeRootfsOverlayOptions>,
     pub mounts: Option<Vec<NativeMountOptions>>,
@@ -90,6 +102,8 @@ impl NativeSpawnSandboxOptions {
             name: self.name,
             vcpus: self.cpu.and_then(|cpu| cpu.vcpus),
             memory_mib: self.memory.and_then(|memory| memory.mib),
+            kernel_format: self.kernel.format,
+            init_crate: self.init.crate_name,
             rootfs_path: self.rootfs.path,
             rootfs_readonly: self.rootfs.readonly,
             rootfs_format: self.rootfs.format,

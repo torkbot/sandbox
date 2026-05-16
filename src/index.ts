@@ -253,6 +253,12 @@ function toNativeSpawnOptions(options: SandboxOptions): NativeSpawnSandboxOption
     name: options.name,
     cpu: options.cpu,
     memory: options.memory,
+    kernel: {
+      format: options.kernel.format,
+    },
+    init: {
+      crateName: options.init.crate,
+    },
     rootfs: {
       path: options.rootfs.path,
       readonly: options.rootfs.readonly,

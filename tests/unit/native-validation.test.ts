@@ -50,3 +50,19 @@ test("spawnSandbox rejects relative mount paths before runtime launch", async ()
     /invalid spawnSandbox options: mount\.path must be absolute/,
   );
 });
+
+test("spawnSandbox rejects unsupported init crates before runtime launch", async () => {
+  await assert.rejects(
+    spawnSandbox({
+      kernel: projectKernel(),
+      init: {
+        kind: "project-init",
+        crate: "other-init" as "sandbox-init",
+      },
+      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
+        format: "erofs",
+      }),
+    }),
+    /invalid spawnSandbox options: unsupported init crate: other-init/,
+  );
+});

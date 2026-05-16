@@ -6,10 +6,32 @@ pub struct MicroVmSpec {
     pub name: Option<String>,
     pub vcpus: u8,
     pub memory_mib: u32,
+    pub kernel: KernelSpec,
+    pub init: InitSpec,
     pub rootfs: RootfsSpec,
     pub rootfs_overlay: Option<RootfsOverlaySpec>,
     pub mounts: Vec<MountSpec>,
     pub network: Option<NetworkSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelSpec {
+    pub format: KernelFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelFormat {
+    Auto,
+    Raw,
+    Elf,
+    PeGz,
+    ImageGz,
+    ImageZstd,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitSpec {
+    pub crate_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +108,20 @@ impl MicroVmSpec {
             return Err(SpecError::new("rootfs.path must not be empty"));
         }
 
+        let kernel = KernelSpec {
+            format: KernelFormat::parse(input.kernel_format.as_deref().unwrap_or("auto"))?,
+        };
+
+        if input.init_crate != "sandbox-init" {
+            return Err(SpecError::new(format!(
+                "unsupported init crate: {}",
+                input.init_crate
+            )));
+        }
+        let init = InitSpec {
+            crate_name: input.init_crate,
+        };
+
         let rootfs = RootfsSpec {
             path: PathBuf::from(input.rootfs_path),
             readonly: input.rootfs_readonly.unwrap_or(true),
@@ -113,11 +149,27 @@ impl MicroVmSpec {
             name: input.name,
             vcpus,
             memory_mib,
+            kernel,
+            init,
             rootfs,
             rootfs_overlay,
             mounts,
             network,
         })
+    }
+}
+
+impl KernelFormat {
+    fn parse(value: &str) -> Result<Self, SpecError> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "raw" => Ok(Self::Raw),
+            "elf" => Ok(Self::Elf),
+            "pe-gz" => Ok(Self::PeGz),
+            "image-gz" => Ok(Self::ImageGz),
+            "image-zstd" => Ok(Self::ImageZstd),
+            other => Err(SpecError::new(format!("unsupported kernel.format: {other}"))),
+        }
     }
 }
 
@@ -170,6 +222,8 @@ pub struct MicroVmSpecInput {
     pub name: Option<String>,
     pub vcpus: Option<u32>,
     pub memory_mib: Option<u32>,
+    pub kernel_format: Option<String>,
+    pub init_crate: String,
     pub rootfs_path: String,
     pub rootfs_readonly: Option<bool>,
     pub rootfs_format: String,
@@ -199,6 +253,8 @@ mod tests {
             name: Some("test".to_string()),
             vcpus: None,
             memory_mib: None,
+            kernel_format: None,
+            init_crate: "sandbox-init".to_string(),
             rootfs_path: "rootfs.erofs".to_string(),
             rootfs_readonly: None,
             rootfs_format: "erofs".to_string(),
@@ -214,6 +270,8 @@ mod tests {
 
         assert_eq!(spec.vcpus, 1);
         assert_eq!(spec.memory_mib, 512);
+        assert_eq!(spec.kernel.format, KernelFormat::Auto);
+        assert_eq!(spec.init.crate_name, "sandbox-init");
         assert_eq!(spec.rootfs.readonly, true);
         assert_eq!(spec.rootfs.format, RootfsFormat::Erofs);
     }
@@ -266,6 +324,15 @@ mod tests {
 
         let err = MicroVmSpec::build(input).unwrap_err();
         assert_eq!(err.to_string(), "cpu.vcpus must be greater than zero");
+    }
+
+    #[test]
+    fn rejects_unknown_init_crate() {
+        let mut input = valid_input();
+        input.init_crate = "other-init".to_string();
+
+        let err = MicroVmSpec::build(input).unwrap_err();
+        assert_eq!(err.to_string(), "unsupported init crate: other-init");
     }
 
     #[test]
