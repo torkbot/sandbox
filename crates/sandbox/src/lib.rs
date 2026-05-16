@@ -5,6 +5,7 @@
 
 pub mod control;
 pub mod config;
+pub mod runtime;
 pub mod vfs;
 
 pub use config::MicroVmSpec;
