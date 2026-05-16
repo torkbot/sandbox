@@ -71,11 +71,16 @@ pub async fn spawn_sandbox(options: NativeSpawnSandboxOptions) -> Result<NativeS
             format!("invalid spawnSandbox options: {error}"),
         )
     })?;
-    let _ = spec.name.as_deref();
+    let _context = sandbox::runtime::KrunContext::create(&spec).map_err(|error| {
+        Error::new(
+            Status::GenericFailure,
+            format!("failed to initialize libkrun context: {error}"),
+        )
+    })?;
 
     Err(Error::new(
         Status::GenericFailure,
-        "spawnSandbox native runtime is not implemented yet",
+        "spawnSandbox VM launch is not implemented yet",
     ))
 }
 
