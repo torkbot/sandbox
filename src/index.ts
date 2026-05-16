@@ -1,8 +1,5 @@
-import { loadNativeBinding } from "./native.ts";
-import {
-  encodeArtifactInspectionRequest,
-  encodeSpawnSandboxRequest,
-} from "./wire.ts";
+import { loadNativeBinding, nativeBindingPath } from "./native.ts";
+import type { NativeSpawnSandboxOptions } from "./native.ts";
 
 export interface Transport<TIncoming = unknown, TOutgoing = unknown> {
   readonly incoming: AsyncIterable<TIncoming>;
@@ -246,8 +243,8 @@ export function virtualFsMount(path: string, fileSystem: SandboxVirtualFileSyste
   };
 }
 
-export async function spawnSandbox(_options: SandboxOptions): Promise<SandboxVm> {
-  await loadNativeBinding().spawnSandbox(encodeSpawnSandboxRequest(_options));
+export async function spawnSandbox(options: SandboxOptions): Promise<SandboxVm> {
+  await loadNativeBinding().spawnSandbox(toNativeSpawnOptions(options));
   throw new Error("native spawnSandbox returned before SandboxVm adaptation was implemented");
 }
 
@@ -270,15 +267,58 @@ export async function inspectSandboxArtifact(
   options: SandboxArtifactInspectionOptions,
 ): Promise<SandboxArtifactInspection> {
   const inspection = await loadNativeBinding().inspectSandboxArtifact(
-    encodeArtifactInspectionRequest(options),
+    {
+      ...options,
+      artifactPath: nativeBindingPath(),
+    },
   );
 
   return {
     staticLinkage: { ok: inspection.staticLinkageOk },
-    dynamicLibraries: [],
+    dynamicLibraries: inspection.dynamicLibraries,
     codesign: {
-      valid: false,
-      entitlements: {},
+      valid: inspection.codesignValid,
+      entitlements: Object.fromEntries(
+        inspection.entitlementNames.map((name) => [name, true] as const),
+      ),
     },
+  };
+}
+
+function toNativeSpawnOptions(options: SandboxOptions): NativeSpawnSandboxOptions {
+  return {
+    name: options.name,
+    cpu: options.cpu,
+    memory: options.memory,
+    rootfs: {
+      path: options.rootfs.path,
+      readonly: options.rootfs.readonly,
+      format: options.rootfs.format,
+    },
+    rootfsOverlay: options.rootfsOverlay,
+    mounts: options.mounts?.map((mount) => {
+      switch (mount.kind) {
+        case "sqlite-fs":
+          return {
+            kind: mount.kind,
+            path: mount.path,
+            name: mount.name,
+          };
+        case "virtual-fs":
+          return {
+            kind: mount.kind,
+            path: mount.path,
+          };
+      }
+    }),
+    network: options.network === undefined
+      ? undefined
+      : {
+          http: options.network.http === undefined
+            ? undefined
+            : {
+                protectedRanges: options.network.http.protectedRanges,
+              },
+        },
   };
 }
