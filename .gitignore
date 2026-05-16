@@ -1,3 +1,4 @@
+crates/sandbox-node/index.js
 crates/sandbox-node/*.node
 crates/sandbox-node/index.d.ts
 node_modules/
