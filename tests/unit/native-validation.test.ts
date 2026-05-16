@@ -5,6 +5,7 @@ import {
   projectInit,
   projectKernel,
   spawnSandbox,
+  virtualFsMount,
 } from "../../src/index.ts";
 
 test("spawnSandbox rejects invalid CPU config before runtime launch", async () => {
@@ -115,4 +116,40 @@ test("spawnSandbox rejects invalid protected CIDR ranges before runtime launch",
     }),
     /invalid spawnSandbox options: invalid CIDR prefix: 127\.0\.0\.0\/33/,
   );
+});
+
+test("spawnSandbox returns an owned VM handle before guest launch is implemented", async () => {
+  const virtualFs = {
+    async stat() {
+      return {
+        type: "directory" as const,
+        sizeBytes: null,
+        mediaType: null,
+        modifiedAtMs: null,
+      };
+    },
+    async list() {
+      return [];
+    },
+    async read() {
+      return new Uint8Array();
+    },
+  };
+
+  const vm = await spawnSandbox({
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    mounts: [virtualFsMount("/sandbox", virtualFs)],
+  });
+
+  assert.equal(vm.mounts.virtualFs("/sandbox"), virtualFs);
+  await assert.rejects(
+    vm.control.exec({ id: "test", argv: ["/bin/true"] }),
+    /sandbox control exec is not implemented yet/,
+  );
+  await vm.close();
+  await vm.close();
 });

@@ -244,8 +244,134 @@ export function virtualFsMount(path: string, fileSystem: SandboxVirtualFileSyste
 }
 
 export async function spawnSandbox(options: SandboxOptions): Promise<SandboxVm> {
-  await loadNativeBinding().spawnSandbox(toNativeSpawnOptions(options));
-  throw new Error("native spawnSandbox returned before SandboxVm adaptation was implemented");
+  const nativeVm = await loadNativeBinding().spawnSandbox(toNativeSpawnOptions(options));
+  return new NativeBackedSandboxVm(nativeVm, options);
+}
+
+class NativeBackedSandboxVm implements SandboxVm {
+  readonly mounts: SandboxMounts;
+  readonly control: SandboxControl;
+  readonly rootfs: SandboxVm["rootfs"];
+
+  readonly #nativeVm: {
+    close(): Promise<void> | void;
+  };
+  #closed = false;
+
+  constructor(
+    nativeVm: {
+      close(): Promise<void> | void;
+    },
+    options: SandboxOptions,
+  ) {
+    this.#nativeVm = nativeVm;
+    this.mounts = new ConfiguredSandboxMounts(options.mounts ?? []);
+    this.control = new UnimplementedSandboxControl();
+    this.rootfs = {
+      async hash() {
+        throw new Error("sandbox rootfs hash is not implemented yet");
+      },
+      async snapshot() {
+        throw new Error("sandbox rootfs snapshot is not implemented yet");
+      },
+    };
+  }
+
+  async close(): Promise<void> {
+    if (this.#closed) {
+      return;
+    }
+
+    this.#closed = true;
+    await this.#nativeVm.close();
+  }
+
+  async [Symbol.asyncDispose](): Promise<void> {
+    await this.close();
+  }
+}
+
+class UnimplementedSandboxControl implements SandboxControl {
+  readonly incoming: AsyncIterable<SandboxControlEvent> = {
+    async *[Symbol.asyncIterator]() {
+      throw new Error("sandbox control plane is not implemented yet");
+    },
+  };
+
+  async send(): Promise<void> {
+    throw new Error("sandbox control plane is not implemented yet");
+  }
+
+  async close(): Promise<void> {}
+
+  async exec(): Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>> {
+    throw new Error("sandbox control exec is not implemented yet");
+  }
+}
+
+class ConfiguredSandboxMounts implements SandboxMounts {
+  readonly #mounts = new Map<string, SandboxMountedFileSystem>();
+  readonly #sqliteMounts = new Map<string, SqliteFsHandle>();
+  readonly #virtualMounts = new Map<string, SandboxVirtualFileSystem>();
+
+  constructor(mounts: readonly MountConfig[]) {
+    for (const mount of mounts) {
+      switch (mount.kind) {
+        case "sqlite-fs": {
+          const handle = new UnimplementedSqliteFsHandle();
+          this.#mounts.set(mount.path, handle);
+          this.#sqliteMounts.set(mount.path, handle);
+          break;
+        }
+        case "virtual-fs":
+          this.#mounts.set(mount.path, mount.fileSystem);
+          this.#virtualMounts.set(mount.path, mount.fileSystem);
+          break;
+      }
+    }
+  }
+
+  get(path: string): SandboxMountedFileSystem {
+    const mount = this.#mounts.get(path);
+    if (mount === undefined) {
+      throw new Error(`sandbox mount not found: ${path}`);
+    }
+    return mount;
+  }
+
+  sqliteFs(path: string): SqliteFsHandle {
+    const mount = this.#sqliteMounts.get(path);
+    if (mount === undefined) {
+      throw new Error(`sqliteFs mount not found: ${path}`);
+    }
+    return mount;
+  }
+
+  virtualFs(path: string): SandboxVirtualFileSystem {
+    const mount = this.#virtualMounts.get(path);
+    if (mount === undefined) {
+      throw new Error(`virtualFs mount not found: ${path}`);
+    }
+    return mount;
+  }
+}
+
+class UnimplementedSqliteFsHandle implements SqliteFsHandle {
+  async stat(): Promise<SandboxFileStat> {
+    throw new Error("sqliteFs mount access is not implemented yet");
+  }
+
+  async list(): Promise<readonly SandboxDirectoryEntry[]> {
+    throw new Error("sqliteFs mount access is not implemented yet");
+  }
+
+  async read(): Promise<Uint8Array> {
+    throw new Error("sqliteFs mount access is not implemented yet");
+  }
+
+  async snapshot(): Promise<SqliteFsSnapshot> {
+    throw new Error("sqliteFs snapshot is not implemented yet");
+  }
 }
 
 function toNativeSpawnOptions(options: SandboxOptions): NativeSpawnSandboxOptions {

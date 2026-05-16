@@ -3,12 +3,15 @@ use napi_derive::napi;
 use sandbox::config::{HttpSpecInput, MicroVmSpecInput, MountSpecInput};
 
 #[napi]
-pub struct NativeSandboxVm {}
+pub struct NativeSandboxVm {
+    context: Option<sandbox::runtime::KrunContext>,
+}
 
 #[napi]
 impl NativeSandboxVm {
     #[napi]
-    pub async fn close(&self) -> Result<()> {
+    pub fn close(&mut self) -> Result<()> {
+        self.context.take();
         Ok(())
     }
 }
@@ -83,17 +86,16 @@ pub async fn spawn_sandbox(options: NativeSpawnSandboxOptions) -> Result<NativeS
             format!("invalid spawnSandbox options: {error}"),
         )
     })?;
-    let _context = sandbox::runtime::KrunContext::create(&spec).map_err(|error| {
+    let context = sandbox::runtime::KrunContext::create(&spec).map_err(|error| {
         Error::new(
             Status::GenericFailure,
             format!("failed to initialize libkrun context: {error}"),
         )
     })?;
 
-    Err(Error::new(
-        Status::GenericFailure,
-        "spawnSandbox VM launch is not implemented yet",
-    ))
+    Ok(NativeSandboxVm {
+        context: Some(context),
+    })
 }
 
 impl NativeSpawnSandboxOptions {
