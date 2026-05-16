@@ -15,6 +15,7 @@
     "check:rust": "cargo check --workspace",
     "test:e2e": "node ./tests/e2e/run.ts",
     "test:rust": "cargo test --workspace",
+    "test:unit": "node --test tests/unit/*.test.ts",
     "typecheck": "tsgo --noEmit --pretty"
   },
   "devDependencies": {

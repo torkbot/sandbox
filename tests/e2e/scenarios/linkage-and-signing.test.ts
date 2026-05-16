@@ -1,12 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { platform } from "node:os";
-import { inspectSandboxArtifact } from "../../../src/index.ts";
+import { inspectNativeArtifact } from "../support/artifact.ts";
 import { writeEvidence } from "../support/evidence.ts";
 
 test("host artifact is statically linked and macOS HVF entitlement is present when required", async () => {
-  const artifact = await inspectSandboxArtifact({
-    expectedStatic: true,
+  const artifact = await inspectNativeArtifact({
     forbiddenDynamicLibraries: ["libkrun", "libkrunfw"],
     macosEntitlements: platform() === "darwin"
       ? ["com.apple.security.hypervisor"]

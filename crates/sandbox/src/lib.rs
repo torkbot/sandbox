@@ -4,20 +4,7 @@
 //! libkrun boundary, host services, and guest-control protocol types.
 
 pub mod control;
+pub mod config;
 pub mod vfs;
 
-/// A configured microVM that has not yet been started.
-#[derive(Debug, Clone)]
-pub struct MicroVmSpec {
-    pub vcpus: u8,
-    pub memory_mib: u32,
-}
-
-impl Default for MicroVmSpec {
-    fn default() -> Self {
-        Self {
-            vcpus: 1,
-            memory_mib: 512,
-        }
-    }
-}
+pub use config::MicroVmSpec;

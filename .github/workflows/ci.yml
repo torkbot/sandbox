@@ -53,5 +53,8 @@ jobs:
       - name: Build native module
         run: npm run build:native
 
+      - name: Run unit tests
+        run: npm run test:unit
+
       - name: Run e2e tests
         run: npm run test:e2e

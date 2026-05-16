@@ -38,25 +38,8 @@ export type NativeSpawnSandboxOptions = {
   };
 };
 
-export type NativeArtifactInspectionOptions = {
-  readonly expectedStatic: boolean;
-  readonly forbiddenDynamicLibraries: readonly string[];
-  readonly macosEntitlements?: readonly string[];
-  readonly artifactPath: string;
-};
-
-type NativeArtifactInspection = {
-  readonly staticLinkageOk: boolean;
-  readonly dynamicLibraries: readonly string[];
-  readonly codesignValid: boolean;
-  readonly entitlementNames: readonly string[];
-};
-
 type NativeBinding = {
   spawnSandbox(options: NativeSpawnSandboxOptions): Promise<NativeSandboxVm>;
-  inspectSandboxArtifact(
-    options: NativeArtifactInspectionOptions,
-  ): Promise<NativeArtifactInspection>;
 };
 
 const require = createRequire(import.meta.url);

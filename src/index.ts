@@ -1,4 +1,4 @@
-import { loadNativeBinding, nativeBindingPath } from "./native.ts";
+import { loadNativeBinding } from "./native.ts";
 import type { NativeSpawnSandboxOptions } from "./native.ts";
 
 export interface Transport<TIncoming = unknown, TOutgoing = unknown> {
@@ -246,43 +246,6 @@ export function virtualFsMount(path: string, fileSystem: SandboxVirtualFileSyste
 export async function spawnSandbox(options: SandboxOptions): Promise<SandboxVm> {
   await loadNativeBinding().spawnSandbox(toNativeSpawnOptions(options));
   throw new Error("native spawnSandbox returned before SandboxVm adaptation was implemented");
-}
-
-export interface SandboxArtifactInspectionOptions {
-  readonly expectedStatic: boolean;
-  readonly forbiddenDynamicLibraries: readonly string[];
-  readonly macosEntitlements?: readonly string[];
-}
-
-export interface SandboxArtifactInspection {
-  readonly staticLinkage: { readonly ok: boolean };
-  readonly dynamicLibraries: readonly string[];
-  readonly codesign: {
-    readonly valid: boolean;
-    readonly entitlements: Record<string, boolean>;
-  };
-}
-
-export async function inspectSandboxArtifact(
-  options: SandboxArtifactInspectionOptions,
-): Promise<SandboxArtifactInspection> {
-  const inspection = await loadNativeBinding().inspectSandboxArtifact(
-    {
-      ...options,
-      artifactPath: nativeBindingPath(),
-    },
-  );
-
-  return {
-    staticLinkage: { ok: inspection.staticLinkageOk },
-    dynamicLibraries: inspection.dynamicLibraries,
-    codesign: {
-      valid: inspection.codesignValid,
-      entitlements: Object.fromEntries(
-        inspection.entitlementNames.map((name) => [name, true] as const),
-      ),
-    },
-  };
 }
 
 function toNativeSpawnOptions(options: SandboxOptions): NativeSpawnSandboxOptions {
