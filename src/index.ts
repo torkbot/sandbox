@@ -1,5 +1,7 @@
 import { loadNativeBinding } from "./native.ts";
+import { HostControlTransport } from "./control.ts";
 import type { NativeSpawnSandboxOptions } from "./native.ts";
+export { HostControlTransport } from "./control.ts";
 
 export interface Transport<TIncoming = unknown, TOutgoing = unknown> {
   readonly incoming: AsyncIterable<TIncoming>;
@@ -266,7 +268,7 @@ class NativeBackedSandboxVm implements SandboxVm {
   ) {
     this.#nativeVm = nativeVm;
     this.mounts = new ConfiguredSandboxMounts(options.mounts ?? []);
-    this.control = new UnimplementedSandboxControl();
+    this.control = new HostControlTransport({ connected: false });
     this.rootfs = {
       async hash() {
         throw new Error("sandbox rootfs hash is not implemented yet");
@@ -288,24 +290,6 @@ class NativeBackedSandboxVm implements SandboxVm {
 
   async [Symbol.asyncDispose](): Promise<void> {
     await this.close();
-  }
-}
-
-class UnimplementedSandboxControl implements SandboxControl {
-  readonly incoming: AsyncIterable<SandboxControlEvent> = {
-    async *[Symbol.asyncIterator]() {
-      throw new Error("sandbox control plane is not implemented yet");
-    },
-  };
-
-  async send(): Promise<void> {
-    throw new Error("sandbox control plane is not implemented yet");
-  }
-
-  async close(): Promise<void> {}
-
-  async exec(): Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>> {
-    throw new Error("sandbox control exec is not implemented yet");
   }
 }
 
