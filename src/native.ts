@@ -17,9 +17,9 @@ type NativeArtifactInspection = {
 };
 
 type NativeBinding = {
-  spawnSandbox(options: NativeSpawnSandboxOptions): Promise<NativeSandboxVm>;
+  spawnSandbox(optionsJson: string): Promise<NativeSandboxVm>;
   inspectSandboxArtifact(
-    options: NativeArtifactInspectionOptions,
+    optionsJson: string,
   ): Promise<NativeArtifactInspection>;
 };
 

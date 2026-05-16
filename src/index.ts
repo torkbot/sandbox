@@ -1,4 +1,8 @@
 import { loadNativeBinding } from "./native.ts";
+import {
+  encodeArtifactInspectionRequest,
+  encodeSpawnSandboxRequest,
+} from "./wire.ts";
 
 export interface Transport<TIncoming = unknown, TOutgoing = unknown> {
   readonly incoming: AsyncIterable<TIncoming>;
@@ -243,7 +247,7 @@ export function virtualFsMount(path: string, fileSystem: SandboxVirtualFileSyste
 }
 
 export async function spawnSandbox(_options: SandboxOptions): Promise<SandboxVm> {
-  await loadNativeBinding().spawnSandbox({ name: _options.name });
+  await loadNativeBinding().spawnSandbox(encodeSpawnSandboxRequest(_options));
   throw new Error("native spawnSandbox returned before SandboxVm adaptation was implemented");
 }
 
@@ -265,9 +269,9 @@ export interface SandboxArtifactInspection {
 export async function inspectSandboxArtifact(
   options: SandboxArtifactInspectionOptions,
 ): Promise<SandboxArtifactInspection> {
-  const inspection = await loadNativeBinding().inspectSandboxArtifact({
-    expectedStatic: options.expectedStatic,
-  });
+  const inspection = await loadNativeBinding().inspectSandboxArtifact(
+    encodeArtifactInspectionRequest(options),
+  );
 
   return {
     staticLinkage: { ok: inspection.staticLinkageOk },
