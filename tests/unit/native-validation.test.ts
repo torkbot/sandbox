@@ -95,3 +95,24 @@ test("spawnSandbox rejects unsupported init crates before runtime launch", async
     /invalid spawnSandbox options: unsupported init crate: other-init/,
   );
 });
+
+test("spawnSandbox rejects invalid protected CIDR ranges before runtime launch", async () => {
+  await assert.rejects(
+    spawnSandbox({
+      kernel: projectKernel(),
+      init: projectInit(),
+      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
+        format: "erofs",
+      }),
+      network: {
+        http: {
+          protectedRanges: ["127.0.0.0/33"],
+          async policy() {
+            return { action: "allow" };
+          },
+        },
+      },
+    }),
+    /invalid spawnSandbox options: invalid CIDR prefix: 127\.0\.0\.0\/33/,
+  );
+});

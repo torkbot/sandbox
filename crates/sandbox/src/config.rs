@@ -146,6 +146,8 @@ impl MicroVmSpec {
                 protected_ranges: http.protected_ranges,
             }),
         });
+        crate::network::NetworkPlan::from_http(network.as_ref().and_then(|network| network.http.as_ref()))
+            .map_err(|error| SpecError::new(error.to_string()))?;
 
         Ok(Self {
             name: input.name,
