@@ -160,6 +160,239 @@ test("writable virtual filesystem mounts persist guest mutations through host ca
   assert.equal(Buffer.from(contents).toString("utf8"), "hello");
 });
 
+test("host filesystem tools read complete files and line ranges through JavaScript", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const fileSystem = createMemoryWritableFileSystem();
+  await fileSystem.createFile("/notes.txt");
+  await fileSystem.write({
+    path: "/notes.txt",
+    offset: 0,
+    contents: Buffer.from("one\ntwo\nthree\nfour\n"),
+  });
+
+  const vm = await spawnSandbox({
+    name: "host-filesystem-read-tools",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    mounts: [
+      virtualFsMount("/workspace", fileSystem),
+    ],
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const all = await vm.mounts.host("/workspace").read({
+    path: "notes.txt",
+    signal: AbortSignal.timeout(1_000),
+  });
+  assert.equal(all.content, "one\ntwo\nthree\nfour\n");
+  assert.equal(all.totalLines, 5);
+  assert.equal(all.truncated, false);
+
+  const range = await vm.mounts.host("/workspace").read({
+    path: "/notes.txt",
+    offset: 2,
+    limit: 2,
+    signal: AbortSignal.timeout(1_000),
+  });
+  assert.equal(range.content, "two\nthree");
+  assert.equal(range.totalLines, 5);
+  assert.equal(range.truncated, true);
+});
+
+test("host filesystem tools write complete files through JavaScript", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const fileSystem = createMemoryWritableFileSystem();
+  const vm = await spawnSandbox({
+    name: "host-filesystem-write-tools",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    mounts: [
+      virtualFsMount("/workspace", fileSystem),
+    ],
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  await vm.mounts.host("/workspace").write({
+    path: "agent.txt",
+    content: "created by host tools\n",
+    signal: AbortSignal.timeout(1_000),
+  });
+
+  const result = await execGuestShell(vm, {
+    id: "host-filesystem-write-tools",
+    script: "cat /workspace/agent.txt",
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, "created by host tools\n");
+});
+
+test("host filesystem tools patch files using exact text replacements", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const fileSystem = createMemoryWritableFileSystem();
+  await fileSystem.createFile("/agent.ts");
+  await fileSystem.write({
+    path: "/agent.ts",
+    offset: 0,
+    contents: Buffer.from("const answer = 'old';\n"),
+  });
+
+  const vm = await spawnSandbox({
+    name: "host-filesystem-patch-tools",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    mounts: [
+      virtualFsMount("/workspace", fileSystem),
+    ],
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  await vm.mounts.host("/workspace").patch({
+    path: "/agent.ts",
+    edits: [
+      {
+        oldText: "'old'",
+        newText: "'new'",
+      },
+    ],
+    signal: AbortSignal.timeout(1_000),
+  });
+
+  const result = await execGuestShell(vm, {
+    id: "host-filesystem-patch-tools",
+    script: "cat /workspace/agent.ts",
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, "const answer = 'new';\n");
+});
+
+test("host filesystem tools run bash against the composed virtual filesystem", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const fileSystem = createMemoryWritableFileSystem();
+  await fileSystem.createFile("/input.txt");
+  await fileSystem.write({
+    path: "/input.txt",
+    offset: 0,
+    contents: Buffer.from("alpha\nbeta\n"),
+  });
+
+  const vm = await spawnSandbox({
+    name: "host-filesystem-bash-tools",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    mounts: [
+      virtualFsMount("/workspace", fileSystem),
+    ],
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await vm.mounts.host("/workspace").bash({
+    command: "grep beta input.txt > output.txt && cat output.txt",
+    timeoutMs: 1_000,
+    signal: AbortSignal.timeout(2_000),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, "beta\n");
+  assert.equal(result.stderr, "");
+  const written = await vm.mounts.host("/workspace").read({
+    path: "/output.txt",
+    signal: AbortSignal.timeout(1_000),
+  });
+  assert.equal(written.content, "beta\n");
+});
+
+test("guest-visible mounts are applied in declaration order so specific mounts can shadow parents", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const parentFs = createDirectoryOnlyFileSystem(["project"]);
+  const childFs = createMemoryWritableFileSystem();
+  await childFs.createFile("/file.txt");
+  await childFs.write({
+    path: "/file.txt",
+    offset: 0,
+    contents: Buffer.from("child mount wins"),
+  });
+
+  const vm = await spawnSandbox({
+    name: "ordered-virtual-filesystem-mounts",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    mounts: [
+      virtualFsMount("/workspace", parentFs),
+      virtualFsMount("/workspace/project", childFs),
+    ],
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuestShell(vm, {
+    id: "ordered-virtual-filesystem-mounts",
+    script: "cat /workspace/project/file.txt",
+  });
+
+  assert.equal(
+    result.exitCode,
+    0,
+    `ordered mount check failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+  );
+  assert.equal(result.stdout, "child mount wins");
+});
+
 test("closing a VM while a host filesystem callback is locked up cleans up the sandbox", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
@@ -548,6 +781,40 @@ function createMemoryWritableFileSystem(): SandboxWritableFileSystem {
       next.set(current.slice(0, size));
       files.set(path, next);
       return fileStat(size, true);
+    },
+  };
+}
+
+function createDirectoryOnlyFileSystem(
+  rootEntries: readonly string[],
+): SandboxWritableFileSystem {
+  return {
+    async stat(path) {
+      if (path === "/" || rootEntries.includes(path.slice(1))) {
+        return directoryStat(true);
+      }
+      throw new Error(`missing path ${path}`);
+    },
+    async list(path) {
+      if (path !== "/") {
+        throw new Error(`missing directory ${path}`);
+      }
+      return rootEntries.map((name): SandboxDirectoryEntry => ({
+        name,
+        type: "directory",
+      }));
+    },
+    async read(input) {
+      throw new Error(`not a file ${input.path}`);
+    },
+    async createFile(path) {
+      throw new Error(`cannot create file ${path}`);
+    },
+    async write(input) {
+      throw new Error(`cannot write file ${input.path}`);
+    },
+    async truncate(path) {
+      throw new Error(`cannot truncate file ${path}`);
     },
   };
 }

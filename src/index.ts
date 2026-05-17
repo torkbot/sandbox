@@ -1,6 +1,7 @@
 import { loadNativeBinding } from "./native.ts";
 import { HostControlTransport } from "./control.ts";
 import { HostProcessSandboxVm } from "./host-process.ts";
+import { createSandboxHostFileSystemTools } from "./host-filesystem-tools.ts";
 import { isSandboxWritableFileSystem } from "./vfs.ts";
 import type { NativeSpawnSandboxOptions } from "./native.ts";
 export { HostControlTransport } from "./control.ts";
@@ -91,6 +92,48 @@ export interface SandboxWritableFileSystem extends SandboxFileSystem {
 export type SandboxVirtualFileSystem = SandboxFileSystem;
 export type SandboxMountedFileSystem = SandboxFileSystem;
 
+export type SandboxHostReadResult = {
+  readonly path: string;
+  readonly content: string;
+  readonly totalLines: number;
+  readonly truncated: boolean;
+};
+
+export type SandboxHostPatchEdit = {
+  readonly oldText: string;
+  readonly newText: string;
+};
+
+export type SandboxHostBashResult = {
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly exitCode: number;
+};
+
+export interface SandboxHostFileSystemTools {
+  read(input: {
+    readonly path: string;
+    readonly offset?: number;
+    readonly limit?: number;
+    readonly signal?: AbortSignal;
+  }): Promise<SandboxHostReadResult>;
+  write(input: {
+    readonly path: string;
+    readonly content: string;
+    readonly signal?: AbortSignal;
+  }): Promise<void>;
+  patch(input: {
+    readonly path: string;
+    readonly edits: readonly SandboxHostPatchEdit[];
+    readonly signal?: AbortSignal;
+  }): Promise<void>;
+  bash(input: {
+    readonly command: string;
+    readonly timeoutMs?: number;
+    readonly signal?: AbortSignal;
+  }): Promise<SandboxHostBashResult>;
+}
+
 export type VirtualFsMountConfig = {
   readonly kind: "virtual-fs";
   readonly path: string;
@@ -139,6 +182,7 @@ export interface SandboxOptions {
 export interface SandboxMounts {
   get(path: string): SandboxMountedFileSystem;
   virtualFs(path: string): SandboxVirtualFileSystem;
+  host(path: string): SandboxHostFileSystemTools;
 }
 
 export type SandboxControlEvent =
@@ -315,11 +359,13 @@ class NativeBackedSandboxVm implements SandboxVm {
 class ConfiguredSandboxMounts implements SandboxMounts {
   readonly #mounts = new Map<string, SandboxMountedFileSystem>();
   readonly #virtualMounts = new Map<string, SandboxVirtualFileSystem>();
+  readonly #hostTools = new Map<string, SandboxHostFileSystemTools>();
 
   constructor(mounts: readonly MountConfig[]) {
     for (const mount of mounts) {
       this.#mounts.set(mount.path, mount.fileSystem);
       this.#virtualMounts.set(mount.path, mount.fileSystem);
+      this.#hostTools.set(mount.path, createSandboxHostFileSystemTools(mount.fileSystem));
     }
   }
 
@@ -337,6 +383,14 @@ class ConfiguredSandboxMounts implements SandboxMounts {
       throw new Error(`virtualFs mount not found: ${path}`);
     }
     return mount;
+  }
+
+  host(path: string): SandboxHostFileSystemTools {
+    const tools = this.#hostTools.get(path);
+    if (tools === undefined) {
+      throw new Error(`host filesystem tools not found: ${path}`);
+    }
+    return tools;
   }
 }
 

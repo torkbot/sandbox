@@ -37,14 +37,22 @@ Failing:
 
 ## `filesystem.test.ts`
 
-This file owns guest-visible filesystem behavior. Durable storage engines are intentionally out of scope here; they should be built above the generic virtual filesystem hooks.
+This file owns filesystem behavior. The tests are split by boundary: guest-visible mount behavior, host-side JavaScript tools over mounted filesystems, mount ordering, and cleanup/error behavior. Durable storage engines are intentionally out of scope here; they should be built above the generic virtual filesystem hooks.
 
 Passing:
 
 - `virtual filesystem mounts are backed by host JavaScript callbacks`
-  - Covers read-only virtual `stat` / `list` / `read`, guest reads, and JS mount handles.
+  - Covers the read-only callback ABI: `stat`, `list`, `read`, guest reads, and raw JS mount handles.
 - `writable virtual filesystem mounts persist guest mutations through host callbacks`
-  - Covers guest create, write, overwrite, truncate, and JS inspection through `vm.mounts.get()`.
+  - Covers guest-originated create, write, overwrite, truncate, and JS inspection through `vm.mounts.get()`.
+- `host filesystem tools read complete files and line ranges through JavaScript`
+  - Covers the coding-agent `read` primitive from the host side, including 1-indexed line windows.
+- `host filesystem tools write complete files through JavaScript`
+  - Covers the coding-agent `write` primitive as complete-file replacement/creation through the host API.
+- `host filesystem tools patch files using exact text replacements`
+  - Covers the coding-agent patch/edit primitive with exact, unique text replacement.
+- `host filesystem tools run bash against the composed virtual filesystem`
+  - Covers the coding-agent `bash` primitive over the same mounted filesystem abstraction without host filesystem access.
 - `closing a VM while a host filesystem callback is locked up cleans up the sandbox`
   - Starts guest work that reaches a never-resolving host callback, closes the VM, and asserts close completes and in-flight work rejects.
 - `virtual filesystem range reads pass correct offsets to host callbacks`
@@ -55,6 +63,8 @@ Passing:
   - Missing file, read-only write, and host callback failure should produce stable guest behavior.
 - `virtual filesystem handles larger file reads without truncation`
   - Read a file larger than the current small fixture and assert exact content.
+- `guest-visible mounts are applied in declaration order so specific mounts can shadow parents`
+  - Covers ordered mount application and the expected parent/child mount shadowing semantics.
 
 Failing:
 

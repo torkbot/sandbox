@@ -101,7 +101,7 @@ if (result.exitCode !== 0) {
 }
 ```
 
-Mounted filesystems are also available from JavaScript through the same `stat` / `list` / `read` shape:
+Mounted filesystems expose both the raw callback shape and a host-side tool surface for agent workflows:
 
 ```ts
 const sandboxProc = vm.mounts.virtualFs("/sandbox/proc");
@@ -111,6 +111,29 @@ const statusBytes = await sandboxProc.read({
 });
 
 console.log(JSON.parse(Buffer.from(statusBytes).toString("utf8")));
+
+const workspace = vm.mounts.host("/workspace");
+
+const notes = await workspace.read({
+  path: "notes.md",
+  offset: 1,
+  limit: 80,
+});
+
+await workspace.write({
+  path: "plan.md",
+  content: "# Plan\n\nStart here.\n",
+});
+
+await workspace.patch({
+  path: "plan.md",
+  edits: [{ oldText: "Start here.", newText: "Ship the narrow slice." }],
+});
+
+const grep = await workspace.bash({
+  command: "grep \"Ship\" plan.md",
+  timeoutMs: 1_000,
+});
 ```
 
 Root filesystems are immutable by default. A writable root is expressed as an explicit Linux overlayfs composition:
