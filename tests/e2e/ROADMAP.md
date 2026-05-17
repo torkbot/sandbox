@@ -70,6 +70,23 @@ Failing:
 
 - No remaining known failures in this scenario file.
 
+## `filesystem-posix-hardening.test.ts`
+
+This file owns production filesystem semantics needed by coding-agent workloads. These tests are real VM tests through the public TypeScript API and should stay focused on user-visible POSIX behavior rather than internal backend structure.
+
+Passing:
+
+- No remaining known passes in this scenario file.
+
+Failing:
+
+- `writable virtual filesystem supports nested directories and atomic rename`
+  - Create nested directories, write a temporary file, atomically rename it into place, and assert the host filesystem view matches.
+- `writable virtual filesystem supports unlink and empty directory removal`
+  - Remove a file and then its empty parent directory from the guest, then assert host-side state is gone.
+- `writable virtual filesystem supports symlink metadata without host path escape`
+  - Create relative and absolute symlinks in a mounted virtual filesystem and assert readlink/relative resolution behavior is stable.
+
 ## `rootfs-shaping.test.ts`
 
 This file owns root filesystem composition. Runtime VMs should stay immutable by default unless the root is explicitly composed with `linuxOverlayFs(...)`.
@@ -139,6 +156,20 @@ Passing:
 Failing:
 
 No remaining known failures in this scenario file.
+
+## `http-production-hardening.test.ts`
+
+This file owns production HTTP behavior that matters for long-running agent workloads and failure cleanup.
+
+Passing:
+
+- `closing a VM while HTTP policy is locked up cleans up the sandbox`
+  - A never-resolving JavaScript policy callback should not prevent VM close from completing and rejecting in-flight guest work.
+
+Failing:
+
+- `HTTP interception streams response bodies without waiting for upstream completion`
+  - A slow upstream response should deliver first bytes to the guest before the origin finishes the whole response.
 
 ## `network.test.ts`
 

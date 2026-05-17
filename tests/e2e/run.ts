@@ -17,7 +17,9 @@ const manifest = {
   scenarios: [
     "boot-smoke",
     "filesystem",
+    "filesystem-posix-hardening",
     "http-policy",
+    "http-production-hardening",
     "libkrun-contract",
     "network",
     "rootfs-shaping",
