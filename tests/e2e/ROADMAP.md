@@ -156,11 +156,11 @@ Passing:
   - Assert the hypervisor-owning process is the helper, not the Node process.
 - `project kernel and init artifacts are selected explicitly`
   - Assert runtime uses `projectKernel()` and `projectInit()` artifacts without dynamic discovery.
+- `Linux host CI runs the core VM/control/network contract`
+  - The CI job should prove the same required e2e subset on a Linux host with KVM.
 
 Failing:
 
-- `Linux host CI runs the core VM/control/network contract`
-  - The CI job should prove the same required e2e subset on a Linux host with KVM.
 - `rootfs fixture builds reproducibly`
   - Build the rootfs fixture twice and compare digest/metadata.
 - `kernel fixture builds reproducibly`

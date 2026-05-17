@@ -850,8 +850,59 @@ test("HTTP keep-alive behavior is explicit and deterministic", () => {
   assert.fail("HTTP keep-alive must either support connection reuse or return a documented deterministic close behavior");
 });
 
-test("upstream connection refused returns a deterministic guest-visible failure", () => {
-  assert.fail("refused upstream connections must produce a stable guest-visible curl status and stderr shape");
+test("upstream connection refused returns a deterministic guest-visible failure", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+  const ca = await createTestCertificateAuthority();
+  t.after(async () => {
+    await ca.close();
+  });
+  const refusedUrl = "http://127.0.0.1:1/refused";
+  const policyUrls: string[] = [];
+
+  const vm = await spawnSandbox({
+    name: "http-upstream-refused",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      http: {
+        ca,
+        async policy(request) {
+          policyUrls.push(request.url);
+          return { action: "allow" };
+        },
+      },
+    },
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuest(vm, {
+    id: "curl-upstream-refused",
+    argv: [
+      "curl",
+      "--max-time",
+      "5",
+      "-sS",
+      "-o",
+      "/dev/null",
+      "-w",
+      "%{http_code}",
+      ...interceptedHttpArgs(refusedUrl),
+    ],
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, "502");
+  assert.deepEqual(policyUrls, [refusedUrl]);
 });
 
 test("upstream timeout returns a deterministic guest-visible failure", () => {
@@ -882,6 +933,7 @@ function interceptedHttpsArgs(url: string): string[] {
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
+
 
 function interceptedHttpsAuthorityArgs(
   url: string,

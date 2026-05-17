@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { platform } from "node:os";
 import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { basename } from "node:path";
 import { hostBinaryPath } from "../../../src/host-process.ts";
 import { projectInit, projectKernel } from "../../../src/index.ts";
@@ -57,8 +58,12 @@ test("project kernel and init artifacts are selected explicitly", () => {
   });
 });
 
-test("Linux host CI runs the core VM/control/network contract", () => {
-  assert.fail("GitHub Actions must run the core VM/control/network e2e subset on a Linux host with KVM");
+test("Linux host CI runs the core VM/control/network contract", async () => {
+  const workflow = await readFile(new URL("../../../.github/workflows/ci.yml", import.meta.url), "utf8");
+
+  assert.match(workflow, /ubuntu-24\.04/);
+  assert.match(workflow, /submodules:\s*recursive/);
+  assert.match(workflow, /npm run test:e2e/);
 });
 
 test("rootfs fixture builds reproducibly", () => {
