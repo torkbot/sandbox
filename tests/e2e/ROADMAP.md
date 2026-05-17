@@ -113,11 +113,11 @@ Passing:
   - Origin accepts but delays response past the host upstream timeout; guest sees a stable `502`.
 - `upstream reset mid-body returns a deterministic guest-visible failure`
   - Origin closes mid-response and the guest observes a stable `502`.
+- `TLS without SNI has deterministic certificate and policy metadata`
+  - Connects by IP literal and asserts missing-SNI metadata reaches one policy call deterministically.
 
 Failing:
 
-- `TLS without SNI has deterministic certificate and policy metadata`
-  - Connect by IP literal and assert the documented no-SNI behavior.
 - `dynamic MITM certificates are reused or bounded intentionally`
   - Repeated SNI requests should provide host evidence for cache behavior.
 - `HTTP/2 ALPN behavior is explicit`

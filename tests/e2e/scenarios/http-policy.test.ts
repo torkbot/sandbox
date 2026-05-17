@@ -1116,8 +1116,65 @@ test("upstream reset mid-body returns a deterministic guest-visible failure", as
   assert.deepEqual(policyUrls, [url]);
 });
 
-test("TLS without SNI has deterministic certificate and policy metadata", () => {
-  assert.fail("IP-literal TLS without SNI must have documented certificate behavior and policy metadata");
+test("TLS without SNI has deterministic certificate and policy metadata", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+  const ca = await createTestCertificateAuthority();
+  t.after(async () => {
+    await ca.close();
+  });
+  const decisions: Pick<HttpPolicyRequest, "url" | "headers" | "tls">[] = [];
+
+  const vm = await spawnSandbox({
+    name: "https-without-sni",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      http: {
+        ca,
+        async policy(request) {
+          decisions.push({
+            url: request.url,
+            headers: request.headers,
+            tls: request.tls,
+          });
+          return { action: "deny", reason: "no sni observed" };
+        },
+      },
+    },
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const denied = await execGuest(vm, {
+    id: "curl-https-without-sni",
+    argv: [
+      "curl",
+      "--max-time",
+      "5",
+      "-k",
+      "-sS",
+      "-o",
+      "/dev/null",
+      "-w",
+      "%{http_code}",
+      "https://203.0.113.10/no-sni",
+    ],
+  });
+
+  assert.equal(denied.stdout, "451");
+  assert.equal(decisions.length, 1);
+  assert.equal(decisions[0]?.tls?.serverName, undefined);
+  assert.equal(decisions[0]?.tls?.alpnProtocol, "http/1.1");
+  assert.equal(decisions[0]?.url, "https://203.0.113.10/no-sni");
 });
 
 test("dynamic MITM certificates are reused or bounded intentionally", () => {
