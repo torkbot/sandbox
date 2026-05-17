@@ -11,7 +11,7 @@ import { execGuestShell } from "../support/guest-control.ts";
 import { requireVmLaunchSupport, skipUntilImplemented } from "../support/capabilities.ts";
 
 test("a VM can run with a writable root overlay and publish a new EROFS rootfs", async (t) => {
-  if (!requireVmLaunchSupport()) {
+  if (!requireVmLaunchSupport(t)) {
     return;
   }
   if (!skipUntilImplemented(t, "writable root overlay snapshots")) {

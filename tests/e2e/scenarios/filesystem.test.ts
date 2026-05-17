@@ -38,7 +38,7 @@ const sqliteFsDatabase = {
 };
 
 test("immutable root, SQLite-backed filesystem, and virtual filesystem mounts behave as designed", async (t) => {
-  if (!requireVmLaunchSupport()) {
+  if (!requireVmLaunchSupport(t)) {
     return;
   }
   if (!skipUntilImplemented(t, "guest virtual and sqlite filesystem mounts")) {

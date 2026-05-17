@@ -13,7 +13,7 @@ import { startTestHttpsOrigin } from "../support/http-origin.ts";
 import { requireVmLaunchSupport, skipUntilImplemented } from "../support/capabilities.ts";
 
 test("HTTPS traffic is intercepted, policy checked, rewritten, and protected ranges are blocked", async (t) => {
-  if (!requireVmLaunchSupport()) {
+  if (!requireVmLaunchSupport(t)) {
     return;
   }
   if (!skipUntilImplemented(t, "HTTP interception and host policy")) {

@@ -16,7 +16,7 @@ function isInitReady(event: SandboxControlEvent): event is Extract<SandboxContro
 }
 
 test("Node can boot a sandbox VM and exchange control messages", async (t) => {
-  if (!requireVmLaunchSupport()) {
+  if (!requireVmLaunchSupport(t)) {
     return;
   }
 
