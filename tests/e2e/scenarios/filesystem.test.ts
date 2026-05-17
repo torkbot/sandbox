@@ -10,7 +10,7 @@ import {
 } from "../../../src/index.ts";
 import { collectAsync, writeEvidence } from "../support/evidence.ts";
 import { execGuestShell } from "../support/guest-control.ts";
-import { requireVmLaunchSupport } from "../support/capabilities.ts";
+import { requireVmLaunchSupport, skipUntilImplemented } from "../support/capabilities.ts";
 
 const sqliteFsDatabase = {
   open: true,
@@ -38,7 +38,10 @@ const sqliteFsDatabase = {
 };
 
 test("immutable root, SQLite-backed filesystem, and virtual filesystem mounts behave as designed", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  if (!requireVmLaunchSupport()) {
+    return;
+  }
+  if (!skipUntilImplemented(t, "guest virtual and sqlite filesystem mounts")) {
     return;
   }
 

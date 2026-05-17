@@ -89,7 +89,15 @@ export class HostControlTransport implements SandboxControl {
 
   async #pumpIncoming(): Promise<void> {
     while (!this.#closed && this.#channel !== null) {
-      const packet = this.#channel.tryReadControlPacket();
+      let packet: Uint8Array | null;
+      try {
+        packet = this.#channel.tryReadControlPacket();
+      } catch (error) {
+        if (this.#closed) {
+          return;
+        }
+        throw error;
+      }
       if (packet !== null) {
         this.#events.push(decodeControlEvent(packet));
         continue;

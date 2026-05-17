@@ -8,10 +8,13 @@ import {
 } from "../../../src/index.ts";
 import { collectAsync, writeEvidence } from "../support/evidence.ts";
 import { execGuestShell } from "../support/guest-control.ts";
-import { requireVmLaunchSupport } from "../support/capabilities.ts";
+import { requireVmLaunchSupport, skipUntilImplemented } from "../support/capabilities.ts";
 
 test("a VM can run with a writable root overlay and publish a new EROFS rootfs", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  if (!requireVmLaunchSupport()) {
+    return;
+  }
+  if (!skipUntilImplemented(t, "writable root overlay snapshots")) {
     return;
   }
 

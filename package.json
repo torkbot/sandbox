@@ -11,7 +11,7 @@
   },
   "scripts": {
     "build": "npm run build:native && tsgo --project tsconfig.build.json --pretty",
-    "build:host": "cargo build -p sandbox-host --release && node ./scripts/sign-host.ts",
+    "build:host": "node ./scripts/build-host.ts",
     "build:init": "node ./scripts/build-init.ts",
     "build:libkrun-init": "node ./scripts/build-libkrun-init.ts",
     "build:kernel": "node ./scripts/build-kernel.ts",

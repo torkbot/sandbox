@@ -141,6 +141,8 @@ macOS needs a separate signing track. HVF requires the correct Hypervisor entitl
 
 The napi-rs addon can still provide efficient local primitives, validation, and non-HVF fast paths, but it must not be the only VM launch path on macOS unless the embedding executable is known to be signed with the HVF entitlement.
 
+The first helper protocol is deliberately small. Node starts `sandbox-host --stdio`, sends one length-prefixed BSON `host.spawn` document containing the validated VM spec, then both sides reuse the existing length-prefixed guest control frames for `init.ready` and `guest.exec`. Filesystem callbacks, HTTP policy, and other host services need explicit protocol additions before their e2e scenarios can move from skipped to required.
+
 ## Phased Implementation
 
 1. Create a minimal Node API and Rust host crate with a libkrun context wrapper.

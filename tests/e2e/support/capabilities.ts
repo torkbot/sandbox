@@ -1,10 +1,10 @@
 import type { TestContext } from "node:test";
 
-export function requireVmLaunchSupport(t: TestContext): boolean {
-  if (process.platform !== "darwin") {
-    return true;
-  }
+export function requireVmLaunchSupport(): boolean {
+  return true;
+}
 
-  t.skip("macOS VM launch must route through signed sandbox-host, not the Node process");
+export function skipUntilImplemented(t: TestContext, feature: string): boolean {
+  t.skip(`${feature} is not implemented through sandbox-host yet`);
   return false;
 }

@@ -165,6 +165,7 @@ The guest contract is intentionally narrow:
 ## Repository Layout
 
 - `src/`: TypeScript API consumed by Node.js callers.
+- `crates/sandbox-host`: signed VM-host helper used for macOS HVF launch.
 - `crates/sandbox`: Rust host implementation that owns the libkrun boundary and host services.
 - `crates/sandbox-init`: custom guest init used to configure the guest before supervising untrusted code.
 - `tests/e2e`: TypeScript e2e scenarios run directly by Node.js 24+ type stripping.

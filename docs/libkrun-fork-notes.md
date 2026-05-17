@@ -30,7 +30,7 @@ Important gap:
 
 - The currently exposed vhost-user device set covers console, RNG, RTC, input, vsock, sound, and CAN. A fully programmable host filesystem backend may need a small fork patch for virtio-fs vhost-user support.
 - Some libkrun surfaces require UNIX socket paths even when Sandbox already owns the relevant socket. Prefer adding fd-taking variants where fd ownership gives cleaner lifecycle control and avoids creating filesystem-visible socket paths only to satisfy libkrun.
-- macOS packaging must handle HVF entitlement code signing for the final executable or native module that opens Hypervisor.framework.
+- macOS packaging must handle HVF entitlement code signing for the `sandbox-host` executable that opens Hypervisor.framework. Signing the Node native module alone is not sufficient.
 - Sandbox should avoid path-only APIs when a lower-level primitive is available: fd for sockets, connected handles for databases, and bytes or async iterables for generated artifacts.
 
 Near-term branch plan:

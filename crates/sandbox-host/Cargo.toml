@@ -6,4 +6,5 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+bson = "3.1"
 sandbox = { path = "../sandbox" }

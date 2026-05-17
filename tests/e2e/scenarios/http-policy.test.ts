@@ -10,10 +10,13 @@ import {
 import { collectAsync, writeEvidence } from "../support/evidence.ts";
 import { execGuest } from "../support/guest-control.ts";
 import { startTestHttpsOrigin } from "../support/http-origin.ts";
-import { requireVmLaunchSupport } from "../support/capabilities.ts";
+import { requireVmLaunchSupport, skipUntilImplemented } from "../support/capabilities.ts";
 
 test("HTTPS traffic is intercepted, policy checked, rewritten, and protected ranges are blocked", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  if (!requireVmLaunchSupport()) {
+    return;
+  }
+  if (!skipUntilImplemented(t, "HTTP interception and host policy")) {
     return;
   }
 

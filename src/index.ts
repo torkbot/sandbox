@@ -1,5 +1,6 @@
 import { loadNativeBinding } from "./native.ts";
 import { HostControlTransport } from "./control.ts";
+import { HostProcessSandboxVm } from "./host-process.ts";
 import type { NativeSpawnSandboxOptions } from "./native.ts";
 export { HostControlTransport } from "./control.ts";
 
@@ -246,7 +247,11 @@ export function virtualFsMount(path: string, fileSystem: SandboxVirtualFileSyste
 }
 
 export async function spawnSandbox(options: SandboxOptions): Promise<SandboxVm> {
-  const nativeVm = await loadNativeBinding().spawnSandbox(toNativeSpawnOptions(options));
+  validateSandboxOptions(options);
+  const nativeOptions = toNativeSpawnOptions(options);
+  const nativeVm = process.platform === "darwin"
+    ? await HostProcessSandboxVm.spawn(nativeOptions)
+    : await loadNativeBinding().spawnSandbox(nativeOptions);
   return new NativeBackedSandboxVm(nativeVm, options);
 }
 
@@ -294,6 +299,7 @@ class NativeBackedSandboxVm implements SandboxVm {
     }
 
     this.#closed = true;
+    await this.control.close();
     await this.#nativeVm.close();
   }
 
@@ -409,4 +415,60 @@ function toNativeSpawnOptions(options: SandboxOptions): NativeSpawnSandboxOption
               },
         },
   };
+}
+
+function validateSandboxOptions(options: SandboxOptions): void {
+  if (options.cpu?.vcpus !== undefined && options.cpu.vcpus <= 0) {
+    throw new Error("invalid spawnSandbox options: cpu.vcpus must be greater than zero");
+  }
+  if (options.memory?.mib !== undefined && options.memory.mib <= 0) {
+    throw new Error("invalid spawnSandbox options: memory.mib must be greater than zero");
+  }
+  if (options.init.crate !== "sandbox-init") {
+    throw new Error(`invalid spawnSandbox options: unsupported init crate: ${options.init.crate}`);
+  }
+  if (options.rootfs.path.length === 0) {
+    throw new Error("invalid spawnSandbox options: rootfs.path must not be empty");
+  }
+
+  const mountPaths = new Set<string>();
+  for (const mount of options.mounts ?? []) {
+    if (!mount.path.startsWith("/")) {
+      throw new Error("invalid spawnSandbox options: mount.path must be absolute");
+    }
+    if (mountPaths.has(mount.path)) {
+      throw new Error(`invalid spawnSandbox options: duplicate mount path: ${mount.path}`);
+    }
+    mountPaths.add(mount.path);
+    if (mount.kind === "sqlite-fs" && mount.name.length === 0) {
+      throw new Error("invalid spawnSandbox options: sqliteFsMount.name must not be empty");
+    }
+  }
+
+  for (const range of options.network?.http?.protectedRanges ?? []) {
+    validateCidr(range);
+  }
+}
+
+function validateCidr(range: string): void {
+  const [address, prefixText, extra] = range.split("/");
+  if (address === undefined || prefixText === undefined || extra !== undefined) {
+    throw new Error(`invalid spawnSandbox options: invalid CIDR range: ${range}`);
+  }
+
+  const prefix = Number(prefixText);
+  if (!Number.isInteger(prefix)) {
+    throw new Error(`invalid spawnSandbox options: invalid CIDR prefix: ${range}`);
+  }
+
+  if (address.includes(":")) {
+    if (prefix < 0 || prefix > 128) {
+      throw new Error(`invalid spawnSandbox options: invalid CIDR prefix: ${range}`);
+    }
+    return;
+  }
+
+  if (prefix < 0 || prefix > 32) {
+    throw new Error(`invalid spawnSandbox options: invalid CIDR prefix: ${range}`);
+  }
 }

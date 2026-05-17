@@ -64,9 +64,9 @@ That builds libkrun's legacy C init so current libkrun can mount the root and ex
 The lowest-level runtime handoff is the generated `kernel.c` bundle, not the `libkrunfw` dynamic library. To compile the Sandbox Rust crate with that bundle linked into the VM host:
 
 ```sh
-SANDBOX_KERNEL_BUNDLE_C=dist/kernel/libkrunfw/arm64/kernel.c npm run build:host
+npm run build:host
 ```
 
-The build script compiles that C bundle into the crate and enables the `sandbox_static_kernel` cfg. At runtime, `sandbox-host` calls the raw kernel-bundle setter in the `torkbot/libkrun` fork with host address, guest load address, entry address, and size.
+The build script expects the kernel bundle from `build:kernel` and the temporary libkrun stage-0 init from `build:libkrun-init`. It passes those paths to Cargo as `SANDBOX_KERNEL_BUNDLE_C` and `KRUN_INIT_BINARY_PATH`. Cargo compiles the C kernel bundle into the crate and enables the `sandbox_static_kernel` cfg. At runtime, `sandbox-host` calls the raw kernel-bundle setter in the `torkbot/libkrun` fork with host address, guest load address, entry address, and size.
 
 This avoids a runtime dependency on `libkrunfw` and avoids resolving a kernel path during VM creation. Paths remain build inputs and package artifacts only; VM instantiation should not require building or discovering kernels dynamically.
