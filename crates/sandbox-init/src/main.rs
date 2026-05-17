@@ -128,9 +128,10 @@ fn mount_virtual_filesystems(
     let Some(mounts) = mounts else { return Ok(()) };
 
     for mount in mounts.split(';').filter(|mount| !mount.is_empty()) {
-        let (tag, path) = mount
+        let (tag, rest) = mount
             .split_once('=')
             .ok_or_else(|| InitError(format!("invalid virtual filesystem mount: {mount}")))?;
+        let (path, mode) = rest.split_once('=').unwrap_or((rest, "ro"));
         std::fs::create_dir_all(Path::new(path))
             .map_err(|error| InitError(format!("create mount point {path}: {error}")))?;
 
@@ -139,14 +140,15 @@ fn mount_virtual_filesystems(
         let target = CString::new(path)
             .map_err(|_| InitError(format!("virtual filesystem path contains nul: {path}")))?;
         let fstype = CString::new("virtiofs").unwrap();
-        let options = CString::new("ro").unwrap();
+        let readonly = mode != "rw";
+        let options = CString::new(if readonly { "ro" } else { "rw" }).unwrap();
 
         let result = unsafe {
             libc::mount(
                 source.as_ptr(),
                 target.as_ptr(),
                 fstype.as_ptr(),
-                libc::MS_RDONLY,
+                if readonly { libc::MS_RDONLY } else { 0 },
                 options.as_ptr().cast(),
             )
         };

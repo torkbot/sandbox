@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { connect } from "@tursodatabase/database";
 import {
   prebuiltRootfs,
   projectInit,
@@ -10,32 +11,7 @@ import {
 } from "../../../src/index.ts";
 import { collectAsync, writeEvidence } from "../support/evidence.ts";
 import { execGuestShell } from "../support/guest-control.ts";
-import { requireVmLaunchSupport, skipUntilImplemented } from "../support/capabilities.ts";
-
-const sqliteFsDatabase = {
-  open: true,
-  prepare(_sql: string) {
-    return {
-      async run(..._parameters: readonly unknown[]) {
-        throw new Error("fixture sqlite filesystem statement is not implemented yet");
-      },
-      async get(..._parameters: readonly unknown[]) {
-        throw new Error("fixture sqlite filesystem statement is not implemented yet");
-      },
-      async all(..._parameters: readonly unknown[]) {
-        throw new Error("fixture sqlite filesystem statement is not implemented yet");
-      },
-    };
-  },
-  async exec(_sql: string) {
-    throw new Error("fixture sqlite filesystem database is not implemented yet");
-  },
-  transaction<TArgs extends readonly unknown[], TResult>(
-    fn: (...args: TArgs) => Promise<TResult>,
-  ) {
-    return async (...args: TArgs) => await fn(...args);
-  },
-};
+import { requireVmLaunchSupport } from "../support/capabilities.ts";
 
 test("virtual filesystem mounts are backed by host JavaScript callbacks", async (t) => {
   if (!requireVmLaunchSupport(t)) {
@@ -133,9 +109,10 @@ test("immutable root and SQLite-backed filesystem mounts behave as designed", as
   if (!requireVmLaunchSupport(t)) {
     return;
   }
-  if (!skipUntilImplemented(t, "guest sqlite filesystem mounts")) {
-    return;
-  }
+  const database = await connect(":memory:");
+  t.after(async () => {
+    await database.close();
+  });
 
   const vm = await spawnSandbox({
     name: "sqlite-filesystem",
@@ -148,7 +125,7 @@ test("immutable root and SQLite-backed filesystem mounts behave as designed", as
       sqliteFsMount({
         path: "/workspace",
         name: "workspace",
-        database: sqliteFsDatabase,
+        database,
       }),
     ],
   });
@@ -163,13 +140,19 @@ test("immutable root and SQLite-backed filesystem mounts behave as designed", as
     id: "sqlite-filesystem-checks",
     script: `
       set -eu
-      test ! -w /
+      if touch /sandbox-root-write-test 2>/dev/null; then
+        exit 10
+      fi
       echo hello > /workspace/hello.txt
       test "$(cat /workspace/hello.txt)" = "hello"
     `,
   });
 
-  assert.equal(checks.exitCode, 0);
+  assert.equal(
+    checks.exitCode,
+    0,
+    `guest sqlite filesystem checks failed\nstdout:\n${checks.stdout}\nstderr:\n${checks.stderr}`,
+  );
 
   const snapshot = await vm.mounts.sqliteFs("/workspace").snapshot();
   assert.deepEqual(snapshot.files["/hello.txt"], {

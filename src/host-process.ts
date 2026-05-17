@@ -5,13 +5,14 @@ import http from "node:http";
 import https from "node:https";
 import { resolve } from "node:path";
 import { rootCertificates } from "node:tls";
-import { BSON } from "bson";
+import { Binary, BSON } from "bson";
 import type { HostControlChannel } from "./control.ts";
 import type { NativeSpawnSandboxOptions } from "./native.ts";
+import { isSandboxWritableFileSystem, SqliteFsHandleImpl } from "./sqlite-fs.ts";
 import type {
   HttpPolicyRequest,
   SandboxOptions,
-  SandboxVirtualFileSystem,
+  SandboxFileSystem,
 } from "./index.ts";
 
 export class HostProcessSandboxVm implements HostControlChannel {
@@ -20,7 +21,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
   readonly #child: ChildProcessWithoutNullStreams;
   readonly #options: SandboxOptions;
   readonly #packets: Uint8Array[] = [];
-  readonly #virtualFs = new Map<string, SandboxVirtualFileSystem>();
+  readonly #hostFs = new Map<string, SandboxFileSystem>();
   #buffer = new Uint8Array();
   #stderr = "";
   #closed = false;
@@ -34,7 +35,13 @@ export class HostProcessSandboxVm implements HostControlChannel {
     this.#options = options;
     for (const mount of options.mounts ?? []) {
       if (mount.kind === "virtual-fs") {
-        this.#virtualFs.set(mount.path, mount.fileSystem);
+        this.#hostFs.set(mount.path, mount.fileSystem);
+      }
+      if (mount.kind === "sqlite-fs") {
+        this.#hostFs.set(mount.path, new SqliteFsHandleImpl({
+          name: mount.name,
+          database: mount.database,
+        }));
       }
     }
     child.stdout.on("data", (chunk: Buffer) => {
@@ -161,7 +168,14 @@ export class HostProcessSandboxVm implements HostControlChannel {
       return true;
     }
 
-    if (type !== "host.vfs.stat" && type !== "host.vfs.list" && type !== "host.vfs.read") {
+    if (
+      type !== "host.vfs.stat"
+      && type !== "host.vfs.list"
+      && type !== "host.vfs.read"
+      && type !== "host.vfs.create"
+      && type !== "host.vfs.write"
+      && type !== "host.vfs.truncate"
+    ) {
       return false;
     }
 
@@ -174,9 +188,9 @@ export class HostProcessSandboxVm implements HostControlChannel {
     try {
       const mountPath = assertString(document.mountPath, "mountPath");
       const path = assertString(document.path, "path");
-      const fileSystem = this.#virtualFs.get(mountPath);
+      const fileSystem = this.#hostFs.get(mountPath);
       if (fileSystem === undefined) {
-        throw new Error(`virtualFs mount not found: ${mountPath}`);
+        throw new Error(`host filesystem mount not found: ${mountPath}`);
       }
 
       switch (document.type) {
@@ -211,6 +225,48 @@ export class HostProcessSandboxVm implements HostControlChannel {
             id,
             ok: true,
             contents,
+          }));
+          return;
+        }
+        case "host.vfs.create": {
+          if (!isSandboxWritableFileSystem(fileSystem)) {
+            throw new Error(`host filesystem mount is read-only: ${mountPath}`);
+          }
+          this.#child.stdin.write(encodePacket({
+            type: "host.vfs.response",
+            id,
+            ok: true,
+            stat: await fileSystem.createFile(path),
+          }));
+          return;
+        }
+        case "host.vfs.write": {
+          if (!isSandboxWritableFileSystem(fileSystem)) {
+            throw new Error(`host filesystem mount is read-only: ${mountPath}`);
+          }
+          const offset = assertNumber(document.offset, "offset");
+          this.#child.stdin.write(encodePacket({
+            type: "host.vfs.response",
+            id,
+            ok: true,
+            written: await fileSystem.write({
+              path,
+              offset,
+              contents: binaryField(document.contents, "contents"),
+            }),
+          }));
+          return;
+        }
+        case "host.vfs.truncate": {
+          if (!isSandboxWritableFileSystem(fileSystem)) {
+            throw new Error(`host filesystem mount is read-only: ${mountPath}`);
+          }
+          const size = assertNumber(document.size, "size");
+          this.#child.stdin.write(encodePacket({
+            type: "host.vfs.response",
+            id,
+            ok: true,
+            stat: await fileSystem.truncate(path, size),
           }));
           return;
         }
@@ -337,7 +393,10 @@ function binaryField(value: unknown, field: string): Uint8Array {
   if (value instanceof Uint8Array) {
     return value;
   }
-  throw new Error(`host HTTP request ${field} must be binary`);
+  if (value instanceof Binary) {
+    return value.buffer;
+  }
+  throw new Error(`host request ${field} must be binary`);
 }
 
 async function requestUpstream(url: string, input: {

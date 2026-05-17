@@ -53,6 +53,21 @@ pub trait HostVirtualFileSystem: Send + Sync + 'static {
     fn readdir(&self, inode: VirtualInode) -> io::Result<Vec<VirtioFsDirEntry>>;
 
     fn read(&self, inode: VirtualInode, offset: u64, size: u32) -> io::Result<Vec<u8>>;
+
+    fn create(&self, parent: VirtualInode, name: &CStr, mode: u32) -> io::Result<VirtioFsEntry> {
+        let _ = (parent, name, mode);
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
+
+    fn write(&self, inode: VirtualInode, offset: u64, data: &[u8]) -> io::Result<usize> {
+        let _ = (inode, offset, data);
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
+
+    fn truncate(&self, inode: VirtualInode, size: u64) -> io::Result<(bindings::stat64, Duration)> {
+        let _ = (inode, size);
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
 }
 
 /// Adapter from Sandbox's host VFS contract into libkrun's virtio-fs contract.
@@ -71,8 +86,16 @@ pub fn virtual_file_entry(inode: u64, size: u64) -> VirtioFsEntry {
     virtio_entry(inode, libc::S_IFREG as u32 | 0o444, size)
 }
 
+pub fn virtual_writable_file_entry(inode: u64, size: u64) -> VirtioFsEntry {
+    virtio_entry(inode, libc::S_IFREG as u32 | 0o644, size)
+}
+
 pub fn virtual_directory_entry(inode: u64) -> VirtioFsEntry {
     virtio_entry(inode, libc::S_IFDIR as u32 | 0o555, 0)
+}
+
+pub fn virtual_writable_directory_entry(inode: u64) -> VirtioFsEntry {
+    virtio_entry(inode, libc::S_IFDIR as u32 | 0o755, 0)
 }
 
 fn virtio_entry(inode: u64, mode: u32, size: u64) -> VirtioFsEntry {
@@ -110,6 +133,18 @@ impl VirtioVirtualFsBackend for VirtualFsAdapter {
 
     fn read(&self, inode: u64, offset: u64, size: u32) -> io::Result<Vec<u8>> {
         self.inner.read(VirtualInode::from(inode), offset, size)
+    }
+
+    fn create(&self, parent: u64, name: &CStr, mode: u32) -> io::Result<VirtioFsEntry> {
+        self.inner.create(VirtualInode::from(parent), name, mode)
+    }
+
+    fn write(&self, inode: u64, offset: u64, data: &[u8]) -> io::Result<usize> {
+        self.inner.write(VirtualInode::from(inode), offset, data)
+    }
+
+    fn truncate(&self, inode: u64, size: u64) -> io::Result<(bindings::stat64, Duration)> {
+        self.inner.truncate(VirtualInode::from(inode), size)
     }
 }
 
@@ -172,6 +207,15 @@ mod tests {
         assert_eq!(entry.attr.st_ino, 7);
         assert_eq!(mode & libc::S_IFMT, libc::S_IFDIR);
         assert_eq!(mode & 0o777, 0o555);
+    }
+
+    #[test]
+    fn writable_entries_use_mutable_metadata() {
+        let file = virtual_writable_file_entry(42, 99);
+        let directory = virtual_writable_directory_entry(7);
+
+        assert_eq!((file.attr.st_mode as libc::mode_t) & 0o777, 0o644);
+        assert_eq!((directory.attr.st_mode as libc::mode_t) & 0o777, 0o755);
     }
 
     #[test]

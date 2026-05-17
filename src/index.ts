@@ -1,6 +1,7 @@
 import { loadNativeBinding } from "./native.ts";
 import { HostControlTransport } from "./control.ts";
 import { HostProcessSandboxVm } from "./host-process.ts";
+import { SqliteFsHandleImpl } from "./sqlite-fs.ts";
 import type { NativeSpawnSandboxOptions } from "./native.ts";
 export { HostControlTransport } from "./control.ts";
 
@@ -46,6 +47,7 @@ export type SandboxFileStat = {
   readonly sizeBytes: number | null;
   readonly mediaType: string | null;
   readonly modifiedAtMs: number | null;
+  readonly writable?: boolean;
 };
 
 export type SandboxDirectoryEntry = {
@@ -64,6 +66,16 @@ export interface SandboxFileSystem {
     };
     readonly signal: AbortSignal;
   }): Promise<Uint8Array>;
+}
+
+export interface SandboxWritableFileSystem extends SandboxFileSystem {
+  createFile(path: string): Promise<SandboxFileStat>;
+  write(input: {
+    readonly path: string;
+    readonly offset: number;
+    readonly contents: Uint8Array;
+  }): Promise<number>;
+  truncate(path: string, size: number): Promise<SandboxFileStat>;
 }
 
 export type SandboxVirtualFileSystem = SandboxFileSystem;
@@ -143,7 +155,7 @@ export interface SqliteFsSnapshot {
   readonly files: Record<string, { readonly type: "file"; readonly contents: string }>;
 }
 
-export interface SqliteFsHandle extends SandboxMountedFileSystem {
+export interface SqliteFsHandle extends SandboxWritableFileSystem {
   snapshot(): Promise<SqliteFsSnapshot>;
 }
 
@@ -324,7 +336,10 @@ class ConfiguredSandboxMounts implements SandboxMounts {
     for (const mount of mounts) {
       switch (mount.kind) {
         case "sqlite-fs": {
-          const handle = new UnimplementedSqliteFsHandle();
+          const handle = new SqliteFsHandleImpl({
+            name: mount.name,
+            database: mount.database,
+          });
           this.#mounts.set(mount.path, handle);
           this.#sqliteMounts.set(mount.path, handle);
           break;
@@ -359,24 +374,6 @@ class ConfiguredSandboxMounts implements SandboxMounts {
       throw new Error(`virtualFs mount not found: ${path}`);
     }
     return mount;
-  }
-}
-
-class UnimplementedSqliteFsHandle implements SqliteFsHandle {
-  async stat(): Promise<SandboxFileStat> {
-    throw new Error("sqliteFs mount access is not implemented yet");
-  }
-
-  async list(): Promise<readonly SandboxDirectoryEntry[]> {
-    throw new Error("sqliteFs mount access is not implemented yet");
-  }
-
-  async read(): Promise<Uint8Array> {
-    throw new Error("sqliteFs mount access is not implemented yet");
-  }
-
-  async snapshot(): Promise<SqliteFsSnapshot> {
-    throw new Error("sqliteFs snapshot is not implemented yet");
   }
 }
 

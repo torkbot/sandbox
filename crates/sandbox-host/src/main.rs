@@ -134,10 +134,19 @@ fn virtual_fs_devices(
                 Some(VirtualFsDevice {
                     tag,
                     path: path.clone(),
+                    readonly: true,
                     backend: NodeVirtualFs::new(path.clone(), bridge.clone()),
                 })
             }
-            MountSpec::SqliteFs { .. } => None,
+            MountSpec::SqliteFs { path, .. } => {
+                let tag = format!("vfs{index}");
+                Some(VirtualFsDevice {
+                    tag,
+                    path: path.clone(),
+                    readonly: false,
+                    backend: NodeVirtualFs::new(path.clone(), bridge.clone()),
+                })
+            }
         })
         .collect()
 }

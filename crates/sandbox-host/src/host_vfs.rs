@@ -9,7 +9,8 @@ use bson::{Bson, Document, doc};
 use sandbox::network_service::{HostHttpHandler, HostHttpRequest, HostHttpResponse};
 use sandbox::vfs::{
     VirtioFsDirEntry, VirtioFsEntry, VirtioVirtualFsBackend, VirtualFsAdapter, VirtualInode,
-    bindings, virtual_directory_entry, virtual_file_entry,
+    bindings, virtual_directory_entry, virtual_file_entry, virtual_writable_directory_entry,
+    virtual_writable_file_entry,
 };
 
 pub struct HostIoBridge {
@@ -197,7 +198,9 @@ impl sandbox::vfs::HostVirtualFileSystem for NodeVirtualFs {
             io::Error::new(io::ErrorKind::InvalidInput, "virtual path is not utf-8")
         })?;
         let path = join_guest_path(&parent, name);
-        let stat = self.stat_path(&path)?;
+        let stat = self
+            .stat_path(&path)
+            .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
         Ok(entry_from_stat(self.inode_for_path(&path), &stat))
     }
 
@@ -250,6 +253,54 @@ impl sandbox::vfs::HostVirtualFileSystem for NodeVirtualFs {
             .cloned()
             .map_err(to_io_error)
     }
+
+    fn create(&self, parent: VirtualInode, name: &CStr, mode: u32) -> io::Result<VirtioFsEntry> {
+        let parent = self.path_for_inode(parent)?;
+        let name = name.to_str().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "virtual path is not utf-8")
+        })?;
+        let path = join_guest_path(&parent, name);
+        let response = self.bridge.request(doc! {
+            "type": "host.vfs.create",
+            "mountPath": &self.mount_path,
+            "path": &path,
+            "mode": mode as i64,
+        })?;
+        let stat = response.get_document("stat").map_err(to_io_error)?;
+        Ok(entry_from_stat(self.inode_for_path(&path), stat))
+    }
+
+    fn write(&self, inode: VirtualInode, offset: u64, data: &[u8]) -> io::Result<usize> {
+        let path = self.path_for_inode(inode)?;
+        let response = self.bridge.request(doc! {
+            "type": "host.vfs.write",
+            "mountPath": &self.mount_path,
+            "path": &path,
+            "offset": offset as i64,
+            "contents": Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: data.to_vec(),
+            }),
+        })?;
+        let written = response.get_i32("written").map_err(to_io_error)?;
+        usize::try_from(written)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid vfs write length"))
+    }
+
+    fn truncate(&self, inode: VirtualInode, size: u64) -> io::Result<(bindings::stat64, Duration)> {
+        let path = self.path_for_inode(inode)?;
+        let response = self.bridge.request(doc! {
+            "type": "host.vfs.truncate",
+            "mountPath": &self.mount_path,
+            "path": &path,
+            "size": size as i64,
+        })?;
+        let stat = response.get_document("stat").map_err(to_io_error)?;
+        Ok((
+            entry_from_stat(u64::from(inode), stat).attr,
+            Duration::from_secs(1),
+        ))
+    }
 }
 
 impl NodeVirtualFs {
@@ -264,9 +315,12 @@ impl NodeVirtualFs {
 }
 
 fn entry_from_stat(inode: u64, stat: &Document) -> VirtioFsEntry {
-    match stat.get_str("type").unwrap_or("file") {
-        "directory" => virtual_directory_entry(inode),
-        _ => virtual_file_entry(inode, stat_size(stat)),
+    let writable = stat.get_bool("writable").unwrap_or(false);
+    match (stat.get_str("type").unwrap_or("file"), writable) {
+        ("directory", true) => virtual_writable_directory_entry(inode),
+        ("directory", false) => virtual_directory_entry(inode),
+        (_, true) => virtual_writable_file_entry(inode, stat_size(stat)),
+        (_, false) => virtual_file_entry(inode, stat_size(stat)),
     }
 }
 

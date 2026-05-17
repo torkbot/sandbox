@@ -276,6 +276,7 @@ impl KrunContext {
 pub struct VirtualFsDevice {
     pub tag: String,
     pub path: String,
+    pub readonly: bool,
     pub backend: Arc<dyn VirtioVirtualFsBackend>,
 }
 
@@ -288,6 +289,8 @@ fn encode_virtual_fs_mounts(virtual_fs: &[VirtualFsDevice]) -> String {
         value.push_str(&device.tag);
         value.push('=');
         value.push_str(&device.path);
+        value.push('=');
+        value.push_str(if device.readonly { "ro" } else { "rw" });
     }
     value
 }
