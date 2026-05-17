@@ -147,10 +147,11 @@ test("spawnSandbox returns an owned VM handle before guest launch is implemented
   });
 
   assert.equal(vm.mounts.virtualFs("/sandbox"), virtualFs);
-  await assert.rejects(
-    vm.control.exec({ id: "test", argv: ["/bin/true"] }),
-    /sandbox control plane is not connected yet/,
-  );
+  await vm.control.send({
+    type: "guest.exec",
+    id: "test",
+    argv: ["/bin/true"],
+  });
   await vm.close();
   await vm.close();
 });

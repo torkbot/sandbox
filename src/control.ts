@@ -114,7 +114,10 @@ async function waitForExecComplete(
 }
 
 function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise((resolve) => {
+    const timeout = setTimeout(resolve, ms);
+    timeout.unref();
+  });
 }
 
 class AsyncQueue<T> implements AsyncIterable<T> {

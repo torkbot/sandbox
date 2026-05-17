@@ -22,12 +22,32 @@ export async function collectAsync<T>(
 export async function collectAsync<T>(
   iterable: AsyncIterable<T>,
   predicate: (item: T) => boolean,
+  timeoutMs = 5_000,
 ): Promise<T> {
-  for await (const item of iterable) {
-    if (predicate(item)) {
-      return item;
+  return await withTimeout((async () => {
+    for await (const item of iterable) {
+      if (predicate(item)) {
+        return item;
+      }
+    }
+
+    throw new Error("Async iterable ended before the expected event was observed");
+  })(), timeoutMs);
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timeout: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => {
+      reject(new Error(`Timed out after ${timeoutMs}ms waiting for expected event`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeout !== undefined) {
+      clearTimeout(timeout);
     }
   }
-
-  throw new Error("Async iterable ended before the expected event was observed");
 }

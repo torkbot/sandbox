@@ -274,7 +274,10 @@ class NativeBackedSandboxVm implements SandboxVm {
   ) {
     this.#nativeVm = nativeVm;
     this.mounts = new ConfiguredSandboxMounts(options.mounts ?? []);
-    this.control = new HostControlTransport({ connected: false });
+    this.control = new HostControlTransport({
+      connected: nativeVm.hasControlSocket,
+      channel: nativeVm,
+    });
     this.rootfs = {
       async hash() {
         throw new Error("sandbox rootfs hash is not implemented yet");
