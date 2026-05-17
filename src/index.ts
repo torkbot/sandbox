@@ -256,12 +256,14 @@ class NativeBackedSandboxVm implements SandboxVm {
   readonly rootfs: SandboxVm["rootfs"];
 
   readonly #nativeVm: {
+    readonly hasControlSocket: boolean;
     close(): Promise<void> | void;
   };
   #closed = false;
 
   constructor(
     nativeVm: {
+      readonly hasControlSocket: boolean;
       close(): Promise<void> | void;
     },
     options: SandboxOptions,

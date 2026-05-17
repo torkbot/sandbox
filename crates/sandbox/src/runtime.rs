@@ -1,6 +1,7 @@
 use std::ffi::CString;
 use std::fmt;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use crate::control::INIT_CONTROL_PORT;
@@ -10,6 +11,17 @@ use crate::MicroVmSpec;
 #[derive(Debug)]
 pub struct KrunContext {
     id: u32,
+}
+
+#[derive(Debug)]
+pub struct KrunVm {
+    context: KrunContext,
+    control_socket: ControlSocket,
+}
+
+#[derive(Debug)]
+pub struct ControlSocket {
+    stream: UnixStream,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +103,38 @@ impl KrunContext {
     }
 }
 
+impl KrunVm {
+    pub fn create(spec: &MicroVmSpec) -> Result<Self, KrunError> {
+        let context = KrunContext::create(spec)?;
+        let (host_socket, guest_socket) =
+            UnixStream::pair().map_err(|_| KrunError::new("UnixStream::pair", -libc::EIO))?;
+
+        context.add_control_socket_fd(guest_socket.as_raw_fd())?;
+        drop(guest_socket);
+
+        Ok(Self {
+            context,
+            control_socket: ControlSocket {
+                stream: host_socket,
+            },
+        })
+    }
+
+    pub fn context(&self) -> &KrunContext {
+        &self.context
+    }
+
+    pub fn control_socket(&self) -> &ControlSocket {
+        &self.control_socket
+    }
+}
+
+impl ControlSocket {
+    pub fn raw_fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
+    }
+}
+
 impl Drop for KrunContext {
     fn drop(&mut self) {
         let _ = krun::krun_free_ctx(self.id);
@@ -110,6 +154,12 @@ fn check_krun(operation: &'static str, code: i32) -> Result<(), KrunError> {
         Ok(())
     } else {
         Err(KrunError { operation, code })
+    }
+}
+
+impl KrunError {
+    fn new(operation: &'static str, code: i32) -> Self {
+        Self { operation, code }
     }
 }
 
@@ -210,6 +260,28 @@ mod tests {
             libc::close(fds[0]);
             libc::close(fds[1]);
         }
+    }
+
+    #[test]
+    fn vm_creation_owns_host_control_socket() {
+        let spec = MicroVmSpec::build(MicroVmSpecInput {
+            name: Some("control-socket".to_string()),
+            vcpus: Some(1),
+            memory_mib: Some(128),
+            kernel_format: None,
+            init_crate: "sandbox-init".to_string(),
+            rootfs_path: "rootfs.erofs".to_string(),
+            rootfs_readonly: Some(true),
+            rootfs_format: "erofs".to_string(),
+            rootfs_overlay_mode: None,
+            mounts: Vec::new(),
+            network_http: None,
+        })
+        .unwrap();
+
+        let vm = KrunVm::create(&spec).unwrap();
+        assert!(vm.context().id() > 0);
+        assert!(vm.control_socket().raw_fd() >= 0);
     }
 
     #[test]

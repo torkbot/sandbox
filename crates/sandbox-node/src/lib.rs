@@ -4,15 +4,23 @@ use sandbox::config::{HttpSpecInput, MicroVmSpecInput, MountSpecInput};
 
 #[napi]
 pub struct NativeSandboxVm {
-    context: Option<sandbox::runtime::KrunContext>,
+    vm: Option<sandbox::runtime::KrunVm>,
 }
 
 #[napi]
 impl NativeSandboxVm {
     #[napi]
     pub fn close(&mut self) -> Result<()> {
-        self.context.take();
+        self.vm.take();
         Ok(())
+    }
+
+    #[napi(getter)]
+    pub fn has_control_socket(&self) -> bool {
+        self.vm
+            .as_ref()
+            .map(|vm| vm.control_socket().raw_fd() >= 0)
+            .unwrap_or(false)
     }
 }
 
@@ -86,16 +94,14 @@ pub async fn spawn_sandbox(options: NativeSpawnSandboxOptions) -> Result<NativeS
             format!("invalid spawnSandbox options: {error}"),
         )
     })?;
-    let context = sandbox::runtime::KrunContext::create(&spec).map_err(|error| {
+    let vm = sandbox::runtime::KrunVm::create(&spec).map_err(|error| {
         Error::new(
             Status::GenericFailure,
             format!("failed to initialize libkrun context: {error}"),
         )
     })?;
 
-    Ok(NativeSandboxVm {
-        context: Some(context),
-    })
+    Ok(NativeSandboxVm { vm: Some(vm) })
 }
 
 impl NativeSpawnSandboxOptions {

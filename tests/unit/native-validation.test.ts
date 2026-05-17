@@ -7,6 +7,7 @@ import {
   spawnSandbox,
   virtualFsMount,
 } from "../../src/index.ts";
+import { loadNativeBinding } from "../../src/native.ts";
 
 test("spawnSandbox rejects invalid CPU config before runtime launch", async () => {
   await assert.rejects(
@@ -152,4 +153,20 @@ test("spawnSandbox returns an owned VM handle before guest launch is implemented
   );
   await vm.close();
   await vm.close();
+});
+
+test("native spawn owns a host control socket", async () => {
+  const nativeVm = await loadNativeBinding().spawnSandbox({
+    kernel: {},
+    init: { crateName: "sandbox-init" },
+    rootfs: {
+      path: "test-fixtures/rootfs/alpine-3.20.erofs",
+      readonly: true,
+      format: "erofs",
+    },
+  });
+
+  assert.equal(nativeVm.hasControlSocket, true);
+  await nativeVm.close();
+  assert.equal(nativeVm.hasControlSocket, false);
 });
