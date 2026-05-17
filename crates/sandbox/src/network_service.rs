@@ -8,8 +8,13 @@ use std::time::Duration;
 
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
+use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address};
+
+const HOST_HTTP_PROBE_PORT: u16 = 8080;
+const HOST_HTTP_PROBE_RESPONSE: &[u8] =
+    b"HTTP/1.1 200 OK\r\ncontent-length: 25\r\nconnection: close\r\n\r\nsandbox explicit network\n";
 
 /// Host-owned endpoint for libkrun's explicit virtio-net unixstream backend.
 #[derive(Debug)]
@@ -62,11 +67,33 @@ fn run_network_service(stream: UnixStream, shutdown: Arc<AtomicBool>) {
         let _ = addresses.push(IpCidr::new(Ipv4Address::new(10, 0, 2, 1).into(), 24));
     });
     let mut sockets = SocketSet::new(Vec::new());
+    let http_probe = sockets.add(tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0; 4096]),
+        tcp::SocketBuffer::new(vec![0; 4096]),
+    ));
 
     while !shutdown.load(Ordering::Acquire) {
         let timestamp = Instant::now();
         let _ = iface.poll(timestamp, &mut device, &mut sockets);
+        poll_http_probe(&mut sockets, http_probe);
         thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn poll_http_probe(sockets: &mut SocketSet<'_>, handle: smoltcp::iface::SocketHandle) {
+    let socket = sockets.get_mut::<tcp::Socket>(handle);
+    if !socket.is_active() {
+        let _ = socket.listen(HOST_HTTP_PROBE_PORT);
+        return;
+    }
+
+    if socket.can_recv() {
+        let mut request = [0; 4096];
+        let received = socket.recv_slice(&mut request).unwrap_or(0);
+        if received > 0 {
+            let _ = socket.send_slice(HOST_HTTP_PROBE_RESPONSE);
+            socket.close();
+        }
     }
 }
 

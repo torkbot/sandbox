@@ -44,6 +44,7 @@ test("HTTP networking uses an explicit virtio-net device, not TSI", async (t) =>
       test -d /sys/class/net/eth0
       ip addr show dev eth0
       ip route show default
+      curl --fail --silent http://10.0.2.1:8080/
     `,
   });
 
@@ -54,4 +55,5 @@ test("HTTP networking uses an explicit virtio-net device, not TSI", async (t) =>
   );
   assert.match(result.stdout, /10\.0\.2\.2\/24/);
   assert.match(result.stdout, /default via 10\.0\.2\.1/);
+  assert.match(result.stdout, /sandbox explicit network/);
 });
