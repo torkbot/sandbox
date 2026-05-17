@@ -137,6 +137,32 @@ impl ControlFrame {
             ))),
         }
     }
+
+    pub fn encode_packet(&self) -> Result<Vec<u8>, ControlFrameError> {
+        let frame = self.encode()?;
+        let frame_len = u32::try_from(frame.len())
+            .map_err(|_| ControlFrameError::new("control frame exceeds u32 length"))?;
+        let mut packet = Vec::with_capacity(4 + frame.len());
+        packet.extend_from_slice(&frame_len.to_le_bytes());
+        packet.extend_from_slice(&frame);
+        Ok(packet)
+    }
+
+    pub fn decode_packet(bytes: &[u8]) -> Result<Self, ControlFrameError> {
+        if bytes.len() < 4 {
+            return Err(ControlFrameError::new("control packet missing length prefix"));
+        }
+
+        let frame_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let frame = bytes
+            .get(4..4 + frame_len)
+            .ok_or_else(|| ControlFrameError::new("control packet body is truncated"))?;
+        if bytes.len() != 4 + frame_len {
+            return Err(ControlFrameError::new("control packet has trailing bytes"));
+        }
+
+        Self::decode(frame)
+    }
 }
 
 impl ControlFrameError {
@@ -189,5 +215,39 @@ mod tests {
         let err = ControlFrame::decode(&encoded).unwrap_err();
 
         assert_eq!(err.to_string(), "unknown control frame type: unknown");
+    }
+
+    #[test]
+    fn packet_encoding_prefixes_frame_length() {
+        let frame = ControlFrame::InitReady {
+            root_readonly: true,
+            init_name: "sandbox-init".to_string(),
+        };
+
+        let packet = frame.encode_packet().unwrap();
+        let frame_len = u32::from_le_bytes(packet[0..4].try_into().unwrap()) as usize;
+        assert_eq!(packet.len(), 4 + frame_len);
+        assert_eq!(ControlFrame::decode_packet(&packet).unwrap(), frame);
+    }
+
+    #[test]
+    fn packet_decoder_rejects_partial_and_extra_bytes() {
+        let frame = ControlFrame::GuestExec {
+            id: "test".to_string(),
+            argv: vec!["/bin/true".to_string()],
+        };
+        let mut packet = frame.encode_packet().unwrap();
+
+        let truncated = &packet[..packet.len() - 1];
+        assert_eq!(
+            ControlFrame::decode_packet(truncated).unwrap_err().to_string(),
+            "control packet body is truncated",
+        );
+
+        packet.push(0);
+        assert_eq!(
+            ControlFrame::decode_packet(&packet).unwrap_err().to_string(),
+            "control packet has trailing bytes",
+        );
     }
 }
