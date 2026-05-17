@@ -18,7 +18,8 @@ const manifest = {
     "boot-smoke",
     "filesystem",
     "http-policy",
-    "linkage-and-signing",
+    "libkrun-contract",
+    "network",
     "rootfs-shaping",
   ],
 };

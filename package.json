@@ -19,7 +19,9 @@
     "build:rootfs:erofs": "node ./scripts/build-rootfs-erofs.ts",
     "build:native": "napi build --platform --release --manifest-path crates/sandbox-node/Cargo.toml && node ./scripts/sign-native.ts",
     "check:rust": "cargo check --workspace",
+    "test:artifact": "node --test tests/artifact/*.test.ts",
     "test:e2e": "node ./tests/e2e/run.ts",
+    "test:reproducibility": "node --test tests/reproducibility/*.test.ts",
     "test:rust": "cargo test --workspace",
     "test:unit": "node --test tests/unit/*.test.ts",
     "typecheck": "tsgo --noEmit --pretty"

@@ -165,9 +165,9 @@ Failing:
 
 - No remaining known failures in this scenario file.
 
-## `linkage-and-signing.test.ts`
+## Artifact Tests: `tests/artifact/linkage-and-signing.test.ts`
 
-This file owns packaging and platform contracts for the executable that actually opens the hypervisor.
+This suite owns cheap packaging and platform contracts for the executable that actually opens the hypervisor. It is intentionally outside `npm run test:e2e` because it does not exercise guest runtime behavior.
 
 Passing:
 
@@ -179,18 +179,14 @@ Passing:
   - Assert runtime uses `projectKernel()` and `projectInit()` artifacts without dynamic discovery.
 - `Linux host CI runs the core VM/control/network contract`
   - The CI job should prove the same required e2e subset on a Linux host with KVM.
-- `rootfs fixture builds reproducibly`
-  - Build the rootfs fixture twice and compare digest/metadata.
-- `kernel fixture builds reproducibly`
-  - Build the kernel fixture and compare expected digest/metadata.
 
 Failing:
 
 - No remaining known failures in this scenario file.
 
-## `libkrun-contract.test.ts`
+## Artifact Tests: `tests/artifact/libkrun-contract.test.ts`
 
-This file owns fork-specific contracts that are too important to leave as comments in architecture docs.
+This suite owns cheap static contracts against the libkrun integration and fork shape.
 
 Passing:
 
@@ -199,7 +195,33 @@ Passing:
 - `Sandbox-owned sockets can be supplied without filesystem socket paths`
   - Prove fd-oriented network/control surfaces where the fork supports them.
 - `virtual filesystem operations use libkrun virtual filesystem traits`
-  - Keep writable VFS e2e tied to the libkrun trait/backend path.
+  - Keep writable VFS tied to the libkrun trait/backend path.
+
+Failing:
+
+- No remaining known failures in this scenario file.
+
+## Reproducibility Tests: `tests/reproducibility/build-artifacts.test.ts`
+
+This suite owns expensive build reproducibility checks. It is intentionally outside default e2e and CI because it rebuilds Docker rootfs artifacts and the Linux kernel.
+
+Passing:
+
+- `rootfs fixture builds reproducibly`
+  - Build the rootfs fixture twice and compare digest/metadata.
+- `kernel fixture builds reproducibly`
+  - Build the kernel fixture twice and compare digest/metadata.
+
+Failing:
+
+- No remaining known failures in this scenario file.
+
+## `libkrun-contract.test.ts`
+
+This runtime e2e file owns fork-specific contracts that require booting a VM.
+
+Passing:
+
 - `direct Rust init injection boots without libkrun stage-1 init`
   - Boot `sandbox-init` directly without relying on libkrun stage-1 init.
 
@@ -209,6 +231,6 @@ Failing:
 
 ## Required Suite Today
 
-`npm run test:e2e` should include passing tests and known failing roadmap tests. Host capability detection may decline to run the suite on machines that cannot launch VMs, but roadmap behavior should never be hidden behind implementation placeholders.
+`npm run test:e2e` should include runtime VM behavior tests. `npm run test:artifact` should include cheap packaging/linkage contracts. `npm run test:reproducibility` should include expensive build reproducibility checks and should be run intentionally, not as part of the default PR loop. Host capability detection may decline to run the suite on machines that cannot launch VMs, but roadmap behavior should never be hidden behind implementation placeholders.
 
 New hardening slices should add or refine real tests with idiomatic test names, then make those tests pass without adding compatibility layers or speculative options.

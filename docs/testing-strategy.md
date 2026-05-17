@@ -17,8 +17,9 @@ Evidence:
 - `cargo check --workspace` passes.
 - the host binary or native module links without `libkrun` or `libkrunfw` dynamic dependencies.
 - the guest init binary is statically linked.
-- packaged kernel/initramfs/rootfs artifacts are content-addressed and reproducible from the same build-time inputs.
-- `deps/libkrunfw` can build the patched Linux kernel artifacts through the Docker-based build entrypoint.
+- cheap artifact checks verify static linkage, selected kernel/init configuration, and platform signing contracts.
+- expensive reproducibility checks verify packaged kernel/initramfs/rootfs artifacts from the same build-time inputs only when explicitly requested.
+- expensive reproducibility checks verify `deps/libkrunfw` can build the patched Linux kernel artifacts through the Docker-based build entrypoint.
 
 Platform checks:
 
@@ -109,7 +110,7 @@ Evidence:
 
 ### Tier 5: libkrun Fork Contract Tests
 
-Runs against `deps/libkrun` or the pinned submodule.
+Cheap static checks run under `npm run test:artifact` against `deps/libkrun` or the pinned submodule. Runtime checks that require a VM stay under `npm run test:e2e`.
 
 Evidence:
 
@@ -122,7 +123,7 @@ Evidence:
 
 ### Tier 6: macOS HVF Packaging Test
 
-Runs on macOS only.
+Runs on macOS only as a cheap artifact test, with VM boot coverage left to the runtime e2e suite.
 
 Evidence:
 
@@ -137,13 +138,13 @@ Use a TypeScript e2e runner as the orchestration layer because the public librar
 
 Each e2e test should emit:
 
-- `manifest.json`: host platform, git commit, artifact hashes, selected test fixture, and capability checks.
+- `manifest.json`: host platform, git commit, selected test fixture, and capability checks.
 - `host.log`: host runtime logs.
 - `guest-console.log`: guest console output.
 - `control.jsonl`: host/guest control-channel transcript.
 - `proxy.jsonl`: HTTP proxy observations and decisions.
 - `fs.json`: filesystem assertions and database state summaries.
-- `linkage.json`: static-link and signing verification.
+- `linkage.json`: static-link and signing verification from `npm run test:artifact`.
 
 ## Capability Detection
 
@@ -151,8 +152,7 @@ The runner may decline to run tests whose host prerequisites are absent. It must
 
 Detected capabilities:
 
-- Docker or compatible CLI for build-time rootfs fixture generation.
-- Docker or compatible CLI for build-time kernel fixture generation.
+- Docker or compatible CLI for explicitly requested build reproducibility checks.
 - Linux KVM access.
 - macOS HVF access.
 - macOS codesign availability and entitlement verification.
@@ -163,7 +163,7 @@ Detected capabilities:
 - Spawn microVMs from Node.js: Node e2e creates a VM, receives readiness, sends commands, and shuts down cleanly.
 - Custom init: the Rust guest init from this repository performs setup, reports readiness, and supervises a test workload. Any libkrun-provided init stage is a temporary bridge and should be removed from the passing target suite once direct Rust init injection lands.
 - Static linking: linkage report shows no dynamic `libkrun` or `libkrunfw` dependency.
-- Immutable root: root hash remains stable and guest root writes fail.
+- Immutable root: guest root writes fail unless an explicit overlay root is configured.
 - Rootfs composition: explicit `linuxOverlayFs(...)` can compose a prebuilt lower and scratch upper without mutating the lower.
 - Virtual filesystem: guest reads host-generated files and metadata through a mounted virtual tree.
 - HTTP interception: TLS traffic is intercepted with guest-trusted CA, policy hooks run in Node.js, headers are modified, and forwarding is transparent.
@@ -181,12 +181,20 @@ Detected capabilities:
 
 ## Initial Scenario Files
 
-The first executable scenario files live under `tests/e2e/scenarios/` as `.test.ts` files. They intentionally describe the desired Node.js developer experience before the implementation exists:
+The runtime scenario files live under `tests/e2e/scenarios/` as `.test.ts` files:
 
 - `boot-smoke.test.ts`: boots a VM, waits for `init.ready`, sends a control command, and checks command output.
 - `filesystem.test.ts`: boots with an immutable root and host-backed virtual filesystem using the same `stat` / `list` / `read` shape as TorkBot plugin filesystems.
 - `rootfs-shaping.test.ts`: expresses immutable roots, Linux overlayfs root composition, scratch isolation, and guest-visible mount boundaries.
 - `http-policy.test.ts`: injects CA trust, intercepts HTTPS, runs Node policy hooks, rewrites headers, and blocks protected destinations.
-- `linkage-and-signing.test.ts`: verifies static linkage, absence of dynamic libkrun/libkrunfw dependencies, and macOS HVF entitlement signing.
+- `network.test.ts`: covers transparent TCP interception, DNS behavior, protected ranges, IPv6 behavior, and non-HTTP denial.
+- `libkrun-contract.test.ts`: boots the VM with direct Rust init injection.
+
+Cheap artifact tests live under `tests/artifact/`:
+
+- `linkage-and-signing.test.ts`: verifies static linkage, absence of dynamic libkrun/libkrunfw dependencies, selected artifacts, CI shape, and macOS HVF entitlement signing.
+- `libkrun-contract.test.ts`: verifies static libkrun integration contracts without booting a VM.
+
+Expensive build reproducibility tests live under `tests/reproducibility/` and run only through `npm run test:reproducibility`.
 
 These tests are expected to fail until the runtime exists. A failing test is useful when the failure points at the next missing runtime boundary; a passing placeholder is not.
