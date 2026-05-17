@@ -170,4 +170,6 @@ The guest contract is intentionally narrow:
 - `tests/e2e`: TypeScript e2e scenarios run directly by Node.js 24+ type stripping.
 
 See [docs/architecture.md](docs/architecture.md) for the initial design.
+
+Kernel artifacts are built separately from runtime VM creation. See [docs/kernel-build.md](docs/kernel-build.md) for the Docker-based `deps/libkrunfw` build entrypoint.
 See [docs/testing-strategy.md](docs/testing-strategy.md) for the integration and e2e verification plan.

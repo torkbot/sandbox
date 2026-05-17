@@ -18,6 +18,7 @@ Evidence:
 - the host binary or native module links without `libkrun` or `libkrunfw` dynamic dependencies.
 - the guest init binary is statically linked.
 - packaged kernel/initramfs/rootfs artifacts are content-addressed and reproducible from the same build-time inputs.
+- `deps/libkrunfw` can build the patched Linux kernel artifacts through the Docker-based build entrypoint.
 
 Platform checks:
 
@@ -152,6 +153,7 @@ The runner should skip, not fail, tests whose host prerequisites are absent. It 
 Detected capabilities:
 
 - Docker or compatible CLI for build-time rootfs fixture generation.
+- Docker or compatible CLI for build-time kernel fixture generation.
 - Linux KVM access.
 - macOS HVF access.
 - macOS codesign availability and entitlement verification.

@@ -1,3 +1,7 @@
 [submodule "deps/libkrun"]
 	path = deps/libkrun
 	url = https://github.com/torkbot/libkrun.git
+[submodule "deps/libkrunfw"]
+	path = deps/libkrunfw
+	url = https://github.com/torkbot/libkrunfw.git
+	branch = torkbot/sandbox
