@@ -249,13 +249,13 @@ fn poll_plain_http_socket(
         return;
     }
 
-    let response = handler
-        .and_then(|handler| {
-            parse_http_request(socket, nat, &connection.request, None)
-                .and_then(|request| handler.handle_http_request(request).ok())
-        })
-        .map(encode_http_response)
-        .unwrap_or_else(|| HOST_HTTP_PROBE_RESPONSE.to_vec());
+    let response = match handler {
+        Some(handler) => parse_http_request(socket, nat, &connection.request, None)
+            .and_then(|request| handler.handle_http_request(request).ok())
+            .map(encode_http_response)
+            .unwrap_or_else(upstream_failure_response),
+        None => HOST_HTTP_PROBE_RESPONSE.to_vec(),
+    };
     connection.request.clear();
     connection.response = response;
     connection.close_after_response = true;
@@ -502,6 +502,10 @@ fn encode_http_response(response: HostHttpResponse) -> Vec<u8> {
     bytes.extend_from_slice(b"connection: close\r\n\r\n");
     bytes.extend_from_slice(&response.body);
     bytes
+}
+
+fn upstream_failure_response() -> Vec<u8> {
+    b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 20\r\nconnection: close\r\n\r\nupstream unavailable".to_vec()
 }
 
 struct LibkrunNetDevice {

@@ -105,13 +105,13 @@ Passing:
   - Covers large HTTPS upload/download.
 - `HTTPS interception handles concurrent guest requests without dropping TLS policy calls`
   - Covers concurrent HTTPS request accounting.
+- `upstream connection refused returns a deterministic guest-visible failure`
+  - Allows policy to a refused origin and asserts the guest sees a stable `502`.
 
 Failing:
 
 - `HTTP keep-alive behavior is explicit and deterministic`
   - Use one client connection for two requests and assert either supported reuse or documented close behavior.
-- `upstream connection refused returns a deterministic guest-visible failure`
-  - Allow policy to a refused origin and assert stable curl status/stderr.
 - `upstream timeout returns a deterministic guest-visible failure`
   - Origin accepts but delays response past timeout.
 - `upstream reset mid-body returns a deterministic guest-visible failure`
