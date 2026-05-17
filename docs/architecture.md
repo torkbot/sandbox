@@ -123,7 +123,7 @@ Terminology matters:
 - **bindings** are host-side attachment points into a filesystem abstraction. They are not guest-visible mount boundaries by definition.
 - **attachment points** are the locations inside a host-side filesystem abstraction where bindings attach.
 
-Do not hide bindings behind `mount(...)`. If Sandbox needs host-side filesystem composition, it should get a separate binding/attachment primitive with a different name and contract. Internal optimizations are allowed for specific filesystem combinations, but they must preserve the named primitive's semantics.
+Do not hide bindings behind `mount(...)`. Sandbox exposes `binding(...)` as the separate host-side primitive. Internal optimizations are allowed for specific filesystem combinations, but they must preserve the named primitive's semantics.
 
 Path-backed virtio-fs is adequate for simple guest-visible mounts, but it does not provide a programmable per-operation host API. The programmable filesystem should be a vhost-user backend owned by this project, with Node.js callbacks behind a Rust service boundary. That keeps guest filesystem traffic on a virtio device instead of inventing a guest agent protocol for normal file operations.
 

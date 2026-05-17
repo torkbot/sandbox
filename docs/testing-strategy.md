@@ -85,7 +85,7 @@ Evidence:
 - the prebuilt lower filesystem remains immutable after guest writes through the overlay.
 - each `scratchFs()` upper is isolated to its VM instance.
 - `mount(path, fs)` creates a guest-visible mount boundary.
-- host-side bindings and attachment points are a separate future primitive, not hidden behind `mount(...)`.
+- `binding(path, fs)` creates a host-side attachment point without a guest-visible mount boundary.
 
 ### Tier 4: Network And HTTP Policy E2E
 

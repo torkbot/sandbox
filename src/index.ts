@@ -140,6 +140,12 @@ export type VirtualFsMountConfig = {
   readonly fileSystem: SandboxVirtualFileSystem;
 };
 
+export type FileSystemBindingConfig = {
+  readonly kind: "filesystem-binding";
+  readonly path: string;
+  readonly fileSystem: SandboxVirtualFileSystem;
+};
+
 export type MountConfig = VirtualFsMountConfig;
 
 export interface HttpPolicyRequest {
@@ -176,6 +182,7 @@ export interface SandboxOptions {
   readonly init: InitConfig;
   readonly rootfs: RootfsConfig;
   readonly mounts?: readonly MountConfig[];
+  readonly bindings?: readonly FileSystemBindingConfig[];
   readonly network?: NetworkConfig;
 }
 
@@ -220,9 +227,6 @@ export interface SandboxVm {
   readonly control: SandboxControl;
   readonly mounts: SandboxMounts;
   readonly diagnostics?: SandboxDiagnostics;
-  readonly rootfs: {
-    hash(): Promise<string>;
-  };
   close(): Promise<void>;
   [Symbol.asyncDispose](): Promise<void>;
 }
@@ -283,6 +287,14 @@ export function mount(path: string, fileSystem: SandboxVirtualFileSystem): Virtu
   return virtualFsMount(path, fileSystem);
 }
 
+export function binding(path: string, fileSystem: SandboxVirtualFileSystem): FileSystemBindingConfig {
+  return {
+    kind: "filesystem-binding",
+    path,
+    fileSystem,
+  };
+}
+
 export async function spawnSandbox(options: SandboxOptions): Promise<SandboxVm> {
   validateSandboxOptions(options);
   const nativeOptions = toNativeSpawnOptions(options);
@@ -302,7 +314,6 @@ class NativeBackedSandboxVm implements SandboxVm {
   readonly mounts: SandboxMounts;
   readonly control: SandboxControl;
   readonly diagnostics?: SandboxDiagnostics;
-  readonly rootfs: SandboxVm["rootfs"];
 
   readonly #nativeVm: {
     readonly hasControlSocket: boolean;
@@ -324,7 +335,7 @@ class NativeBackedSandboxVm implements SandboxVm {
     options: SandboxOptions,
   ) {
     this.#nativeVm = nativeVm;
-    this.mounts = new ConfiguredSandboxMounts(options.mounts ?? []);
+    this.mounts = new ConfiguredSandboxMounts(options.mounts ?? [], options.bindings ?? []);
     this.control = new HostControlTransport({
       connected: nativeVm.hasControlSocket,
       channel: nativeVm,
@@ -334,11 +345,6 @@ class NativeBackedSandboxVm implements SandboxVm {
         terminateHostForTest: () => nativeVm.terminateHostForTest?.() ?? Promise.resolve(),
       };
     }
-    this.rootfs = {
-      async hash() {
-        throw new Error("sandbox rootfs hash is not implemented yet");
-      },
-    };
   }
 
   async close(): Promise<void> {
@@ -361,11 +367,17 @@ class ConfiguredSandboxMounts implements SandboxMounts {
   readonly #virtualMounts = new Map<string, SandboxVirtualFileSystem>();
   readonly #hostTools = new Map<string, SandboxHostFileSystemTools>();
 
-  constructor(mounts: readonly MountConfig[]) {
+  constructor(
+    mounts: readonly MountConfig[],
+    bindings: readonly FileSystemBindingConfig[],
+  ) {
     for (const mount of mounts) {
       this.#mounts.set(mount.path, mount.fileSystem);
       this.#virtualMounts.set(mount.path, mount.fileSystem);
       this.#hostTools.set(mount.path, createSandboxHostFileSystemTools(mount.fileSystem));
+    }
+    for (const binding of bindings) {
+      this.#hostTools.set(binding.path, createSandboxHostFileSystemTools(binding.fileSystem));
     }
   }
 
@@ -482,6 +494,20 @@ function validateSandboxOptions(options: SandboxOptions): void {
       throw new Error(`invalid spawnSandbox options: duplicate mount path: ${mount.path}`);
     }
     mountPaths.add(mount.path);
+  }
+
+  const bindingPaths = new Set<string>();
+  for (const binding of options.bindings ?? []) {
+    if (!binding.path.startsWith("/")) {
+      throw new Error("invalid spawnSandbox options: binding.path must be absolute");
+    }
+    if (mountPaths.has(binding.path)) {
+      throw new Error(`invalid spawnSandbox options: binding path conflicts with mount path: ${binding.path}`);
+    }
+    if (bindingPaths.has(binding.path)) {
+      throw new Error(`invalid spawnSandbox options: duplicate binding path: ${binding.path}`);
+    }
+    bindingPaths.add(binding.path);
   }
 
   for (const range of options.network?.http?.protectedRanges ?? []) {

@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  binding,
   linuxOverlayFs,
   mount,
   prebuiltRootfs,
@@ -9,6 +10,8 @@ import {
   scratchFs,
   spawnSandbox,
   virtualFsMount,
+  type SandboxFileStat,
+  type SandboxWritableFileSystem,
 } from "../../../src/index.ts";
 import { collectAsync, writeEvidence } from "../support/evidence.ts";
 import { execGuestShell } from "../support/guest-control.ts";
@@ -252,7 +255,68 @@ test("mount creates a guest-visible mount boundary", async (t) => {
   assert.match(result.stdout, /visible/);
 });
 
-test("virtualFsMount remains an alias for guest-visible mounts while bindings are a separate future primitive", () => {
+test("binding creates a host-side attachment point without a guest-visible mount boundary", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const fileSystem = createMemoryWritableFileSystem();
+  await fileSystem.createFile("/notes.txt");
+  await fileSystem.write({
+    path: "/notes.txt",
+    offset: 0,
+    contents: Buffer.from("host only\n"),
+  });
+
+  const vm = await spawnSandbox({
+    name: "host-side-filesystem-binding",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    bindings: [
+      binding("/workspace", fileSystem),
+    ],
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const guest = await execGuestShell(vm, {
+    id: "host-side-filesystem-binding",
+    script: `
+      set -eu
+      test ! -e /workspace/notes.txt
+      ! grep ' /workspace ' /proc/mounts
+    `,
+  });
+  assert.equal(
+    guest.exitCode,
+    0,
+    `binding leaked into the guest\nstdout:\n${guest.stdout}\nstderr:\n${guest.stderr}`,
+  );
+
+  const host = await vm.mounts.host("/workspace").read({
+    path: "notes.txt",
+    signal: AbortSignal.timeout(1_000),
+  });
+  assert.equal(host.content, "host only\n");
+
+  assert.throws(
+    () => vm.mounts.get("/workspace"),
+    /sandbox mount not found: \/workspace/,
+  );
+  assert.throws(
+    () => vm.mounts.virtualFs("/workspace"),
+    /virtualFs mount not found: \/workspace/,
+  );
+});
+
+test("virtualFsMount remains an alias for guest-visible mounts", () => {
   const fileSystem = {
     async stat() {
       return {
@@ -272,3 +336,87 @@ test("virtualFsMount remains an alias for guest-visible mounts while bindings ar
 
   assert.deepEqual(mount("/sandbox", fileSystem), virtualFsMount("/sandbox", fileSystem));
 });
+
+function createMemoryWritableFileSystem(): SandboxWritableFileSystem {
+  const files = new Map<string, Uint8Array>();
+
+  return {
+    async stat(path) {
+      if (path === "/") {
+        return directoryStat(true);
+      }
+      const contents = files.get(path);
+      if (contents === undefined) {
+        throw new Error(`missing path ${path}`);
+      }
+      return fileStat(contents.byteLength, true);
+    },
+    async list(path) {
+      if (path !== "/") {
+        throw new Error(`missing directory ${path}`);
+      }
+      return [...files.keys()]
+        .filter((filePath) => filePath.slice(1).indexOf("/") === -1)
+        .sort()
+        .map((filePath) => ({
+          name: filePath.slice(1),
+          type: "file" as const,
+        }));
+    },
+    async read(input) {
+      const contents = files.get(input.path);
+      if (contents === undefined) {
+        throw new Error(`missing file ${input.path}`);
+      }
+      const offset = input.range?.offset ?? 0;
+      const length = input.range?.length ?? contents.byteLength - offset;
+      return contents.slice(offset, offset + length);
+    },
+    async createFile(path) {
+      files.set(path, new Uint8Array());
+      return fileStat(0, true);
+    },
+    async write(input) {
+      const current = files.get(input.path);
+      if (current === undefined) {
+        throw new Error(`missing file ${input.path}`);
+      }
+      const nextLength = Math.max(current.byteLength, input.offset + input.contents.byteLength);
+      const next = new Uint8Array(nextLength);
+      next.set(current);
+      next.set(input.contents, input.offset);
+      files.set(input.path, next);
+      return input.contents.byteLength;
+    },
+    async truncate(path, size) {
+      const current = files.get(path);
+      if (current === undefined) {
+        throw new Error(`missing file ${path}`);
+      }
+      const next = new Uint8Array(size);
+      next.set(current.slice(0, size));
+      files.set(path, next);
+      return fileStat(size, true);
+    },
+  };
+}
+
+function directoryStat(writable: boolean): SandboxFileStat {
+  return {
+    type: "directory",
+    sizeBytes: null,
+    mediaType: null,
+    modifiedAtMs: null,
+    writable,
+  };
+}
+
+function fileStat(sizeBytes: number, writable: boolean): SandboxFileStat {
+  return {
+    type: "file",
+    sizeBytes,
+    mediaType: "application/octet-stream",
+    modifiedAtMs: null,
+    writable,
+  };
+}

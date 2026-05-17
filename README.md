@@ -12,6 +12,7 @@ The target shape is:
 
 ```ts
 import {
+  binding,
   linuxOverlayFs,
   mount,
   prebuiltRootfs,
@@ -19,7 +20,10 @@ import {
   projectKernel,
   scratchFs,
   spawnSandbox,
+  type SandboxWritableFileSystem,
 } from "@torkbot/sandbox";
+
+declare const workspaceFs: SandboxWritableFileSystem;
 
 await using vm = await spawnSandbox({
   kernel: projectKernel(),
@@ -66,6 +70,10 @@ await using vm = await spawnSandbox({
         return Buffer.from(JSON.stringify({ ready: true }));
       },
     }),
+  ],
+
+  bindings: [
+    binding("/workspace", workspaceFs),
   ],
 
   network: {
@@ -154,7 +162,7 @@ await vm.control.exec({
 });
 ```
 
-`mount(...)` means a guest-visible mount boundary. Host-side attachment points and bindings are a separate future primitive; they should not be hidden behind `mount(...)`.
+`mount(...)` means a guest-visible mount boundary. `binding(...)` means a host-side attachment point into the same filesystem abstraction and does not create a guest mount.
 
 The guest contract is intentionally narrow:
 
@@ -172,7 +180,7 @@ The guest contract is intentionally narrow:
 - avoid host filesystem coordination unless it is intrinsic to the artifact; prefer file descriptors, database handles, bytes, and async iterables over paths,
 - build-time rootfs shaping, with prebuilt rootfs artifacts supplied at VM instantiation,
 - root filesystem composition through small explicit primitives such as `linuxOverlayFs(...)` and `scratchFs()`, with lower and upper expressed as filesystem values,
-- `mount(...)` only for guest-visible mounts; host-side bindings/attachment points must be a separate primitive,
+- `mount(...)` only for guest-visible mounts; `binding(...)` only for host-side attachment points,
 - programmable virtual filesystems backed by TypeScript callbacks,
 - transparent HTTP interception with TypeScript policy hooks,
 - protected network ranges enforced before policy, with private/link-local ranges blocked by default,

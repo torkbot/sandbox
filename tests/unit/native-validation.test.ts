@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  binding,
   prebuiltRootfs,
   projectInit,
   projectKernel,
@@ -81,6 +82,62 @@ test("spawnSandbox rejects duplicate mount paths before runtime launch", async (
   );
 });
 
+test("spawnSandbox rejects relative binding paths before runtime launch", async () => {
+  await assert.rejects(
+    spawnSandbox({
+      kernel: projectKernel(),
+      init: projectInit(),
+      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
+        format: "erofs",
+      }),
+      bindings: [
+        binding("workspace", unreachableFileSystem()),
+      ],
+    }),
+    /invalid spawnSandbox options: binding\.path must be absolute/,
+  );
+});
+
+test("spawnSandbox rejects duplicate binding paths before runtime launch", async () => {
+  const fileSystem = unreachableFileSystem();
+
+  await assert.rejects(
+    spawnSandbox({
+      kernel: projectKernel(),
+      init: projectInit(),
+      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
+        format: "erofs",
+      }),
+      bindings: [
+        binding("/workspace", fileSystem),
+        binding("/workspace", fileSystem),
+      ],
+    }),
+    /invalid spawnSandbox options: duplicate binding path: \/workspace/,
+  );
+});
+
+test("spawnSandbox rejects binding paths that conflict with guest mounts", async () => {
+  const fileSystem = unreachableFileSystem();
+
+  await assert.rejects(
+    spawnSandbox({
+      kernel: projectKernel(),
+      init: projectInit(),
+      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
+        format: "erofs",
+      }),
+      mounts: [
+        virtualFsMount("/workspace", fileSystem),
+      ],
+      bindings: [
+        binding("/workspace", fileSystem),
+      ],
+    }),
+    /invalid spawnSandbox options: binding path conflicts with mount path: \/workspace/,
+  );
+});
+
 test("spawnSandbox rejects unsupported init crates before runtime launch", async () => {
   await assert.rejects(
     spawnSandbox({
@@ -142,3 +199,26 @@ test("virtualFsMount preserves the host filesystem object", () => {
   assert.equal(mount.path, "/sandbox");
   assert.equal(mount.fileSystem, virtualFs);
 });
+
+test("binding preserves the host filesystem object without creating a mount", () => {
+  const virtualFs = unreachableFileSystem();
+  const config = binding("/workspace", virtualFs);
+
+  assert.equal(config.kind, "filesystem-binding");
+  assert.equal(config.path, "/workspace");
+  assert.equal(config.fileSystem, virtualFs);
+});
+
+function unreachableFileSystem() {
+  return {
+    async stat() {
+      throw new Error("not reached");
+    },
+    async list() {
+      throw new Error("not reached");
+    },
+    async read() {
+      throw new Error("not reached");
+    },
+  };
+}

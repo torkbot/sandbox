@@ -86,8 +86,10 @@ Passing:
   - Mutate one scratch upper, then boot another `scratchFs()` upper and assert the mutation is absent.
 - `mount creates a guest-visible mount boundary`
   - Assert `mount(path, fs)` is visible in the guest as a real mount boundary.
-- `virtualFsMount remains an alias for guest-visible mounts while bindings are a separate future primitive`
-  - Preserve compatibility while keeping mount/binding terminology explicit.
+- `binding creates a host-side attachment point without a guest-visible mount boundary`
+  - Assert host tools can use a binding while the guest cannot see it as a path or mount.
+- `virtualFsMount remains an alias for guest-visible mounts`
+  - Preserve compatibility while keeping mount terminology explicit.
 
 Failing:
 
