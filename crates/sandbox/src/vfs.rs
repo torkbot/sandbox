@@ -68,6 +68,48 @@ pub trait HostVirtualFileSystem: Send + Sync + 'static {
         let _ = (inode, size);
         Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
     }
+
+    fn mkdir(&self, parent: VirtualInode, name: &CStr, mode: u32) -> io::Result<VirtioFsEntry> {
+        let _ = (parent, name, mode);
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
+
+    fn unlink(&self, parent: VirtualInode, name: &CStr) -> io::Result<()> {
+        let _ = (parent, name);
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
+
+    fn rmdir(&self, parent: VirtualInode, name: &CStr) -> io::Result<()> {
+        let _ = (parent, name);
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
+
+    fn rename(
+        &self,
+        olddir: VirtualInode,
+        oldname: &CStr,
+        newdir: VirtualInode,
+        newname: &CStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        let _ = (olddir, oldname, newdir, newname, flags);
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
+
+    fn symlink(
+        &self,
+        linkname: &CStr,
+        parent: VirtualInode,
+        name: &CStr,
+    ) -> io::Result<VirtioFsEntry> {
+        let _ = (linkname, parent, name);
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
+
+    fn readlink(&self, inode: VirtualInode) -> io::Result<Vec<u8>> {
+        let _ = inode;
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
 }
 
 /// Adapter from Sandbox's host VFS contract into libkrun's virtio-fs contract.
@@ -96,6 +138,10 @@ pub fn virtual_directory_entry(inode: u64) -> VirtioFsEntry {
 
 pub fn virtual_writable_directory_entry(inode: u64) -> VirtioFsEntry {
     virtio_entry(inode, libc::S_IFDIR as u32 | 0o755, 0)
+}
+
+pub fn virtual_symlink_entry(inode: u64, size: u64) -> VirtioFsEntry {
+    virtio_entry(inode, libc::S_IFLNK as u32 | 0o777, size)
 }
 
 fn virtio_entry(inode: u64, mode: u32, size: u64) -> VirtioFsEntry {
@@ -145,6 +191,43 @@ impl VirtioVirtualFsBackend for VirtualFsAdapter {
 
     fn truncate(&self, inode: u64, size: u64) -> io::Result<(bindings::stat64, Duration)> {
         self.inner.truncate(VirtualInode::from(inode), size)
+    }
+
+    fn mkdir(&self, parent: u64, name: &CStr, mode: u32) -> io::Result<VirtioFsEntry> {
+        self.inner.mkdir(VirtualInode::from(parent), name, mode)
+    }
+
+    fn unlink(&self, parent: u64, name: &CStr) -> io::Result<()> {
+        self.inner.unlink(VirtualInode::from(parent), name)
+    }
+
+    fn rmdir(&self, parent: u64, name: &CStr) -> io::Result<()> {
+        self.inner.rmdir(VirtualInode::from(parent), name)
+    }
+
+    fn rename(
+        &self,
+        olddir: u64,
+        oldname: &CStr,
+        newdir: u64,
+        newname: &CStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        self.inner.rename(
+            VirtualInode::from(olddir),
+            oldname,
+            VirtualInode::from(newdir),
+            newname,
+            flags,
+        )
+    }
+
+    fn symlink(&self, linkname: &CStr, parent: u64, name: &CStr) -> io::Result<VirtioFsEntry> {
+        self.inner.symlink(linkname, VirtualInode::from(parent), name)
+    }
+
+    fn readlink(&self, inode: u64) -> io::Result<Vec<u8>> {
+        self.inner.readlink(VirtualInode::from(inode))
     }
 }
 
@@ -216,6 +299,17 @@ mod tests {
 
         assert_eq!((file.attr.st_mode as libc::mode_t) & 0o777, 0o644);
         assert_eq!((directory.attr.st_mode as libc::mode_t) & 0o777, 0o755);
+    }
+
+    #[test]
+    fn virtual_symlink_entry_uses_symlink_metadata() {
+        let entry = virtual_symlink_entry(12, 9);
+        let mode = entry.attr.st_mode as libc::mode_t;
+
+        assert_eq!(entry.inode, 12);
+        assert_eq!(entry.attr.st_size, 9);
+        assert_eq!(mode & libc::S_IFMT, libc::S_IFLNK);
+        assert_eq!(mode & 0o777, 0o777);
     }
 
     #[test]

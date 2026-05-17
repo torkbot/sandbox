@@ -12,7 +12,7 @@ use sandbox::network_service::{
 use sandbox::vfs::{
     VirtioFsDirEntry, VirtioFsEntry, VirtioVirtualFsBackend, VirtualFsAdapter, VirtualInode,
     bindings, virtual_directory_entry, virtual_file_entry, virtual_writable_directory_entry,
-    virtual_writable_file_entry,
+    virtual_writable_file_entry, virtual_symlink_entry,
 };
 
 pub struct HostIoBridge {
@@ -321,6 +321,115 @@ impl sandbox::vfs::HostVirtualFileSystem for NodeVirtualFs {
             Duration::from_secs(1),
         ))
     }
+
+    fn mkdir(&self, parent: VirtualInode, name: &CStr, mode: u32) -> io::Result<VirtioFsEntry> {
+        let parent = self.path_for_inode(parent)?;
+        let name = name.to_str().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "virtual path is not utf-8")
+        })?;
+        let path = join_guest_path(&parent, name);
+        let response = self.bridge.request(doc! {
+            "type": "host.vfs.mkdir",
+            "mountPath": &self.mount_path,
+            "path": &path,
+            "mode": mode as i64,
+        })?;
+        let stat = response.get_document("stat").map_err(to_io_error)?;
+        Ok(entry_from_stat(self.inode_for_path(&path), stat))
+    }
+
+    fn unlink(&self, parent: VirtualInode, name: &CStr) -> io::Result<()> {
+        let parent = self.path_for_inode(parent)?;
+        let name = name.to_str().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "virtual path is not utf-8")
+        })?;
+        let path = join_guest_path(&parent, name);
+        self.bridge.request(doc! {
+            "type": "host.vfs.unlink",
+            "mountPath": &self.mount_path,
+            "path": &path,
+        })?;
+        self.forget_path(&path);
+        Ok(())
+    }
+
+    fn rmdir(&self, parent: VirtualInode, name: &CStr) -> io::Result<()> {
+        let parent = self.path_for_inode(parent)?;
+        let name = name.to_str().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "virtual path is not utf-8")
+        })?;
+        let path = join_guest_path(&parent, name);
+        self.bridge.request(doc! {
+            "type": "host.vfs.rmdir",
+            "mountPath": &self.mount_path,
+            "path": &path,
+        })?;
+        self.forget_path(&path);
+        Ok(())
+    }
+
+    fn rename(
+        &self,
+        olddir: VirtualInode,
+        oldname: &CStr,
+        newdir: VirtualInode,
+        newname: &CStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        let olddir = self.path_for_inode(olddir)?;
+        let oldname = oldname.to_str().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "virtual path is not utf-8")
+        })?;
+        let newdir = self.path_for_inode(newdir)?;
+        let newname = newname.to_str().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "virtual path is not utf-8")
+        })?;
+        let from = join_guest_path(&olddir, oldname);
+        let to = join_guest_path(&newdir, newname);
+        self.bridge.request(doc! {
+            "type": "host.vfs.rename",
+            "mountPath": &self.mount_path,
+            "from": &from,
+            "to": &to,
+            "flags": flags as i64,
+        })?;
+        self.rename_path(&from, &to);
+        Ok(())
+    }
+
+    fn symlink(
+        &self,
+        linkname: &CStr,
+        parent: VirtualInode,
+        name: &CStr,
+    ) -> io::Result<VirtioFsEntry> {
+        let parent = self.path_for_inode(parent)?;
+        let name = name.to_str().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "virtual path is not utf-8")
+        })?;
+        let target = linkname.to_str().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "symlink target is not utf-8")
+        })?;
+        let path = join_guest_path(&parent, name);
+        let response = self.bridge.request(doc! {
+            "type": "host.vfs.symlink",
+            "mountPath": &self.mount_path,
+            "target": target,
+            "path": &path,
+        })?;
+        let stat = response.get_document("stat").map_err(to_io_error)?;
+        Ok(entry_from_stat(self.inode_for_path(&path), stat))
+    }
+
+    fn readlink(&self, inode: VirtualInode) -> io::Result<Vec<u8>> {
+        let path = self.path_for_inode(inode)?;
+        let response = self.bridge.request(doc! {
+            "type": "host.vfs.readlink",
+            "mountPath": &self.mount_path,
+            "path": &path,
+        })?;
+        Ok(response.get_str("target").map_err(to_io_error)?.as_bytes().to_vec())
+    }
 }
 
 impl NodeVirtualFs {
@@ -329,8 +438,30 @@ impl NodeVirtualFs {
             "type": "host.vfs.stat",
             "mountPath": &self.mount_path,
             "path": path,
+        }).map_err(|error| {
+            if error.to_string().contains("missing path") {
+                io::Error::from_raw_os_error(libc::ENOENT)
+            } else {
+                error
+            }
         })?;
         response.get_document("stat").cloned().map_err(to_io_error)
+    }
+
+    fn forget_path(&self, path: &str) {
+        let mut state = self.state.lock().expect("vfs inode state lock poisoned");
+        if let Some(inode) = state.inodes_by_path.remove(path) {
+            state.paths_by_inode.remove(&inode);
+        }
+    }
+
+    fn rename_path(&self, from: &str, to: &str) {
+        let mut state = self.state.lock().expect("vfs inode state lock poisoned");
+        let Some(inode) = state.inodes_by_path.remove(from) else {
+            return;
+        };
+        state.inodes_by_path.insert(to.to_string(), inode);
+        state.paths_by_inode.insert(inode, to.to_string());
     }
 }
 
@@ -339,6 +470,7 @@ fn entry_from_stat(inode: u64, stat: &Document) -> VirtioFsEntry {
     match (stat.get_str("type").unwrap_or("file"), writable) {
         ("directory", true) => virtual_writable_directory_entry(inode),
         ("directory", false) => virtual_directory_entry(inode),
+        ("symlink", _) => virtual_symlink_entry(inode, stat_size(stat)),
         (_, true) => virtual_writable_file_entry(inode, stat_size(stat)),
         (_, false) => virtual_file_entry(inode, stat_size(stat)),
     }
@@ -356,6 +488,7 @@ fn dirent_type(ty: &str) -> io::Result<u32> {
     match ty {
         "directory" => Ok(libc::DT_DIR as u32),
         "file" => Ok(libc::DT_REG as u32),
+        "symlink" => Ok(libc::DT_LNK as u32),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported virtual filesystem entry type: {other}"),

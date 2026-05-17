@@ -2,8 +2,10 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Cursor, Read, Write};
 use std::net::ToSocketAddrs;
+use std::net::TcpStream;
 use std::os::fd::{IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -259,6 +261,7 @@ fn poll_plain_http_socket(
 ) {
     let connection = http_connections.entry(handle).or_default();
     flush_plain_http_response(socket, connection);
+    poll_upstream_stream(connection);
     if connection.close_after_response && connection.response.is_empty() {
         socket.close();
         return;
@@ -285,19 +288,65 @@ fn poll_plain_http_socket(
         return;
     }
 
-    let response = match handler {
-        Some(handler) => parse_http_request(socket, nat, &connection.request, None)
-            .and_then(|request| handler.handle_http_request(request).ok())
-            .map(encode_http_response)
-            .unwrap_or_else(upstream_failure_response),
-        None => HOST_HTTP_PROBE_RESPONSE.to_vec(),
+    let Some(request) = parse_http_request(socket, nat, &connection.request, None) else {
+        connection.request.clear();
+        connection.response = upstream_failure_response();
+        connection.close_after_response = true;
+        flush_plain_http_response(socket, connection);
+        return;
     };
     connection.request.clear();
-    connection.response = response;
-    connection.close_after_response = true;
+    let response = match handler {
+        Some(handler) => {
+            let mut policy_request = request.clone();
+            policy_request.body.clear();
+            handler.handle_http_request(policy_request).ok()
+        }
+        None => {
+            connection.response = HOST_HTTP_PROBE_RESPONSE.to_vec();
+            connection.close_after_response = true;
+            flush_plain_http_response(socket, connection);
+            return;
+        }
+    };
+    match response {
+        Some(response) if response.status == 0 => {
+            connection.upstream = Some(start_plain_upstream_stream(request, response.headers));
+            poll_upstream_stream(connection);
+        }
+        Some(response) => {
+            connection.response = encode_http_response(response);
+            connection.close_after_response = true;
+        }
+        None => {
+            connection.response = upstream_failure_response();
+            connection.close_after_response = true;
+        }
+    }
     flush_plain_http_response(socket, connection);
     if connection.close_after_response && connection.response.is_empty() {
         socket.close();
+    }
+}
+
+fn poll_upstream_stream(connection: &mut HttpConnection) {
+    let Some(receiver) = connection.upstream.take() else {
+        return;
+    };
+    let mut finished = false;
+    while let Ok(chunk) = receiver.try_recv() {
+        match chunk {
+            Some(chunk) => connection.response.extend_from_slice(&chunk),
+            None => {
+                finished = true;
+                break;
+            }
+        }
+    }
+    if finished {
+        connection.close_after_response = true;
+    } else {
+        connection.upstream = Some(receiver);
     }
 }
 
@@ -544,6 +593,130 @@ fn upstream_failure_response() -> Vec<u8> {
     b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 20\r\nconnection: close\r\n\r\nupstream unavailable".to_vec()
 }
 
+fn start_plain_upstream_stream(
+    request: HostHttpRequest,
+    headers: Vec<(String, String)>,
+) -> Receiver<Option<Vec<u8>>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        if let Err(sent_any) = stream_plain_upstream(request, headers, &tx) {
+            if sent_any {
+                let _ = tx.send(None);
+                return;
+            }
+            let _ = tx.send(Some(upstream_failure_response()));
+        }
+        let _ = tx.send(None);
+    });
+    rx
+}
+
+fn stream_plain_upstream(
+    request: HostHttpRequest,
+    headers: Vec<(String, String)>,
+    tx: &mpsc::Sender<Option<Vec<u8>>>,
+) -> Result<(), bool> {
+    let parsed = ParsedHttpUrl::parse(&request.url).map_err(|_| false)?;
+    let mut sent_any = false;
+    let mut stream = TcpStream::connect((parsed.host.as_str(), parsed.port)).map_err(|_| sent_any)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).map_err(|_| sent_any)?;
+    stream.set_write_timeout(Some(Duration::from_secs(2))).map_err(|_| sent_any)?;
+    let outbound = encode_upstream_http_request(&request, &headers, &parsed);
+    stream.write_all(&outbound).map_err(|_| sent_any)?;
+
+    let mut buffer = [0; 16 * 1024];
+    loop {
+        let read = stream.read(&mut buffer).map_err(|_| sent_any)?;
+        if read == 0 {
+            break;
+        }
+        sent_any = true;
+        if tx.send(Some(buffer[..read].to_vec())).is_err() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn encode_upstream_http_request(
+    request: &HostHttpRequest,
+    headers: &[(String, String)],
+    parsed: &ParsedHttpUrl,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(
+        format!("{} {} HTTP/1.1\r\n", request.method, parsed.path).as_bytes(),
+    );
+    let mut has_host = false;
+    for (name, value) in headers {
+        let lower = name.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "connection"
+                | "content-length"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+        ) {
+            continue;
+        }
+        if lower == "host" {
+            has_host = true;
+        }
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.extend_from_slice(b": ");
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.extend_from_slice(b"\r\n");
+    }
+    if !has_host {
+        bytes.extend_from_slice(format!("host: {}\r\n", parsed.authority).as_bytes());
+    }
+    if !request.body.is_empty() {
+        bytes.extend_from_slice(format!("content-length: {}\r\n", request.body.len()).as_bytes());
+    }
+    bytes.extend_from_slice(b"connection: close\r\n\r\n");
+    bytes.extend_from_slice(&request.body);
+    bytes
+}
+
+struct ParsedHttpUrl {
+    host: String,
+    port: u16,
+    authority: String,
+    path: String,
+}
+
+impl ParsedHttpUrl {
+    fn parse(url: &str) -> io::Result<Self> {
+        let rest = url.strip_prefix("http://").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "only plain HTTP URLs can be streamed")
+        })?;
+        let (authority, path) = match rest.split_once('/') {
+            Some((authority, path)) => (authority, format!("/{path}")),
+            None => (rest, "/".to_string()),
+        };
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) => {
+                let port = port.parse::<u16>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "invalid HTTP upstream port")
+                })?;
+                (host.to_string(), port)
+            }
+            None => (authority.to_string(), 80),
+        };
+        Ok(Self {
+            host,
+            port,
+            authority: authority.to_string(),
+            path,
+        })
+    }
+}
+
 fn dns_response(request: &[u8]) -> Option<Vec<u8>> {
     if request.len() < 12 {
         return None;
@@ -734,6 +907,7 @@ struct HttpConnection {
     response: Vec<u8>,
     close_after_response: bool,
     continue_sent: bool,
+    upstream: Option<Receiver<Option<Vec<u8>>>>,
 }
 
 struct TlsConnection {

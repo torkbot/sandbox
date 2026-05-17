@@ -51,7 +51,7 @@ export type ScratchFsConfig = {
   readonly kind: "scratch-fs";
 };
 
-export type SandboxFileType = "file" | "directory";
+export type SandboxFileType = "file" | "directory" | "symlink";
 
 export type SandboxFileStat = {
   readonly type: SandboxFileType;
@@ -87,6 +87,15 @@ export interface SandboxWritableFileSystem extends SandboxFileSystem {
     readonly contents: Uint8Array;
   }): Promise<number>;
   truncate(path: string, size: number): Promise<SandboxFileStat>;
+}
+
+export interface SandboxPosixFileSystem extends SandboxWritableFileSystem {
+  mkdir(path: string): Promise<SandboxFileStat>;
+  unlink(path: string): Promise<void>;
+  rmdir(path: string): Promise<void>;
+  rename(from: string, to: string, flags?: number): Promise<void>;
+  symlink(target: string, path: string): Promise<SandboxFileStat>;
+  readlink(path: string): Promise<string>;
 }
 
 export type SandboxVirtualFileSystem = SandboxFileSystem;

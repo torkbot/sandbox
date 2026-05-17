@@ -212,7 +212,7 @@ function createPosixMemoryFileSystem(): PosixMemoryFileSystem {
         return directoryStat(true);
       }
       if (entry.type === "symlink") {
-        return fileStat(entry.target.length, true);
+        return symlinkStat(entry.target.length);
       }
       return fileStat(entry.contents.byteLength, true);
     },
@@ -311,7 +311,7 @@ function createPosixMemoryFileSystem(): PosixMemoryFileSystem {
       const normalized = normalizePath(path);
       assertParentDirectory(entries, normalized);
       entries.set(normalized, { type: "symlink", target });
-      return fileStat(target.length, true);
+      return symlinkStat(target.length);
     },
     async readlink(path) {
       const entry = entries.get(normalizePath(path));
@@ -362,5 +362,15 @@ function fileStat(sizeBytes: number, writable: boolean): SandboxFileStat {
     mediaType: "application/octet-stream",
     modifiedAtMs: null,
     writable,
+  };
+}
+
+function symlinkStat(sizeBytes: number): SandboxFileStat {
+  return {
+    type: "symlink",
+    sizeBytes,
+    mediaType: null,
+    modifiedAtMs: null,
+    writable: true,
   };
 }

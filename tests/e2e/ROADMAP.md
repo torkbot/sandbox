@@ -76,16 +76,16 @@ This file owns production filesystem semantics needed by coding-agent workloads.
 
 Passing:
 
-- No remaining known passes in this scenario file.
-
-Failing:
-
 - `writable virtual filesystem supports nested directories and atomic rename`
   - Create nested directories, write a temporary file, atomically rename it into place, and assert the host filesystem view matches.
 - `writable virtual filesystem supports unlink and empty directory removal`
   - Remove a file and then its empty parent directory from the guest, then assert host-side state is gone.
 - `writable virtual filesystem supports symlink metadata without host path escape`
   - Create relative and absolute symlinks in a mounted virtual filesystem and assert readlink/relative resolution behavior is stable.
+
+Failing:
+
+- No remaining known failures in this scenario file.
 
 ## `rootfs-shaping.test.ts`
 
@@ -144,8 +144,8 @@ Passing:
   - Allows policy to a refused origin and asserts the guest sees a stable `502`.
 - `upstream timeout returns a deterministic guest-visible failure`
   - Origin accepts but delays response past the host upstream timeout; guest sees a stable `502`.
-- `upstream reset mid-body returns a deterministic guest-visible failure`
-  - Origin closes mid-response and the guest observes a stable `502`.
+- `upstream reset mid-body is passed through as a truncated response`
+  - Origin closes mid-response after headers are sent; the guest observes the upstream status and client-level truncation.
 - `TLS without SNI has deterministic certificate and policy metadata`
   - Connects by IP literal and asserts missing-SNI metadata reaches one policy call deterministically.
 - `dynamic MITM certificates are reused or bounded intentionally`
@@ -163,13 +163,14 @@ This file owns production HTTP behavior that matters for long-running agent work
 
 Passing:
 
+- `HTTP interception streams response bodies without waiting for upstream completion`
+  - A slow upstream response should deliver first bytes to the guest before the origin finishes the whole response.
 - `closing a VM while HTTP policy is locked up cleans up the sandbox`
   - A never-resolving JavaScript policy callback should not prevent VM close from completing and rejecting in-flight guest work.
 
 Failing:
 
-- `HTTP interception streams response bodies without waiting for upstream completion`
-  - A slow upstream response should deliver first bytes to the guest before the origin finishes the whole response.
+- No remaining known failures in this scenario file.
 
 ## `network.test.ts`
 

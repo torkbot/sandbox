@@ -13,6 +13,7 @@ import type {
   HttpPolicyRequest,
   SandboxOptions,
   SandboxFileSystem,
+  SandboxPosixFileSystem,
 } from "./index.ts";
 
 const DEFAULT_PROTECTED_RANGES = [
@@ -196,6 +197,12 @@ export class HostProcessSandboxVm implements HostControlChannel {
       && type !== "host.vfs.create"
       && type !== "host.vfs.write"
       && type !== "host.vfs.truncate"
+      && type !== "host.vfs.mkdir"
+      && type !== "host.vfs.unlink"
+      && type !== "host.vfs.rmdir"
+      && type !== "host.vfs.rename"
+      && type !== "host.vfs.symlink"
+      && type !== "host.vfs.readlink"
     ) {
       return false;
     }
@@ -208,7 +215,6 @@ export class HostProcessSandboxVm implements HostControlChannel {
     const id = typeof document.id === "string" ? document.id : "";
     try {
       const mountPath = assertString(document.mountPath, "mountPath");
-      const path = assertString(document.path, "path");
       const fileSystem = this.#hostFs.get(mountPath);
       if (fileSystem === undefined) {
         throw new Error(`host filesystem mount not found: ${mountPath}`);
@@ -216,6 +222,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
 
       switch (document.type) {
         case "host.vfs.stat": {
+          const path = assertString(document.path, "path");
           this.#child.stdin.write(encodePacket({
             type: "host.vfs.response",
             id,
@@ -225,6 +232,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
           return;
         }
         case "host.vfs.list": {
+          const path = assertString(document.path, "path");
           this.#child.stdin.write(encodePacket({
             type: "host.vfs.response",
             id,
@@ -234,6 +242,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
           return;
         }
         case "host.vfs.read": {
+          const path = assertString(document.path, "path");
           const offset = assertNumber(document.offset, "offset");
           const size = assertNumber(document.size, "size");
           const contents = await fileSystem.read({
@@ -250,6 +259,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
           return;
         }
         case "host.vfs.create": {
+          const path = assertString(document.path, "path");
           if (!isSandboxWritableFileSystem(fileSystem)) {
             throw new Error(`host filesystem mount is read-only: ${mountPath}`);
           }
@@ -262,6 +272,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
           return;
         }
         case "host.vfs.write": {
+          const path = assertString(document.path, "path");
           if (!isSandboxWritableFileSystem(fileSystem)) {
             throw new Error(`host filesystem mount is read-only: ${mountPath}`);
           }
@@ -279,6 +290,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
           return;
         }
         case "host.vfs.truncate": {
+          const path = assertString(document.path, "path");
           if (!isSandboxWritableFileSystem(fileSystem)) {
             throw new Error(`host filesystem mount is read-only: ${mountPath}`);
           }
@@ -288,6 +300,76 @@ export class HostProcessSandboxVm implements HostControlChannel {
             id,
             ok: true,
             stat: await fileSystem.truncate(path, size),
+          }));
+          return;
+        }
+        case "host.vfs.mkdir": {
+          const path = assertString(document.path, "path");
+          const posix = assertPosixFileSystem(fileSystem, mountPath);
+          this.#child.stdin.write(encodePacket({
+            type: "host.vfs.response",
+            id,
+            ok: true,
+            stat: await posix.mkdir(path),
+          }));
+          return;
+        }
+        case "host.vfs.unlink": {
+          const path = assertString(document.path, "path");
+          const posix = assertPosixFileSystem(fileSystem, mountPath);
+          await posix.unlink(path);
+          this.#child.stdin.write(encodePacket({
+            type: "host.vfs.response",
+            id,
+            ok: true,
+          }));
+          return;
+        }
+        case "host.vfs.rmdir": {
+          const path = assertString(document.path, "path");
+          const posix = assertPosixFileSystem(fileSystem, mountPath);
+          await posix.rmdir(path);
+          this.#child.stdin.write(encodePacket({
+            type: "host.vfs.response",
+            id,
+            ok: true,
+          }));
+          return;
+        }
+        case "host.vfs.rename": {
+          const posix = assertPosixFileSystem(fileSystem, mountPath);
+          const from = assertString(document.from, "from");
+          const to = assertString(document.to, "to");
+          const flags = assertNumber(document.flags, "flags");
+          await posix.rename(from, to, flags);
+          this.#child.stdin.write(encodePacket({
+            type: "host.vfs.response",
+            id,
+            ok: true,
+          }));
+          return;
+        }
+        case "host.vfs.symlink": {
+          const path = assertString(document.path, "path");
+          const posix = assertPosixFileSystem(fileSystem, mountPath);
+          const target = assertString(document.target, "target");
+          const stat = await posix.symlink(target, path);
+          this.#child.stdin.write(encodePacket({
+            type: "host.vfs.response",
+            id,
+            ok: true,
+            stat,
+          }));
+          return;
+        }
+        case "host.vfs.readlink": {
+          const path = assertString(document.path, "path");
+          const posix = assertPosixFileSystem(fileSystem, mountPath);
+          this.#child.stdin.write(encodePacket({
+            type: "host.vfs.response",
+            id,
+            ok: true,
+            target: await posix.readlink(path),
           }));
           return;
         }
@@ -347,6 +429,18 @@ export class HostProcessSandboxVm implements HostControlChannel {
       }
 
       const outboundHeaders = decision.headers ?? headers;
+      if (request.tls === undefined) {
+        this.#child.stdin.write(encodePacket({
+          type: "host.http.response",
+          id,
+          ok: true,
+          status: 0,
+          headers: responseHeadersFromRecord(outboundHeaders),
+          body: new Uint8Array(),
+        }));
+        return;
+      }
+
       const upstream = await requestUpstream(request.url, {
         method: request.method,
         headers: outboundHeaders,
@@ -374,6 +468,10 @@ export class HostProcessSandboxVm implements HostControlChannel {
       }));
     }
   }
+}
+
+function responseHeadersFromRecord(headers: Record<string, string>): { name: string; value: string }[] {
+  return Object.entries(headers).map(([name, value]) => ({ name, value }));
 }
 
 export function hostBinaryPath(): string {
@@ -447,6 +545,25 @@ function binaryField(value: unknown, field: string): Uint8Array {
     return value.buffer;
   }
   throw new Error(`host request ${field} must be binary`);
+}
+
+function assertPosixFileSystem(
+  fileSystem: SandboxFileSystem,
+  mountPath: string,
+): SandboxPosixFileSystem {
+  const candidate = fileSystem as Partial<SandboxPosixFileSystem>;
+  if (
+    !isSandboxWritableFileSystem(fileSystem)
+    || typeof candidate.mkdir !== "function"
+    || typeof candidate.unlink !== "function"
+    || typeof candidate.rmdir !== "function"
+    || typeof candidate.rename !== "function"
+    || typeof candidate.symlink !== "function"
+    || typeof candidate.readlink !== "function"
+  ) {
+    throw new Error(`host filesystem mount does not support POSIX mutations: ${mountPath}`);
+  }
+  return candidate as SandboxPosixFileSystem;
 }
 
 async function requestUpstream(url: string, input: {

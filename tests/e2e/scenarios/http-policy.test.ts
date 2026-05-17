@@ -1044,7 +1044,7 @@ test("upstream timeout returns a deterministic guest-visible failure", async (t)
   assert.deepEqual(policyUrls, [url]);
 });
 
-test("upstream reset mid-body returns a deterministic guest-visible failure", async (t) => {
+test("upstream reset mid-body is passed through as a truncated response", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
   }
@@ -1111,8 +1111,8 @@ test("upstream reset mid-body returns a deterministic guest-visible failure", as
     ],
   });
 
-  assert.equal(result.exitCode, 0);
-  assert.equal(result.stdout, "502");
+  assert.notEqual(result.exitCode, 0);
+  assert.equal(result.stdout, "200");
   assert.deepEqual(policyUrls, [url]);
 });
 
