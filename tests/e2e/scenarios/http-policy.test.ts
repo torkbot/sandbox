@@ -1177,8 +1177,49 @@ test("TLS without SNI has deterministic certificate and policy metadata", async 
   assert.equal(decisions[0]?.url, "https://203.0.113.10/no-sni");
 });
 
-test("dynamic MITM certificates are reused or bounded intentionally", () => {
-  assert.fail("MITM certificate generation must expose evidence that cache or bound behavior is intentional");
+test("dynamic MITM certificates are reused or bounded intentionally", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+  const ca = await createTestCertificateAuthority();
+  t.after(async () => {
+    await ca.close();
+  });
+
+  const vm = await spawnSandbox({
+    name: "https-mitm-cert-cache",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      http: {
+        ca,
+        async policy() {
+          return { action: "deny", reason: "cert cache probe" };
+        },
+      },
+    },
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const first = await guestLeafCertificate(vm, "cache.test", "/first");
+  const second = await guestLeafCertificate(vm, "cache.test", "/second");
+  const other = await guestLeafCertificate(vm, "other-cache.test", "/other");
+
+  assert.equal(first.exitCode, 0);
+  assert.equal(second.exitCode, 0);
+  assert.equal(other.exitCode, 0);
+  assert.equal(first.stdout, second.stdout);
+  assert.notEqual(first.stdout, other.stdout);
+  assert.match(first.stdout, /X509v3 Subject Alternative Name:DNS:cache\.test/);
+  assert.match(other.stdout, /X509v3 Subject Alternative Name:DNS:other-cache\.test/);
 });
 
 test("HTTP/2 ALPN behavior is explicit", async (t) => {
@@ -1265,4 +1306,28 @@ function interceptedHttpsAuthorityArgs(
     `${sourceAuthority}:${connectAddress}:443`,
     url,
   ];
+}
+
+async function guestLeafCertificate(
+  vm: Awaited<ReturnType<typeof spawnSandbox>>,
+  host: string,
+  path: string,
+): Promise<Awaited<ReturnType<typeof execGuest>>> {
+  return await execGuest(vm, {
+    id: `curl-cert-${host}-${path.replace(/\W/g, "-")}`,
+    argv: [
+      "curl",
+      "--max-time",
+      "5",
+      "-k",
+      "-sS",
+      "-o",
+      "/dev/null",
+      "-w",
+      "%{certs}",
+      "--connect-to",
+      `${host}:443:203.0.113.10:443`,
+      `https://${host}${path}`,
+    ],
+  });
 }
