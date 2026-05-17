@@ -139,7 +139,7 @@ The desired output is a statically linked Sandbox VM-host binary, including the 
 
 macOS needs a separate signing track. HVF requires the correct Hypervisor entitlement on the executable process that opens Hypervisor.framework. That process must be a Sandbox-owned helper executable, not `node`. The Node package remains the ergonomic TypeScript API, but macOS VM launch is delegated to the signed `sandbox-host` binary over a local control transport. Signing the napi addon or a dylib is not sufficient for HVF because the entitlement is process-scoped.
 
-The napi-rs addon can still provide efficient local primitives, validation, and non-HVF fast paths, but it must not be the only VM launch path on macOS unless the embedding executable is known to be signed with the HVF entitlement.
+The napi-rs addon can still provide efficient local primitives, validation, and non-HVF fast paths, but it must not be the only VM launch path on macOS unless the embedding executable is known to be signed with the HVF entitlement. The addon may be ad-hoc signed as a loadable native module, but it should not carry the HVF entitlement.
 
 The first helper protocol is deliberately small. Node starts `sandbox-host --stdio`, sends one length-prefixed BSON `host.spawn` document containing the validated VM spec, then both sides reuse the existing length-prefixed guest control frames for `init.ready` and `guest.exec`. Filesystem callbacks, HTTP policy, and other host services need explicit protocol additions before their e2e scenarios can move from skipped to required.
 
