@@ -3,15 +3,29 @@ import type {
   SandboxControlCommand,
   SandboxControlEvent,
 } from "./index.ts";
+import {
+  decodeControlEvent,
+  encodeControlCommand,
+} from "./control-codec.ts";
+
+export interface HostControlChannel {
+  writeControlPacket(packet: Uint8Array): void;
+  tryReadControlPacket(): Uint8Array | null;
+}
 
 export class HostControlTransport implements SandboxControl {
   readonly incoming: AsyncIterable<SandboxControlEvent>;
 
   readonly #events: AsyncQueue<SandboxControlEvent>;
   readonly #connected: boolean;
+  readonly #channel: HostControlChannel | null;
   #closed = false;
 
-  constructor(options: { readonly connected?: boolean } = {}) {
+  constructor(options: {
+    readonly connected?: boolean;
+    readonly channel?: HostControlChannel;
+  } = {}) {
+    this.#channel = options.channel ?? null;
     this.#connected = options.connected ?? true;
     this.#events = new AsyncQueue();
     this.incoming = this.#connected
@@ -21,11 +35,18 @@ export class HostControlTransport implements SandboxControl {
             throw new Error("sandbox control plane is not connected yet");
           },
         };
+
+    if (this.#channel !== null && this.#connected) {
+      void this.#pumpIncoming();
+    }
   }
 
-  async send(_message: SandboxControlCommand): Promise<void> {
+  async send(message: SandboxControlCommand): Promise<void> {
     this.#assertOpen();
-    throw new Error("sandbox control send is not connected yet");
+    if (this.#channel === null) {
+      throw new Error("sandbox control send is not connected yet");
+    }
+    this.#channel.writeControlPacket(encodeControlCommand(message));
   }
 
   async exec(input: {
@@ -33,12 +54,14 @@ export class HostControlTransport implements SandboxControl {
     readonly argv: readonly string[];
   }): Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>> {
     this.#assertOpen();
+    const id = input.id ?? crypto.randomUUID();
+    const completion = waitForExecComplete(this.incoming, id);
     await this.send({
       type: "guest.exec",
-      id: input.id ?? crypto.randomUUID(),
+      id,
       argv: input.argv,
     });
-    throw new Error("sandbox control exec is not connected yet");
+    return await completion;
   }
 
   async close(): Promise<void> {
@@ -63,6 +86,35 @@ export class HostControlTransport implements SandboxControl {
       throw new Error("sandbox control plane is not connected yet");
     }
   }
+
+  async #pumpIncoming(): Promise<void> {
+    while (!this.#closed && this.#channel !== null) {
+      const packet = this.#channel.tryReadControlPacket();
+      if (packet !== null) {
+        this.#events.push(decodeControlEvent(packet));
+        continue;
+      }
+
+      await sleep(10);
+    }
+  }
+}
+
+async function waitForExecComplete(
+  incoming: AsyncIterable<SandboxControlEvent>,
+  id: string,
+): Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>> {
+  for await (const event of incoming) {
+    if (event.type === "guest.exec.complete" && event.id === id) {
+      return event;
+    }
+  }
+
+  throw new Error(`sandbox control closed before exec completed: ${id}`);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 class AsyncQueue<T> implements AsyncIterable<T> {
