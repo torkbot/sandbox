@@ -429,6 +429,154 @@ test("redirects to protected destinations are blocked before JavaScript policy",
   assert.deepEqual(policyUrls, [`${origin.url}/redirect`]);
 });
 
+test("HTTPS interception buffers fragmented TLS plaintext before policy", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const ca = await createTestCertificateAuthority();
+  t.after(async () => {
+    await ca.close();
+  });
+
+  const largeHeader = "h".repeat(2 * 1024);
+  const originEvidence: Array<{
+    readonly headerBytes: number;
+  }> = [];
+  const policyUrls: string[] = [];
+
+  const origin = await startTestHttpsOrigin({
+    ca,
+    respond(request) {
+      originEvidence.push({
+        headerBytes: request.headers["x-fragmented-header"]?.length ?? 0,
+      });
+      return {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+        body: "fragmented ok",
+      };
+    },
+  });
+  t.after(async () => {
+    await origin.close();
+  });
+
+  const vm = await spawnSandbox({
+    name: "https-fragmented-request",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      http: {
+        ca,
+        async policy(request) {
+          policyUrls.push(request.url);
+          return { action: "allow" };
+        },
+      },
+    },
+  });
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuest(vm, {
+    id: "curl-https-fragmented-request",
+    argv: [
+      "sh",
+      "-lc",
+      [
+        "curl --max-time 10 -fsS",
+        `-H ${shellQuote(`x-fragmented-header: ${largeHeader}`)}`,
+        ...interceptedHttpsArgs(`${origin.url}/fragmented`).map(shellQuote),
+      ].join(" "),
+    ],
+  });
+
+  assert.equal(
+    result.exitCode,
+    0,
+    `fragmented HTTPS request failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+  );
+  assert.equal(result.stdout, "fragmented ok");
+  assert.deepEqual(originEvidence, [{
+    headerBytes: largeHeader.length,
+  }]);
+  assert.deepEqual(policyUrls, [`${origin.url}/fragmented`]);
+});
+
+test("HTTPS interception handles forwarded TLS ports without remapping to 443", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const ca = await createTestCertificateAuthority();
+  t.after(async () => {
+    await ca.close();
+  });
+
+  const policyUrls: string[] = [];
+  const origin = await startTestHttpsOrigin({
+    ca,
+    respond() {
+      return {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+        body: "non-443 ok",
+      };
+    },
+  });
+  t.after(async () => {
+    await origin.close();
+  });
+
+  const vm = await spawnSandbox({
+    name: "https-forwarded-non-443",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      http: {
+        ca,
+        async policy(request) {
+          policyUrls.push(request.url);
+          return { action: "allow" };
+        },
+      },
+    },
+  });
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuest(vm, {
+    id: "curl-https-forwarded-non-443",
+    argv: [
+      "curl",
+      "--max-time",
+      "5",
+      "--retry",
+      "2",
+      "--retry-connrefused",
+      "-fsS",
+      ...interceptedHttpsAltPortArgs(`${origin.url}/non-443`),
+    ],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stdout, "non-443 ok");
+  assert.deepEqual(policyUrls, [`${origin.url}/non-443`]);
+});
+
 function interceptedHttpArgs(url: string): string[] {
   const parsed = new URL(url);
   return [
@@ -447,8 +595,21 @@ function interceptedHttpsArgs(url: string): string[] {
   ];
 }
 
+function interceptedHttpsAltPortArgs(url: string): string[] {
+  const parsed = new URL(url);
+  return [
+    "--connect-to",
+    `${parsed.hostname}:${parsed.port}:203.0.113.10:8443`,
+    url,
+  ];
+}
+
 function assertPolicyRequestHasNoBody(request: HttpPolicyRequest): void {
   assert.equal("body" in request, false);
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 async function startStreamingHttpOrigin(): Promise<{

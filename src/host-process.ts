@@ -626,6 +626,7 @@ function outboundRequestHeaders(headers: Record<string, string>): Record<string,
   const hopByHop = new Set([
     "connection",
     "content-length",
+    "expect",
     "keep-alive",
     "proxy-authenticate",
     "proxy-authorization",

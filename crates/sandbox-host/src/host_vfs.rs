@@ -3,6 +3,7 @@ use std::ffi::CStr;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use std::time::Duration;
 
 use bson::{Bson, Document, doc};
@@ -32,8 +33,8 @@ impl HostIoBridge {
 
     pub fn write_raw_packet(&self, packet: &[u8]) -> io::Result<()> {
         let mut stdout = self.stdout.lock().expect("stdout lock poisoned");
-        stdout.write_all(packet)?;
-        stdout.flush()
+        write_all_retrying_would_block(&mut *stdout, packet)?;
+        flush_retrying_would_block(&mut *stdout)
     }
 
     pub fn request(&self, mut document: Document) -> io::Result<Document> {
@@ -462,6 +463,37 @@ impl NodeVirtualFs {
         };
         state.inodes_by_path.insert(to.to_string(), inode);
         state.paths_by_inode.insert(inode, to.to_string());
+    }
+}
+
+fn write_all_retrying_would_block(writer: &mut impl Write, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        match writer.write(bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write host packet",
+                ));
+            }
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn flush_retrying_would_block(writer: &mut impl Write) -> io::Result<()> {
+    loop {
+        match writer.flush() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 

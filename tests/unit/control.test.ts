@@ -121,6 +121,70 @@ test("HostControlTransport exec waits for matching completion", async () => {
   await control.close();
 });
 
+test("HostControlTransport demultiplexes concurrent exec completions", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const first = control.exec({ id: "first", argv: ["/bin/true"] });
+  const second = control.exec({ id: "second", argv: ["/bin/true"] });
+
+  channel.reads.push(
+    encodePacket({
+      type: "guest.exec.complete",
+      id: "second",
+      exitCode: 0,
+      stdout: new Binary(new TextEncoder().encode("second")),
+      stderr: new Binary(new Uint8Array()),
+    }),
+    encodePacket({
+      type: "guest.exec.complete",
+      id: "first",
+      exitCode: 0,
+      stdout: new Binary(new TextEncoder().encode("first")),
+      stderr: new Binary(new Uint8Array()),
+    }),
+  );
+
+  assert.equal((await first).stdout, "first");
+  assert.equal((await second).stdout, "second");
+  await control.close();
+});
+
+test("HostControlTransport exec is not starved by incoming consumers", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const iterator = control.incoming[Symbol.asyncIterator]();
+  const exec = control.exec({ id: "test", argv: ["/bin/true"] });
+
+  channel.reads.push(
+    encodePacket({
+      type: "guest.exec.complete",
+      id: "test",
+      exitCode: 0,
+      stdout: new Binary(new TextEncoder().encode("ok")),
+      stderr: new Binary(new Uint8Array()),
+    }),
+  );
+
+  assert.deepEqual(await exec, {
+    type: "guest.exec.complete",
+    id: "test",
+    exitCode: 0,
+    stdout: "ok",
+    stderr: "",
+  });
+  assert.deepEqual(await iterator.next(), {
+    done: false,
+    value: {
+      type: "guest.exec.complete",
+      id: "test",
+      exitCode: 0,
+      stdout: "ok",
+      stderr: "",
+    },
+  });
+  await control.close();
+});
+
 class MemoryControlChannel implements HostControlChannel {
   readonly writes: Uint8Array[] = [];
   readonly reads: Uint8Array[] = [];

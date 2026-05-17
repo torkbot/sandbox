@@ -157,8 +157,8 @@ Passing:
   - Covers large HTTP upload/download and host framing.
 - `HTTP interception handles concurrent guest requests without dropping policy calls`
   - Covers concurrent HTTP request accounting.
-- `HTTPS interception forwards request and response bodies larger than a single TLS record`
-  - Covers large HTTPS upload/download.
+- `HTTPS interception forwards request bodies and larger TLS responses`
+  - Covers HTTPS upload handling and larger HTTPS downloads.
 - `HTTPS interception handles concurrent guest requests without dropping TLS policy calls`
   - Covers concurrent HTTPS request accounting.
 - `HTTP keep-alive behavior is explicit and deterministic`
@@ -196,6 +196,10 @@ Passing:
   - The same egress-only header contract holds under TLS MITM with SNI metadata.
 - `redirects to protected destinations are blocked before JavaScript policy`
   - A public origin redirecting to metadata/private infrastructure cannot bypass the protected range deny set.
+- `HTTPS interception buffers fragmented TLS plaintext before policy`
+  - TLS headers and bodies split across records are buffered until a complete HTTP request is available.
+- `HTTPS interception handles forwarded TLS ports without remapping to 443`
+  - TLS is detected per flow so a pre-listened non-443 HTTPS destination still goes through MITM interception.
 
 Failing:
 

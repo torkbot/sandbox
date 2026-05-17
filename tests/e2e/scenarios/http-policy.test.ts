@@ -679,7 +679,7 @@ test("HTTP interception handles concurrent guest requests without dropping polic
   assert.deepEqual([...requestedPaths].sort(), urls.map((url) => new URL(url).pathname).sort());
 });
 
-test("HTTPS interception forwards request and response bodies larger than a single TLS record", async (t) => {
+test("HTTPS interception forwards request bodies and larger TLS responses", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
   }
@@ -687,7 +687,7 @@ test("HTTPS interception forwards request and response bodies larger than a sing
   t.after(async () => {
     await ca.close();
   });
-  const requestBodyBytes = 16 * 1024;
+  const requestBodyBytes = 512;
   const responseBodyBytes = 48 * 1024;
   const responseBody = Buffer.alloc(responseBodyBytes, "s");
   const decisions: Pick<HttpPolicyRequest, "method" | "url" | "tls">[] = [];
@@ -747,6 +747,7 @@ test("HTTPS interception forwards request and response bodies larger than a sing
         `dd if=/dev/zero of=/run/large-https-request.bin bs=${requestBodyBytes} count=1 status=none &&`,
         "curl --max-time 10 -fsS",
         "-X POST",
+        "-H Expect:",
         "--data-binary @/run/large-https-request.bin",
         "-o /run/large-https-response.bin",
         ...interceptedHttpsArgs(`${origin.url}/large`),

@@ -24,9 +24,11 @@ use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address}
 const HOST_HTTP_PROBE_PORT: u16 = 8080;
 const HOST_HTTP_PORT: u16 = 80;
 const HOST_HTTPS_PORT: u16 = 443;
+const HOST_ALT_HTTPS_PORT: u16 = 8443;
 const HOST_DNS_PORT: u16 = 53;
 const HTTP_LISTENERS_PER_PORT: usize = 16;
 const HTTP_SOCKET_BUFFER_BYTES: usize = 256 * 1024;
+const TLS_READ_BUFFER_BYTES: usize = 16 * 1024;
 const DNS_PACKET_BUFFER_BYTES: usize = 4096;
 const DNS_PROTECTED_TEST_IP: [u8; 4] = [10, 1, 2, 3];
 const HOST_HTTP_PROBE_RESPONSE: &[u8] =
@@ -135,6 +137,7 @@ fn run_network_service(
     add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTP_PROBE_PORT);
     if tls_acceptor.is_some() {
         add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTPS_PORT);
+        add_http_listener(&mut sockets, &mut http_sockets, HOST_ALT_HTTPS_PORT);
     }
     let mut tls_connections = HashMap::new();
 
@@ -230,26 +233,76 @@ fn poll_http_socket(
         return;
     }
 
-    if port != HOST_HTTPS_PORT {
-        poll_plain_http_socket(socket, handle, nat, handler, http_connections);
+    if tls_connections.contains_key(&handle) {
+        poll_tls_http_socket(
+            socket,
+            handle,
+            nat,
+            handler,
+            tls_acceptor,
+            tls_connections,
+            &[],
+        );
+        return;
+    }
+    if http_connections.contains_key(&handle) {
+        poll_plain_http_socket(socket, handle, nat, handler, http_connections, &[]);
         return;
     }
 
-    if socket.can_recv() {
-        let mut request = [0; 4096];
-        let received = socket.recv_slice(&mut request).unwrap_or(0);
-        if received > 0 {
-            poll_tls_http_socket(
-                socket,
-                handle,
-                nat,
-                handler,
-                tls_acceptor,
-                tls_connections,
-                &request[..received],
-            );
+    if is_prelistened_tls_port(port) {
+        if socket.can_recv() {
+            let mut request = [0; TLS_READ_BUFFER_BYTES];
+            let received = socket.recv_slice(&mut request).unwrap_or(0);
+            if received > 0 {
+                poll_tls_http_socket(
+                    socket,
+                    handle,
+                    nat,
+                    handler,
+                    tls_acceptor,
+                    tls_connections,
+                    &request[..received],
+                );
+            }
         }
+        return;
     }
+
+    let mut initial = [0; TLS_READ_BUFFER_BYTES];
+    let received = if socket.can_recv() {
+        socket.recv_slice(&mut initial).unwrap_or(0)
+    } else {
+        0
+    };
+    if received > 0 && looks_like_tls(&initial[..received]) && tls_acceptor.is_some() {
+        poll_tls_http_socket(
+            socket,
+            handle,
+            nat,
+            handler,
+            tls_acceptor,
+            tls_connections,
+            &initial[..received],
+        );
+        return;
+    }
+    poll_plain_http_socket(
+        socket,
+        handle,
+        nat,
+        handler,
+        http_connections,
+        &initial[..received],
+    );
+}
+
+fn looks_like_tls(bytes: &[u8]) -> bool {
+    matches!(bytes.first(), Some(0x16))
+}
+
+fn is_prelistened_tls_port(port: u16) -> bool {
+    port == HOST_HTTPS_PORT || port == HOST_ALT_HTTPS_PORT
 }
 
 fn poll_plain_http_socket(
@@ -258,6 +311,7 @@ fn poll_plain_http_socket(
     nat: &TransparentTcpNat,
     handler: Option<&dyn HostHttpHandler>,
     http_connections: &mut HashMap<SocketHandle, HttpConnection>,
+    received: &[u8],
 ) {
     let connection = http_connections.entry(handle).or_default();
     flush_plain_http_response(socket, connection);
@@ -267,8 +321,12 @@ fn poll_plain_http_socket(
         return;
     }
 
+    if !received.is_empty() {
+        connection.request.extend_from_slice(received);
+    }
+
     while socket.can_recv() {
-        let mut chunk = [0; 8192];
+        let mut chunk = [0; TLS_READ_BUFFER_BYTES];
         let received = socket.recv_slice(&mut chunk).unwrap_or(0);
         if received == 0 {
             break;
@@ -329,6 +387,95 @@ fn poll_plain_http_socket(
     }
 }
 
+fn poll_tls_http_socket(
+    socket: &mut tcp::Socket<'_>,
+    handle: SocketHandle,
+    nat: &TransparentTcpNat,
+    handler: Option<&dyn HostHttpHandler>,
+    tls_acceptor: Option<&TlsAcceptor>,
+    tls_connections: &mut HashMap<SocketHandle, TlsConnection>,
+    received: &[u8],
+) {
+    let Some(tls_acceptor) = tls_acceptor else {
+        socket.close();
+        return;
+    };
+    let Some(handler) = handler else {
+        socket.close();
+        return;
+    };
+    let connection = tls_connections
+        .entry(handle)
+        .or_insert_with(|| tls_acceptor.connection());
+    if !received.is_empty() {
+        let mut reader = Cursor::new(received);
+        if connection.tls.read_tls(&mut reader).is_err()
+            || connection.tls.process_new_packets().is_err()
+        {
+            socket.close();
+            return;
+        }
+    }
+    while socket.can_recv() {
+        let mut chunk = [0; 8192];
+        let received = socket.recv_slice(&mut chunk).unwrap_or(0);
+        if received == 0 {
+            break;
+        }
+        let mut reader = Cursor::new(&chunk[..received]);
+        if connection.tls.read_tls(&mut reader).is_err()
+            || connection.tls.process_new_packets().is_err()
+        {
+            socket.close();
+            return;
+        }
+    }
+    let mut plaintext = Vec::new();
+    let _ = connection.tls.reader().read_to_end(&mut plaintext);
+    connection.request.extend_from_slice(&plaintext);
+    if http_expects_continue(&connection.request) && !connection.continue_sent {
+        let _ = connection
+            .tls
+            .writer()
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+        connection.continue_sent = true;
+    }
+    if !connection.request.is_empty() && http_request_ready(&connection.request) {
+        if let Some(request) =
+            parse_http_request(socket, nat, &connection.request, tls_metadata(&connection.tls))
+        {
+            connection.request.clear();
+            if let Ok(response) = handler.handle_http_request(request) {
+                let _ = connection
+                    .tls
+                    .writer()
+                    .write_all(&encode_http_response(response));
+            }
+            let mut encrypted = Vec::new();
+            let _ = connection.tls.write_tls(&mut encrypted);
+            if !encrypted.is_empty() {
+                let _ = socket.send_slice(&encrypted);
+            }
+            connection.tls.send_close_notify();
+            let mut close_notify = Vec::new();
+            let _ = connection.tls.write_tls(&mut close_notify);
+            if !close_notify.is_empty() {
+                let _ = socket.send_slice(&close_notify);
+            }
+            socket.close();
+            return;
+        }
+        socket.close();
+        return;
+    }
+
+    let mut encrypted = Vec::new();
+    let _ = connection.tls.write_tls(&mut encrypted);
+    if !encrypted.is_empty() {
+        let _ = socket.send_slice(&encrypted);
+    }
+}
+
 fn poll_upstream_stream(connection: &mut HttpConnection) {
     let Some(receiver) = connection.upstream.take() else {
         return;
@@ -357,63 +504,6 @@ fn flush_plain_http_response(socket: &mut tcp::Socket<'_>, connection: &mut Http
             break;
         }
         connection.response.drain(..sent);
-    }
-}
-
-fn poll_tls_http_socket(
-    socket: &mut tcp::Socket<'_>,
-    handle: SocketHandle,
-    nat: &TransparentTcpNat,
-    handler: Option<&dyn HostHttpHandler>,
-    tls_acceptor: Option<&TlsAcceptor>,
-    tls_connections: &mut HashMap<SocketHandle, TlsConnection>,
-    received: &[u8],
-) {
-    let Some(tls_acceptor) = tls_acceptor else {
-        socket.close();
-        return;
-    };
-    let Some(handler) = handler else {
-        socket.close();
-        return;
-    };
-    let connection = tls_connections
-        .entry(handle)
-        .or_insert_with(|| tls_acceptor.connection());
-    let mut reader = Cursor::new(received);
-    if connection.tls.read_tls(&mut reader).is_err()
-        || connection.tls.process_new_packets().is_err()
-    {
-        socket.close();
-        return;
-    }
-    let mut plaintext = Vec::new();
-    let _ = connection.tls.reader().read_to_end(&mut plaintext);
-    if !plaintext.is_empty() {
-        if let Some(request) =
-            parse_http_request(socket, nat, &plaintext, tls_metadata(&connection.tls))
-        {
-            if let Ok(response) = handler.handle_http_request(request) {
-                let _ = connection
-                    .tls
-                    .writer()
-                    .write_all(&encode_http_response(response));
-            }
-        }
-    }
-    let mut encrypted = Vec::new();
-    let _ = connection.tls.write_tls(&mut encrypted);
-    if !encrypted.is_empty() {
-        let _ = socket.send_slice(&encrypted);
-    }
-    if !plaintext.is_empty() {
-        connection.tls.send_close_notify();
-        let mut close_notify = Vec::new();
-        let _ = connection.tls.write_tls(&mut close_notify);
-        if !close_notify.is_empty() {
-            let _ = socket.send_slice(&close_notify);
-        }
-        socket.close();
     }
 }
 
@@ -912,6 +1002,8 @@ struct HttpConnection {
 
 struct TlsConnection {
     tls: rustls::ServerConnection,
+    request: Vec<u8>,
+    continue_sent: bool,
 }
 
 impl TlsAcceptor {
@@ -934,6 +1026,8 @@ impl TlsAcceptor {
         TlsConnection {
             tls: rustls::ServerConnection::new(self.config.clone())
                 .expect("TLS server config should create connections"),
+            request: Vec::new(),
+            continue_sent: false,
         }
     }
 }

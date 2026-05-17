@@ -19,6 +19,10 @@ export class HostControlTransport implements SandboxControl {
   readonly #events: AsyncQueue<SandboxControlEvent>;
   readonly #connected: boolean;
   readonly #channel: HostControlChannel | null;
+  readonly #pendingExec = new Map<string, {
+    resolve(event: Extract<SandboxControlEvent, { type: "guest.exec.complete" }>): void;
+    reject(error: unknown): void;
+  }>();
   #closed = false;
 
   constructor(options: {
@@ -56,13 +60,21 @@ export class HostControlTransport implements SandboxControl {
   }): Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>> {
     this.#assertOpen();
     const id = input.id ?? crypto.randomUUID();
-    await this.send({
-      type: "guest.exec",
-      id,
-      argv: input.argv,
-      env: input.env,
+    const completion = new Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>>((resolve, reject) => {
+      this.#pendingExec.set(id, { resolve, reject });
     });
-    return await waitForExecComplete(this.incoming, id);
+    try {
+      await this.send({
+        type: "guest.exec",
+        id,
+        argv: input.argv,
+        env: input.env,
+      });
+    } catch (error) {
+      this.#pendingExec.delete(id);
+      throw error;
+    }
+    return await completion;
   }
 
   async close(): Promise<void> {
@@ -71,12 +83,13 @@ export class HostControlTransport implements SandboxControl {
     }
 
     this.#closed = true;
+    this.#rejectPendingExec(new Error("sandbox control is closed"));
     this.#events.close();
   }
 
   emit(event: SandboxControlEvent): void {
     this.#assertOpen();
-    this.#events.push(event);
+    this.#dispatchEvent(event);
   }
 
   #assertOpen(): void {
@@ -98,30 +111,41 @@ export class HostControlTransport implements SandboxControl {
           return;
         }
         this.#closed = true;
+        this.#rejectPendingExec(error);
         this.#events.close(error);
         return;
       }
       if (packet !== null) {
-        this.#events.push(decodeControlEvent(packet));
+        if (this.#closed) {
+          return;
+        }
+        this.#dispatchEvent(decodeControlEvent(packet));
         continue;
       }
 
       await sleep(10);
     }
   }
-}
 
-async function waitForExecComplete(
-  incoming: AsyncIterable<SandboxControlEvent>,
-  id: string,
-): Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>> {
-  for await (const event of incoming) {
-    if (event.type === "guest.exec.complete" && event.id === id) {
-      return event;
+  #dispatchEvent(event: SandboxControlEvent): void {
+    this.#events.push(event);
+    if (event.type !== "guest.exec.complete") {
+      return;
     }
+    const pending = this.#pendingExec.get(event.id);
+    if (pending === undefined) {
+      return;
+    }
+    this.#pendingExec.delete(event.id);
+    pending.resolve(event);
   }
 
-  throw new Error(`sandbox control closed before exec completed: ${id}`);
+  #rejectPendingExec(error: unknown): void {
+    for (const pending of this.#pendingExec.values()) {
+      pending.reject(error);
+    }
+    this.#pendingExec.clear();
+  }
 }
 
 function sleep(ms: number): Promise<void> {
