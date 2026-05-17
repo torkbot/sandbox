@@ -105,6 +105,8 @@ Passing:
   - Covers large HTTPS upload/download.
 - `HTTPS interception handles concurrent guest requests without dropping TLS policy calls`
   - Covers concurrent HTTPS request accounting.
+- `HTTP keep-alive behavior is explicit and deterministic`
+  - Uses one client connection for two pipelined requests and asserts the documented close-after-one-response behavior.
 - `upstream connection refused returns a deterministic guest-visible failure`
   - Allows policy to a refused origin and asserts the guest sees a stable `502`.
 - `upstream timeout returns a deterministic guest-visible failure`
@@ -112,8 +114,6 @@ Passing:
 
 Failing:
 
-- `HTTP keep-alive behavior is explicit and deterministic`
-  - Use one client connection for two requests and assert either supported reuse or documented close behavior.
 - `upstream reset mid-body returns a deterministic guest-visible failure`
   - Origin closes mid-response and the guest observes a stable failure.
 - `TLS without SNI has deterministic certificate and policy metadata`

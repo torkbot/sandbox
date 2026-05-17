@@ -846,8 +846,81 @@ test("HTTPS interception handles concurrent guest requests without dropping TLS 
   assert.deepEqual([...requestedPaths].sort(), urls.map((url) => new URL(url).pathname).sort());
 });
 
-test("HTTP keep-alive behavior is explicit and deterministic", () => {
-  assert.fail("HTTP keep-alive must either support connection reuse or return a documented deterministic close behavior");
+test("HTTP keep-alive behavior is explicit and deterministic", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+  const ca = await createTestCertificateAuthority();
+  t.after(async () => {
+    await ca.close();
+  });
+  const requestedPaths: string[] = [];
+  const policyUrls: string[] = [];
+
+  const origin = await startTestHttpOrigin({
+    respond(request) {
+      requestedPaths.push(request.url);
+      return {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+        body: request.url,
+      };
+    },
+  });
+
+  t.after(async () => {
+    await origin.close();
+  });
+
+  const vm = await spawnSandbox({
+    name: "http-keep-alive",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      http: {
+        ca,
+        async policy(request) {
+          policyUrls.push(request.url);
+          return { action: "allow" };
+        },
+      },
+    },
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const authority = new URL(origin.url).host;
+  const result = await execGuest(vm, {
+    id: "http-keep-alive",
+    argv: [
+      "sh",
+      "-lc",
+      [
+        "printf 'GET /first HTTP/1.1\\r\\nHost: ",
+        authority,
+        "\\r\\nConnection: keep-alive\\r\\n\\r\\nGET /second HTTP/1.1\\r\\nHost: ",
+        authority,
+        "\\r\\nConnection: close\\r\\n\\r\\n' | nc -w 3 203.0.113.10 80",
+      ].join(""),
+    ],
+  });
+
+  assert.equal(
+    result.exitCode,
+    0,
+    `keep-alive probe failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+  );
+  assert.match(result.stdout, /\/first/);
+  assert.doesNotMatch(result.stdout, /\/second/);
+  assert.deepEqual(policyUrls, [`${origin.url}/first`]);
+  assert.deepEqual(requestedPaths, ["/first"]);
 });
 
 test("upstream connection refused returns a deterministic guest-visible failure", async (t) => {
