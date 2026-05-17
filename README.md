@@ -12,20 +12,25 @@ The target shape is:
 
 ```ts
 import {
+  linuxOverlayFs,
+  mount,
   prebuiltRootfs,
   projectInit,
   projectKernel,
+  scratchFs,
   spawnSandbox,
-  virtualFsMount,
 } from "@torkbot/sandbox";
 
 await using vm = await spawnSandbox({
   kernel: projectKernel(),
   init: projectInit(),
-  rootfs: prebuiltRootfs("dist/rootfs/sandbox.erofs", { format: "erofs" }),
+  rootfs: linuxOverlayFs({
+    lower: prebuiltRootfs("dist/rootfs/sandbox.erofs", { format: "erofs" }),
+    upper: scratchFs(),
+  }),
 
   mounts: [
-    virtualFsMount("/sandbox/proc", {
+    mount("/sandbox/proc", {
       async stat(path) {
         if (path === "/") {
           return {
@@ -108,31 +113,29 @@ const statusBytes = await sandboxProc.read({
 console.log(JSON.parse(Buffer.from(statusBytes).toString("utf8")));
 ```
 
-Root filesystems are immutable by default. For build-time image shaping, a VM can opt into a writable root overlay and publish the result as a new EROFS artifact:
+Root filesystems are immutable by default. A writable root is expressed as an explicit Linux overlayfs composition:
 
 ```ts
 await using vm = await spawnSandbox({
   kernel: projectKernel(),
   init: projectInit(),
-  rootfs: prebuiltRootfs("dist/rootfs/base.erofs", { format: "erofs" }),
-  rootfsOverlay: {
-    mode: "writable",
-  },
+  rootfs: linuxOverlayFs({
+    lower: prebuiltRootfs("dist/rootfs/base.erofs", { format: "erofs" }),
+    upper: scratchFs(),
+  }),
 });
 
 await vm.control.exec({
   id: "install-toolchain",
   argv: ["/bin/sh", "-lc", "apk add --no-cache git nodejs"],
 });
-
-const shaped = await vm.rootfs.snapshot({
-  format: "erofs",
-});
 ```
+
+`mount(...)` means a guest-visible mount boundary. Host-side attachment points and bindings are a separate future primitive; they should not be hidden behind `mount(...)`.
 
 The guest contract is intentionally narrow:
 
-- `/` is read-only.
+- `/` is read-only unless the rootfs is a `linuxOverlayFs(...)` composition.
 - `/sandbox/proc` is implemented by the host.
 - HTTP policy and header rewriting happen in TypeScript on the host.
 - RFC1918, carrier-grade NAT, and link-local destinations are blocked before JavaScript policy.
@@ -145,6 +148,8 @@ The guest contract is intentionally narrow:
 - implicit fd-backed host control sockets owned by Sandbox,
 - avoid host filesystem coordination unless it is intrinsic to the artifact; prefer file descriptors, database handles, bytes, and async iterables over paths,
 - build-time rootfs shaping, with prebuilt rootfs artifacts supplied at VM instantiation,
+- root filesystem composition through small explicit primitives such as `linuxOverlayFs(...)` and `scratchFs()`, with lower and upper expressed as filesystem values,
+- `mount(...)` only for guest-visible mounts; host-side bindings/attachment points must be a separate primitive,
 - programmable virtual filesystems backed by TypeScript callbacks,
 - transparent HTTP interception with TypeScript policy hooks,
 - protected network ranges enforced before policy, with private/link-local ranges blocked by default,

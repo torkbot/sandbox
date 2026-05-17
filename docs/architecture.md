@@ -64,9 +64,20 @@ Build the guest root filesystem before VM instantiation. The runtime API should 
 
 The build-time tooling can use a simple Docker image create/export/extract flow to shape the rootfs. That flow belongs in packaging or fixture-generation tools, not in the hot runtime path.
 
-The target shape is an immutable read-only root volume, likely EROFS, produced from that extracted rootfs. Writable guest state should come from explicit programmable filesystem mounts rather than by making the root filesystem writable. That keeps the base environment content-addressable and makes all mutable state visible to the host-side filesystem layer.
+The target shape is an immutable read-only root volume, likely EROFS, produced from that extracted rootfs. Runtime writable root behavior should be a filesystem composition, not a second unrelated VM option.
 
-Rootfs shaping is a separate build-time mode. Normal VM instantiation should boot an immutable root by default, but authoring tools may opt into a writable root overlay. In that mode the host can run incremental guest commands, capture rootfs deltas, and produce a new EROFS artifact programmatically. The low-level snapshot API should return artifact bytes and a digest, not force a host filesystem write. The output becomes the next prebuilt rootfs input; it should not turn normal runtime VMs into mutable-root machines.
+The first writable-root primitive is explicit Linux overlayfs:
+
+```ts
+rootfs: linuxOverlayFs({
+  lower: prebuiltRootfs("dist/rootfs/base.erofs", { format: "erofs" }),
+  upper: scratchFs(),
+})
+```
+
+`linuxOverlayFs(...)` means real Linux overlayfs semantics. It should not silently switch to a host-side userspace merge implementation for different inputs. Unsupported lower/upper combinations should be rejected until they are intentionally implemented.
+
+Snapshotting a modified rootfs back into EROFS is deferred. The near-term contract is only that `linuxOverlayFs(...)` makes `/` writable through an isolated scratch upper while leaving the prebuilt lower unchanged.
 
 ## Networking
 
@@ -98,13 +109,23 @@ HTTP interception requires explicit guest trust injection. The guest init should
 
 ## Filesystems
 
-Sandbox needs three filesystem modes:
+Sandbox needs small filesystem primitives:
 
-- Static or read-only host directory mounts through libkrun virtio-fs, and eventually immutable root volumes such as EROFS.
-- Fully virtual filesystems implemented by host Node.js code, including procfs-like control trees.
-- Writable virtual filesystems implemented through the same host filesystem hooks.
+- `prebuiltRootfs(...)`: a supplied root artifact such as a directory or EROFS image.
+- `scratchFs()`: an isolated writable filesystem owned by one VM instance.
+- `linuxOverlayFs({ lower, upper })`: a real Linux overlayfs composition over generic filesystem values, rejecting combinations that cannot be mounted with Linux overlayfs.
+- `mount(path, fs)`: a guest-visible mount boundary.
+- `virtualFs(...)` / `virtualFsMount(...)`: host Node.js callbacks implementing a guest-visible filesystem.
 
-Path-backed virtio-fs is adequate for immutable roots and simple mounts, but it does not provide a programmable per-operation host API. The programmable filesystem should be a vhost-user backend owned by this project, with Node.js callbacks behind a Rust service boundary. That keeps guest filesystem traffic on a virtio device instead of inventing a guest agent protocol for normal file operations.
+Terminology matters:
+
+- **mounts** are guest-visible kernel mounts. They should appear as mount boundaries in the guest.
+- **bindings** are host-side attachment points into a filesystem abstraction. They are not guest-visible mount boundaries by definition.
+- **attachment points** are the locations inside a host-side filesystem abstraction where bindings attach.
+
+Do not hide bindings behind `mount(...)`. If Sandbox needs host-side filesystem composition, it should get a separate binding/attachment primitive with a different name and contract. Internal optimizations are allowed for specific filesystem combinations, but they must preserve the named primitive's semantics.
+
+Path-backed virtio-fs is adequate for simple guest-visible mounts, but it does not provide a programmable per-operation host API. The programmable filesystem should be a vhost-user backend owned by this project, with Node.js callbacks behind a Rust service boundary. That keeps guest filesystem traffic on a virtio device instead of inventing a guest agent protocol for normal file operations.
 
 Durable filesystem implementations should be layered on top of the generic user-space filesystem hooks, not built into Sandbox as first-class mount types. Sandbox's responsibility is to provide correct guest filesystem operations and a stable JavaScript mount handle; storage engines belong above that boundary.
 
@@ -149,7 +170,7 @@ The first helper protocol is deliberately small. Node starts `sandbox-host --std
 2. Build `sandbox-init` as a static guest binary and boot it with an explicit kernel/initramfs. If needed, use libkrun's legacy init only as a temporary bridge.
 3. Add a vsock control channel and adapt it to the TypeScript `Transport` interface.
 4. Add build-time Docker image export/extract rootfs tooling, then consume a prebuilt immutable read-only root volume at VM instantiation.
-5. Add rootfs overlay shaping mode that can run incremental guest operations and publish a new EROFS artifact.
+5. Add `linuxOverlayFs({ lower: prebuiltRootfs(...), upper: scratchFs() })` so `/` can be writable while the prebuilt lower remains immutable.
 6. Add CA injection and a host HTTP proxy with Node.js policy callbacks.
-7. Add a vhost-user filesystem backend for virtual and writable host-implemented mounts.
+7. Add a vhost-user filesystem backend for virtual and writable host-implemented guest mounts.
 8. Move any required libkrun changes into `torkbot/libkrun` and keep them upstream-shaped.

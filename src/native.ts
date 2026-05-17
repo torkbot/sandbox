@@ -26,9 +26,6 @@ export type NativeSpawnSandboxOptions = {
     readonly readonly?: boolean;
     readonly format: "directory" | "erofs";
   };
-  readonly rootfsOverlay?: {
-    readonly mode: "writable";
-  };
   readonly mounts?: readonly (
     | {
         readonly kind: "virtual-fs";

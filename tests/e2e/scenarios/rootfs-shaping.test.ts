@@ -1,16 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  linuxOverlayFs,
+  mount,
   prebuiltRootfs,
   projectInit,
   projectKernel,
+  scratchFs,
   spawnSandbox,
+  virtualFsMount,
 } from "../../../src/index.ts";
 import { collectAsync, writeEvidence } from "../support/evidence.ts";
 import { execGuestShell } from "../support/guest-control.ts";
 import { requireVmLaunchSupport } from "../support/capabilities.ts";
 
-test("a VM can run with a writable root overlay and publish a new EROFS rootfs", async (t) => {
+test("linuxOverlayFs composes a prebuilt lower filesystem with a scratch upper filesystem", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
   }
@@ -19,12 +23,12 @@ test("a VM can run with a writable root overlay and publish a new EROFS rootfs",
     name: "rootfs-shaping",
     kernel: projectKernel(),
     init: projectInit(),
-    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
-      format: "erofs",
+    rootfs: linuxOverlayFs({
+      lower: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+        format: "erofs",
+      }),
+      upper: scratchFs(),
     }),
-    rootfsOverlay: {
-      mode: "writable",
-    },
   });
 
   t.after(async () => {
@@ -44,19 +48,8 @@ test("a VM can run with a writable root overlay and publish a new EROFS rootfs",
   });
   assert.equal(install.exitCode, 0);
 
-  const snapshot = await vm.rootfs.snapshot({
-    format: "erofs",
-  });
-
-  assert.equal(snapshot.format, "erofs");
-  assert.match(snapshot.digest, /^sha256:/);
-  assert.ok(snapshot.bytes instanceof Uint8Array);
-
   await writeEvidence("rootfs-shaping.json", {
-    snapshot: {
-      format: snapshot.format,
-      digest: snapshot.digest,
-    },
+    rootfs: "linux-overlay-fs",
   });
 });
 
@@ -89,14 +82,192 @@ test("immutable root remains the default when overlay mode is absent", async (t)
   assert.match(result.stderr, /Read-only file system|read-only/i);
 });
 
-test("writable root overlay captures guest mutations", () => {
-  assert.fail("writable root overlay must capture guest mutations without changing the supplied base rootfs");
+test("linuxOverlayFs does not mutate its prebuilt lower filesystem", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const lower = prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+    format: "erofs",
+  });
+  const overlayVm = await spawnSandbox({
+    name: "overlay-does-not-mutate-lower",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: linuxOverlayFs({
+      lower,
+      upper: scratchFs(),
+    }),
+  });
+
+  t.after(async () => {
+    await overlayVm.close();
+  });
+
+  await collectAsync(overlayVm.control.incoming, (event) => event.type === "init.ready");
+
+  const write = await execGuestShell(overlayVm, {
+    id: "write-overlay",
+    script: "mkdir -p /opt/sandbox && printf overlay > /opt/sandbox/lower-check.txt",
+  });
+  assert.equal(write.exitCode, 0);
+  await overlayVm.close();
+
+  const lowerVm = await spawnSandbox({
+    name: "overlay-lower-check",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: lower,
+  });
+
+  t.after(async () => {
+    await lowerVm.close();
+  });
+
+  await collectAsync(lowerVm.control.incoming, (event) => event.type === "init.ready");
+
+  const check = await execGuestShell(lowerVm, {
+    id: "check-lower",
+    script: "test ! -e /opt/sandbox/lower-check.txt",
+  });
+
+  assert.equal(check.exitCode, 0);
 });
 
-test("rootfs snapshot returns bytes and digest without forcing a host output path", () => {
-  assert.fail("rootfs snapshot must return an EROFS byte blob and digest without requiring an output path");
+test("scratchFs upper state is isolated between VM instances", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const rootfs = linuxOverlayFs({
+    lower: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    upper: scratchFs(),
+  });
+  const first = await spawnSandbox({
+    name: "scratch-isolated-first",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs,
+  });
+
+  t.after(async () => {
+    await first.close();
+  });
+
+  await collectAsync(first.control.incoming, (event) => event.type === "init.ready");
+
+  const write = await execGuestShell(first, {
+    id: "write-scratch",
+    script: "mkdir -p /opt/sandbox && printf first > /opt/sandbox/scratch.txt",
+  });
+  assert.equal(write.exitCode, 0);
+  await first.close();
+
+  const second = await spawnSandbox({
+    name: "scratch-isolated-second",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: linuxOverlayFs({
+      lower: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+        format: "erofs",
+      }),
+      upper: scratchFs(),
+    }),
+  });
+
+  t.after(async () => {
+    await second.close();
+  });
+
+  await collectAsync(second.control.incoming, (event) => event.type === "init.ready");
+
+  const check = await execGuestShell(second, {
+    id: "check-scratch",
+    script: "test ! -e /opt/sandbox/scratch.txt",
+  });
+
+  assert.equal(check.exitCode, 0);
 });
 
-test("a VM can boot from a produced rootfs snapshot", () => {
-  assert.fail("a rootfs snapshot produced by one VM must boot a second VM as a read-only rootfs");
+test("mount creates a guest-visible mount boundary", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const vm = await spawnSandbox({
+    name: "guest-visible-mount",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    mounts: [
+      mount("/sandbox", {
+        async stat(path) {
+          if (path === "/") {
+            return {
+              type: "directory",
+              sizeBytes: null,
+              mediaType: null,
+              modifiedAtMs: null,
+            };
+          }
+          if (path === "/visible.txt") {
+            return {
+              type: "file",
+              sizeBytes: 7,
+              mediaType: "text/plain",
+              modifiedAtMs: null,
+            };
+          }
+          throw new Error(`missing path ${path}`);
+        },
+        async list(path) {
+          if (path !== "/") throw new Error(`missing directory ${path}`);
+          return [{ name: "visible.txt", type: "file" }];
+        },
+        async read(input) {
+          if (input.path !== "/visible.txt") throw new Error(`missing file ${input.path}`);
+          return new TextEncoder().encode("visible");
+        },
+      }),
+    ],
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuestShell(vm, {
+    id: "guest-visible-mount",
+    script: "cat /sandbox/visible.txt && grep ' /sandbox ' /proc/mounts",
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.match(result.stdout, /visible/);
+});
+
+test("virtualFsMount remains an alias for guest-visible mounts while bindings are a separate future primitive", () => {
+  const fileSystem = {
+    async stat() {
+      return {
+        type: "directory" as const,
+        sizeBytes: null,
+        mediaType: null,
+        modifiedAtMs: null,
+      };
+    },
+    async list() {
+      return [];
+    },
+    async read() {
+      return new Uint8Array();
+    },
+  };
+
+  assert.deepEqual(mount("/sandbox", fileSystem), virtualFsMount("/sandbox", fileSystem));
 });

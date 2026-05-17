@@ -29,15 +29,25 @@ export type InitConfig = {
   readonly crate: "sandbox-init";
 };
 
-export type RootfsConfig = {
+export type SandboxFsConfig = PrebuiltRootfsConfig | LinuxOverlayRootfsConfig | ScratchFsConfig;
+
+export type RootfsConfig = PrebuiltRootfsConfig | LinuxOverlayRootfsConfig;
+
+export type PrebuiltRootfsConfig = {
   readonly kind: "prebuilt-rootfs";
   readonly path: string;
   readonly readonly?: boolean;
   readonly format: "directory" | "erofs";
 };
 
-export type RootfsOverlayConfig = {
-  readonly mode: "writable";
+export type LinuxOverlayRootfsConfig = {
+  readonly kind: "linux-overlay-fs";
+  readonly lower: SandboxFsConfig;
+  readonly upper: SandboxFsConfig;
+};
+
+export type ScratchFsConfig = {
+  readonly kind: "scratch-fs";
 };
 
 export type SandboxFileType = "file" | "directory";
@@ -122,7 +132,6 @@ export interface SandboxOptions {
   readonly kernel: KernelConfig;
   readonly init: InitConfig;
   readonly rootfs: RootfsConfig;
-  readonly rootfsOverlay?: RootfsOverlayConfig;
   readonly mounts?: readonly MountConfig[];
   readonly network?: NetworkConfig;
 }
@@ -163,23 +172,12 @@ export interface SandboxControl extends Transport<SandboxControlEvent, SandboxCo
   }): Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>>;
 }
 
-export interface RootfsSnapshotOptions {
-  readonly format: "erofs";
-}
-
-export interface RootfsSnapshot {
-  readonly format: "erofs";
-  readonly digest: string;
-  readonly bytes: Uint8Array;
-}
-
 export interface SandboxVm {
   readonly control: SandboxControl;
   readonly mounts: SandboxMounts;
   readonly diagnostics?: SandboxDiagnostics;
   readonly rootfs: {
     hash(): Promise<string>;
-    snapshot(options: RootfsSnapshotOptions): Promise<RootfsSnapshot>;
   };
   close(): Promise<void>;
   [Symbol.asyncDispose](): Promise<void>;
@@ -203,12 +201,29 @@ export function projectInit(): InitConfig {
   };
 }
 
-export function prebuiltRootfs(path: string, options: Omit<RootfsConfig, "kind" | "path">): RootfsConfig {
+export function prebuiltRootfs(path: string, options: Omit<PrebuiltRootfsConfig, "kind" | "path">): PrebuiltRootfsConfig {
   return {
     kind: "prebuilt-rootfs",
     path,
     readonly: options.readonly ?? true,
     format: options.format,
+  };
+}
+
+export function scratchFs(): ScratchFsConfig {
+  return {
+    kind: "scratch-fs",
+  };
+}
+
+export function linuxOverlayFs(input: {
+  readonly lower: SandboxFsConfig;
+  readonly upper: SandboxFsConfig;
+}): LinuxOverlayRootfsConfig {
+  return {
+    kind: "linux-overlay-fs",
+    lower: input.lower,
+    upper: input.upper,
   };
 }
 
@@ -218,6 +233,10 @@ export function virtualFsMount(path: string, fileSystem: SandboxVirtualFileSyste
     path,
     fileSystem,
   };
+}
+
+export function mount(path: string, fileSystem: SandboxVirtualFileSystem): VirtualFsMountConfig {
+  return virtualFsMount(path, fileSystem);
 }
 
 export async function spawnSandbox(options: SandboxOptions): Promise<SandboxVm> {
@@ -275,9 +294,6 @@ class NativeBackedSandboxVm implements SandboxVm {
       async hash() {
         throw new Error("sandbox rootfs hash is not implemented yet");
       },
-      async snapshot() {
-        throw new Error("sandbox rootfs snapshot is not implemented yet");
-      },
     };
   }
 
@@ -325,6 +341,10 @@ class ConfiguredSandboxMounts implements SandboxMounts {
 }
 
 function toNativeSpawnOptions(options: SandboxOptions): NativeSpawnSandboxOptions {
+  if (options.rootfs.kind !== "prebuilt-rootfs") {
+    throw new Error(`rootfs ${options.rootfs.kind} is not implemented yet`);
+  }
+
   return {
     name: options.name,
     cpu: options.cpu,
@@ -340,7 +360,6 @@ function toNativeSpawnOptions(options: SandboxOptions): NativeSpawnSandboxOption
       readonly: options.rootfs.readonly,
       format: options.rootfs.format,
     },
-    rootfsOverlay: options.rootfsOverlay,
     mounts: options.mounts?.map((mount) => {
       return {
         kind: mount.kind,
@@ -376,8 +395,10 @@ function validateSandboxOptions(options: SandboxOptions): void {
   if (options.init.crate !== "sandbox-init") {
     throw new Error(`invalid spawnSandbox options: unsupported init crate: ${options.init.crate}`);
   }
-  if (options.rootfs.path.length === 0) {
-    throw new Error("invalid spawnSandbox options: rootfs.path must not be empty");
+  if (options.rootfs.kind === "prebuilt-rootfs") {
+    if (options.rootfs.path.length === 0) {
+      throw new Error("invalid spawnSandbox options: rootfs.path must not be empty");
+    }
   }
 
   const mountPaths = new Set<string>();

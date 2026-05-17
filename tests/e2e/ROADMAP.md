@@ -28,11 +28,12 @@ Passing:
   - Starts a non-returning guest command, closes the VM, and asserts cleanup completes without leaking the host API.
 - `host process exit is surfaced through the VM API`
   - Terminates `sandbox-host` underneath an active VM and asserts the next host operation rejects with an idiomatic closed/crashed error.
+- `guest OOM is surfaced through the VM API`
+  - Trigger an intentional guest OOM and assert the host observes VM failure deterministically.
 
 Failing:
 
-- `guest OOM is surfaced through the VM API`
-  - Trigger an intentional guest OOM and assert the host observes VM failure deterministically.
+- No remaining known failures in this scenario file.
 
 ## `filesystem.test.ts`
 
@@ -61,23 +62,25 @@ Failing:
 
 ## `rootfs-shaping.test.ts`
 
-This file owns build-time rootfs mutation and artifact publishing. Runtime VMs should stay immutable by default.
+This file owns root filesystem composition. Runtime VMs should stay immutable by default unless the root is explicitly composed with `linuxOverlayFs(...)`.
 
 Passing:
 
 - `immutable root remains the default when overlay mode is absent`
   - Assert root writes fail in normal runtime mode.
+- `mount creates a guest-visible mount boundary`
+  - Assert `mount(path, fs)` is visible in the guest as a real mount boundary.
+- `virtualFsMount remains an alias for guest-visible mounts while bindings are a separate future primitive`
+  - Preserve compatibility while keeping mount/binding terminology explicit.
 
 Failing:
 
-- `a VM can run with a writable root overlay and publish a new EROFS rootfs`
-  - This exists as a required e2e test and should fail until rootfs overlay and EROFS snapshotting are implemented.
-- `writable root overlay captures guest mutations`
-  - Opt into overlay mode, mutate root, and verify the base rootfs remains unchanged.
-- `rootfs snapshot returns bytes and digest without forcing a host output path`
-  - Assert the low-level snapshot primitive returns an EROFS blob and stable digest.
-- `a VM can boot from a produced rootfs snapshot`
-  - Boot a second VM from the snapshot bytes/artifact and verify the mutation is present read-only.
+- `linuxOverlayFs composes a prebuilt lower filesystem with a scratch upper filesystem`
+  - Assert `/` is writable when the rootfs is an explicit Linux overlayfs composition.
+- `linuxOverlayFs does not mutate its prebuilt lower filesystem`
+  - Mutate the overlay root, then boot the lower root alone and assert the mutation is absent.
+- `scratchFs upper state is isolated between VM instances`
+  - Mutate one scratch upper, then boot another `scratchFs()` upper and assert the mutation is absent.
 
 ## `http-policy.test.ts`
 
@@ -136,9 +139,6 @@ Passing:
   - Configure a custom CIDR and assert pre-policy block.
 - `public destinations reach JavaScript policy`
   - Request a non-protected destination and assert policy evidence.
-
-Failing:
-
 - `DNS-dependent traffic is observable and cannot bypass policy`
   - Guest requests a hostname without `--connect-to`; assert DNS behavior and policy evidence.
 - `DNS resolution to a protected IP is still blocked before policy`
@@ -147,6 +147,10 @@ Failing:
   - Attempt IPv6 HTTP destination and assert deterministic unsupported or implemented behavior.
 - `UDP and non-HTTP traffic cannot silently bypass policy`
   - Probe UDP/non-HTTP traffic and assert the documented behavior.
+
+Failing:
+
+- No remaining known failures in this scenario file.
 
 ## `linkage-and-signing.test.ts`
 
@@ -182,11 +186,12 @@ Passing:
   - Prove fd-oriented network/control surfaces where the fork supports them.
 - `virtual filesystem operations use libkrun virtual filesystem traits`
   - Keep writable VFS e2e tied to the libkrun trait/backend path.
+- `direct Rust init injection boots without libkrun stage-1 init`
+  - Boot `sandbox-init` directly without relying on libkrun stage-1 init.
 
 Failing:
 
-- `direct Rust init injection boots without libkrun stage-1 init`
-  - Boot `sandbox-init` directly without relying on libkrun stage-1 init.
+- No remaining known failures in this scenario file.
 
 ## Required Suite Today
 

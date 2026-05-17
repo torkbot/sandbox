@@ -617,7 +617,6 @@ function encodeHostSpawn(options: NativeSpawnSandboxOptions): Uint8Array {
     rootfsPath: options.rootfs.path,
     rootfsReadonly: options.rootfs.readonly,
     rootfsFormat: options.rootfs.format,
-    rootfsOverlayMode: options.rootfsOverlay?.mode,
     mounts: options.mounts ?? [],
     networkHttp: options.network?.http === undefined
       ? undefined

@@ -4,7 +4,7 @@
 
 Sandbox needs integration-style tests that objectively prove the runtime properties we care about: a statically linked host artifact can boot a libkrun microVM, configure a guest with our init, enforce host-side policy, intercept HTTP, mount immutable and writable filesystems, and provide a reliable host/guest control channel.
 
-The test suite should produce artifacts that are easy to inspect after failure: host logs, guest console logs, control-channel transcripts, proxy traces, filesystem snapshots, and platform-link/signing reports.
+The test suite should produce artifacts that are easy to inspect after failure: host logs, guest console logs, control-channel transcripts, proxy traces, filesystem evidence, and platform-link/signing reports.
 
 ## Test Tiers
 
@@ -74,17 +74,18 @@ Evidence:
 - virtual files show host-generated contents and directory metadata.
 - JavaScript can inspect mounted virtual filesystems through stable mount handles without entering the guest.
 
-### Tier 3b: Rootfs Shaping E2E
+### Tier 3b: Rootfs Composition E2E
 
-Runs with a real VM in an explicit writable-overlay mode.
+Runs with a real VM and explicit filesystem composition primitives.
 
 Evidence:
 
 - immutable root mode remains the default.
-- writable-overlay mode allows incremental guest operations to modify root contents.
-- `vm.rootfs.snapshot({ format: "erofs" })` produces EROFS artifact bytes.
-- the snapshot report includes a stable digest.
-- a subsequent VM can boot from the produced artifact as a read-only root.
+- `linuxOverlayFs({ lower: prebuiltRootfs(...), upper: scratchFs() })` makes `/` writable through real Linux overlayfs.
+- the prebuilt lower filesystem remains immutable after guest writes through the overlay.
+- each `scratchFs()` upper is isolated to its VM instance.
+- `mount(path, fs)` creates a guest-visible mount boundary.
+- host-side bindings and attachment points are a separate future primitive, not hidden behind `mount(...)`.
 
 ### Tier 4: Network And HTTP Policy E2E
 
@@ -163,7 +164,7 @@ Detected capabilities:
 - Custom init: the Rust guest init from this repository performs setup, reports readiness, and supervises a test workload. Any libkrun-provided init stage is a temporary bridge and should be removed from the passing target suite once direct Rust init injection lands.
 - Static linking: linkage report shows no dynamic `libkrun` or `libkrunfw` dependency.
 - Immutable root: root hash remains stable and guest root writes fail.
-- Rootfs shaping: explicit writable-overlay mode can capture deltas and publish a new EROFS rootfs artifact.
+- Rootfs composition: explicit `linuxOverlayFs(...)` can compose a prebuilt lower and scratch upper without mutating the lower.
 - Virtual filesystem: guest reads host-generated files and metadata through a mounted virtual tree.
 - HTTP interception: TLS traffic is intercepted with guest-trusted CA, policy hooks run in Node.js, headers are modified, and forwarding is transparent.
 - Network policy: default protected ranges and configured protected ranges are blocked with deterministic evidence before JavaScript policy.
@@ -184,7 +185,7 @@ The first executable scenario files live under `tests/e2e/scenarios/` as `.test.
 
 - `boot-smoke.test.ts`: boots a VM, waits for `init.ready`, sends a control command, and checks command output.
 - `filesystem.test.ts`: boots with an immutable root and host-backed virtual filesystem using the same `stat` / `list` / `read` shape as TorkBot plugin filesystems.
-- `rootfs-shaping.test.ts`: opts into writable root overlay mode, runs incremental guest commands, and snapshots the result as an EROFS artifact.
+- `rootfs-shaping.test.ts`: expresses immutable roots, Linux overlayfs root composition, scratch isolation, and guest-visible mount boundaries.
 - `http-policy.test.ts`: injects CA trust, intercepts HTTPS, runs Node policy hooks, rewrites headers, and blocks protected destinations.
 - `linkage-and-signing.test.ts`: verifies static linkage, absence of dynamic libkrun/libkrunfw dependencies, and macOS HVF entitlement signing.
 
