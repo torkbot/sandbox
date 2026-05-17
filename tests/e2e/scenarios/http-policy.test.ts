@@ -1181,8 +1181,66 @@ test("dynamic MITM certificates are reused or bounded intentionally", () => {
   assert.fail("MITM certificate generation must expose evidence that cache or bound behavior is intentional");
 });
 
-test("HTTP/2 ALPN behavior is explicit", () => {
-  assert.fail("HTTP/2-capable clients must observe documented downgrade, denial, or implemented HTTP/2 behavior");
+test("HTTP/2 ALPN behavior is explicit", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+  const ca = await createTestCertificateAuthority();
+  t.after(async () => {
+    await ca.close();
+  });
+  const decisions: Pick<HttpPolicyRequest, "url" | "tls">[] = [];
+
+  const vm = await spawnSandbox({
+    name: "https-http2-alpn",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      http: {
+        ca,
+        async policy(request) {
+          decisions.push({
+            url: request.url,
+            tls: request.tls,
+          });
+          return { action: "deny", reason: "http2 downgrade observed" };
+        },
+      },
+    },
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuest(vm, {
+    id: "curl-http2-alpn",
+    argv: [
+      "curl",
+      "--http2",
+      "--max-time",
+      "5",
+      "-sS",
+      "-o",
+      "/dev/null",
+      "-w",
+      "%{http_version} %{http_code}",
+      ...interceptedHttpsAuthorityArgs("https://http2.test/alpn", "203.0.113.10"),
+    ],
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, "1.1 451");
+  assert.equal(decisions.length, 1);
+  assert.equal(decisions[0]?.url, "https://http2.test/alpn");
+  assert.equal(decisions[0]?.tls?.serverName, "http2.test");
+  assert.equal(decisions[0]?.tls?.alpnProtocol, "http/1.1");
+  assert.match(decisions[0]?.tls?.protocol ?? "", /TLS/);
 });
 
 function interceptedHttpsArgs(url: string): string[] {

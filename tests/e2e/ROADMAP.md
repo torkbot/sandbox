@@ -115,13 +115,13 @@ Passing:
   - Origin closes mid-response and the guest observes a stable `502`.
 - `TLS without SNI has deterministic certificate and policy metadata`
   - Connects by IP literal and asserts missing-SNI metadata reaches one policy call deterministically.
+- `HTTP/2 ALPN behavior is explicit`
+  - Attempts an HTTP/2-capable client and asserts deterministic HTTP/1.1 ALPN downgrade.
 
 Failing:
 
 - `dynamic MITM certificates are reused or bounded intentionally`
   - Repeated SNI requests should provide host evidence for cache behavior.
-- `HTTP/2 ALPN behavior is explicit`
-  - Attempt an HTTP/2-capable client and assert downgrade, deny, or implemented HTTP/2 support.
 
 ## `network.test.ts`
 
