@@ -295,6 +295,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
         url: assertString(document.url, "url"),
         destinationIp: assertString(document.destinationIp, "destinationIp"),
         headers,
+        tls: tlsFromWire(document.tls),
       };
       if (isProtectedDestination(request.destinationIp, interception.protectedRanges ?? [])) {
         this.#child.stdin.write(encodePacket({
@@ -387,6 +388,31 @@ function headersFromWire(value: unknown): Record<string, string> {
     headers[assertString(record.name, "header.name")] = assertString(record.value, "header.value");
   }
   return headers;
+}
+
+function tlsFromWire(value: unknown): HttpPolicyRequest["tls"] {
+  if (value === null || value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "object") {
+    throw new TypeError("tls must be an object");
+  }
+  const record = value as Record<string, unknown>;
+  return {
+    serverName: optionalString(record.serverName, "tls.serverName"),
+    alpnProtocol: optionalString(record.alpnProtocol, "tls.alpnProtocol"),
+    protocol: optionalString(record.protocol, "tls.protocol"),
+  };
+}
+
+function optionalString(value: unknown, field: string): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value !== "string") {
+    throw new TypeError(`${field} must be a string`);
+  }
+  return value;
 }
 
 function binaryField(value: unknown, field: string): Uint8Array {

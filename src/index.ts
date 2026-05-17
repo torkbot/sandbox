@@ -121,6 +121,7 @@ export interface HttpPolicyRequest {
   readonly headers: Record<string, string>;
   readonly tls?: {
     readonly serverName?: string;
+    readonly alpnProtocol?: string;
     readonly protocol?: string;
   };
 }

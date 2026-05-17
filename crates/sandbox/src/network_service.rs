@@ -1,13 +1,17 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::io::{self, Cursor, Read, Write};
 use std::os::fd::{IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp;
@@ -28,6 +32,14 @@ pub struct HostHttpRequest {
     pub destination_ip: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    pub tls: Option<HostTlsMetadata>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HostTlsMetadata {
+    pub server_name: Option<String>,
+    pub alpn_protocol: Option<String>,
+    pub protocol: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -192,7 +204,7 @@ fn poll_http_socket(
             } else {
                 let response = handler
                     .and_then(|handler| {
-                        parse_http_request(socket, nat, &request[..received], false)
+                        parse_http_request(socket, nat, &request[..received], None)
                             .and_then(|request| handler.handle_http_request(request).ok())
                     })
                     .map(encode_http_response)
@@ -234,7 +246,9 @@ fn poll_tls_http_socket(
     let mut plaintext = Vec::new();
     let _ = connection.tls.reader().read_to_end(&mut plaintext);
     if !plaintext.is_empty() {
-        if let Some(request) = parse_http_request(socket, nat, &plaintext, true) {
+        if let Some(request) =
+            parse_http_request(socket, nat, &plaintext, tls_metadata(&connection.tls))
+        {
             if let Ok(response) = handler.handle_http_request(request) {
                 let _ = connection
                     .tls
@@ -263,7 +277,7 @@ fn parse_http_request(
     socket: &tcp::Socket<'_>,
     nat: &TransparentTcpNat,
     bytes: &[u8],
-    tls: bool,
+    tls: Option<HostTlsMetadata>,
 ) -> Option<HostHttpRequest> {
     let text = std::str::from_utf8(bytes).ok()?;
     let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text, ""));
@@ -294,7 +308,7 @@ fn parse_http_request(
     } else {
         format!(
             "{}://{authority}{target}",
-            if tls { "https" } else { "http" }
+            if tls.is_some() { "https" } else { "http" }
         )
     };
 
@@ -304,6 +318,19 @@ fn parse_http_request(
         destination_ip,
         headers,
         body: body.as_bytes().to_vec(),
+        tls,
+    })
+}
+
+fn tls_metadata(connection: &rustls::ServerConnection) -> Option<HostTlsMetadata> {
+    Some(HostTlsMetadata {
+        server_name: connection.server_name().map(str::to_string),
+        alpn_protocol: connection
+            .alpn_protocol()
+            .map(|value| String::from_utf8_lossy(value).to_string()),
+        protocol: connection
+            .protocol_version()
+            .map(|version| format!("{version:?}")),
     })
 }
 
@@ -425,19 +452,11 @@ impl TlsAcceptor {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
         let ca = rcgen::Issuer::from_ca_cert_pem(&config.ca_certificate_pem, ca_key)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        let leaf_key = rcgen::KeyPair::generate()
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        let leaf =
-            rcgen::CertificateParams::new(vec!["127.0.0.1".to_string(), "localhost".to_string()])
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?
-                .signed_by(&leaf_key, &ca)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        let cert_chain = vec![CertificateDer::from(leaf.der().to_vec())];
-        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
         let config = rustls::ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(cert_chain, key_der)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+            .with_cert_resolver(Arc::new(DynamicMitmCertResolver::new(ca)));
+        let mut config = config;
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
         Ok(Self {
             config: Arc::new(config),
         })
@@ -448,6 +467,66 @@ impl TlsAcceptor {
             tls: rustls::ServerConnection::new(self.config.clone())
                 .expect("TLS server config should create connections"),
         }
+    }
+}
+
+struct DynamicMitmCertResolver {
+    issuer: Mutex<MitmCertIssuer>,
+}
+
+struct MitmCertIssuer {
+    ca: rcgen::Issuer<'static, rcgen::KeyPair>,
+    cache: HashMap<String, Arc<CertifiedKey>>,
+}
+
+impl DynamicMitmCertResolver {
+    fn new(ca: rcgen::Issuer<'static, rcgen::KeyPair>) -> Self {
+        Self {
+            issuer: Mutex::new(MitmCertIssuer {
+                ca,
+                cache: HashMap::new(),
+            }),
+        }
+    }
+}
+
+impl fmt::Debug for DynamicMitmCertResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DynamicMitmCertResolver")
+    }
+}
+
+impl ResolvesServerCert for DynamicMitmCertResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let server_name = client_hello.server_name().unwrap_or("127.0.0.1");
+        self.issuer.lock().ok()?.certificate_for(server_name).ok()
+    }
+}
+
+impl MitmCertIssuer {
+    fn certificate_for(&mut self, server_name: &str) -> io::Result<Arc<CertifiedKey>> {
+        if let Some(certificate) = self.cache.get(server_name) {
+            return Ok(certificate.clone());
+        }
+
+        let certificate = Arc::new(self.generate_certificate(server_name)?);
+        self.cache
+            .insert(server_name.to_string(), certificate.clone());
+        Ok(certificate)
+    }
+
+    fn generate_certificate(&self, server_name: &str) -> io::Result<CertifiedKey> {
+        let leaf_key = rcgen::KeyPair::generate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        let leaf = rcgen::CertificateParams::new(vec![server_name.to_string()])
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?
+            .signed_by(&leaf_key, &self.ca)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        let cert_chain = vec![CertificateDer::from(leaf.der().to_vec())];
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
+        let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key_der)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        Ok(CertifiedKey::new(cert_chain, signing_key))
     }
 }
 

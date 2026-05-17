@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use bson::{Bson, Document, doc};
-use sandbox::network_service::{HostHttpHandler, HostHttpRequest, HostHttpResponse};
+use sandbox::network_service::{
+    HostHttpHandler, HostHttpRequest, HostHttpResponse, HostTlsMetadata,
+};
 use sandbox::vfs::{
     VirtioFsDirEntry, VirtioFsEntry, VirtioVirtualFsBackend, VirtualFsAdapter, VirtualInode,
     bindings, virtual_directory_entry, virtual_file_entry, virtual_writable_directory_entry,
@@ -103,6 +105,7 @@ impl HostHttpHandler for HostIoBridge {
                 "name": name,
                 "value": value,
             }).collect::<Vec<_>>(),
+            "tls": tls_metadata_to_bson(request.tls),
             "body": Bson::Binary(bson::Binary {
                 subtype: bson::spec::BinarySubtype::Generic,
                 bytes: request.body,
@@ -135,6 +138,23 @@ impl HostHttpHandler for HostIoBridge {
             body,
         })
     }
+}
+
+fn tls_metadata_to_bson(tls: Option<HostTlsMetadata>) -> Bson {
+    let Some(tls) = tls else {
+        return Bson::Null;
+    };
+    let mut document = Document::new();
+    if let Some(server_name) = tls.server_name {
+        document.insert("serverName", server_name);
+    }
+    if let Some(alpn_protocol) = tls.alpn_protocol {
+        document.insert("alpnProtocol", alpn_protocol);
+    }
+    if let Some(protocol) = tls.protocol {
+        document.insert("protocol", protocol);
+    }
+    Bson::Document(document)
 }
 
 #[derive(Clone)]
