@@ -56,14 +56,13 @@ export class HostControlTransport implements SandboxControl {
   }): Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>> {
     this.#assertOpen();
     const id = input.id ?? crypto.randomUUID();
-    const completion = waitForExecComplete(this.incoming, id);
     await this.send({
       type: "guest.exec",
       id,
       argv: input.argv,
       env: input.env,
     });
-    return await completion;
+    return await waitForExecComplete(this.incoming, id);
   }
 
   async close(): Promise<void> {
@@ -98,7 +97,9 @@ export class HostControlTransport implements SandboxControl {
         if (this.#closed) {
           return;
         }
-        throw error;
+        this.#closed = true;
+        this.#events.close(error);
+        return;
       }
       if (packet !== null) {
         this.#events.push(decodeControlEvent(packet));
@@ -132,8 +133,12 @@ function sleep(ms: number): Promise<void> {
 
 class AsyncQueue<T> implements AsyncIterable<T> {
   readonly #values: T[] = [];
-  readonly #waiters: ((result: IteratorResult<T>) => void)[] = [];
+  readonly #waiters: Array<{
+    resolve(result: IteratorResult<T>): void;
+    reject(error: unknown): void;
+  }> = [];
   #closed = false;
+  #error: unknown;
 
   push(value: T): void {
     if (this.#closed) {
@@ -142,21 +147,26 @@ class AsyncQueue<T> implements AsyncIterable<T> {
 
     const waiter = this.#waiters.shift();
     if (waiter !== undefined) {
-      waiter({ value, done: false });
+      waiter.resolve({ value, done: false });
       return;
     }
 
     this.#values.push(value);
   }
 
-  close(): void {
+  close(error?: unknown): void {
     if (this.#closed) {
       return;
     }
 
     this.#closed = true;
+    this.#error = error;
     for (const waiter of this.#waiters.splice(0)) {
-      waiter({ value: undefined, done: true });
+      if (error === undefined) {
+        waiter.resolve({ value: undefined, done: true });
+      } else {
+        waiter.reject(error);
+      }
     }
   }
 
@@ -169,11 +179,17 @@ class AsyncQueue<T> implements AsyncIterable<T> {
         }
 
         if (this.#closed) {
+          if (this.#error !== undefined) {
+            throw this.#error;
+          }
           return { value: undefined, done: true };
         }
 
-        return await new Promise<IteratorResult<T>>((resolve) => {
-          this.#waiters.push(resolve);
+        return await new Promise<IteratorResult<T>>((resolve, reject) => {
+          this.#waiters.push({
+            resolve,
+            reject,
+          });
         });
       },
     };

@@ -126,6 +126,25 @@ export class HostProcessSandboxVm implements HostControlChannel {
     ]);
   }
 
+  async terminateHostForTest(): Promise<void> {
+    if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
+      return;
+    }
+
+    const exited = once(this.#child, "exit").then(() => undefined);
+    this.#child.kill("SIGTERM");
+    await Promise.race([
+      exited,
+      delay(1_000),
+    ]);
+    if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
+      return;
+    }
+
+    this.#child.kill("SIGKILL");
+    await exited;
+  }
+
   #assertOpen(): void {
     if (this.#closed) {
       throw new Error("sandbox VM is closed");

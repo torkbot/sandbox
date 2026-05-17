@@ -76,10 +76,13 @@ test("guest init death is surfaced through the VM API", async (t) => {
 
   await collectAsync(vm.control.incoming, isInitReady);
 
-  await execGuestShell(vm, {
-    id: "kill-init",
-    script: "kill -9 1",
-  });
+  await assert.rejects(
+    withTimeout(execGuestShell(vm, {
+      id: "kill-init",
+      script: "kill -9 $(pidof sandbox-init)",
+    }), 1_000, "kill init"),
+    /sandbox VM|sandbox-host|control closed|exited|closed/i,
+  );
 
   await assert.rejects(
     withTimeout(execGuest(vm, {
@@ -90,24 +93,108 @@ test("guest init death is surfaced through the VM API", async (t) => {
   );
 });
 
-test("guest exec receives explicit environment variables", () => {
-  assert.fail("guest exec env propagation must be proven through the guest control channel");
+test("guest exec receives explicit environment variables", async (t) => {
+  const vm = await spawnBootVm(t, "guest-exec-env");
+  if (vm === null) {
+    return;
+  }
+
+  const result = await execGuestShell(vm, {
+    id: "guest-exec-env",
+    env: { SANDBOX_E2E_ENV: "typed-env-value" },
+    script: "printf '%s' \"$SANDBOX_E2E_ENV\"",
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, "typed-env-value");
+  assert.equal(result.stderr, "");
 });
 
-test("guest exec preserves stderr and non-zero exit status", () => {
-  assert.fail("guest exec stderr and non-zero exit status must be surfaced without lossy wrapping");
+test("guest exec preserves stderr and non-zero exit status", async (t) => {
+  const vm = await spawnBootVm(t, "guest-exec-status");
+  if (vm === null) {
+    return;
+  }
+
+  const result = await execGuestShell(vm, {
+    id: "guest-exec-status",
+    script: "printf 'out'; printf 'err' >&2; exit 23",
+  });
+
+  assert.equal(result.exitCode, 23);
+  assert.equal(result.stdout, "out");
+  assert.equal(result.stderr, "err");
 });
 
-test("guest exec preserves large stdout and stderr payloads", () => {
-  assert.fail("guest exec output framing must preserve large stdout and stderr payloads exactly");
+test("guest exec preserves large stdout and stderr payloads", async (t) => {
+  const vm = await spawnBootVm(t, "guest-exec-large-output");
+  if (vm === null) {
+    return;
+  }
+
+  const stdoutBytes = 96 * 1024;
+  const stderrBytes = 80 * 1024;
+  const result = await execGuestShell(vm, {
+    id: "guest-exec-large-output",
+    script: [
+      `head -c ${stdoutBytes} /dev/zero | tr '\\0' A`,
+      `head -c ${stderrBytes} /dev/zero | tr '\\0' B >&2`,
+    ].join("\n"),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout.length, stdoutBytes);
+  assert.equal(result.stderr.length, stderrBytes);
+  assert.equal(result.stdout, "A".repeat(stdoutBytes));
+  assert.equal(result.stderr, "B".repeat(stderrBytes));
 });
 
-test("guest exec supports multiple in-flight commands", () => {
-  assert.fail("guest control must correlate concurrent exec completions by request id");
+test("guest exec supports multiple in-flight commands", async (t) => {
+  const vm = await spawnBootVm(t, "guest-exec-concurrent");
+  if (vm === null) {
+    return;
+  }
+
+  const results = await Promise.all(
+    Array.from({ length: 6 }, (_, index) =>
+      execGuestShell(vm, {
+        id: `guest-exec-concurrent-${index}`,
+        script: `sleep 0.${6 - index}; printf 'result-${index}'`,
+      }),
+    ),
+  );
+
+  assert.deepEqual(
+    results.map((result) => ({
+      id: result.id,
+      exitCode: result.exitCode,
+      stdout: result.stdout,
+      stderr: result.stderr,
+    })),
+    Array.from({ length: 6 }, (_, index) => ({
+      id: `guest-exec-concurrent-${index}`,
+      exitCode: 0,
+      stdout: `result-${index}`,
+      stderr: "",
+    })),
+  );
 });
 
-test("closing a VM terminates resources and rejects later operations", () => {
-  assert.fail("VM close must deterministically reject later control and mount operations");
+test("closing a VM terminates resources and rejects later operations", async (t) => {
+  const vm = await spawnBootVm(t, "guest-close-rejects");
+  if (vm === null) {
+    return;
+  }
+
+  await vm.close();
+
+  await assert.rejects(
+    execGuest(vm, {
+      id: "after-close",
+      argv: ["/bin/true"],
+    }),
+    /closed/i,
+  );
 });
 
 test("guest command lockup can be cleaned up by closing the VM", async (t) => {
@@ -214,6 +301,30 @@ test("guest OOM is surfaced through the VM API", async (t) => {
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function spawnBootVm(t: test.TestContext, name: string): Promise<SandboxVm | null> {
+  if (!requireVmLaunchSupport(t)) {
+    return null;
+  }
+
+  const vm = await spawnSandbox({
+    name,
+    cpu: { vcpus: 1 },
+    memory: { mib: 512 },
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20", {
+      format: "directory",
+    }),
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, isInitReady);
+  return vm;
 }
 
 function hostFailureDiagnostics(vm: SandboxVm): {

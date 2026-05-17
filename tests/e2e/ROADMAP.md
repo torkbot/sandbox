@@ -12,25 +12,25 @@ Passing:
 
 - `Node can boot a sandbox VM and exchange control messages`
   - Covers VM creation, `init.ready`, root/init metadata, and a basic guest command.
+- `guest init death is surfaced through the VM API`
+  - Kills the guest init and asserts in-flight and later control operations fail deterministically.
+- `guest exec receives explicit environment variables`
+  - Runs a shell command that prints a host-supplied env var.
+- `guest exec preserves stderr and non-zero exit status`
+  - Runs a command that writes to stderr and exits with a chosen non-zero code.
+- `guest exec preserves large stdout and stderr payloads`
+  - Emits multi-64KB stdout/stderr and asserts exact byte counts/content.
+- `guest exec supports multiple in-flight commands`
+  - Starts several execs concurrently and verifies completions match request IDs.
+- `closing a VM terminates resources and rejects later operations`
+  - Closes the VM, then asserts later `exec` operations fail deterministically.
 - `guest command lockup can be cleaned up by closing the VM`
   - Starts a non-returning guest command, closes the VM, and asserts cleanup completes without leaking the host API.
+- `host process exit is surfaced through the VM API`
+  - Terminates `sandbox-host` underneath an active VM and asserts the next host operation rejects with an idiomatic closed/crashed error.
 
 Failing:
 
-- `guest exec receives explicit environment variables`
-  - Run a shell command that prints a host-supplied env var.
-- `guest exec preserves stderr and non-zero exit status`
-  - Run a command that writes to stderr and exits with a chosen non-zero code.
-- `guest exec preserves large stdout and stderr payloads`
-  - Emit multi-64KB stdout/stderr and assert exact byte counts/content.
-- `guest exec supports multiple in-flight commands`
-  - Start several execs concurrently and verify completions match request IDs.
-- `closing a VM terminates resources and rejects later operations`
-  - Close the VM, then assert later `exec` and mount operations fail deterministically.
-- `closing a VM while a host callback is locked up cleans up the sandbox`
-  - Start guest work that reaches a never-resolving host callback, close the VM, and assert close completes and in-flight work rejects.
-- `host process exit is surfaced through the VM API`
-  - Terminate `sandbox-host` underneath an active VM and assert the next host operation rejects with an idiomatic closed/crashed error.
 - `guest OOM is surfaced through the VM API`
   - Trigger an intentional guest OOM and assert the host observes VM failure deterministically.
 
@@ -44,9 +44,8 @@ Passing:
   - Covers read-only virtual `stat` / `list` / `read`, guest reads, and JS mount handles.
 - `writable virtual filesystem mounts persist guest mutations through host callbacks`
   - Covers guest create, write, overwrite, truncate, and JS inspection through `vm.mounts.get()`.
-
-Failing:
-
+- `closing a VM while a host filesystem callback is locked up cleans up the sandbox`
+  - Starts guest work that reaches a never-resolving host callback, closes the VM, and asserts close completes and in-flight work rejects.
 - `virtual filesystem range reads pass correct offsets to host callbacks`
   - Guest reads slices from a larger virtual file and the host records requested ranges.
 - `virtual filesystem metadata is reflected in guest stat output`
@@ -55,6 +54,10 @@ Failing:
   - Missing file, read-only write, and host callback failure should produce stable guest behavior.
 - `virtual filesystem handles larger file reads without truncation`
   - Read a file larger than the current small fixture and assert exact content.
+
+Failing:
+
+- No remaining known failures in this scenario file.
 
 ## `rootfs-shaping.test.ts`
 

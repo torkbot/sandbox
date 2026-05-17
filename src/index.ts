@@ -176,12 +176,17 @@ export interface RootfsSnapshot {
 export interface SandboxVm {
   readonly control: SandboxControl;
   readonly mounts: SandboxMounts;
+  readonly diagnostics?: SandboxDiagnostics;
   readonly rootfs: {
     hash(): Promise<string>;
     snapshot(options: RootfsSnapshotOptions): Promise<RootfsSnapshot>;
   };
   close(): Promise<void>;
   [Symbol.asyncDispose](): Promise<void>;
+}
+
+export interface SandboxDiagnostics {
+  terminateHostForTest(): Promise<void>;
 }
 
 export function projectKernel(options: Omit<KernelConfig, "kind"> = {}): KernelConfig {
@@ -233,6 +238,7 @@ function shouldUseHostProcess(options: SandboxOptions): boolean {
 class NativeBackedSandboxVm implements SandboxVm {
   readonly mounts: SandboxMounts;
   readonly control: SandboxControl;
+  readonly diagnostics?: SandboxDiagnostics;
   readonly rootfs: SandboxVm["rootfs"];
 
   readonly #nativeVm: {
@@ -240,6 +246,7 @@ class NativeBackedSandboxVm implements SandboxVm {
     writeControlPacket(packet: Uint8Array): void;
     tryReadControlPacket(): Uint8Array | null;
     close(): Promise<void> | void;
+    terminateHostForTest?(): Promise<void>;
   };
   #closed = false;
 
@@ -249,6 +256,7 @@ class NativeBackedSandboxVm implements SandboxVm {
       writeControlPacket(packet: Uint8Array): void;
       tryReadControlPacket(): Uint8Array | null;
       close(): Promise<void> | void;
+      terminateHostForTest?(): Promise<void>;
     },
     options: SandboxOptions,
   ) {
@@ -258,6 +266,11 @@ class NativeBackedSandboxVm implements SandboxVm {
       connected: nativeVm.hasControlSocket,
       channel: nativeVm,
     });
+    if (nativeVm.terminateHostForTest !== undefined) {
+      this.diagnostics = {
+        terminateHostForTest: () => nativeVm.terminateHostForTest?.() ?? Promise.resolve(),
+      };
+    }
     this.rootfs = {
       async hash() {
         throw new Error("sandbox rootfs hash is not implemented yet");

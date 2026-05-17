@@ -179,7 +179,7 @@ test("closing a VM while a host filesystem callback is locked up cleans up the s
       format: "erofs",
     }),
     mounts: [
-      virtualFsMount("/locked", {
+      virtualFsMount("/sandbox", {
         async stat(path) {
           if (path === "/") {
             return directoryStat(false);
@@ -215,7 +215,7 @@ test("closing a VM while a host filesystem callback is locked up cleans up the s
 
   const read = execGuestShell(vm, {
     id: "locked-vfs-read",
-    script: "cat /locked/stuck.txt",
+    script: "cat /sandbox/stuck.txt",
   });
   const readRejects = assert.rejects(
     withTimeout(read, 5_000, "locked filesystem guest command"),
@@ -227,20 +227,265 @@ test("closing a VM while a host filesystem callback is locked up cleans up the s
   await readRejects;
 });
 
-test("virtual filesystem range reads pass correct offsets to host callbacks", () => {
-  assert.fail("guest range reads must reach the host VFS callback with exact offset and length");
+test("virtual filesystem range reads pass correct offsets to host callbacks", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const contents = Buffer.from("abcdefghijklmnopqrstuvwxyz".repeat(512));
+  const reads: Array<{ offset: number | null; length: number | null }> = [];
+  const vm = await spawnSandbox({
+    name: "virtual-filesystem-range-reads",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    mounts: [
+      virtualFsMount("/sandbox", {
+        async stat(path) {
+          if (path === "/") {
+            return directoryStat(false);
+          }
+          if (path === "/alphabet.txt") {
+            return fileStat(contents.byteLength, false);
+          }
+          throw new Error(`missing path ${path}`);
+        },
+        async list(path) {
+          if (path !== "/") {
+            throw new Error(`missing directory ${path}`);
+          }
+          return [{ name: "alphabet.txt", type: "file" }];
+        },
+        async read(input) {
+          reads.push({
+            offset: input.range?.offset ?? null,
+            length: input.range?.length ?? null,
+          });
+          const offset = input.range?.offset ?? 0;
+          const length = input.range?.length ?? contents.byteLength - offset;
+          return contents.subarray(offset, offset + length);
+        },
+      }),
+    ],
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuestShell(vm, {
+    id: "virtual-filesystem-range-reads",
+    script: "dd if=/sandbox/alphabet.txt bs=1 skip=5000 count=13 status=none",
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, contents.subarray(5000, 5013).toString("utf8"));
+  assert.ok(
+    reads.some((read) =>
+      read.offset !== null
+      && read.length !== null
+      && read.offset <= 5000
+      && read.offset + read.length >= 5013
+    ),
+    `expected a host range read covering offset 5000 length 13, got ${JSON.stringify(reads)}`,
+  );
 });
 
-test("virtual filesystem metadata is reflected in guest stat output", () => {
-  assert.fail("guest stat output must reflect host VFS file type, directory type, size, and writable bits");
+test("virtual filesystem metadata is reflected in guest stat output", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const vm = await spawnSandbox({
+    name: "virtual-filesystem-metadata",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    mounts: [
+      virtualFsMount("/sandbox", {
+        async stat(path) {
+          if (path === "/") {
+            return directoryStat(false);
+          }
+          if (path === "/data.bin") {
+            return fileStat(1234, false);
+          }
+          throw new Error(`missing path ${path}`);
+        },
+        async list(path) {
+          if (path !== "/") {
+            throw new Error(`missing directory ${path}`);
+          }
+          return [{ name: "data.bin", type: "file" }];
+        },
+        async read() {
+          return Buffer.alloc(1234, "m");
+        },
+      }),
+    ],
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuestShell(vm, {
+    id: "virtual-filesystem-metadata",
+    script: `
+      set -eu
+      test -d /sandbox
+      test -f /sandbox/data.bin
+      test "$(wc -c < /sandbox/data.bin)" = "1234"
+      stat /sandbox/data.bin | grep 'regular file'
+      stat /sandbox/data.bin | grep 'Size: 1234'
+      stat /sandbox/data.bin | grep 'Access: (0444'
+    `,
+  });
+
+  assert.equal(
+    result.exitCode,
+    0,
+    `guest metadata checks failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+  );
 });
 
-test("virtual filesystem errors surface deterministically to the guest", () => {
-  assert.fail("missing files, read-only writes, and host callback failures must have stable guest-visible errors");
+test("virtual filesystem errors surface deterministically to the guest", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const vm = await spawnSandbox({
+    name: "virtual-filesystem-errors",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    mounts: [
+      virtualFsMount("/sandbox", {
+        async stat(path) {
+          if (path === "/") {
+            return directoryStat(false);
+          }
+          if (path === "/readonly.txt" || path === "/throws.txt") {
+            return fileStat(4, false);
+          }
+          throw new Error(`missing path ${path}`);
+        },
+        async list(path) {
+          if (path !== "/") {
+            throw new Error(`missing directory ${path}`);
+          }
+          return [
+            { name: "readonly.txt", type: "file" },
+            { name: "throws.txt", type: "file" },
+          ];
+        },
+        async read(input) {
+          if (input.path === "/throws.txt") {
+            throw new Error("host read failed intentionally");
+          }
+          return Buffer.from("data");
+        },
+      }),
+    ],
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuestShell(vm, {
+    id: "virtual-filesystem-errors",
+    script: `
+      set +e
+      cat /sandbox/missing.txt >/tmp/missing.out 2>/tmp/missing.err
+      missing_status=$?
+      printf nope > /sandbox/readonly.txt 2>/tmp/write.err
+      write_status=$?
+      cat /sandbox/throws.txt >/tmp/throws.out 2>/tmp/throws.err
+      throws_status=$?
+      echo "missing=$missing_status"
+      echo "write=$write_status"
+      echo "throws=$throws_status"
+      test "$missing_status" != "0"
+      test "$write_status" != "0"
+      test "$throws_status" != "0"
+    `,
+  });
+
+  assert.equal(
+    result.exitCode,
+    0,
+    `guest error checks failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+  );
+  assert.match(result.stdout, /missing=[1-9][0-9]*/);
+  assert.match(result.stdout, /write=[1-9][0-9]*/);
+  assert.match(result.stdout, /throws=[1-9][0-9]*/);
 });
 
-test("virtual filesystem handles larger file reads without truncation", () => {
-  assert.fail("virtual filesystem reads must preserve content larger than the current smoke fixture");
+test("virtual filesystem handles larger file reads without truncation", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const contents = Buffer.alloc(512 * 1024, "L");
+  const vm = await spawnSandbox({
+    name: "virtual-filesystem-large-read",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    mounts: [
+      virtualFsMount("/sandbox", {
+        async stat(path) {
+          if (path === "/") {
+            return directoryStat(false);
+          }
+          if (path === "/sandbox.bin") {
+            return fileStat(contents.byteLength, false);
+          }
+          throw new Error(`missing path ${path}`);
+        },
+        async list(path) {
+          if (path !== "/") {
+            throw new Error(`missing directory ${path}`);
+          }
+          return [{ name: "large.bin", type: "file" }];
+        },
+        async read(input) {
+          const offset = input.range?.offset ?? 0;
+          const length = input.range?.length ?? contents.byteLength - offset;
+          return contents.subarray(offset, offset + length);
+        },
+      }),
+    ],
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuestShell(vm, {
+    id: "virtual-filesystem-large-read",
+    script: "wc -c < /sandbox/sandbox.bin",
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(Number(result.stdout.trim()), contents.byteLength);
 });
 
 function createMemoryWritableFileSystem(): SandboxWritableFileSystem {

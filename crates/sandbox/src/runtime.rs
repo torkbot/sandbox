@@ -444,6 +444,7 @@ impl ControlSocket {
         let mut packet = Vec::with_capacity(4 + frame_len);
         packet.extend_from_slice(&len);
         packet.resize(4 + frame_len, 0);
+        self.stream.set_nonblocking(false)?;
         self.stream.read_exact(&mut packet[4..])?;
         Ok(Some(packet))
     }
