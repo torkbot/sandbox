@@ -163,6 +163,84 @@ test("writable virtual filesystem supports symlink metadata without host path es
   assert.equal(await fileSystem.readlink("/src/host-escape"), "/etc/passwd");
 });
 
+test("writable virtual filesystem preserves POSIX rename edge semantics", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const fileSystem = createPosixMemoryFileSystem();
+  await fileSystem.mkdir("/src");
+  await fileSystem.mkdir("/non-empty");
+  await fileSystem.createFile("/non-empty/child.txt");
+  await fileSystem.write({
+    path: "/non-empty/child.txt",
+    offset: 0,
+    contents: Buffer.from("child"),
+  });
+  await fileSystem.createFile("/src/current.txt");
+  await fileSystem.write({
+    path: "/src/current.txt",
+    offset: 0,
+    contents: Buffer.from("old"),
+  });
+  await fileSystem.createFile("/src/next.txt");
+  await fileSystem.write({
+    path: "/src/next.txt",
+    offset: 0,
+    contents: Buffer.from("new"),
+  });
+
+  const vm = await spawnSandbox({
+    name: "vfs-posix-rename-edges",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    mounts: [
+      virtualFsMount("/workspace", fileSystem),
+    ],
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuestShell(vm, {
+    id: "vfs-posix-rename-edges",
+    script: `
+      set -eu
+      mv /workspace/src/next.txt /workspace/src/current.txt
+      test "$(cat /workspace/src/current.txt)" = "new"
+      test ! -e /workspace/src/next.txt
+      mkdir /workspace/empty
+      if mv -T /workspace/empty /workspace/non-empty 2>/run/rename-non-empty.err; then
+        exit 10
+      fi
+      test -d /workspace/empty
+      test "$(cat /workspace/non-empty/child.txt)" = "child"
+    `,
+  });
+
+  assert.equal(
+    result.exitCode,
+    0,
+    `guest rename edge operations failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+  );
+  assert.deepEqual(await fileSystem.list("/src"), [
+    { name: "current.txt", type: "file" },
+  ]);
+  assert.deepEqual(
+    new TextDecoder().decode(await fileSystem.read({
+      path: "/src/current.txt",
+      signal: new AbortController().signal,
+    })),
+    "new",
+  );
+});
+
 type PosixMemoryFileSystem = SandboxWritableFileSystem & {
   mkdir(path: string): Promise<SandboxFileStat>;
   unlink(path: string): Promise<void>;
@@ -304,6 +382,13 @@ function createPosixMemoryFileSystem(): PosixMemoryFileSystem {
         throw new Error(`missing path ${from}`);
       }
       assertParentDirectory(entries, normalizedTo);
+      const target = entries.get(normalizedTo);
+      if (target?.type === "directory") {
+        const prefix = `${normalizedTo}/`;
+        if ([...entries.keys()].some((entryPath) => entryPath.startsWith(prefix))) {
+          throw new Error(`directory not empty ${to}`);
+        }
+      }
       entries.delete(normalizedFrom);
       entries.set(normalizedTo, entry);
     },

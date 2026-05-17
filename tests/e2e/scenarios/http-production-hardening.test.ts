@@ -6,10 +6,11 @@ import {
   projectInit,
   projectKernel,
   spawnSandbox,
+  type HttpPolicyRequest,
 } from "../../../src/index.ts";
 import { collectAsync } from "../support/evidence.ts";
 import { execGuest, withTimeout } from "../support/guest-control.ts";
-import { createTestCertificateAuthority, startTestHttpOrigin } from "../support/http-origin.ts";
+import { createTestCertificateAuthority, startTestHttpOrigin, startTestHttpsOrigin } from "../support/http-origin.ts";
 import { requireVmLaunchSupport } from "../support/capabilities.ts";
 
 test("HTTP interception streams response bodies without waiting for upstream completion", async (t) => {
@@ -140,6 +141,294 @@ test("closing a VM while HTTP policy is locked up cleans up the sandbox", async 
   await requestRejects;
 });
 
+test("plain HTTP egress header rewrite does not expose or modify request bodies", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const ca = await createTestCertificateAuthority();
+  t.after(async () => {
+    await ca.close();
+  });
+
+  const policyEvidence: Array<{
+    readonly url: string;
+    readonly keys: readonly string[];
+  }> = [];
+  const originEvidence: Array<{
+    readonly body: string;
+    readonly rewrite: string | undefined;
+  }> = [];
+
+  const origin = await startTestHttpOrigin({
+    respond(request) {
+      originEvidence.push({
+        body: new TextDecoder().decode(request.body),
+        rewrite: request.headers["x-sandbox-rewrite"],
+      });
+      return {
+        status: 200,
+        headers: {
+          "content-type": "text/plain",
+          "x-origin-response": "passthrough",
+        },
+        body: "origin response body",
+      };
+    },
+  });
+  t.after(async () => {
+    await origin.close();
+  });
+
+  const vm = await spawnSandbox({
+    name: "http-egress-header-only",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      http: {
+        ca,
+        async policy(request) {
+          policyEvidence.push({
+            url: request.url,
+            keys: Object.keys(request).sort(),
+          });
+          assertPolicyRequestHasNoBody(request);
+          return {
+            action: "allow",
+            headers: {
+              ...request.headers,
+              "x-sandbox-rewrite": "egress-only",
+            },
+          };
+        },
+      },
+    },
+  });
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuest(vm, {
+    id: "curl-http-egress-header-only",
+    argv: [
+      "curl",
+      "--max-time",
+      "5",
+      "-fsS",
+      "-X",
+      "POST",
+      "--data-binary",
+      "guest request body",
+      "-D",
+      "/run/http-egress-headers.txt",
+      ...interceptedHttpArgs(`${origin.url}/header-only`),
+    ],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stdout, "origin response body");
+  assert.deepEqual(originEvidence, [{
+    body: "guest request body",
+    rewrite: "egress-only",
+  }]);
+  assert.deepEqual(policyEvidence, [{
+    url: `${origin.url}/header-only`,
+    keys: ["destinationIp", "headers", "method", "url"],
+  }]);
+
+  const headers = await execGuest(vm, {
+    id: "cat-http-egress-response-headers",
+    argv: ["cat", "/run/http-egress-headers.txt"],
+  });
+  assert.match(headers.stdout, /x-origin-response: passthrough/i);
+});
+
+test("HTTPS egress header rewrite does not expose or modify request bodies", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const ca = await createTestCertificateAuthority();
+  t.after(async () => {
+    await ca.close();
+  });
+
+  const policyEvidence: Array<{
+    readonly url: string;
+    readonly keys: readonly string[];
+    readonly tlsServerName: string | undefined;
+  }> = [];
+  const originEvidence: Array<{
+    readonly body: string;
+    readonly rewrite: string | undefined;
+  }> = [];
+
+  const origin = await startTestHttpsOrigin({
+    ca,
+    respond(request) {
+      originEvidence.push({
+        body: new TextDecoder().decode(request.body),
+        rewrite: request.headers["x-sandbox-rewrite"],
+      });
+      return {
+        status: 200,
+        headers: {
+          "content-type": "text/plain",
+          "x-origin-response": "passthrough",
+        },
+        body: "secure origin response body",
+      };
+    },
+  });
+  t.after(async () => {
+    await origin.close();
+  });
+
+  const vm = await spawnSandbox({
+    name: "https-egress-header-only",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      http: {
+        ca,
+        async policy(request) {
+          policyEvidence.push({
+            url: request.url,
+            keys: Object.keys(request).sort(),
+            tlsServerName: request.tls?.serverName,
+          });
+          assertPolicyRequestHasNoBody(request);
+          return {
+            action: "allow",
+            headers: {
+              ...request.headers,
+              "x-sandbox-rewrite": "egress-only",
+            },
+          };
+        },
+      },
+    },
+  });
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuest(vm, {
+    id: "curl-https-egress-header-only",
+    argv: [
+      "curl",
+      "--max-time",
+      "5",
+      "-fsS",
+      "-X",
+      "POST",
+      "--data-binary",
+      "secure guest request body",
+      "-D",
+      "/run/https-egress-headers.txt",
+      ...interceptedHttpsArgs(`${origin.url}/header-only`),
+    ],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stdout, "secure origin response body");
+  assert.deepEqual(originEvidence, [{
+    body: "secure guest request body",
+    rewrite: "egress-only",
+  }]);
+  assert.deepEqual(policyEvidence, [{
+    url: `${origin.url}/header-only`,
+    keys: ["destinationIp", "headers", "method", "tls", "url"],
+    tlsServerName: undefined,
+  }]);
+
+  const headers = await execGuest(vm, {
+    id: "cat-https-egress-response-headers",
+    argv: ["cat", "/run/https-egress-headers.txt"],
+  });
+  assert.match(headers.stdout, /x-origin-response: passthrough/i);
+});
+
+test("redirects to protected destinations are blocked before JavaScript policy", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const ca = await createTestCertificateAuthority();
+  t.after(async () => {
+    await ca.close();
+  });
+
+  const policyUrls: string[] = [];
+  const origin = await startTestHttpOrigin({
+    respond() {
+      return {
+        status: 302,
+        headers: {
+          location: "http://169.254.169.254/latest/meta-data/",
+        },
+        body: "redirecting",
+      };
+    },
+  });
+  t.after(async () => {
+    await origin.close();
+  });
+
+  const vm = await spawnSandbox({
+    name: "http-redirect-protected",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      http: {
+        ca,
+        async policy(request) {
+          policyUrls.push(request.url);
+          return { action: "allow" };
+        },
+      },
+    },
+  });
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuest(vm, {
+    id: "curl-redirect-protected",
+    argv: [
+      "curl",
+      "--max-time",
+      "5",
+      "-sS",
+      "-L",
+      "-o",
+      "/dev/null",
+      "-w",
+      "%{http_code}",
+      ...interceptedHttpArgs(`${origin.url}/redirect`),
+    ],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stdout, "403");
+  assert.deepEqual(policyUrls, [`${origin.url}/redirect`]);
+});
+
 function interceptedHttpArgs(url: string): string[] {
   const parsed = new URL(url);
   return [
@@ -147,6 +436,19 @@ function interceptedHttpArgs(url: string): string[] {
     `${parsed.hostname}:${parsed.port}:203.0.113.10:80`,
     url,
   ];
+}
+
+function interceptedHttpsArgs(url: string): string[] {
+  const parsed = new URL(url);
+  return [
+    "--connect-to",
+    `${parsed.hostname}:${parsed.port}:203.0.113.10:443`,
+    url,
+  ];
+}
+
+function assertPolicyRequestHasNoBody(request: HttpPolicyRequest): void {
+  assert.equal("body" in request, false);
 }
 
 async function startStreamingHttpOrigin(): Promise<{

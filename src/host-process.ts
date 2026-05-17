@@ -393,12 +393,13 @@ export class HostProcessSandboxVm implements HostControlChannel {
       }
 
       const headers = headersFromWire(document.headers);
+      const tls = tlsFromWire(document.tls);
       const request: HttpPolicyRequest = {
         method: assertString(document.method, "method"),
         url: assertString(document.url, "url"),
         destinationIp: assertString(document.destinationIp, "destinationIp"),
         headers,
-        tls: tlsFromWire(document.tls),
+        ...(tls === undefined ? {} : { tls }),
       };
       if (isProtectedDestination(request.destinationIp, [
         ...DEFAULT_PROTECTED_RANGES,

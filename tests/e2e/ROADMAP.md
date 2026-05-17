@@ -82,6 +82,8 @@ Passing:
   - Remove a file and then its empty parent directory from the guest, then assert host-side state is gone.
 - `writable virtual filesystem supports symlink metadata without host path escape`
   - Create relative and absolute symlinks in a mounted virtual filesystem and assert readlink/relative resolution behavior is stable.
+- `writable virtual filesystem preserves POSIX rename edge semantics`
+  - Rename over an existing file atomically and reject replacing a non-empty directory.
 
 Failing:
 
@@ -167,6 +169,12 @@ Passing:
   - A slow upstream response should deliver first bytes to the guest before the origin finishes the whole response.
 - `closing a VM while HTTP policy is locked up cleans up the sandbox`
   - A never-resolving JavaScript policy callback should not prevent VM close from completing and rejecting in-flight guest work.
+- `plain HTTP egress header rewrite does not expose or modify request bodies`
+  - JavaScript policy sees request metadata and headers only; Rust forwards the original body and the upstream response unchanged.
+- `HTTPS egress header rewrite does not expose or modify request bodies`
+  - The same egress-only header contract holds under TLS MITM with SNI metadata.
+- `redirects to protected destinations are blocked before JavaScript policy`
+  - A public origin redirecting to metadata/private infrastructure cannot bypass the protected range deny set.
 
 Failing:
 
