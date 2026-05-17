@@ -39,12 +39,14 @@ Environment knobs:
 
 The build is intentionally not part of `spawnSandbox`. Runtime VM creation should receive a prebuilt kernel/rootfs artifact set.
 
-## Next Integration Step
+## Static Link Handoff
 
-The current script preserves the artifacts libkrunfw already knows how to make. The next host-runtime slice should choose the exact artifact format consumed by the Rust crate:
+The lowest-level runtime handoff is the generated `kernel.c` bundle, not the `libkrunfw` dynamic library. To compile the Sandbox Rust crate with that bundle linked into the native module:
 
-- directly map/use the built kernel image, or
-- compile the generated `kernel.c` bundle into the native module, or
-- patch libkrun/libkrunfw for an fd/blob-backed kernel handoff.
+```sh
+SANDBOX_KERNEL_BUNDLE_C=dist/kernel/libkrunfw/arm64/kernel.c cargo test -p sandbox
+```
 
-The choice should keep the runtime contract path-minimal: paths are acceptable for build inputs and package artifacts, but VM instantiation should not require building or discovering kernels dynamically.
+The build script compiles that C bundle into the crate and enables the `sandbox_static_kernel` cfg. At runtime, Sandbox calls the raw kernel-bundle setter in the `torkbot/libkrun` fork with host address, guest load address, entry address, and size.
+
+This avoids a runtime dependency on `libkrunfw` and avoids resolving a kernel path during VM creation. Paths remain build inputs and package artifacts only; VM instantiation should not require building or discovering kernels dynamically.

@@ -34,6 +34,6 @@ Sandbox build entrypoint:
 Near-term branch plan:
 
 1. Keep the fork branch aligned with upstream until Sandbox needs a patch.
-2. Prefer adding build/export hooks that expose kernel artifacts directly instead of requiring consumers to load a dynamic library.
+2. Keep producing the generated `kernel.c` bundle; Sandbox compiles that into the native module when `SANDBOX_KERNEL_BUNDLE_C` is supplied.
 3. Keep runtime integration in the Sandbox Rust crate: package or embed prebuilt kernel artifacts and pass low-level primitives to libkrun.
-4. If libkrun only supports path-oriented kernel setup where fd/blob setup is cleaner, stage the small API patch in `torkbot/libkrun`.
+4. Continue staging path-avoiding low-level APIs in `torkbot/libkrun` when libkrun only exposes path-oriented setup.

@@ -5,9 +5,9 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use crate::control::INIT_CONTROL_PORT;
-use crate::config::RootfsFormat;
 use crate::MicroVmSpec;
+use crate::config::{KernelFormat, RootfsFormat};
+use crate::control::INIT_CONTROL_PORT;
 
 #[derive(Debug)]
 pub struct KrunContext {
@@ -44,6 +44,7 @@ impl KrunContext {
 
         let context = Self { id: raw_id as u32 };
         context.apply_vm_config(spec)?;
+        context.apply_kernel(spec)?;
         context.apply_rootfs(spec)?;
         Ok(context)
     }
@@ -64,6 +65,19 @@ impl KrunContext {
             "krun_set_vm_config",
             krun::krun_set_vm_config(self.id, spec.vcpus, spec.memory_mib),
         )
+    }
+
+    fn apply_kernel(&self, spec: &MicroVmSpec) -> Result<(), KrunError> {
+        match spec.kernel.format {
+            KernelFormat::Auto | KernelFormat::Raw => apply_project_kernel(self.id),
+            KernelFormat::Elf
+            | KernelFormat::PeGz
+            | KernelFormat::ImageGz
+            | KernelFormat::ImageZstd => Err(KrunError::new(
+                "unsupported project kernel format",
+                -libc::EINVAL,
+            )),
+        }
     }
 
     fn apply_rootfs(&self, spec: &MicroVmSpec) -> Result<(), KrunError> {
@@ -103,6 +117,44 @@ impl KrunContext {
             }
         }
     }
+}
+
+#[cfg(sandbox_static_kernel)]
+fn apply_project_kernel(ctx_id: u32) -> Result<(), KrunError> {
+    let mut guest_addr: usize = 0;
+    let mut entry_addr: usize = 0;
+    let mut size: usize = 0;
+    let host_addr = unsafe {
+        krunfw_get_kernel(
+            &mut guest_addr as *mut usize,
+            &mut entry_addr as *mut usize,
+            &mut size as *mut usize,
+        )
+    };
+
+    check_krun("krun_set_kernel_bundle_raw", unsafe {
+        krun::krun_set_kernel_bundle_raw(
+            ctx_id,
+            host_addr as u64,
+            guest_addr as u64,
+            entry_addr as u64,
+            size,
+        )
+    })
+}
+
+#[cfg(not(sandbox_static_kernel))]
+fn apply_project_kernel(_ctx_id: u32) -> Result<(), KrunError> {
+    Ok(())
+}
+
+#[cfg(sandbox_static_kernel)]
+unsafe extern "C" {
+    fn krunfw_get_kernel(
+        load_addr: *mut usize,
+        entry_addr: *mut usize,
+        size: *mut usize,
+    ) -> *mut u8;
 }
 
 impl KrunVm {
@@ -201,11 +253,7 @@ fn cstring_path(operation: &'static str, path: &Path) -> Result<CString, KrunErr
 }
 
 fn sync_mode() -> u32 {
-    if cfg!(target_os = "macos") {
-        1
-    } else {
-        2
-    }
+    if cfg!(target_os = "macos") { 1 } else { 2 }
 }
 
 #[cfg(test)]
@@ -274,14 +322,8 @@ mod tests {
 
         let context = KrunContext::create(&spec).unwrap();
         let mut fds = [0; 2];
-        let socketpair_result = unsafe {
-            libc::socketpair(
-                libc::AF_UNIX,
-                libc::SOCK_STREAM,
-                0,
-                fds.as_mut_ptr(),
-            )
-        };
+        let socketpair_result =
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
         assert_eq!(socketpair_result, 0);
 
         context.add_control_socket_fd(fds[0]).unwrap();

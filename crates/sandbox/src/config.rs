@@ -96,8 +96,7 @@ impl MicroVmSpec {
             return Err(SpecError::new("cpu.vcpus must be greater than zero"));
         }
 
-        let vcpus = u8::try_from(vcpus)
-            .map_err(|_| SpecError::new("cpu.vcpus must fit in u8"))?;
+        let vcpus = u8::try_from(vcpus).map_err(|_| SpecError::new("cpu.vcpus must fit in u8"))?;
 
         let memory_mib = input.memory_mib.unwrap_or(512);
         if memory_mib == 0 {
@@ -146,8 +145,10 @@ impl MicroVmSpec {
                 protected_ranges: http.protected_ranges,
             }),
         });
-        crate::network::NetworkPlan::from_http(network.as_ref().and_then(|network| network.http.as_ref()))
-            .map_err(|error| SpecError::new(error.to_string()))?;
+        crate::network::NetworkPlan::from_http(
+            network.as_ref().and_then(|network| network.http.as_ref()),
+        )
+        .map_err(|error| SpecError::new(error.to_string()))?;
 
         Ok(Self {
             name: input.name,
@@ -172,7 +173,9 @@ impl KernelFormat {
             "pe-gz" => Ok(Self::PeGz),
             "image-gz" => Ok(Self::ImageGz),
             "image-zstd" => Ok(Self::ImageZstd),
-            other => Err(SpecError::new(format!("unsupported kernel.format: {other}"))),
+            other => Err(SpecError::new(format!(
+                "unsupported kernel.format: {other}"
+            ))),
         }
     }
 }
@@ -182,7 +185,9 @@ impl RootfsFormat {
         match value {
             "directory" => Ok(Self::Directory),
             "erofs" => Ok(Self::Erofs),
-            other => Err(SpecError::new(format!("unsupported rootfs.format: {other}"))),
+            other => Err(SpecError::new(format!(
+                "unsupported rootfs.format: {other}"
+            ))),
         }
     }
 }

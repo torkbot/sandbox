@@ -11,5 +11,8 @@ krun = { package = "libkrun", path = "../../deps/libkrun/src/libkrun", default-f
 libc = "0.2"
 sandbox-protocol = { path = "../sandbox-protocol" }
 
+[build-dependencies]
+cc = "1.2"
+
 [lib]
 crate-type = ["rlib"]

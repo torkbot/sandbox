@@ -124,11 +124,11 @@ More generally, avoid host filesystem coordination unless the filesystem path is
 
 ## Static Kernel
 
-The package should not depend on `libkrunfw` at runtime. The host crate should configure a project-built kernel/initramfs pair directly through the libkrun Rust integration. The build needs to produce reproducible artifacts and package them with the Node module or resolve them from a configured runtime directory.
+The package should not depend on `libkrunfw` at runtime. The host crate should configure a project-built kernel directly through the libkrun Rust integration. The build needs to produce reproducible artifacts and statically link the kernel bundle into the native module.
 
 `torkbot/libkrunfw` is still useful as build-time kernel infrastructure because it already defines the Linux version, kernel config, and patch series libkrun expects. Sandbox tracks that fork at `deps/libkrunfw` on `torkbot/sandbox` and uses it to build patched kernel artifacts. The dynamic `libkrunfw` output remains an intermediate or compatibility artifact, not something the runtime should load.
 
-The first build entrypoint is `npm run build:kernel`, which assumes a local Docker environment and runs the libkrunfw Makefile in a Linux builder container. See [kernel-build.md](kernel-build.md). The output should feed the later static/bundled-kernel integration path instead of causing `spawnSandbox` to build or discover a kernel dynamically.
+The first build entrypoint is `npm run build:kernel`, which assumes a local Docker environment and runs the libkrunfw Makefile in a Linux builder container. See [kernel-build.md](kernel-build.md). The generated `kernel.c` bundle can be compiled into the Sandbox Rust crate with `SANDBOX_KERNEL_BUNDLE_C`, then handed to the `torkbot/libkrun` fork through a raw kernel-bundle setter. `spawnSandbox` must not build or discover a kernel dynamically.
 
 ## Static Linking And macOS Signing
 

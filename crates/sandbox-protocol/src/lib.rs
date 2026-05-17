@@ -100,10 +100,9 @@ impl ControlFrame {
                     .map_err(|_| ControlFrameError::new("guest.exec missing argv"))?
                     .iter()
                     .map(|value| {
-                        value
-                            .as_str()
-                            .map(str::to_string)
-                            .ok_or_else(|| ControlFrameError::new("guest.exec argv must be strings"))
+                        value.as_str().map(str::to_string).ok_or_else(|| {
+                            ControlFrameError::new("guest.exec argv must be strings")
+                        })
                     })
                     .collect::<Result<Vec<_>, _>>()?,
             }),
@@ -142,7 +141,9 @@ impl ControlFrame {
 
     pub fn decode_packet(bytes: &[u8]) -> Result<Self, ControlFrameError> {
         if bytes.len() < 4 {
-            return Err(ControlFrameError::new("control packet missing length prefix"));
+            return Err(ControlFrameError::new(
+                "control packet missing length prefix",
+            ));
         }
 
         let frame_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
@@ -232,13 +233,17 @@ mod tests {
 
         let truncated = &packet[..packet.len() - 1];
         assert_eq!(
-            ControlFrame::decode_packet(truncated).unwrap_err().to_string(),
+            ControlFrame::decode_packet(truncated)
+                .unwrap_err()
+                .to_string(),
             "control packet body is truncated",
         );
 
         packet.push(0);
         assert_eq!(
-            ControlFrame::decode_packet(&packet).unwrap_err().to_string(),
+            ControlFrame::decode_packet(&packet)
+                .unwrap_err()
+                .to_string(),
             "control packet has trailing bytes",
         );
     }

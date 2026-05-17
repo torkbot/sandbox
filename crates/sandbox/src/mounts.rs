@@ -25,10 +25,9 @@ impl MountTable {
 
         for mount in mounts {
             let (path, planned) = match mount {
-                MountSpec::SqliteFs { path, name } => (
-                    path.as_str(),
-                    PlannedMount::SqliteFs { name: name.clone() },
-                ),
+                MountSpec::SqliteFs { path, name } => {
+                    (path.as_str(), PlannedMount::SqliteFs { name: name.clone() })
+                }
                 MountSpec::VirtualFs { path } => (path.as_str(), PlannedMount::VirtualFs),
             };
 

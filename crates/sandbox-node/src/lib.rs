@@ -25,9 +25,10 @@ impl NativeSandboxVm {
 
     #[napi]
     pub fn write_control_packet(&mut self, packet: Uint8Array) -> Result<()> {
-        let vm = self.vm.as_mut().ok_or_else(|| {
-            Error::new(Status::InvalidArg, "sandbox VM is closed")
-        })?;
+        let vm = self
+            .vm
+            .as_mut()
+            .ok_or_else(|| Error::new(Status::InvalidArg, "sandbox VM is closed"))?;
         vm.control_socket_mut()
             .write_packet(packet.as_ref())
             .map_err(|error| {
@@ -40,9 +41,10 @@ impl NativeSandboxVm {
 
     #[napi]
     pub fn try_read_control_packet(&mut self) -> Result<Option<Uint8Array>> {
-        let vm = self.vm.as_mut().ok_or_else(|| {
-            Error::new(Status::InvalidArg, "sandbox VM is closed")
-        })?;
+        let vm = self
+            .vm
+            .as_mut()
+            .ok_or_else(|| Error::new(Status::InvalidArg, "sandbox VM is closed"))?;
         vm.control_socket_mut()
             .try_read_packet()
             .map(|packet| packet.map(Uint8Array::from))

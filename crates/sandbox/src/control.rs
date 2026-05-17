@@ -4,9 +4,7 @@
 //! adapt one of those sockets to TorkBot's `Transport` shape: an async stream
 //! of decoded messages plus async `send` and `close`.
 
-pub use sandbox_protocol::{
-    ControlFrame, ControlFrameError, INIT_CONTROL_PORT,
-};
+pub use sandbox_protocol::{ControlFrame, ControlFrameError, INIT_CONTROL_PORT};
 
 /// Minimal envelope for messages exchanged between the host runtime and guest
 /// init before higher-level RPC framing is attached.

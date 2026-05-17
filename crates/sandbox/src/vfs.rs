@@ -48,10 +48,7 @@ impl From<VirtualHandle> for u64 {
 pub trait HostVirtualFileSystem: Send + Sync + 'static {
     fn lookup(&self, parent: VirtualInode, name: &CStr) -> io::Result<VirtioFsEntry>;
 
-    fn getattr(
-        &self,
-        inode: VirtualInode,
-    ) -> io::Result<(bindings::stat64, Duration)>;
+    fn getattr(&self, inode: VirtualInode) -> io::Result<(bindings::stat64, Duration)>;
 }
 
 /// Adapter from Sandbox's host VFS contract into libkrun's virtio-fs contract.
@@ -136,10 +133,7 @@ mod tests {
             Ok(virtual_file_entry(2, 19))
         }
 
-        fn getattr(
-            &self,
-            inode: VirtualInode,
-        ) -> io::Result<(bindings::stat64, Duration)> {
+        fn getattr(&self, inode: VirtualInode) -> io::Result<(bindings::stat64, Duration)> {
             assert_eq!(u64::from(inode), 2);
             Ok((virtual_file_entry(2, 19).attr, Duration::from_secs(1)))
         }
