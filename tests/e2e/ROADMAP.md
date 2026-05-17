@@ -76,8 +76,14 @@ This file owns root filesystem composition. Runtime VMs should stay immutable by
 
 Passing:
 
+- `linuxOverlayFs composes a prebuilt lower filesystem with a scratch upper filesystem`
+  - Assert `/` is writable when the rootfs is an explicit Linux overlayfs composition.
 - `immutable root remains the default when overlay mode is absent`
   - Assert root writes fail in normal runtime mode.
+- `linuxOverlayFs does not mutate its prebuilt lower filesystem`
+  - Mutate the overlay root, then boot the lower root alone and assert the mutation is absent.
+- `scratchFs upper state is isolated between VM instances`
+  - Mutate one scratch upper, then boot another `scratchFs()` upper and assert the mutation is absent.
 - `mount creates a guest-visible mount boundary`
   - Assert `mount(path, fs)` is visible in the guest as a real mount boundary.
 - `virtualFsMount remains an alias for guest-visible mounts while bindings are a separate future primitive`
@@ -85,12 +91,7 @@ Passing:
 
 Failing:
 
-- `linuxOverlayFs composes a prebuilt lower filesystem with a scratch upper filesystem`
-  - Assert `/` is writable when the rootfs is an explicit Linux overlayfs composition.
-- `linuxOverlayFs does not mutate its prebuilt lower filesystem`
-  - Mutate the overlay root, then boot the lower root alone and assert the mutation is absent.
-- `scratchFs upper state is isolated between VM instances`
-  - Mutate one scratch upper, then boot another `scratchFs()` upper and assert the mutation is absent.
+- No remaining known failures in this scenario file.
 
 ## `http-policy.test.ts`
 
@@ -176,13 +177,14 @@ Passing:
   - Assert runtime uses `projectKernel()` and `projectInit()` artifacts without dynamic discovery.
 - `Linux host CI runs the core VM/control/network contract`
   - The CI job should prove the same required e2e subset on a Linux host with KVM.
-
-Failing:
-
 - `rootfs fixture builds reproducibly`
   - Build the rootfs fixture twice and compare digest/metadata.
 - `kernel fixture builds reproducibly`
   - Build the kernel fixture and compare expected digest/metadata.
+
+Failing:
+
+- No remaining known failures in this scenario file.
 
 ## `libkrun-contract.test.ts`
 

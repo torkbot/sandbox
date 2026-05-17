@@ -11,6 +11,10 @@ fn main() {
 }
 
 fn run() -> Result<(), InitError> {
+    let rootfs_overlay_enabled = prepare_rootfs_overlay(
+        std::env::args().skip(1),
+        std::env::var("SANDBOX_ROOTFS_OVERLAY").ok(),
+    )?;
     mount_kernel_filesystems()?;
     configure_http_network(std::env::args().skip(1))?;
     install_http_ca(std::env::var("SANDBOX_HTTP_CA_PEM_B64").ok())?;
@@ -18,10 +22,89 @@ fn run() -> Result<(), InitError> {
         std::env::args().skip(1),
         std::env::var("SANDBOX_VIRTIOFS_MOUNTS").ok(),
     )?;
-    let packet = init_ready_packet()?;
+    let packet = init_ready_packet(!rootfs_overlay_enabled)?;
     let mut control = connect_control()?;
     send_init_ready(&mut control, &packet)?;
     run_control_loop(&mut control)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_rootfs_overlay(
+    args: impl Iterator<Item = String>,
+    mode: Option<String>,
+) -> Result<bool, InitError> {
+    mount_fs("proc", "/proc", "proc", 0)?;
+    let enabled = mode.as_deref() == Some("writable")
+        || args.into_iter().any(|arg| arg == "--rootfs-overlay=writable")
+        || read_key_value_from_proc_cmdline("SANDBOX_ROOTFS_OVERLAY").as_deref() == Some("writable");
+    if !enabled {
+        return Ok(false);
+    }
+
+    mount_fs("tmpfs", "/run", "tmpfs", 0)?;
+    std::fs::create_dir_all("/run/sandbox-rootfs-upper")
+        .map_err(|error| InitError(format!("create overlay upperdir: {error}")))?;
+    std::fs::create_dir_all("/run/sandbox-rootfs-work")
+        .map_err(|error| InitError(format!("create overlay workdir: {error}")))?;
+    std::fs::create_dir_all("/run/sandbox-rootfs-root")
+        .map_err(|error| InitError(format!("create overlay root: {error}")))?;
+
+    mount_overlay_root(
+        "/run/sandbox-rootfs-root",
+        "lowerdir=/,upperdir=/run/sandbox-rootfs-upper,workdir=/run/sandbox-rootfs-work",
+    )?;
+
+    std::env::set_current_dir("/run/sandbox-rootfs-root")
+        .map_err(|error| InitError(format!("chdir overlay root: {error}")))?;
+    chroot(".")?;
+    std::env::set_current_dir("/")
+        .map_err(|error| InitError(format!("chdir / after overlay chroot: {error}")))?;
+    Ok(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn prepare_rootfs_overlay(
+    _args: impl Iterator<Item = String>,
+    _mode: Option<String>,
+) -> Result<bool, InitError> {
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+fn mount_overlay_root(target: &str, options: &str) -> Result<(), InitError> {
+    use std::ffi::CString;
+
+    let source = CString::new("overlay").unwrap();
+    let target = CString::new(target)
+        .map_err(|_| InitError("overlay target contains nul".to_string()))?;
+    let fstype = CString::new("overlay").unwrap();
+    let options = CString::new(options)
+        .map_err(|_| InitError("overlay options contain nul".to_string()))?;
+    let result = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            0,
+            options.as_ptr().cast(),
+        )
+    };
+    if result < 0 {
+        return Err(InitError::last_os("mount writable root overlay"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn chroot(path: &str) -> Result<(), InitError> {
+    use std::ffi::CString;
+
+    let path = CString::new(path).map_err(|_| InitError("chroot path contains nul".to_string()))?;
+    let result = unsafe { libc::chroot(path.as_ptr()) };
+    if result < 0 {
+        return Err(InitError::last_os("chroot overlay root"));
+    }
     Ok(())
 }
 
@@ -228,9 +311,21 @@ fn read_flag_from_proc_cmdline(flag: &str) -> bool {
         .any(|token| token == flag || token == format!("{flag}=1"))
 }
 
-fn init_ready_packet() -> Result<Vec<u8>, InitError> {
+#[cfg(target_os = "linux")]
+fn read_key_value_from_proc_cmdline(key: &str) -> Option<String> {
+    let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;
+    for token in cmdline.split_ascii_whitespace() {
+        let token = token.trim_matches('"');
+        if let Some(value) = token.strip_prefix(&format!("{key}=")) {
+            return Some(value.trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
+fn init_ready_packet(root_readonly: bool) -> Result<Vec<u8>, InitError> {
     ControlFrame::InitReady {
-        root_readonly: true,
+        root_readonly,
         init_name: "sandbox-init".to_string(),
     }
     .encode_packet()
@@ -440,7 +535,7 @@ mod tests {
     #[test]
     fn init_ready_packet_uses_shared_protocol() {
         assert_eq!(
-            ControlFrame::decode_packet(&init_ready_packet().unwrap()).unwrap(),
+            ControlFrame::decode_packet(&init_ready_packet(true).unwrap()).unwrap(),
             ControlFrame::InitReady {
                 root_readonly: true,
                 init_name: "sandbox-init".to_string(),

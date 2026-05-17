@@ -23,7 +23,7 @@ await run("docker", [
   [
     "apt-get update",
     "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends erofs-utils ca-certificates",
-    `mkfs.erofs -x-1 /out/${shellArg(basename(outPath))} /rootfs`,
+    `mkfs.erofs -x-1 -T0 -U 00000000-0000-0000-0000-000000000000 --all-root /out/${shellArg(basename(outPath))} /rootfs`,
   ].join(" && "),
 ]);
 

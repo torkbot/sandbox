@@ -395,9 +395,7 @@ class ConfiguredSandboxMounts implements SandboxMounts {
 }
 
 function toNativeSpawnOptions(options: SandboxOptions): NativeSpawnSandboxOptions {
-  if (options.rootfs.kind !== "prebuilt-rootfs") {
-    throw new Error(`rootfs ${options.rootfs.kind} is not implemented yet`);
-  }
+  const rootfs = lowerNativeRootfs(options.rootfs);
 
   return {
     name: options.name,
@@ -410,10 +408,13 @@ function toNativeSpawnOptions(options: SandboxOptions): NativeSpawnSandboxOption
       crateName: options.init.crate,
     },
     rootfs: {
-      path: options.rootfs.path,
-      readonly: options.rootfs.readonly,
-      format: options.rootfs.format,
+      path: rootfs.path,
+      readonly: rootfs.readonly,
+      format: rootfs.format,
     },
+    rootfsOverlay: options.rootfs.kind === "linux-overlay-fs"
+      ? { mode: "writable" }
+      : undefined,
     mounts: options.mounts?.map((mount) => {
       return {
         kind: mount.kind,
@@ -436,6 +437,23 @@ function toNativeSpawnOptions(options: SandboxOptions): NativeSpawnSandboxOption
                   : options.network.http.ca?.privateKeyPem,
               },
         },
+  };
+}
+
+function lowerNativeRootfs(rootfs: RootfsConfig): PrebuiltRootfsConfig {
+  if (rootfs.kind === "prebuilt-rootfs") {
+    return rootfs;
+  }
+
+  if (rootfs.lower.kind !== "prebuilt-rootfs") {
+    throw new Error(`rootfs ${rootfs.kind} lower ${rootfs.lower.kind} is not implemented yet`);
+  }
+  if (rootfs.upper.kind !== "scratch-fs") {
+    throw new Error(`rootfs ${rootfs.kind} upper ${rootfs.upper.kind} is not implemented yet`);
+  }
+  return {
+    ...rootfs.lower,
+    readonly: true,
   };
 }
 

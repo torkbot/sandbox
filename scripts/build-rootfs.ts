@@ -1,4 +1,4 @@
-import { copyFile, mkdir, rm, stat } from "node:fs/promises";
+import { copyFile, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { spawn } from "node:child_process";
 
@@ -26,6 +26,12 @@ await run("docker", [
 
 await assertExists(initPath);
 await copyFile(initPath, resolve(outDir, "sandbox-init"));
+await rm(resolve(outDir, ".dockerenv"), { force: true });
+await writeFile(resolve(outDir, "etc/hostname"), "sandbox\n");
+await writeFile(
+  resolve(outDir, "etc/hosts"),
+  "127.0.0.1 localhost sandbox\n::1 localhost ip6-localhost ip6-loopback\n",
+);
 await mkdir(resolve(outDir, "dev"), { recursive: true });
 await mkdir(resolve(outDir, "proc"), { recursive: true });
 await mkdir(resolve(outDir, "sandbox"), { recursive: true });

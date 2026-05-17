@@ -236,6 +236,7 @@ impl KrunContext {
         let encoded_mounts = encode_virtual_fs_mounts(virtual_fs);
         let mount_arg = CString::new(format!("--virtiofs-mounts={encoded_mounts}")).unwrap();
         let http_network_arg = CString::new("--http-network").unwrap();
+        let rootfs_overlay_arg = CString::new("--rootfs-overlay=writable").unwrap();
         let http_network_enabled = spec
             .network
             .as_ref()
@@ -243,6 +244,7 @@ impl KrunContext {
             .is_some();
         let mount_env = CString::new(format!("SANDBOX_VIRTIOFS_MOUNTS={encoded_mounts}")).unwrap();
         let http_network_env = CString::new("SANDBOX_HTTP_NETWORK=1").unwrap();
+        let rootfs_overlay_env = CString::new("SANDBOX_ROOTFS_OVERLAY=writable").unwrap();
         let ca_env = spec
             .network
             .as_ref()
@@ -261,6 +263,10 @@ impl KrunContext {
         if http_network_enabled {
             argv.push(http_network_arg.as_ptr());
             envp.push(http_network_env.as_ptr());
+        }
+        if spec.rootfs_overlay.is_some() {
+            argv.push(rootfs_overlay_arg.as_ptr());
+            envp.push(rootfs_overlay_env.as_ptr());
         }
         if let Some(ca_env) = ca_env.as_ref() {
             envp.push(ca_env.as_ptr());

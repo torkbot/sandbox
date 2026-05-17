@@ -35,7 +35,8 @@ test("linuxOverlayFs composes a prebuilt lower filesystem with a scratch upper f
     await vm.close();
   });
 
-  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+  const ready = await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+  assert.equal(ready.guest.root.readonly, false);
 
   const install = await execGuestShell(vm, {
     id: "shape-rootfs",
