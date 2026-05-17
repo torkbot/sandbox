@@ -257,6 +257,8 @@ class NativeBackedSandboxVm implements SandboxVm {
 
   readonly #nativeVm: {
     readonly hasControlSocket: boolean;
+    writeControlPacket(packet: Uint8Array): void;
+    tryReadControlPacket(): Uint8Array | null;
     close(): Promise<void> | void;
   };
   #closed = false;
@@ -264,6 +266,8 @@ class NativeBackedSandboxVm implements SandboxVm {
   constructor(
     nativeVm: {
       readonly hasControlSocket: boolean;
+      writeControlPacket(packet: Uint8Array): void;
+      tryReadControlPacket(): Uint8Array | null;
       close(): Promise<void> | void;
     },
     options: SandboxOptions,

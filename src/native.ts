@@ -2,6 +2,8 @@ import { createRequire } from "node:module";
 
 type NativeSandboxVm = {
   readonly hasControlSocket: boolean;
+  writeControlPacket(packet: Uint8Array): void;
+  tryReadControlPacket(): Uint8Array | null;
   close(): Promise<void>;
 };
 

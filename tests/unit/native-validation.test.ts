@@ -167,6 +167,11 @@ test("native spawn owns a host control socket", async () => {
   });
 
   assert.equal(nativeVm.hasControlSocket, true);
+  assert.equal(nativeVm.tryReadControlPacket(), null);
   await nativeVm.close();
   assert.equal(nativeVm.hasControlSocket, false);
+  assert.throws(
+    () => nativeVm.tryReadControlPacket(),
+    /sandbox VM is closed/,
+  );
 });

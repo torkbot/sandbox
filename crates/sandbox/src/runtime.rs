@@ -1,5 +1,6 @@
 use std::ffi::CString;
 use std::fmt;
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -17,6 +18,7 @@ pub struct KrunContext {
 pub struct KrunVm {
     context: KrunContext,
     control_socket: ControlSocket,
+    guest_control_socket: UnixStream,
 }
 
 #[derive(Debug)]
@@ -110,13 +112,12 @@ impl KrunVm {
             UnixStream::pair().map_err(|_| KrunError::new("UnixStream::pair", -libc::EIO))?;
 
         context.add_control_socket_fd(guest_socket.as_raw_fd())?;
-        drop(guest_socket);
-
         Ok(Self {
             context,
             control_socket: ControlSocket {
                 stream: host_socket,
             },
+            guest_control_socket: guest_socket,
         })
     }
 
@@ -127,11 +128,40 @@ impl KrunVm {
     pub fn control_socket(&self) -> &ControlSocket {
         &self.control_socket
     }
+
+    pub fn control_socket_mut(&mut self) -> &mut ControlSocket {
+        &mut self.control_socket
+    }
+
+    pub fn guest_control_socket_raw_fd(&self) -> RawFd {
+        self.guest_control_socket.as_raw_fd()
+    }
 }
 
 impl ControlSocket {
     pub fn raw_fd(&self) -> RawFd {
         self.stream.as_raw_fd()
+    }
+
+    pub fn write_packet(&mut self, packet: &[u8]) -> io::Result<()> {
+        self.stream.write_all(packet)
+    }
+
+    pub fn try_read_packet(&mut self) -> io::Result<Option<Vec<u8>>> {
+        self.stream.set_nonblocking(true)?;
+        let mut len = [0; 4];
+        match self.stream.read_exact(&mut len) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error),
+        }
+
+        let frame_len = u32::from_le_bytes(len) as usize;
+        let mut packet = Vec::with_capacity(4 + frame_len);
+        packet.extend_from_slice(&len);
+        packet.resize(4 + frame_len, 0);
+        self.stream.read_exact(&mut packet[4..])?;
+        Ok(Some(packet))
     }
 }
 
@@ -282,6 +312,27 @@ mod tests {
         let vm = KrunVm::create(&spec).unwrap();
         assert!(vm.context().id() > 0);
         assert!(vm.control_socket().raw_fd() >= 0);
+        assert!(vm.guest_control_socket_raw_fd() >= 0);
+    }
+
+    #[test]
+    fn control_socket_reads_framed_packets_without_blocking() {
+        let (host_socket, mut guest_socket) = UnixStream::pair().unwrap();
+        let mut control_socket = ControlSocket {
+            stream: host_socket,
+        };
+
+        assert!(control_socket.try_read_packet().unwrap().is_none());
+
+        let packet = crate::control::ControlFrame::InitReady {
+            root_readonly: true,
+            init_name: "sandbox-init".to_string(),
+        }
+        .encode_packet()
+        .unwrap();
+        guest_socket.write_all(&packet).unwrap();
+
+        assert_eq!(control_socket.try_read_packet().unwrap(), Some(packet));
     }
 
     #[test]
