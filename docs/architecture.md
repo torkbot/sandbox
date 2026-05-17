@@ -134,7 +134,7 @@ The first build entrypoint is `npm run build:kernel`, which assumes a local Dock
 
 The desired output is a statically linked Sandbox host binary or native Node module, including the libkrun pieces we depend on. Dynamic dependencies should be treated as build failures unless they are unavoidable platform system libraries.
 
-macOS needs a separate signing track. HVF requires the correct Hypervisor entitlement on the executable that touches Hypervisor.framework. The build and packaging flow must identify the final signed binary, apply the HVF entitlement plist, and verify codesigning before launch. This is part of the runtime contract, not a release-only afterthought.
+macOS needs a separate signing track. HVF requires the correct Hypervisor entitlement on the host executable process, not on the Node native addon alone. Sandbox signs the addon as a build artifact so it can be loaded, but TorkBot or any other host executable that actually launches VMs must be signed with the Hypervisor entitlement before launch. This is part of the runtime contract, not a release-only afterthought.
 
 ## Phased Implementation
 

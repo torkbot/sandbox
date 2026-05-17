@@ -12,7 +12,7 @@
   "scripts": {
     "build": "npm run build:native && tsgo --project tsconfig.build.json --pretty",
     "build:kernel": "node ./scripts/build-kernel.ts",
-    "build:native": "napi build --platform --release --manifest-path crates/sandbox-node/Cargo.toml",
+    "build:native": "napi build --platform --release --manifest-path crates/sandbox-node/Cargo.toml && node ./scripts/sign-native.ts",
     "check:rust": "cargo check --workspace",
     "test:e2e": "node ./tests/e2e/run.ts",
     "test:rust": "cargo test --workspace",

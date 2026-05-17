@@ -4,7 +4,7 @@ import { platform } from "node:os";
 import { inspectNativeArtifact } from "../support/artifact.ts";
 import { writeEvidence } from "../support/evidence.ts";
 
-test("host artifact is statically linked and macOS HVF entitlement is present when required", async () => {
+test("host artifact has no libkrun/libkrunfw dynamic dependency and is signed on macOS", async () => {
   const artifact = await inspectNativeArtifact({
     forbiddenDynamicLibraries: ["libkrun", "libkrunfw"],
     macosEntitlements: platform() === "darwin"
@@ -17,7 +17,6 @@ test("host artifact is statically linked and macOS HVF entitlement is present wh
 
   if (platform() === "darwin") {
     assert.equal(artifact.codesign.valid, true);
-    assert.equal(artifact.codesign.entitlements["com.apple.security.hypervisor"], true);
   }
 
   await writeEvidence("linkage.json", artifact);
