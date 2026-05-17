@@ -114,14 +114,13 @@ export interface HttpPolicyRequest {
 }
 
 export type HttpPolicyDecision =
-  | { readonly action: "allow" }
+  | { readonly action: "allow"; readonly headers?: Record<string, string> }
   | { readonly action: "deny"; readonly reason: string };
 
 export interface HttpInterceptionConfig {
   readonly ca?: "ephemeral" | { readonly certificatePem: string; readonly privateKeyPem: string };
   readonly protectedRanges?: readonly string[];
   policy(request: HttpPolicyRequest): Promise<HttpPolicyDecision>;
-  modifyRequestHeaders?(headers: Record<string, string>): Promise<Record<string, string>>;
 }
 
 export interface NetworkConfig {
@@ -423,6 +422,9 @@ function toNativeSpawnOptions(options: SandboxOptions): NativeSpawnSandboxOption
                 caCertificatePem: options.network.http.ca === "ephemeral"
                   ? undefined
                   : options.network.http.ca?.certificatePem,
+                caPrivateKeyPem: options.network.http.ca === "ephemeral"
+                  ? undefined
+                  : options.network.http.ca?.privateKeyPem,
               },
         },
   };

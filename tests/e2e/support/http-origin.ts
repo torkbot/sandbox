@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import https from "node:https";
 import type { IncomingHttpHeaders } from "node:http";
@@ -11,6 +11,12 @@ const execFileAsync = promisify(execFile);
 
 export interface TestHttpsOrigin {
   readonly url: string;
+  close(): Promise<void>;
+}
+
+export interface TestCertificateAuthority {
+  readonly certificatePem: string;
+  readonly privateKeyPem: string;
   close(): Promise<void>;
 }
 
@@ -53,6 +59,7 @@ export async function startTestHttpOrigin(input: {
 }
 
 export async function startTestHttpsOrigin(input: {
+  readonly ca: Pick<TestCertificateAuthority, "certificatePem" | "privateKeyPem">;
   respond(request: {
     readonly headers: Record<string, string>;
     readonly url: string;
@@ -63,24 +70,55 @@ export async function startTestHttpsOrigin(input: {
   };
 }): Promise<TestHttpsOrigin> {
   const workDir = await mkdtemp(join(tmpdir(), "sandbox-origin-"));
+  const caKeyPath = join(workDir, "ca.key");
+  const caCertPath = join(workDir, "ca.pem");
   const keyPath = join(workDir, "origin.key");
+  const csrPath = join(workDir, "origin.csr");
   const certPath = join(workDir, "origin.pem");
+  const configPath = join(workDir, "openssl.cnf");
+  await writeFile(caKeyPath, input.ca.privateKeyPem);
+  await writeFile(caCertPath, input.ca.certificatePem);
+  await writeFile(configPath, [
+    "[req]",
+    "distinguished_name=req_distinguished_name",
+    "req_extensions=v3_req",
+    "prompt=no",
+    "[req_distinguished_name]",
+    "CN=127.0.0.1",
+    "[v3_req]",
+    "subjectAltName=IP:127.0.0.1",
+    "",
+  ].join("\n"));
   await execFileAsync("openssl", [
     "req",
-    "-x509",
     "-newkey",
     "rsa:2048",
     "-nodes",
-    "-days",
-    "1",
-    "-subj",
-    "/CN=127.0.0.1",
-    "-addext",
-    "subjectAltName=IP:127.0.0.1",
     "-keyout",
     keyPath,
     "-out",
+    csrPath,
+    "-config",
+    configPath,
+  ]);
+  await execFileAsync("openssl", [
+    "x509",
+    "-req",
+    "-in",
+    csrPath,
+    "-CA",
+    caCertPath,
+    "-CAkey",
+    caKeyPath,
+    "-CAcreateserial",
+    "-out",
     certPath,
+    "-days",
+    "1",
+    "-extensions",
+    "v3_req",
+    "-extfile",
+    configPath,
   ]);
 
   const server = https.createServer({
@@ -106,6 +144,35 @@ export async function startTestHttpsOrigin(input: {
     url: `https://127.0.0.1:${address.port}`,
     async close() {
       await close(server);
+      await rm(workDir, { recursive: true, force: true });
+    },
+  };
+}
+
+export async function createTestCertificateAuthority(): Promise<TestCertificateAuthority> {
+  const workDir = await mkdtemp(join(tmpdir(), "sandbox-ca-"));
+  const keyPath = join(workDir, "ca.key");
+  const certPath = join(workDir, "ca.pem");
+  await execFileAsync("openssl", [
+    "req",
+    "-x509",
+    "-newkey",
+    "rsa:2048",
+    "-nodes",
+    "-days",
+    "1",
+    "-subj",
+    "/CN=Sandbox Test CA",
+    "-keyout",
+    keyPath,
+    "-out",
+    certPath,
+  ]);
+
+  return {
+    certificatePem: await readFile(certPath, "utf8"),
+    privateKeyPem: await readFile(keyPath, "utf8"),
+    async close() {
       await rm(workDir, { recursive: true, force: true });
     },
   };

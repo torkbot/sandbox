@@ -92,6 +92,7 @@ mod tests {
         let plan = NetworkPlan::from_http(Some(&HttpSpec {
             protected_ranges: vec!["127.0.0.0/8".to_string(), "::1/128".to_string()],
             ca_certificate_pem: None,
+            ca_private_key_pem: None,
         }))
         .unwrap()
         .unwrap();
@@ -104,6 +105,7 @@ mod tests {
         let err = NetworkPlan::from_http(Some(&HttpSpec {
             protected_ranges: vec!["127.0.0.0/33".to_string()],
             ca_certificate_pem: None,
+            ca_private_key_pem: None,
         }))
         .unwrap_err();
 

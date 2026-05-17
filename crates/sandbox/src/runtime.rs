@@ -12,7 +12,7 @@ use base64::Engine;
 use crate::MicroVmSpec;
 use crate::config::{KernelFormat, RootfsFormat};
 use crate::control::INIT_CONTROL_PORT;
-use crate::network_service::{HostHttpHandler, HostNetwork};
+use crate::network_service::{HostHttpHandler, HostNetwork, MitmTlsConfig};
 use crate::vfs::VirtioVirtualFsBackend;
 
 #[derive(Debug)]
@@ -112,7 +112,13 @@ impl KrunContext {
             return Ok(());
         }
 
-        let network = HostNetwork::new(services.http_handler.clone())
+        let tls_config = network.http.as_ref().and_then(|http| {
+            Some(MitmTlsConfig {
+                ca_certificate_pem: http.ca_certificate_pem.clone()?,
+                ca_private_key_pem: http.ca_private_key_pem.clone()?,
+            })
+        });
+        let network = HostNetwork::new(services.http_handler.clone(), tls_config)
             .map_err(|_| KrunError::new("HostNetwork::new", -libc::EIO))?;
         let guest_fd = network.guest_fd();
         let mac = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xef];

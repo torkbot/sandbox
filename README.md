@@ -80,13 +80,12 @@ await using vm = await spawnSandbox({
           return { action: "deny", reason: "blocked by host policy" };
         }
 
-        return { action: "allow" };
-      },
-
-      async modifyRequestHeaders(headers) {
         return {
-          ...headers,
-          "x-sandbox": "1",
+          action: "allow",
+          headers: {
+            ...request.headers,
+            "x-sandbox": "1",
+          },
         };
       },
     },

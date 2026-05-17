@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::io::{self, Cursor, Read, Write};
 use std::os::fd::{IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp;
@@ -15,6 +16,7 @@ use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
 
 const HOST_HTTP_PROBE_PORT: u16 = 8080;
 const HOST_HTTP_PORT: u16 = 80;
+const HOST_HTTPS_PORT: u16 = 443;
 const HTTP_LISTENERS_PER_PORT: usize = 4;
 const HOST_HTTP_PROBE_RESPONSE: &[u8] =
     b"HTTP/1.1 200 OK\r\ncontent-length: 25\r\nconnection: close\r\n\r\nsandbox explicit network\n";
@@ -39,6 +41,12 @@ pub trait HostHttpHandler: Send + Sync + 'static {
     fn handle_http_request(&self, request: HostHttpRequest) -> io::Result<HostHttpResponse>;
 }
 
+#[derive(Debug, Clone)]
+pub struct MitmTlsConfig {
+    pub ca_certificate_pem: String,
+    pub ca_private_key_pem: String,
+}
+
 /// Host-owned endpoint for libkrun's explicit virtio-net unixstream backend.
 #[derive(Debug)]
 pub struct HostNetwork {
@@ -48,12 +56,17 @@ pub struct HostNetwork {
 }
 
 impl HostNetwork {
-    pub fn new(http_handler: Option<Arc<dyn HostHttpHandler>>) -> io::Result<Self> {
+    pub fn new(
+        http_handler: Option<Arc<dyn HostHttpHandler>>,
+        tls_config: Option<MitmTlsConfig>,
+    ) -> io::Result<Self> {
         let (host, guest) = UnixStream::pair()?;
+        let tls_acceptor = tls_config.map(TlsAcceptor::new).transpose()?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = shutdown.clone();
-        let worker =
-            thread::spawn(move || run_network_service(host, worker_shutdown, http_handler));
+        let worker = thread::spawn(move || {
+            run_network_service(host, worker_shutdown, http_handler, tls_acceptor)
+        });
         Ok(Self {
             guest_fd: guest.into_raw_fd(),
             shutdown,
@@ -79,6 +92,7 @@ fn run_network_service(
     stream: UnixStream,
     shutdown: Arc<AtomicBool>,
     http_handler: Option<Arc<dyn HostHttpHandler>>,
+    tls_acceptor: Option<TlsAcceptor>,
 ) {
     let _ = stream.set_nonblocking(true);
     let tx = match stream.try_clone() {
@@ -98,6 +112,10 @@ fn run_network_service(
     let mut http_sockets = HashMap::new();
     add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTP_PORT);
     add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTP_PROBE_PORT);
+    if tls_acceptor.is_some() {
+        add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTPS_PORT);
+    }
+    let mut tls_connections = HashMap::new();
 
     while !shutdown.load(Ordering::Acquire) {
         let timestamp = Instant::now();
@@ -116,6 +134,8 @@ fn run_network_service(
                 port,
                 http_handler.as_deref(),
                 &device.nat,
+                tls_acceptor.as_ref(),
+                &mut tls_connections,
             );
         }
         thread::sleep(Duration::from_millis(1));
@@ -145,9 +165,12 @@ fn poll_http_socket(
     port: u16,
     handler: Option<&dyn HostHttpHandler>,
     nat: &TransparentTcpNat,
+    tls_acceptor: Option<&TlsAcceptor>,
+    tls_connections: &mut HashMap<SocketHandle, TlsConnection>,
 ) {
     let socket = sockets.get_mut::<tcp::Socket>(handle);
     if !socket.is_active() {
+        tls_connections.remove(&handle);
         let _ = socket.listen(port);
         return;
     }
@@ -156,16 +179,83 @@ fn poll_http_socket(
         let mut request = [0; 4096];
         let received = socket.recv_slice(&mut request).unwrap_or(0);
         if received > 0 {
-            let response = handler
-                .and_then(|handler| {
-                    parse_http_request(socket, nat, &request[..received])
-                        .and_then(|request| handler.handle_http_request(request).ok())
-                })
-                .map(encode_http_response)
-                .unwrap_or_else(|| HOST_HTTP_PROBE_RESPONSE.to_vec());
-            let _ = socket.send_slice(&response);
-            socket.close();
+            if port == HOST_HTTPS_PORT {
+                poll_tls_http_socket(
+                    socket,
+                    handle,
+                    nat,
+                    handler,
+                    tls_acceptor,
+                    tls_connections,
+                    &request[..received],
+                );
+            } else {
+                let response = handler
+                    .and_then(|handler| {
+                        parse_http_request(socket, nat, &request[..received], false)
+                            .and_then(|request| handler.handle_http_request(request).ok())
+                    })
+                    .map(encode_http_response)
+                    .unwrap_or_else(|| HOST_HTTP_PROBE_RESPONSE.to_vec());
+                let _ = socket.send_slice(&response);
+                socket.close();
+            }
         }
+    }
+}
+
+fn poll_tls_http_socket(
+    socket: &mut tcp::Socket<'_>,
+    handle: SocketHandle,
+    nat: &TransparentTcpNat,
+    handler: Option<&dyn HostHttpHandler>,
+    tls_acceptor: Option<&TlsAcceptor>,
+    tls_connections: &mut HashMap<SocketHandle, TlsConnection>,
+    received: &[u8],
+) {
+    let Some(tls_acceptor) = tls_acceptor else {
+        socket.close();
+        return;
+    };
+    let Some(handler) = handler else {
+        socket.close();
+        return;
+    };
+    let connection = tls_connections
+        .entry(handle)
+        .or_insert_with(|| tls_acceptor.connection());
+    let mut reader = Cursor::new(received);
+    if connection.tls.read_tls(&mut reader).is_err()
+        || connection.tls.process_new_packets().is_err()
+    {
+        socket.close();
+        return;
+    }
+    let mut plaintext = Vec::new();
+    let _ = connection.tls.reader().read_to_end(&mut plaintext);
+    if !plaintext.is_empty() {
+        if let Some(request) = parse_http_request(socket, nat, &plaintext, true) {
+            if let Ok(response) = handler.handle_http_request(request) {
+                let _ = connection
+                    .tls
+                    .writer()
+                    .write_all(&encode_http_response(response));
+            }
+        }
+    }
+    let mut encrypted = Vec::new();
+    let _ = connection.tls.write_tls(&mut encrypted);
+    if !encrypted.is_empty() {
+        let _ = socket.send_slice(&encrypted);
+    }
+    if !plaintext.is_empty() {
+        connection.tls.send_close_notify();
+        let mut close_notify = Vec::new();
+        let _ = connection.tls.write_tls(&mut close_notify);
+        if !close_notify.is_empty() {
+            let _ = socket.send_slice(&close_notify);
+        }
+        socket.close();
     }
 }
 
@@ -173,6 +263,7 @@ fn parse_http_request(
     socket: &tcp::Socket<'_>,
     nat: &TransparentTcpNat,
     bytes: &[u8],
+    tls: bool,
 ) -> Option<HostHttpRequest> {
     let text = std::str::from_utf8(bytes).ok()?;
     let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text, ""));
@@ -201,7 +292,10 @@ fn parse_http_request(
     let url = if target.starts_with("http://") || target.starts_with("https://") {
         target
     } else {
-        format!("http://{authority}{target}")
+        format!(
+            "{}://{authority}{target}",
+            if tls { "https" } else { "http" }
+        )
     };
 
     Some(HostHttpRequest {
@@ -314,6 +408,46 @@ impl phy::TxToken for LibkrunTxToken<'_> {
         self.nat.rewrite_host_frame(&mut frame);
         let _ = write_ethernet_frame(self.stream, &frame);
         result
+    }
+}
+
+struct TlsAcceptor {
+    config: Arc<rustls::ServerConfig>,
+}
+
+struct TlsConnection {
+    tls: rustls::ServerConnection,
+}
+
+impl TlsAcceptor {
+    fn new(config: MitmTlsConfig) -> io::Result<Self> {
+        let ca_key = rcgen::KeyPair::from_pem(&config.ca_private_key_pem)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        let ca = rcgen::Issuer::from_ca_cert_pem(&config.ca_certificate_pem, ca_key)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        let leaf_key = rcgen::KeyPair::generate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        let leaf =
+            rcgen::CertificateParams::new(vec!["127.0.0.1".to_string(), "localhost".to_string()])
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?
+                .signed_by(&leaf_key, &ca)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        let cert_chain = vec![CertificateDer::from(leaf.der().to_vec())];
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key_der)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        Ok(Self {
+            config: Arc::new(config),
+        })
+    }
+
+    fn connection(&self) -> TlsConnection {
+        TlsConnection {
+            tls: rustls::ServerConnection::new(self.config.clone())
+                .expect("TLS server config should create connections"),
+        }
     }
 }
 

@@ -1,7 +1,10 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
 import { existsSync } from "node:fs";
+import http from "node:http";
+import https from "node:https";
 import { resolve } from "node:path";
+import { rootCertificates } from "node:tls";
 import { BSON } from "bson";
 import type { HostControlChannel } from "./control.ts";
 import type { NativeSpawnSandboxOptions } from "./native.ts";
@@ -225,8 +228,8 @@ export class HostProcessSandboxVm implements HostControlChannel {
   async #handleHttpRequest(document: Record<string, unknown>): Promise<void> {
     const id = typeof document.id === "string" ? document.id : "";
     try {
-      const http = this.#options.network?.http;
-      if (http === undefined) {
+      const interception = this.#options.network?.http;
+      if (interception === undefined) {
         throw new Error("HTTP interception is not configured");
       }
 
@@ -237,7 +240,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
         destinationIp: assertString(document.destinationIp, "destinationIp"),
         headers,
       };
-      if (isProtectedDestination(request.destinationIp, http.protectedRanges ?? [])) {
+      if (isProtectedDestination(request.destinationIp, interception.protectedRanges ?? [])) {
         this.#child.stdin.write(encodePacket({
           type: "host.http.response",
           id,
@@ -249,7 +252,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
         return;
       }
 
-      const decision = await http.policy(request);
+      const decision = await interception.policy(request);
       if (decision.action === "deny") {
         this.#child.stdin.write(encodePacket({
           type: "host.http.response",
@@ -262,23 +265,24 @@ export class HostProcessSandboxVm implements HostControlChannel {
         return;
       }
 
-      const outboundHeaders = http.modifyRequestHeaders === undefined
-        ? headers
-        : await http.modifyRequestHeaders(headers);
-      const upstream = await fetch(request.url, {
+      const outboundHeaders = decision.headers ?? headers;
+      const upstream = await requestUpstream(request.url, {
         method: request.method,
         headers: outboundHeaders,
         body: request.method === "GET" || request.method === "HEAD"
           ? undefined
           : binaryField(document.body, "body"),
+        extraCaCertificatePem: interception.ca === "ephemeral"
+          ? undefined
+          : interception.ca?.certificatePem,
       });
       this.#child.stdin.write(encodePacket({
         type: "host.http.response",
         id,
         ok: true,
         status: upstream.status,
-        headers: responseHeadersFromFetch(upstream.headers),
-        body: new Uint8Array(await upstream.arrayBuffer()),
+        headers: responseHeadersFromNode(upstream.headers),
+        body: upstream.body,
       }));
     } catch (error) {
       this.#child.stdin.write(encodePacket({
@@ -336,7 +340,66 @@ function binaryField(value: unknown, field: string): Uint8Array {
   throw new Error(`host HTTP request ${field} must be binary`);
 }
 
-function responseHeadersFromFetch(headers: Headers): { name: string; value: string }[] {
+async function requestUpstream(url: string, input: {
+  readonly method: string;
+  readonly headers: Record<string, string>;
+  readonly body?: Uint8Array;
+  readonly extraCaCertificatePem?: string;
+}): Promise<{
+  readonly status: number;
+  readonly headers: http.IncomingHttpHeaders;
+  readonly body: Uint8Array;
+}> {
+  const parsed = new URL(url);
+  const client = parsed.protocol === "https:" ? https : http;
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`unsupported upstream URL protocol: ${parsed.protocol}`);
+  }
+
+  return await new Promise((resolvePromise, reject) => {
+    const request = client.request({
+      protocol: parsed.protocol,
+      hostname: parsed.hostname,
+      port: parsed.port,
+      path: `${parsed.pathname}${parsed.search}`,
+      method: input.method,
+      headers: input.headers,
+      ca: parsed.protocol === "https:" && input.extraCaCertificatePem !== undefined
+        ? [...rootCertificates, input.extraCaCertificatePem]
+        : undefined,
+    }, (response) => {
+      const chunks: Uint8Array[] = [];
+      response.on("data", (chunk: Uint8Array) => {
+        chunks.push(chunk);
+      });
+      response.on("end", () => {
+        resolvePromise({
+          status: response.statusCode ?? 502,
+          headers: response.headers,
+          body: concatBytes(chunks),
+        });
+      });
+    });
+    request.once("error", reject);
+    if (input.body !== undefined) {
+      request.write(input.body);
+    }
+    request.end();
+  });
+}
+
+function concatBytes(chunks: readonly Uint8Array[]): Uint8Array {
+  const size = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
+  const result = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return result;
+}
+
+function responseHeadersFromNode(headers: http.IncomingHttpHeaders): { name: string; value: string }[] {
   const hopByHop = new Set([
     "connection",
     "content-length",
@@ -348,9 +411,20 @@ function responseHeadersFromFetch(headers: Headers): { name: string; value: stri
     "transfer-encoding",
     "upgrade",
   ]);
-  return Array.from(headers.entries())
-    .filter(([name]) => !hopByHop.has(name.toLowerCase()))
-    .map(([name, value]) => ({ name, value }));
+  const result: { name: string; value: string }[] = [];
+  for (const [name, value] of Object.entries(headers)) {
+    if (hopByHop.has(name.toLowerCase()) || value === undefined) {
+      continue;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        result.push({ name, value: item });
+      }
+    } else {
+      result.push({ name, value });
+    }
+  }
+  return result;
 }
 
 function isProtectedDestination(destinationIp: string, ranges: readonly string[]): boolean {
@@ -413,6 +487,7 @@ function encodeHostSpawn(options: NativeSpawnSandboxOptions): Uint8Array {
       : {
           protectedRanges: options.network.http.protectedRanges ?? [],
           caCertificatePem: options.network.http.caCertificatePem,
+          caPrivateKeyPem: options.network.http.caPrivateKeyPem,
         },
   });
 }

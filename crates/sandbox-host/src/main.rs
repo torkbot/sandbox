@@ -205,6 +205,7 @@ fn parse_network_http(
     Ok(Some(HttpSpecInput {
         protected_ranges,
         ca_certificate_pem: optional_string(document, "caCertificatePem"),
+        ca_private_key_pem: optional_string(document, "caPrivateKeyPem"),
     }))
 }
 

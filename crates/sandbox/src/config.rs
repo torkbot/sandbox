@@ -67,6 +67,7 @@ pub struct NetworkSpec {
 pub struct HttpSpec {
     pub protected_ranges: Vec<String>,
     pub ca_certificate_pem: Option<String>,
+    pub ca_private_key_pem: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +146,7 @@ impl MicroVmSpec {
             http: Some(HttpSpec {
                 protected_ranges: http.protected_ranges,
                 ca_certificate_pem: http.ca_certificate_pem,
+                ca_private_key_pem: http.ca_private_key_pem,
             }),
         });
         crate::network::NetworkPlan::from_http(
@@ -254,6 +256,7 @@ pub struct MountSpecInput {
 pub struct HttpSpecInput {
     pub protected_ranges: Vec<String>,
     pub ca_certificate_pem: Option<String>,
+    pub ca_private_key_pem: Option<String>,
 }
 
 #[cfg(test)]
@@ -308,6 +311,9 @@ mod tests {
             protected_ranges: vec!["127.0.0.0/8".to_string()],
             ca_certificate_pem: Some(
                 "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----".to_string(),
+            ),
+            ca_private_key_pem: Some(
+                "-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----".to_string(),
             ),
         });
 

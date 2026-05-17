@@ -106,6 +106,7 @@ pub struct NativeMountOptions {
 pub struct NativeHttpOptions {
     pub protected_ranges: Option<Vec<String>>,
     pub ca_certificate_pem: Option<String>,
+    pub ca_private_key_pem: Option<String>,
 }
 
 #[napi(object)]
@@ -176,6 +177,7 @@ impl NativeSpawnSandboxOptions {
                 network.http.map(|http| HttpSpecInput {
                     protected_ranges: http.protected_ranges.unwrap_or_default(),
                     ca_certificate_pem: http.ca_certificate_pem,
+                    ca_private_key_pem: http.ca_private_key_pem,
                 })
             }),
         }
