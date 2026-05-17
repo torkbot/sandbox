@@ -128,13 +128,13 @@ Passing:
 
 - `HTTP networking transparently intercepts guest TCP over explicit virtio-net`
   - Covers guest interface, route, and transparent TCP interception through the in-process backend.
-
-Failing:
-
 - `caller protected ranges extend the default network deny set`
   - Configure a custom CIDR and assert pre-policy block.
 - `public destinations reach JavaScript policy`
   - Request a non-protected destination and assert policy evidence.
+
+Failing:
+
 - `DNS-dependent traffic is observable and cannot bypass policy`
   - Guest requests a hostname without `--connect-to`; assert DNS behavior and policy evidence.
 - `DNS resolution to a protected IP is still blocked before policy`
@@ -152,13 +152,13 @@ Passing:
 
 - `VM host artifact has no libkrun/libkrunfw dynamic dependency and is signed on macOS`
   - Covers dynamic dependency rejection and macOS HVF entitlement checks on `sandbox-host`.
-
-Failing:
-
 - `unsigned Node is acceptable because VM launch goes through sandbox-host`
   - Assert the hypervisor-owning process is the helper, not the Node process.
 - `project kernel and init artifacts are selected explicitly`
   - Assert runtime uses `projectKernel()` and `projectInit()` artifacts without dynamic discovery.
+
+Failing:
+
 - `Linux host CI runs the core VM/control/network contract`
   - The CI job should prove the same required e2e subset on a Linux host with KVM.
 - `rootfs fixture builds reproducibly`
