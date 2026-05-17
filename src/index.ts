@@ -1,7 +1,7 @@
 import { loadNativeBinding } from "./native.ts";
 import { HostControlTransport } from "./control.ts";
 import { HostProcessSandboxVm } from "./host-process.ts";
-import { SqliteFsHandleImpl } from "./sqlite-fs.ts";
+import { isSandboxWritableFileSystem } from "./vfs.ts";
 import type { NativeSpawnSandboxOptions } from "./native.ts";
 export { HostControlTransport } from "./control.ts";
 
@@ -81,38 +81,13 @@ export interface SandboxWritableFileSystem extends SandboxFileSystem {
 export type SandboxVirtualFileSystem = SandboxFileSystem;
 export type SandboxMountedFileSystem = SandboxFileSystem;
 
-export type SqliteFsMountConfig = {
-  readonly kind: "sqlite-fs";
-  readonly path: string;
-  readonly name: string;
-  readonly database: SqliteFsDatabase;
-};
-
-export interface SqliteFsDatabase {
-  readonly open: boolean;
-  prepare(sql: string): SqliteFsStatement;
-  exec(sql: string): Promise<void>;
-  transaction<TArgs extends readonly unknown[], TResult>(
-    fn: (...args: TArgs) => Promise<TResult>,
-  ): (...args: TArgs) => Promise<TResult>;
-}
-
-export interface SqliteFsStatement {
-  run(...parameters: readonly unknown[]): Promise<{
-    readonly changes: number;
-    readonly lastInsertRowid: number;
-  }>;
-  get(...parameters: readonly unknown[]): Promise<unknown>;
-  all(...parameters: readonly unknown[]): Promise<readonly unknown[]>;
-}
-
 export type VirtualFsMountConfig = {
   readonly kind: "virtual-fs";
   readonly path: string;
   readonly fileSystem: SandboxVirtualFileSystem;
 };
 
-export type MountConfig = SqliteFsMountConfig | VirtualFsMountConfig;
+export type MountConfig = VirtualFsMountConfig;
 
 export interface HttpPolicyRequest {
   readonly method: string;
@@ -152,17 +127,8 @@ export interface SandboxOptions {
   readonly network?: NetworkConfig;
 }
 
-export interface SqliteFsSnapshot {
-  readonly files: Record<string, { readonly type: "file"; readonly contents: string }>;
-}
-
-export interface SqliteFsHandle extends SandboxWritableFileSystem {
-  snapshot(): Promise<SqliteFsSnapshot>;
-}
-
 export interface SandboxMounts {
   get(path: string): SandboxMountedFileSystem;
-  sqliteFs(path: string): SqliteFsHandle;
   virtualFs(path: string): SandboxVirtualFileSystem;
 }
 
@@ -238,17 +204,6 @@ export function prebuiltRootfs(path: string, options: Omit<RootfsConfig, "kind" 
     path,
     readonly: options.readonly ?? true,
     format: options.format,
-  };
-}
-
-export function sqliteFsMount(input: {
-  readonly path: string;
-  readonly name: string;
-  readonly database: SqliteFsDatabase;
-}): SqliteFsMountConfig {
-  return {
-    kind: "sqlite-fs",
-    ...input,
   };
 }
 
@@ -330,26 +285,12 @@ class NativeBackedSandboxVm implements SandboxVm {
 
 class ConfiguredSandboxMounts implements SandboxMounts {
   readonly #mounts = new Map<string, SandboxMountedFileSystem>();
-  readonly #sqliteMounts = new Map<string, SqliteFsHandle>();
   readonly #virtualMounts = new Map<string, SandboxVirtualFileSystem>();
 
   constructor(mounts: readonly MountConfig[]) {
     for (const mount of mounts) {
-      switch (mount.kind) {
-        case "sqlite-fs": {
-          const handle = new SqliteFsHandleImpl({
-            name: mount.name,
-            database: mount.database,
-          });
-          this.#mounts.set(mount.path, handle);
-          this.#sqliteMounts.set(mount.path, handle);
-          break;
-        }
-        case "virtual-fs":
-          this.#mounts.set(mount.path, mount.fileSystem);
-          this.#virtualMounts.set(mount.path, mount.fileSystem);
-          break;
-      }
+      this.#mounts.set(mount.path, mount.fileSystem);
+      this.#virtualMounts.set(mount.path, mount.fileSystem);
     }
   }
 
@@ -357,14 +298,6 @@ class ConfiguredSandboxMounts implements SandboxMounts {
     const mount = this.#mounts.get(path);
     if (mount === undefined) {
       throw new Error(`sandbox mount not found: ${path}`);
-    }
-    return mount;
-  }
-
-  sqliteFs(path: string): SqliteFsHandle {
-    const mount = this.#sqliteMounts.get(path);
-    if (mount === undefined) {
-      throw new Error(`sqliteFs mount not found: ${path}`);
     }
     return mount;
   }
@@ -396,19 +329,11 @@ function toNativeSpawnOptions(options: SandboxOptions): NativeSpawnSandboxOption
     },
     rootfsOverlay: options.rootfsOverlay,
     mounts: options.mounts?.map((mount) => {
-      switch (mount.kind) {
-        case "sqlite-fs":
-          return {
-            kind: mount.kind,
-            path: mount.path,
-            name: mount.name,
-          };
-        case "virtual-fs":
-          return {
-            kind: mount.kind,
-            path: mount.path,
-          };
-      }
+      return {
+        kind: mount.kind,
+        path: mount.path,
+        writable: isSandboxWritableFileSystem(mount.fileSystem),
+      };
     }),
     network: options.network === undefined
       ? undefined
@@ -451,9 +376,6 @@ function validateSandboxOptions(options: SandboxOptions): void {
       throw new Error(`invalid spawnSandbox options: duplicate mount path: ${mount.path}`);
     }
     mountPaths.add(mount.path);
-    if (mount.kind === "sqlite-fs" && mount.name.length === 0) {
-      throw new Error("invalid spawnSandbox options: sqliteFsMount.name must not be empty");
-    }
   }
 
   for (const range of options.network?.http?.protectedRanges ?? []) {

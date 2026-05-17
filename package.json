@@ -34,7 +34,6 @@
     "node": ">=24.0.0"
   },
   "dependencies": {
-    "@tursodatabase/database": "^0.5.3",
     "bson": "^7.2.0"
   }
 }

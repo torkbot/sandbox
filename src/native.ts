@@ -31,13 +31,9 @@ export type NativeSpawnSandboxOptions = {
   };
   readonly mounts?: readonly (
     | {
-        readonly kind: "sqlite-fs";
-        readonly path: string;
-        readonly name: string;
-      }
-    | {
         readonly kind: "virtual-fs";
         readonly path: string;
+        readonly writable?: boolean;
       }
   )[];
   readonly network?: {

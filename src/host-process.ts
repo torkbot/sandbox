@@ -8,7 +8,7 @@ import { rootCertificates } from "node:tls";
 import { Binary, BSON } from "bson";
 import type { HostControlChannel } from "./control.ts";
 import type { NativeSpawnSandboxOptions } from "./native.ts";
-import { isSandboxWritableFileSystem, SqliteFsHandleImpl } from "./sqlite-fs.ts";
+import { isSandboxWritableFileSystem } from "./vfs.ts";
 import type {
   HttpPolicyRequest,
   SandboxOptions,
@@ -44,12 +44,6 @@ export class HostProcessSandboxVm implements HostControlChannel {
     for (const mount of options.mounts ?? []) {
       if (mount.kind === "virtual-fs") {
         this.#hostFs.set(mount.path, mount.fileSystem);
-      }
-      if (mount.kind === "sqlite-fs") {
-        this.#hostFs.set(mount.path, new SqliteFsHandleImpl({
-          name: mount.name,
-          database: mount.database,
-        }));
       }
     }
     child.stdout.on("data", (chunk: Buffer) => {

@@ -129,21 +129,12 @@ fn virtual_fs_devices(
         .iter()
         .enumerate()
         .filter_map(|(index, mount)| match mount {
-            MountSpec::VirtualFs { path } => {
+            MountSpec::VirtualFs { path, writable } => {
                 let tag = format!("vfs{index}");
                 Some(VirtualFsDevice {
                     tag,
                     path: path.clone(),
-                    readonly: true,
-                    backend: NodeVirtualFs::new(path.clone(), bridge.clone()),
-                })
-            }
-            MountSpec::SqliteFs { path, .. } => {
-                let tag = format!("vfs{index}");
-                Some(VirtualFsDevice {
-                    tag,
-                    path: path.clone(),
-                    readonly: false,
+                    readonly: !writable,
                     backend: NodeVirtualFs::new(path.clone(), bridge.clone()),
                 })
             }
@@ -184,7 +175,7 @@ fn parse_mounts(values: &[bson::Bson]) -> Result<Vec<MountSpecInput>, Box<dyn st
             Ok(MountSpecInput {
                 kind: document.get_str("kind")?.to_string(),
                 path: document.get_str("path")?.to_string(),
-                name: optional_string(document, "name"),
+                writable: optional_bool(document, "writable"),
             })
         })
         .collect()

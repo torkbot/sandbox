@@ -99,7 +99,7 @@ pub struct NativeRootfsOverlayOptions {
 pub struct NativeMountOptions {
     pub kind: String,
     pub path: String,
-    pub name: Option<String>,
+    pub writable: Option<bool>,
 }
 
 #[napi(object)]
@@ -170,7 +170,7 @@ impl NativeSpawnSandboxOptions {
                 .map(|mount| MountSpecInput {
                     kind: mount.kind,
                     path: mount.path,
-                    name: mount.name,
+                    writable: mount.writable,
                 })
                 .collect(),
             network_http: self.network.and_then(|network| {

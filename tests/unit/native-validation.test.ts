@@ -5,7 +5,6 @@ import {
   projectInit,
   projectKernel,
   spawnSandbox,
-  sqliteFsMount,
   virtualFsMount,
 } from "../../src/index.ts";
 
@@ -142,32 +141,4 @@ test("virtualFsMount preserves the host filesystem object", () => {
   assert.equal(mount.kind, "virtual-fs");
   assert.equal(mount.path, "/sandbox");
   assert.equal(mount.fileSystem, virtualFs);
-});
-
-test("sqliteFsMount requires a supplied database handle", () => {
-  const database = {
-    open: true,
-    prepare() {
-      throw new Error("not reached");
-    },
-    async exec() {
-      throw new Error("not reached");
-    },
-    transaction<TArgs extends readonly unknown[], TResult>(
-      fn: (...args: TArgs) => Promise<TResult>,
-    ) {
-      return fn;
-    },
-  };
-
-  const mount = sqliteFsMount({
-    path: "/data",
-    name: "state",
-    database,
-  });
-
-  assert.equal(mount.kind, "sqlite-fs");
-  assert.equal(mount.path, "/data");
-  assert.equal(mount.name, "state");
-  assert.equal(mount.database, database);
 });

@@ -10,7 +10,6 @@ pub struct MountTable {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlannedMount {
-    SqliteFs { name: String },
     VirtualFs,
 }
 
@@ -25,10 +24,7 @@ impl MountTable {
 
         for mount in mounts {
             let (path, planned) = match mount {
-                MountSpec::SqliteFs { path, name } => {
-                    (path.as_str(), PlannedMount::SqliteFs { name: name.clone() })
-                }
-                MountSpec::VirtualFs { path } => (path.as_str(), PlannedMount::VirtualFs),
+                MountSpec::VirtualFs { path, .. } => (path.as_str(), PlannedMount::VirtualFs),
             };
 
             if path == "/" {
@@ -77,25 +73,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plans_sqlite_and_virtual_mounts_by_guest_path() {
-        let table = MountTable::plan(&[
-            MountSpec::SqliteFs {
-                path: "/workspace".to_string(),
-                name: "workspace".to_string(),
-            },
-            MountSpec::VirtualFs {
-                path: "/sandbox".to_string(),
-            },
-        ])
+    fn plans_virtual_mounts_by_guest_path() {
+        let table = MountTable::plan(&[MountSpec::VirtualFs {
+            path: "/sandbox".to_string(),
+            writable: false,
+        }])
         .unwrap();
 
-        assert_eq!(table.len(), 2);
-        assert_eq!(
-            table.get("/workspace"),
-            Some(&PlannedMount::SqliteFs {
-                name: "workspace".to_string(),
-            }),
-        );
+        assert_eq!(table.len(), 1);
         assert_eq!(table.get("/sandbox"), Some(&PlannedMount::VirtualFs));
     }
 
@@ -104,9 +89,11 @@ mod tests {
         let err = MountTable::plan(&[
             MountSpec::VirtualFs {
                 path: "/sandbox".to_string(),
+                writable: false,
             },
             MountSpec::VirtualFs {
                 path: "/sandbox".to_string(),
+                writable: true,
             },
         ])
         .unwrap_err();
@@ -118,6 +105,7 @@ mod tests {
     fn rejects_mounting_over_root() {
         let err = MountTable::plan(&[MountSpec::VirtualFs {
             path: "/".to_string(),
+            writable: false,
         }])
         .unwrap_err();
 

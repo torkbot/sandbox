@@ -54,8 +54,7 @@ pub enum RootfsOverlaySpec {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MountSpec {
-    SqliteFs { path: String, name: String },
-    VirtualFs { path: String },
+    VirtualFs { path: String, writable: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,17 +213,10 @@ impl MountSpec {
         }
 
         match input.kind.as_str() {
-            "sqlite-fs" => {
-                let name = input
-                    .name
-                    .filter(|name| !name.is_empty())
-                    .ok_or_else(|| SpecError::new("sqliteFsMount.name must not be empty"))?;
-                Ok(Self::SqliteFs {
-                    path: input.path,
-                    name,
-                })
-            }
-            "virtual-fs" => Ok(Self::VirtualFs { path: input.path }),
+            "virtual-fs" => Ok(Self::VirtualFs {
+                path: input.path,
+                writable: input.writable.unwrap_or(false),
+            }),
             other => Err(SpecError::new(format!("unsupported mount.kind: {other}"))),
         }
     }
@@ -249,7 +241,7 @@ pub struct MicroVmSpecInput {
 pub struct MountSpecInput {
     pub kind: String,
     pub path: String,
-    pub name: Option<String>,
+    pub writable: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,18 +287,11 @@ mod tests {
     fn keeps_requested_mount_and_network_shape() {
         let mut input = valid_input();
         input.rootfs_overlay_mode = Some("writable".to_string());
-        input.mounts = vec![
-            MountSpecInput {
-                kind: "sqlite-fs".to_string(),
-                path: "/workspace".to_string(),
-                name: Some("workspace".to_string()),
-            },
-            MountSpecInput {
-                kind: "virtual-fs".to_string(),
-                path: "/sandbox".to_string(),
-                name: None,
-            },
-        ];
+        input.mounts = vec![MountSpecInput {
+            kind: "virtual-fs".to_string(),
+            path: "/sandbox".to_string(),
+            writable: Some(true),
+        }];
         input.network_http = Some(HttpSpecInput {
             protected_ranges: vec!["127.0.0.0/8".to_string()],
             ca_certificate_pem: Some(
@@ -322,15 +307,10 @@ mod tests {
         assert_eq!(spec.rootfs_overlay, Some(RootfsOverlaySpec::Writable));
         assert_eq!(
             spec.mounts,
-            vec![
-                MountSpec::SqliteFs {
-                    path: "/workspace".to_string(),
-                    name: "workspace".to_string(),
-                },
-                MountSpec::VirtualFs {
-                    path: "/sandbox".to_string(),
-                },
-            ],
+            vec![MountSpec::VirtualFs {
+                path: "/sandbox".to_string(),
+                writable: true,
+            }],
         );
         assert_eq!(
             spec.network.unwrap().http.unwrap().protected_ranges,
@@ -362,7 +342,7 @@ mod tests {
         input.mounts = vec![MountSpecInput {
             kind: "virtual-fs".to_string(),
             path: "sandbox".to_string(),
-            name: None,
+            writable: None,
         }];
 
         let err = MicroVmSpec::build(input).unwrap_err();
