@@ -60,8 +60,33 @@ test("a VM can run with a writable root overlay and publish a new EROFS rootfs",
   });
 });
 
-test("immutable root remains the default when overlay mode is absent", () => {
-  assert.fail("runtime rootfs writes must fail unless writable overlay mode is explicitly requested");
+test("immutable root remains the default when overlay mode is absent", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const vm = await spawnSandbox({
+    name: "immutable-root-default",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuestShell(vm, {
+    id: "immutable-root-default",
+    script: "mkdir -p /opt/sandbox",
+  });
+
+  assert.notEqual(result.exitCode, 0);
+  assert.match(result.stderr, /Read-only file system|read-only/i);
 });
 
 test("writable root overlay captures guest mutations", () => {

@@ -63,12 +63,15 @@ Failing:
 
 This file owns build-time rootfs mutation and artifact publishing. Runtime VMs should stay immutable by default.
 
+Passing:
+
+- `immutable root remains the default when overlay mode is absent`
+  - Assert root writes fail in normal runtime mode.
+
 Failing:
 
 - `a VM can run with a writable root overlay and publish a new EROFS rootfs`
   - This exists as a required e2e test and should fail until rootfs overlay and EROFS snapshotting are implemented.
-- `immutable root remains the default when overlay mode is absent`
-  - Assert root writes fail in normal runtime mode.
 - `writable root overlay captures guest mutations`
   - Opt into overlay mode, mutate root, and verify the base rootfs remains unchanged.
 - `rootfs snapshot returns bytes and digest without forcing a host output path`
