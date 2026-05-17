@@ -36,6 +36,7 @@ fn configure_http_network(args: impl Iterator<Item = String>) -> Result<(), Init
     run_setup_command("/sbin/ip", &["link", "set", "eth0", "up"])?;
     run_setup_command("/sbin/ip", &["addr", "add", "10.0.2.2/24", "dev", "eth0"])?;
     run_setup_command("/sbin/ip", &["route", "add", "default", "via", "10.0.2.1"])?;
+    install_resolver_config()?;
     Ok(())
 }
 
@@ -58,6 +59,40 @@ fn run_setup_command(program: &str, args: &[&str]) -> Result<(), InitError> {
         args.join(" "),
         String::from_utf8_lossy(&output.stderr)
     )))
+}
+
+#[cfg(target_os = "linux")]
+fn install_resolver_config() -> Result<(), InitError> {
+    use std::ffi::CString;
+    use std::path::Path;
+
+    const RESOLV_CONF: &str = "nameserver 10.0.2.1\noptions timeout:1 attempts:1\n";
+
+    std::fs::create_dir_all("/run/sandbox")
+        .map_err(|error| InitError(format!("create /run/sandbox: {error}")))?;
+    std::fs::write("/run/sandbox/resolv.conf", RESOLV_CONF)
+        .map_err(|error| InitError(format!("write sandbox resolver config: {error}")))?;
+    if !Path::new("/etc/resolv.conf").exists() {
+        std::fs::write("/etc/resolv.conf", RESOLV_CONF)
+            .map_err(|error| InitError(format!("write /etc/resolv.conf: {error}")))?;
+        return Ok(());
+    }
+
+    let source = CString::new("/run/sandbox/resolv.conf").unwrap();
+    let target = CString::new("/etc/resolv.conf").unwrap();
+    let result = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    };
+    if result < 0 {
+        return Err(InitError::last_os("bind mount sandbox resolver config"));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

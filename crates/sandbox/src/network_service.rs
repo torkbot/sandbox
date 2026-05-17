@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Cursor, Read, Write};
+use std::net::ToSocketAddrs;
 use std::os::fd::{IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -14,15 +15,18 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
-use smoltcp::socket::tcp;
+use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
 
 const HOST_HTTP_PROBE_PORT: u16 = 8080;
 const HOST_HTTP_PORT: u16 = 80;
 const HOST_HTTPS_PORT: u16 = 443;
+const HOST_DNS_PORT: u16 = 53;
 const HTTP_LISTENERS_PER_PORT: usize = 16;
 const HTTP_SOCKET_BUFFER_BYTES: usize = 256 * 1024;
+const DNS_PACKET_BUFFER_BYTES: usize = 4096;
+const DNS_PROTECTED_TEST_IP: [u8; 4] = [10, 1, 2, 3];
 const HOST_HTTP_PROBE_RESPONSE: &[u8] =
     b"HTTP/1.1 200 OK\r\ncontent-length: 25\r\nconnection: close\r\n\r\nsandbox explicit network\n";
 
@@ -122,6 +126,7 @@ fn run_network_service(
         let _ = addresses.push(IpCidr::new(Ipv4Address::new(10, 0, 2, 1).into(), 24));
     });
     let mut sockets = SocketSet::new(Vec::new());
+    let dns_handle = add_dns_socket(&mut sockets);
     let mut http_sockets = HashMap::new();
     let mut http_connections = HashMap::new();
     add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTP_PORT);
@@ -134,6 +139,7 @@ fn run_network_service(
     while !shutdown.load(Ordering::Acquire) {
         let timestamp = Instant::now();
         let _ = iface.poll(timestamp, &mut device, &mut sockets);
+        poll_dns_socket(&mut sockets, dns_handle);
         for port in device.nat.host_ports() {
             add_http_listener(&mut sockets, &mut http_sockets, port);
         }
@@ -154,6 +160,36 @@ fn run_network_service(
             );
         }
         thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn add_dns_socket(sockets: &mut SocketSet<'_>) -> SocketHandle {
+    let rx = udp::PacketBuffer::new(
+        vec![udp::PacketMetadata::EMPTY; 8],
+        vec![0; DNS_PACKET_BUFFER_BYTES],
+    );
+    let tx = udp::PacketBuffer::new(
+        vec![udp::PacketMetadata::EMPTY; 8],
+        vec![0; DNS_PACKET_BUFFER_BYTES],
+    );
+    let mut socket = udp::Socket::new(rx, tx);
+    let _ = socket.bind(HOST_DNS_PORT);
+    sockets.add(socket)
+}
+
+fn poll_dns_socket(sockets: &mut SocketSet<'_>, handle: SocketHandle) {
+    let socket = sockets.get_mut::<udp::Socket>(handle);
+    while socket.can_recv() && socket.can_send() {
+        let Ok((request, remote)) = socket.recv() else {
+            return;
+        };
+        let Some(response) = dns_response(request) else {
+            continue;
+        };
+        let _ = socket.send_slice(
+            &response,
+            IpEndpoint::new(remote.endpoint.addr, remote.endpoint.port),
+        );
     }
 }
 
@@ -506,6 +542,79 @@ fn encode_http_response(response: HostHttpResponse) -> Vec<u8> {
 
 fn upstream_failure_response() -> Vec<u8> {
     b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 20\r\nconnection: close\r\n\r\nupstream unavailable".to_vec()
+}
+
+fn dns_response(request: &[u8]) -> Option<Vec<u8>> {
+    if request.len() < 12 {
+        return None;
+    }
+
+    let query_count = u16::from_be_bytes([request[4], request[5]]);
+    if query_count != 1 {
+        return None;
+    }
+
+    let (name, question_end) = parse_dns_name(request, 12)?;
+    if request.len() < question_end + 4 {
+        return None;
+    }
+    let qtype = u16::from_be_bytes([request[question_end], request[question_end + 1]]);
+    let qclass = u16::from_be_bytes([request[question_end + 2], request[question_end + 3]]);
+
+    let answer = if qclass == 1 && qtype == 1 {
+        dns_address(&name)
+    } else {
+        None
+    };
+
+    let mut response = Vec::new();
+    response.extend_from_slice(&request[0..2]);
+    response.extend_from_slice(if answer.is_some() { &[0x81, 0x80] } else { &[0x81, 0x83] });
+    response.extend_from_slice(&request[4..6]);
+    response.extend_from_slice(&(answer.is_some() as u16).to_be_bytes());
+    response.extend_from_slice(&[0, 0, 0, 0]);
+    response.extend_from_slice(&request[12..question_end + 4]);
+
+    if let Some(address) = answer {
+        response.extend_from_slice(&[0xc0, 0x0c]);
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&60u32.to_be_bytes());
+        response.extend_from_slice(&4u16.to_be_bytes());
+        response.extend_from_slice(&address);
+    }
+
+    Some(response)
+}
+
+fn parse_dns_name(packet: &[u8], mut offset: usize) -> Option<(String, usize)> {
+    let mut labels = Vec::new();
+    loop {
+        let len = usize::from(*packet.get(offset)?);
+        offset += 1;
+        if len == 0 {
+            return Some((labels.join("."), offset));
+        }
+        if len > 63 || packet.len() < offset + len {
+            return None;
+        }
+        let label = std::str::from_utf8(&packet[offset..offset + len]).ok()?;
+        labels.push(label.to_ascii_lowercase());
+        offset += len;
+    }
+}
+
+fn dns_address(name: &str) -> Option<[u8; 4]> {
+    if name == "protected.sandbox.test" {
+        return Some(DNS_PROTECTED_TEST_IP);
+    }
+    (name, 0)
+        .to_socket_addrs()
+        .ok()?
+        .find_map(|addr| match addr.ip() {
+            std::net::IpAddr::V4(address) => Some(address.octets()),
+            std::net::IpAddr::V6(_) => None,
+        })
 }
 
 struct LibkrunNetDevice {
