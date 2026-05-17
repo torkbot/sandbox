@@ -479,6 +479,9 @@ function validateSandboxOptions(options: SandboxOptions): void {
     if (options.rootfs.path.length === 0) {
       throw new Error("invalid spawnSandbox options: rootfs.path must not be empty");
     }
+    if (options.rootfs.format === "directory") {
+      throw new Error("invalid spawnSandbox options: directory rootfs is not supported for sandboxed VM launch; use an EROFS rootfs");
+    }
   }
 
   const mountPaths = new Set<string>();

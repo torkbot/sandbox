@@ -23,6 +23,19 @@ test("spawnSandbox rejects invalid CPU config before runtime launch", async () =
   );
 });
 
+test("spawnSandbox rejects directory rootfs before runtime launch", async () => {
+  await assert.rejects(
+    spawnSandbox({
+      kernel: projectKernel(),
+      init: projectInit(),
+      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20", {
+        format: "directory",
+      }),
+    }),
+    /invalid spawnSandbox options: directory rootfs is not supported for sandboxed VM launch; use an EROFS rootfs/,
+  );
+});
+
 test("spawnSandbox rejects relative mount paths before runtime launch", async () => {
   await assert.rejects(
     spawnSandbox({

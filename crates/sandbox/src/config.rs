@@ -127,6 +127,11 @@ impl MicroVmSpec {
             readonly: input.rootfs_readonly.unwrap_or(true),
             format: RootfsFormat::parse(&input.rootfs_format)?,
         };
+        if rootfs.format == RootfsFormat::Directory {
+            return Err(SpecError::new(
+                "directory rootfs is not supported for sandboxed VM launch; use an EROFS rootfs",
+            ));
+        }
 
         let rootfs_overlay = input
             .rootfs_overlay_mode

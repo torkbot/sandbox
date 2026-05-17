@@ -4,6 +4,7 @@ import { once } from "node:events";
 import { existsSync } from "node:fs";
 import http from "node:http";
 import https from "node:https";
+import { isIP } from "node:net";
 import { resolve } from "node:path";
 import { rootCertificates } from "node:tls";
 import { Binary, BSON } from "bson";
@@ -406,7 +407,8 @@ export class HostProcessSandboxVm implements HostControlChannel {
         ...DEFAULT_PROTECTED_RANGES,
         ...(interception.protectedRanges ?? []),
       ];
-      if (await isProtectedHttpRequest(request, protectedRanges)) {
+      const protection = await inspectHttpProtection(request, protectedRanges);
+      if (protection.blocked) {
         this.#child.stdin.write(encodePacket({
           type: "host.http.response",
           id,
@@ -440,6 +442,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
           status: 0,
           headers: responseHeadersFromRecord(outboundHeaders),
           body: new Uint8Array(),
+          upstreamIp: protection.upstreamIp,
         }));
         return;
       }
@@ -451,6 +454,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
           ? undefined
           : binaryField(document.body, "body"),
         extraCaCertificatePem: interception.ca?.certificatePem,
+        upstreamIp: protection.upstreamIp,
       });
       this.#child.stdin.write(encodePacket({
         type: "host.http.response",
@@ -572,6 +576,7 @@ async function requestUpstream(url: string, input: {
   readonly headers: Record<string, string>;
   readonly body?: Uint8Array;
   readonly extraCaCertificatePem?: string;
+  readonly upstreamIp?: string;
 }): Promise<{
   readonly status: number;
   readonly headers: http.IncomingHttpHeaders;
@@ -586,11 +591,14 @@ async function requestUpstream(url: string, input: {
   return await new Promise((resolvePromise, reject) => {
     const request = client.request({
       protocol: parsed.protocol,
-      hostname: parsed.hostname,
+      hostname: input.upstreamIp ?? parsed.hostname,
       port: parsed.port,
       path: `${parsed.pathname}${parsed.search}`,
       method: input.method,
       headers: outboundRequestHeaders(input.headers),
+      servername: parsed.protocol === "https:" && isIP(parsed.hostname) === 0
+        ? parsed.hostname
+        : undefined,
       ca: parsed.protocol === "https:" && input.extraCaCertificatePem !== undefined
         ? [...rootCertificates, input.extraCaCertificatePem]
         : undefined,
@@ -704,20 +712,24 @@ function isProtectedDestination(destinationIp: string, ranges: readonly string[]
   });
 }
 
-async function isProtectedHttpRequest(
+async function inspectHttpProtection(
   request: HttpPolicyRequest,
   ranges: readonly string[],
-): Promise<boolean> {
+): Promise<{ readonly blocked: boolean; readonly upstreamIp?: string }> {
   if (isProtectedDestination(request.destinationIp, ranges)) {
-    return true;
+    return { blocked: true };
   }
 
-  for (const address of await resolveUrlAddresses(request.url)) {
+  const addresses = await resolveUrlAddresses(request.url);
+  for (const address of addresses) {
     if (isProtectedDestination(address, ranges)) {
-      return true;
+      return { blocked: true };
     }
   }
-  return false;
+  return {
+    blocked: false,
+    ...(addresses[0] === undefined ? {} : { upstreamIp: addresses[0] }),
+  };
 }
 
 async function resolveUrlAddresses(url: string): Promise<string[]> {

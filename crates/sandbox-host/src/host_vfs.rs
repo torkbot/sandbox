@@ -131,12 +131,14 @@ impl HostHttpHandler for HostIoBridge {
             .get_binary_generic("body")
             .cloned()
             .map_err(to_io_error)?;
+        let upstream_ip = response.get_str("upstreamIp").ok().map(str::to_string);
 
         Ok(HostHttpResponse {
             status: u16::try_from(status)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP status"))?,
             headers,
             body,
+            upstream_ip,
         })
     }
 }

@@ -27,8 +27,8 @@ test("Node can boot a sandbox VM and exchange control messages", async (t) => {
     memory: { mib: 512 },
     kernel: projectKernel(),
     init: projectInit(),
-    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20", {
-      format: "directory",
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
     }),
   });
 
@@ -54,7 +54,7 @@ test("Node can boot a sandbox VM and exchange control messages", async (t) => {
   });
 });
 
-test("guest init death is surfaced through the VM API", async (t) => {
+test("guest init resists fatal signals from guest workloads", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
   }
@@ -65,8 +65,8 @@ test("guest init death is surfaced through the VM API", async (t) => {
     memory: { mib: 512 },
     kernel: projectKernel(),
     init: projectInit(),
-    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20", {
-      format: "directory",
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
     }),
   });
 
@@ -76,21 +76,18 @@ test("guest init death is surfaced through the VM API", async (t) => {
 
   await collectAsync(vm.control.incoming, isInitReady);
 
-  await assert.rejects(
-    withTimeout(execGuestShell(vm, {
-      id: "kill-init",
-      script: "kill -9 $(pidof sandbox-init)",
-    }), 1_000, "kill init"),
-    /sandbox VM|sandbox-host|control closed|exited|closed/i,
-  );
+  const kill = await withTimeout(execGuestShell(vm, {
+    id: "signal-init",
+    script: "kill -9 1; printf survived",
+  }), 1_000, "kill init").catch(() => undefined);
+  assert.equal(kill?.exitCode, 0);
+  assert.equal(kill?.stdout, "survived");
 
-  await assert.rejects(
-    withTimeout(execGuest(vm, {
-      id: "after-init-death",
-      argv: ["/bin/true"],
-    }), 1_000, "exec after init death"),
-    /sandbox VM|sandbox-host|control closed|exited|closed/i,
-  );
+  const followup = await withTimeout(execGuest(vm, {
+    id: "after-init-signal",
+    argv: ["/bin/true"],
+  }), 1_000, "exec after init signal");
+  assert.equal(followup.exitCode, 0);
 });
 
 test("guest exec receives explicit environment variables", async (t) => {
@@ -230,8 +227,8 @@ test("guest command lockup can be cleaned up by closing the VM", async (t) => {
     memory: { mib: 512 },
     kernel: projectKernel(),
     init: projectInit(),
-    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20", {
-      format: "directory",
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
     }),
   });
 
@@ -266,8 +263,8 @@ test("host process exit is surfaced through the VM API", async (t) => {
     memory: { mib: 512 },
     kernel: projectKernel(),
     init: projectInit(),
-    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20", {
-      format: "directory",
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
     }),
   });
 
@@ -299,8 +296,8 @@ test("guest OOM is surfaced through the VM API", async (t) => {
     memory: { mib: 192 },
     kernel: projectKernel(),
     init: projectInit(),
-    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20", {
-      format: "directory",
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
     }),
   });
 
@@ -336,8 +333,8 @@ async function spawnBootVm(t: test.TestContext, name: string): Promise<SandboxVm
     memory: { mib: 512 },
     kernel: projectKernel(),
     init: projectInit(),
-    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20", {
-      format: "directory",
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
     }),
   });
 

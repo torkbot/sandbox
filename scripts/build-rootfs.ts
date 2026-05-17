@@ -1,6 +1,7 @@
 import { copyFile, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { spawn } from "node:child_process";
+import { getgid, getuid } from "node:process";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 const image = process.env.SANDBOX_ROOTFS_IMAGE ?? "alpine:3.20";
@@ -21,7 +22,7 @@ await run("docker", [
   image,
   "sh",
   "-lc",
-  "apk add --no-cache curl && cd / && tar --exclude=out --exclude=proc --exclude=sys --exclude=dev --exclude=tmp -cf - . | tar -C /out -xf -",
+  `apk add --no-cache curl && cd / && tar --exclude=out --exclude=proc --exclude=sys --exclude=dev --exclude=tmp -cf - . | tar -C /out -xf - && chown -R ${getuid?.() ?? 0}:${getgid?.() ?? 0} /out`,
 ]);
 
 await assertExists(initPath);

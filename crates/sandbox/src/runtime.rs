@@ -536,8 +536,8 @@ mod tests {
     }
 
     #[test]
-    fn configures_directory_rootfs() {
-        let spec = MicroVmSpec::build(MicroVmSpecInput {
+    fn rejects_directory_rootfs() {
+        let err = MicroVmSpec::build(MicroVmSpecInput {
             name: Some("directory-root".to_string()),
             vcpus: Some(1),
             memory_mib: Some(128),
@@ -550,10 +550,12 @@ mod tests {
             mounts: Vec::new(),
             network_http: None,
         })
-        .unwrap();
+        .unwrap_err();
 
-        let context = KrunContext::create(&spec).unwrap();
-        let _ = context.id();
+        assert_eq!(
+            err.to_string(),
+            "directory rootfs is not supported for sandboxed VM launch; use an EROFS rootfs"
+        );
     }
 
     #[test]

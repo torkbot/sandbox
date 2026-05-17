@@ -56,6 +56,7 @@ pub struct HostHttpResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    pub upstream_ip: Option<String>,
 }
 
 pub trait HostHttpHandler: Send + Sync + 'static {
@@ -369,7 +370,11 @@ fn poll_plain_http_socket(
     };
     match response {
         Some(response) if response.status == 0 => {
-            connection.upstream = Some(start_plain_upstream_stream(request, response.headers));
+            connection.upstream = Some(start_plain_upstream_stream(
+                request,
+                response.headers,
+                response.upstream_ip,
+            ));
             poll_upstream_stream(connection);
         }
         Some(response) => {
@@ -686,10 +691,11 @@ fn upstream_failure_response() -> Vec<u8> {
 fn start_plain_upstream_stream(
     request: HostHttpRequest,
     headers: Vec<(String, String)>,
+    upstream_ip: Option<String>,
 ) -> Receiver<Option<Vec<u8>>> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        if let Err(sent_any) = stream_plain_upstream(request, headers, &tx) {
+        if let Err(sent_any) = stream_plain_upstream(request, headers, upstream_ip, &tx) {
             if sent_any {
                 let _ = tx.send(None);
                 return;
@@ -704,11 +710,13 @@ fn start_plain_upstream_stream(
 fn stream_plain_upstream(
     request: HostHttpRequest,
     headers: Vec<(String, String)>,
+    upstream_ip: Option<String>,
     tx: &mpsc::Sender<Option<Vec<u8>>>,
 ) -> Result<(), bool> {
     let parsed = ParsedHttpUrl::parse(&request.url).map_err(|_| false)?;
     let mut sent_any = false;
-    let mut stream = TcpStream::connect((parsed.host.as_str(), parsed.port)).map_err(|_| sent_any)?;
+    let dial_host = upstream_ip.as_deref().unwrap_or(parsed.host.as_str());
+    let mut stream = TcpStream::connect((dial_host, parsed.port)).map_err(|_| sent_any)?;
     stream.set_read_timeout(Some(Duration::from_secs(2))).map_err(|_| sent_any)?;
     stream.set_write_timeout(Some(Duration::from_secs(2))).map_err(|_| sent_any)?;
     let outbound = encode_upstream_http_request(&request, &headers, &parsed);
