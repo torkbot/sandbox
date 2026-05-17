@@ -37,27 +37,19 @@ const sqliteFsDatabase = {
   },
 };
 
-test("immutable root, SQLite-backed filesystem, and virtual filesystem mounts behave as designed", async (t) => {
+test("virtual filesystem mounts are backed by host JavaScript callbacks", async (t) => {
   if (!requireVmLaunchSupport(t)) {
-    return;
-  }
-  if (!skipUntilImplemented(t, "guest virtual and sqlite filesystem mounts")) {
     return;
   }
 
   const vm = await spawnSandbox({
-    name: "filesystem",
+    name: "virtual-filesystem",
     kernel: projectKernel(),
     init: projectInit(),
     rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
       format: "erofs",
     }),
     mounts: [
-      sqliteFsMount({
-        path: "/workspace",
-        name: "workspace",
-        database: sqliteFsDatabase,
-      }),
       virtualFsMount("/sandbox", {
         async stat(path) {
           if (path === "/") {
@@ -102,17 +94,24 @@ test("immutable root, SQLite-backed filesystem, and virtual filesystem mounts be
   await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
 
   const checks = await execGuestShell(vm, {
-    id: "filesystem-checks",
+    id: "virtual-filesystem-checks",
     script: `
-      set -eu
-      test ! -w /
-      echo hello > /workspace/hello.txt
-      test "$(cat /workspace/hello.txt)" = "hello"
-      test "$(cat /sandbox/status.json)" = '{"status":"ready"}'
+      set -u
+      root_status=0
+      test ! -w / || root_status=$?
+      contents="$(cat /sandbox/status.json)"
+      echo "root_status=$root_status"
+      echo "contents=$contents"
+      test "$root_status" = "0"
+      test "$contents" = '{"status":"ready"}'
     `,
   });
 
-  assert.equal(checks.exitCode, 0);
+  assert.equal(
+    checks.exitCode,
+    0,
+    `guest filesystem checks failed\nstdout:\n${checks.stdout}\nstderr:\n${checks.stderr}`,
+  );
 
   assert.equal((await vm.mounts.get("/sandbox").stat("/status.json")).type, "file");
   assert.deepEqual(await vm.mounts.get("/sandbox").list("/"), [
@@ -125,14 +124,56 @@ test("immutable root, SQLite-backed filesystem, and virtual filesystem mounts be
   });
   assert.equal(Buffer.from(virtualRead).toString("utf8"), '{"status":"ready"}\n');
 
+  await writeEvidence("fs.json", {
+    virtualRead: Buffer.from(virtualRead).toString("utf8"),
+  });
+});
+
+test("immutable root and SQLite-backed filesystem mounts behave as designed", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+  if (!skipUntilImplemented(t, "guest sqlite filesystem mounts")) {
+    return;
+  }
+
+  const vm = await spawnSandbox({
+    name: "sqlite-filesystem",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    mounts: [
+      sqliteFsMount({
+        path: "/workspace",
+        name: "workspace",
+        database: sqliteFsDatabase,
+      }),
+    ],
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const checks = await execGuestShell(vm, {
+    id: "sqlite-filesystem-checks",
+    script: `
+      set -eu
+      test ! -w /
+      echo hello > /workspace/hello.txt
+      test "$(cat /workspace/hello.txt)" = "hello"
+    `,
+  });
+
+  assert.equal(checks.exitCode, 0);
+
   const snapshot = await vm.mounts.sqliteFs("/workspace").snapshot();
   assert.deepEqual(snapshot.files["/hello.txt"], {
     type: "file",
     contents: "hello\n",
-  });
-
-  await writeEvidence("fs.json", {
-    rootfs: await vm.rootfs.hash(),
-    snapshot,
   });
 });

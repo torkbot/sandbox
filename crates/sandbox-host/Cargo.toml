@@ -7,4 +7,5 @@ repository.workspace = true
 
 [dependencies]
 bson = "3.1"
+libc = "0.2"
 sandbox = { path = "../sandbox" }

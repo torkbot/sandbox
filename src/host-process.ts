@@ -5,25 +5,33 @@ import { resolve } from "node:path";
 import { BSON } from "bson";
 import type { HostControlChannel } from "./control.ts";
 import type { NativeSpawnSandboxOptions } from "./native.ts";
+import type { SandboxOptions, SandboxVirtualFileSystem } from "./index.ts";
 
 export class HostProcessSandboxVm implements HostControlChannel {
   readonly hasControlSocket = true;
 
   readonly #child: ChildProcessWithoutNullStreams;
   readonly #packets: Uint8Array[] = [];
+  readonly #virtualFs = new Map<string, SandboxVirtualFileSystem>();
   #buffer = new Uint8Array();
+  #stderr = "";
   #closed = false;
   #exitError: Error | null = null;
 
-  private constructor(child: ChildProcessWithoutNullStreams) {
+  private constructor(child: ChildProcessWithoutNullStreams, options: SandboxOptions) {
     this.#child = child;
+    for (const mount of options.mounts ?? []) {
+      if (mount.kind === "virtual-fs") {
+        this.#virtualFs.set(mount.path, mount.fileSystem);
+      }
+    }
     child.stdout.on("data", (chunk: Buffer) => {
       this.#receive(chunk);
     });
     child.stderr.on("data", (chunk: Buffer) => {
       const text = chunk.toString("utf8").trim();
       if (text.length > 0) {
-        this.#exitError = new Error(`sandbox-host stderr: ${text}`);
+        this.#stderr = this.#stderr.length === 0 ? text : `${this.#stderr}\n${text}`;
       }
     });
     child.on("exit", (code, signal) => {
@@ -31,26 +39,31 @@ export class HostProcessSandboxVm implements HostControlChannel {
         return;
       }
 
-      this.#exitError = new Error(
+      const exitText =
         signal === null
           ? `sandbox-host exited with ${code ?? "unknown status"}`
-          : `sandbox-host exited from signal ${signal}`,
+          : `sandbox-host exited from signal ${signal}`;
+      this.#exitError = new Error(
+        this.#stderr.length === 0 ? exitText : `${exitText}\n${this.#stderr}`,
       );
     });
   }
 
-  static async spawn(options: NativeSpawnSandboxOptions): Promise<HostProcessSandboxVm> {
+  static async spawn(
+    options: SandboxOptions,
+    nativeOptions: NativeSpawnSandboxOptions,
+  ): Promise<HostProcessSandboxVm> {
     const child = spawn(hostBinaryPath(), ["--stdio"], {
       stdio: ["pipe", "pipe", "pipe"],
     });
-    const vm = new HostProcessSandboxVm(child);
+    const vm = new HostProcessSandboxVm(child, options);
     await Promise.race([
       once(child, "spawn"),
       once(child, "error").then(([error]) => {
         throw error;
       }),
     ]);
-    child.stdin.write(encodeHostSpawn(options));
+    child.stdin.write(encodeHostSpawn(nativeOptions));
     return vm;
   }
 
@@ -70,11 +83,25 @@ export class HostProcessSandboxVm implements HostControlChannel {
     }
 
     this.#closed = true;
+    const exited = this.#child.exitCode !== null || this.#child.signalCode !== null
+      ? Promise.resolve()
+      : once(this.#child, "exit").then(() => undefined);
+
     this.#child.stdin.destroy();
-    this.#child.kill();
+    this.#child.kill("SIGTERM");
     await Promise.race([
-      once(this.#child, "exit"),
-      new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 100)),
+      exited,
+      delay(500),
+    ]);
+
+    if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
+      return;
+    }
+
+    this.#child.kill("SIGKILL");
+    await Promise.race([
+      exited,
+      delay(1_000),
     ]);
   }
 
@@ -100,8 +127,84 @@ export class HostProcessSandboxVm implements HostControlChannel {
         return;
       }
 
-      this.#packets.push(this.#buffer.slice(0, packetLength));
+      const packet = this.#buffer.slice(0, packetLength);
       this.#buffer = this.#buffer.slice(packetLength);
+      if (!this.#routeHostPacket(packet)) {
+        this.#packets.push(packet);
+      }
+    }
+  }
+
+  #routeHostPacket(packet: Uint8Array): boolean {
+    let document: Record<string, unknown>;
+    try {
+      document = BSON.deserialize(packet.slice(4)) as Record<string, unknown>;
+    } catch {
+      return false;
+    }
+
+    const type = document.type;
+    if (type !== "host.vfs.stat" && type !== "host.vfs.list" && type !== "host.vfs.read") {
+      return false;
+    }
+
+    void this.#handleVirtualFsRequest(document);
+    return true;
+  }
+
+  async #handleVirtualFsRequest(document: Record<string, unknown>): Promise<void> {
+    const id = typeof document.id === "string" ? document.id : "";
+    try {
+      const mountPath = assertString(document.mountPath, "mountPath");
+      const path = assertString(document.path, "path");
+      const fileSystem = this.#virtualFs.get(mountPath);
+      if (fileSystem === undefined) {
+        throw new Error(`virtualFs mount not found: ${mountPath}`);
+      }
+
+      switch (document.type) {
+        case "host.vfs.stat": {
+          this.#child.stdin.write(encodePacket({
+            type: "host.vfs.response",
+            id,
+            ok: true,
+            stat: await fileSystem.stat(path),
+          }));
+          return;
+        }
+        case "host.vfs.list": {
+          this.#child.stdin.write(encodePacket({
+            type: "host.vfs.response",
+            id,
+            ok: true,
+            entries: await fileSystem.list(path),
+          }));
+          return;
+        }
+        case "host.vfs.read": {
+          const offset = assertNumber(document.offset, "offset");
+          const size = assertNumber(document.size, "size");
+          const contents = await fileSystem.read({
+            path,
+            range: { offset, length: size },
+            signal: AbortSignal.timeout(30_000),
+          });
+          this.#child.stdin.write(encodePacket({
+            type: "host.vfs.response",
+            id,
+            ok: true,
+            contents,
+          }));
+          return;
+        }
+      }
+    } catch (error) {
+      this.#child.stdin.write(encodePacket({
+        type: "host.vfs.response",
+        id,
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      }));
     }
   }
 }
@@ -112,6 +215,24 @@ export function hostBinaryPath(): string {
     throw new Error(`sandbox-host is not built: ${path}`);
   }
   return path;
+}
+
+function assertString(value: unknown, field: string): string {
+  if (typeof value !== "string") {
+    throw new Error(`host vfs request ${field} must be a string`);
+  }
+  return value;
+}
+
+function assertNumber(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`host vfs request ${field} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
 }
 
 function encodeHostSpawn(options: NativeSpawnSandboxOptions): Uint8Array {

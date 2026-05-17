@@ -10,6 +10,7 @@ use std::thread::{self, JoinHandle};
 use crate::MicroVmSpec;
 use crate::config::{KernelFormat, RootfsFormat};
 use crate::control::INIT_CONTROL_PORT;
+use crate::vfs::VirtioVirtualFsBackend;
 
 #[derive(Debug)]
 pub struct KrunContext {
@@ -38,6 +39,13 @@ pub struct KrunError {
 
 impl KrunContext {
     pub fn create(spec: &MicroVmSpec) -> Result<Self, KrunError> {
+        Self::create_with_virtual_fs(spec, &[])
+    }
+
+    pub fn create_with_virtual_fs(
+        spec: &MicroVmSpec,
+        virtual_fs: &[VirtualFsDevice],
+    ) -> Result<Self, KrunError> {
         init_krun_logging();
         let raw_id = krun::krun_create_ctx();
         if raw_id < 0 {
@@ -49,10 +57,26 @@ impl KrunContext {
 
         let context = Self { id: raw_id as u32 };
         context.apply_vm_config(spec)?;
+        context.apply_console_output()?;
         context.apply_kernel(spec)?;
         context.apply_rootfs(spec)?;
-        context.apply_init(spec)?;
+        for device in virtual_fs {
+            context.add_virtual_fs(device)?;
+        }
+        context.apply_init(spec, virtual_fs)?;
         Ok(context)
+    }
+
+    fn add_virtual_fs(&self, device: &VirtualFsDevice) -> Result<(), KrunError> {
+        check_krun(
+            "krun_add_virtual_virtiofs",
+            krun::krun_add_virtual_virtiofs(
+                self.id,
+                device.tag.clone(),
+                device.backend.clone(),
+                Some(1 << 29),
+            ),
+        )
     }
 
     pub fn add_control_socket_fd(&self, fd: RawFd) -> Result<(), KrunError> {
@@ -71,6 +95,20 @@ impl KrunContext {
             "krun_set_vm_config",
             krun::krun_set_vm_config(self.id, spec.vcpus, spec.memory_mib),
         )
+    }
+
+    fn apply_console_output(&self) -> Result<(), KrunError> {
+        let Some(path) = std::env::var_os("SANDBOX_CONSOLE_OUTPUT") else {
+            return check_krun(
+                "krun_disable_implicit_console",
+                krun::krun_disable_implicit_console(self.id),
+            );
+        };
+        let path = CString::new(path.to_string_lossy().as_bytes())
+            .map_err(|_| KrunError::new("SANDBOX_CONSOLE_OUTPUT", -libc::EINVAL))?;
+        check_krun("krun_set_console_output", unsafe {
+            krun::krun_set_console_output(self.id, path.as_ptr())
+        })
     }
 
     fn apply_kernel(&self, spec: &MicroVmSpec) -> Result<(), KrunError> {
@@ -109,32 +147,56 @@ impl KrunContext {
                     )
                 })?;
 
-                let device = CString::new("/dev/vda").unwrap();
-                let fstype = CString::new("erofs").unwrap();
-                let options = CString::new(if spec.rootfs.readonly { "ro" } else { "rw" }).unwrap();
-                check_krun("krun_set_root_disk_remount", unsafe {
-                    krun::krun_set_root_disk_remount(
+                check_krun(
+                    "krun_set_direct_block_root",
+                    krun::krun_set_direct_block_root(
                         self.id,
-                        device.as_ptr(),
-                        fstype.as_ptr(),
-                        options.as_ptr(),
-                    )
-                })
+                        "/dev/vda".to_string(),
+                        "erofs".to_string(),
+                        if spec.rootfs.readonly { "ro" } else { "rw" }.to_string(),
+                        "/sandbox-init".to_string(),
+                    ),
+                )
             }
         }
     }
 
-    fn apply_init(&self, _spec: &MicroVmSpec) -> Result<(), KrunError> {
-        // Temporary bridge: current libkrun still injects its own stage-0 init,
-        // which then execs our Rust init after the root is mounted. The target
-        // is direct Rust init injection through the libkrun fork.
+    fn apply_init(
+        &self,
+        _spec: &MicroVmSpec,
+        virtual_fs: &[VirtualFsDevice],
+    ) -> Result<(), KrunError> {
+        // Keep exec metadata populated for directory-root compatibility. EROFS
+        // roots boot directly through krun_set_direct_block_root.
         let exec_path = CString::new("/sandbox-init").unwrap();
-        let argv = [exec_path.as_ptr(), std::ptr::null()];
-        let envp = [std::ptr::null()];
+        let encoded_mounts = encode_virtual_fs_mounts(virtual_fs);
+        let mount_arg = CString::new(format!("--virtiofs-mounts={encoded_mounts}")).unwrap();
+        let mount_env = CString::new(format!("SANDBOX_VIRTIOFS_MOUNTS={encoded_mounts}")).unwrap();
+        let argv = [exec_path.as_ptr(), mount_arg.as_ptr(), std::ptr::null()];
+        let envp = [mount_env.as_ptr(), std::ptr::null()];
         check_krun("krun_set_exec", unsafe {
             krun::krun_set_exec(self.id, exec_path.as_ptr(), argv.as_ptr(), envp.as_ptr())
         })
     }
+}
+
+pub struct VirtualFsDevice {
+    pub tag: String,
+    pub path: String,
+    pub backend: Arc<dyn VirtioVirtualFsBackend>,
+}
+
+fn encode_virtual_fs_mounts(virtual_fs: &[VirtualFsDevice]) -> String {
+    let mut value = String::new();
+    for (index, device) in virtual_fs.iter().enumerate() {
+        if index > 0 {
+            value.push(';');
+        }
+        value.push_str(&device.tag);
+        value.push('=');
+        value.push_str(&device.path);
+    }
+    value
 }
 
 fn init_krun_logging() {
@@ -186,7 +248,14 @@ unsafe extern "C" {
 
 impl KrunVm {
     pub fn create(spec: &MicroVmSpec) -> Result<Self, KrunError> {
-        let context = KrunContext::create(spec)?;
+        Self::create_with_virtual_fs(spec, Vec::new())
+    }
+
+    pub fn create_with_virtual_fs(
+        spec: &MicroVmSpec,
+        virtual_fs: Vec<VirtualFsDevice>,
+    ) -> Result<Self, KrunError> {
+        let context = KrunContext::create_with_virtual_fs(spec, &virtual_fs)?;
         let (host_socket, guest_socket) =
             UnixStream::pair().map_err(|_| KrunError::new("UnixStream::pair", -libc::EIO))?;
 

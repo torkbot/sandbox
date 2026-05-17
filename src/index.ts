@@ -249,10 +249,14 @@ export function virtualFsMount(path: string, fileSystem: SandboxVirtualFileSyste
 export async function spawnSandbox(options: SandboxOptions): Promise<SandboxVm> {
   validateSandboxOptions(options);
   const nativeOptions = toNativeSpawnOptions(options);
-  const nativeVm = process.platform === "darwin"
-    ? await HostProcessSandboxVm.spawn(nativeOptions)
+  const nativeVm = shouldUseHostProcess(options)
+    ? await HostProcessSandboxVm.spawn(options, nativeOptions)
     : await loadNativeBinding().spawnSandbox(nativeOptions);
   return new NativeBackedSandboxVm(nativeVm, options);
+}
+
+function shouldUseHostProcess(options: SandboxOptions): boolean {
+  return process.platform === "darwin" || (options.mounts ?? []).some((mount) => mount.kind === "virtual-fs");
 }
 
 class NativeBackedSandboxVm implements SandboxVm {

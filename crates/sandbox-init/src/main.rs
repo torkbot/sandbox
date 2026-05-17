@@ -10,11 +10,135 @@ fn main() {
 }
 
 fn run() -> Result<(), InitError> {
+    mount_kernel_filesystems()?;
+    mount_virtual_filesystems(
+        std::env::args().skip(1),
+        std::env::var("SANDBOX_VIRTIOFS_MOUNTS").ok(),
+    )?;
     let packet = init_ready_packet()?;
     let mut control = connect_control()?;
     send_init_ready(&mut control, &packet)?;
     run_control_loop(&mut control)?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn mount_kernel_filesystems() -> Result<(), InitError> {
+    mount_fs("proc", "/proc", "proc", 0)?;
+    mount_fs("sysfs", "/sys", "sysfs", 0)?;
+    mount_fs("devtmpfs", "/dev", "devtmpfs", 0)?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_kernel_filesystems() -> Result<(), InitError> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn mount_fs(
+    source: &str,
+    target: &str,
+    fstype: &str,
+    flags: libc::c_ulong,
+) -> Result<(), InitError> {
+    use std::ffi::CString;
+    use std::path::Path;
+
+    std::fs::create_dir_all(Path::new(target))
+        .map_err(|error| InitError(format!("create mount point {target}: {error}")))?;
+
+    let source = CString::new(source)
+        .map_err(|_| InitError(format!("mount source contains nul: {source}")))?;
+    let target_cstr = CString::new(target)
+        .map_err(|_| InitError(format!("mount target contains nul: {target}")))?;
+    let fstype = CString::new(fstype)
+        .map_err(|_| InitError(format!("mount fstype contains nul: {fstype}")))?;
+
+    let result = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target_cstr.as_ptr(),
+            fstype.as_ptr(),
+            flags,
+            std::ptr::null(),
+        )
+    };
+    if result < 0 {
+        if std::io::Error::last_os_error().raw_os_error() == Some(libc::EBUSY) {
+            return Ok(());
+        }
+        return Err(InitError::last_os(&format!("mount {target}")));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn mount_virtual_filesystems(
+    args: impl Iterator<Item = String>,
+    env_mounts: Option<String>,
+) -> Result<(), InitError> {
+    use std::ffi::CString;
+    use std::path::Path;
+
+    let mounts = args
+        .filter_map(|arg| arg.strip_prefix("--virtiofs-mounts=").map(str::to_string))
+        .next()
+        .or(env_mounts)
+        .or_else(read_mounts_from_proc_cmdline);
+    let Some(mounts) = mounts else { return Ok(()) };
+
+    for mount in mounts.split(';').filter(|mount| !mount.is_empty()) {
+        let (tag, path) = mount
+            .split_once('=')
+            .ok_or_else(|| InitError(format!("invalid virtual filesystem mount: {mount}")))?;
+        std::fs::create_dir_all(Path::new(path))
+            .map_err(|error| InitError(format!("create mount point {path}: {error}")))?;
+
+        let source = CString::new(tag)
+            .map_err(|_| InitError(format!("virtual filesystem tag contains nul: {tag}")))?;
+        let target = CString::new(path)
+            .map_err(|_| InitError(format!("virtual filesystem path contains nul: {path}")))?;
+        let fstype = CString::new("virtiofs").unwrap();
+        let options = CString::new("ro").unwrap();
+
+        let result = unsafe {
+            libc::mount(
+                source.as_ptr(),
+                target.as_ptr(),
+                fstype.as_ptr(),
+                libc::MS_RDONLY,
+                options.as_ptr().cast(),
+            )
+        };
+        if result < 0 {
+            return Err(InitError::last_os(&format!(
+                "mount virtiofs {tag} at {path}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_virtual_filesystems(
+    _args: impl Iterator<Item = String>,
+    _env_mounts: Option<String>,
+) -> Result<(), InitError> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_mounts_from_proc_cmdline() -> Option<String> {
+    let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;
+    for token in cmdline.split_ascii_whitespace() {
+        let token = token.trim_matches('"');
+        if let Some(value) = token.strip_prefix("SANDBOX_VIRTIOFS_MOUNTS=") {
+            return Some(value.trim_matches('"').to_string());
+        }
+    }
+    None
 }
 
 fn init_ready_packet() -> Result<Vec<u8>, InitError> {

@@ -1,12 +1,18 @@
 use std::env;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
 use bson::Document;
+use sandbox::config::MountSpec;
 use sandbox::config::{HttpSpecInput, MicroVmSpecInput, MountSpecInput};
+use sandbox::runtime::VirtualFsDevice;
+
+mod host_vfs;
+
+use host_vfs::{HostIoBridge, NodeVirtualFs};
 
 const USAGE: &str = "usage: sandbox-host --capabilities | --stdio";
 
@@ -26,16 +32,14 @@ fn main() -> ExitCode {
 }
 
 fn print_capabilities() {
-    println!(
-        concat!(
-            "{{",
-            "\"schemaVersion\":1,",
-            "\"vmHost\":true,",
-            "\"controlTransport\":\"unix-fd\",",
-            "\"hypervisorEntitlementProcess\":true",
-            "}}"
-        )
-    );
+    println!(concat!(
+        "{{",
+        "\"schemaVersion\":1,",
+        "\"vmHost\":true,",
+        "\"controlTransport\":\"unix-fd\",",
+        "\"hypervisorEntitlementProcess\":true",
+        "}}"
+    ));
 }
 
 fn run_stdio() -> ExitCode {
@@ -54,20 +58,25 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
     drop(stdin);
 
     let spec = sandbox::MicroVmSpec::build(parse_spawn(spawn_document)?)?;
-    let mut vm = sandbox::runtime::KrunVm::create(&spec)?;
+    let bridge = HostIoBridge::new();
+    let virtual_fs = virtual_fs_devices(&spec, bridge.clone());
+    let mut vm = sandbox::runtime::KrunVm::create_with_virtual_fs(&spec, virtual_fs)?;
     vm.start()?;
 
     let (command_tx, command_rx) = mpsc::channel::<Vec<u8>>();
+    let stdin_bridge = bridge.clone();
     thread::spawn(move || {
         let mut stdin = io::stdin().lock();
-        while let Ok(packet) = read_raw_packet(&mut stdin) {
+        while let Ok((packet, document)) = read_packet(&mut stdin) {
+            if stdin_bridge.route_response(document) {
+                continue;
+            }
             if command_tx.send(packet).is_err() {
                 break;
             }
         }
     });
 
-    let mut stdout = io::stdout().lock();
     loop {
         if let Some(result) = vm.start_status() {
             result?;
@@ -78,8 +87,7 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if let Some(packet) = vm.control_socket_mut().try_read_packet()? {
-            stdout.write_all(&packet)?;
-            stdout.flush()?;
+            bridge.write_raw_packet(&packet)?;
         }
 
         thread::sleep(Duration::from_millis(10));
@@ -87,12 +95,11 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn read_document_packet(reader: &mut impl Read) -> Result<Document, Box<dyn std::error::Error>> {
-    let packet = read_raw_packet(reader)?;
-    let document = Document::from_reader(&packet[4..])?;
+    let (_packet, document) = read_packet(reader)?;
     Ok(document)
 }
 
-fn read_raw_packet(reader: &mut impl Read) -> io::Result<Vec<u8>> {
+fn read_packet(reader: &mut impl Read) -> io::Result<(Vec<u8>, Document)> {
     let mut len = [0; 4];
     reader.read_exact(&mut len)?;
     let frame_len = u32::from_le_bytes(len) as usize;
@@ -100,7 +107,30 @@ fn read_raw_packet(reader: &mut impl Read) -> io::Result<Vec<u8>> {
     packet.extend_from_slice(&len);
     packet.resize(4 + frame_len, 0);
     reader.read_exact(&mut packet[4..])?;
-    Ok(packet)
+    let document = Document::from_reader(&packet[4..])
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    Ok((packet, document))
+}
+
+fn virtual_fs_devices(
+    spec: &sandbox::MicroVmSpec,
+    bridge: std::sync::Arc<HostIoBridge>,
+) -> Vec<VirtualFsDevice> {
+    spec.mounts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, mount)| match mount {
+            MountSpec::VirtualFs { path } => {
+                let tag = format!("vfs{index}");
+                Some(VirtualFsDevice {
+                    tag,
+                    path: path.clone(),
+                    backend: NodeVirtualFs::new(path.clone(), bridge.clone()),
+                })
+            }
+            MountSpec::SqliteFs { .. } => None,
+        })
+        .collect()
 }
 
 fn parse_spawn(document: Document) -> Result<MicroVmSpecInput, Box<dyn std::error::Error>> {
@@ -111,8 +141,12 @@ fn parse_spawn(document: Document) -> Result<MicroVmSpecInput, Box<dyn std::erro
 
     Ok(MicroVmSpecInput {
         name: optional_string(&document, "name"),
-        vcpus: optional_i32(&document, "vcpus").map(u32::try_from).transpose()?,
-        memory_mib: optional_i32(&document, "memoryMib").map(u32::try_from).transpose()?,
+        vcpus: optional_i32(&document, "vcpus")
+            .map(u32::try_from)
+            .transpose()?,
+        memory_mib: optional_i32(&document, "memoryMib")
+            .map(u32::try_from)
+            .transpose()?,
         kernel_format: optional_string(&document, "kernelFormat"),
         init_crate: document.get_str("initCrate")?.to_string(),
         rootfs_path: document.get_str("rootfsPath")?.to_string(),
@@ -138,7 +172,9 @@ fn parse_mounts(values: &[bson::Bson]) -> Result<Vec<MountSpecInput>, Box<dyn st
         .collect()
 }
 
-fn parse_network_http(document: Option<&Document>) -> Result<Option<HttpSpecInput>, Box<dyn std::error::Error>> {
+fn parse_network_http(
+    document: Option<&Document>,
+) -> Result<Option<HttpSpecInput>, Box<dyn std::error::Error>> {
     let Some(document) = document else {
         return Ok(None);
     };

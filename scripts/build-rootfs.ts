@@ -26,6 +26,11 @@ await run("docker", [
 
 await assertExists(initPath);
 await copyFile(initPath, resolve(outDir, "sandbox-init"));
+await mkdir(resolve(outDir, "dev"), { recursive: true });
+await mkdir(resolve(outDir, "proc"), { recursive: true });
+await mkdir(resolve(outDir, "sandbox"), { recursive: true });
+await mkdir(resolve(outDir, "sys"), { recursive: true });
+await mkdir(resolve(outDir, "workspace"), { recursive: true });
 
 console.log(`rootfs directory written to ${outDir}`);
 

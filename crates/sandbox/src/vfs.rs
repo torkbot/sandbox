@@ -5,10 +5,10 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use krun_devices::virtio::bindings;
+pub use krun_devices::virtio::bindings;
 pub use krun_devices::virtio::fs::{
-    Context as VirtioFsContext, DirEntry as VirtioFsDirEntry, Entry as VirtioFsEntry,
-    FileSystem as VirtioFileSystem, FsOptions as VirtioFsOptions,
+    Entry as VirtioFsEntry, VirtualDirEntry as VirtioFsDirEntry,
+    VirtualFsBackend as VirtioVirtualFsBackend,
 };
 
 /// Inode used by host-provided virtual mounts.
@@ -49,6 +49,10 @@ pub trait HostVirtualFileSystem: Send + Sync + 'static {
     fn lookup(&self, parent: VirtualInode, name: &CStr) -> io::Result<VirtioFsEntry>;
 
     fn getattr(&self, inode: VirtualInode) -> io::Result<(bindings::stat64, Duration)>;
+
+    fn readdir(&self, inode: VirtualInode) -> io::Result<Vec<VirtioFsDirEntry>>;
+
+    fn read(&self, inode: VirtualInode, offset: u64, size: u32) -> io::Result<Vec<u8>>;
 }
 
 /// Adapter from Sandbox's host VFS contract into libkrun's virtio-fs contract.
@@ -60,33 +64,6 @@ pub struct VirtualFsAdapter {
 impl VirtualFsAdapter {
     pub fn new(inner: Arc<dyn HostVirtualFileSystem>) -> Self {
         Self { inner }
-    }
-}
-
-impl VirtioFileSystem for VirtualFsAdapter {
-    type Inode = VirtualInode;
-    type Handle = VirtualHandle;
-
-    fn init(&self, capable: VirtioFsOptions) -> io::Result<VirtioFsOptions> {
-        Ok(capable & VirtioFsOptions::DO_READDIRPLUS)
-    }
-
-    fn lookup(
-        &self,
-        _ctx: VirtioFsContext,
-        parent: Self::Inode,
-        name: &CStr,
-    ) -> io::Result<VirtioFsEntry> {
-        self.inner.lookup(parent, name)
-    }
-
-    fn getattr(
-        &self,
-        _ctx: VirtioFsContext,
-        inode: Self::Inode,
-        _handle: Option<Self::Handle>,
-    ) -> io::Result<(bindings::stat64, Duration)> {
-        self.inner.getattr(inode)
     }
 }
 
@@ -118,6 +95,24 @@ fn stat(inode: u64, mode: u32, size: u64) -> bindings::stat64 {
     stat
 }
 
+impl VirtioVirtualFsBackend for VirtualFsAdapter {
+    fn lookup(&self, parent: u64, name: &CStr) -> io::Result<VirtioFsEntry> {
+        self.inner.lookup(VirtualInode::from(parent), name)
+    }
+
+    fn getattr(&self, inode: u64) -> io::Result<(bindings::stat64, Duration)> {
+        self.inner.getattr(VirtualInode::from(inode))
+    }
+
+    fn readdir(&self, inode: u64) -> io::Result<Vec<VirtioFsDirEntry>> {
+        self.inner.readdir(VirtualInode::from(inode))
+    }
+
+    fn read(&self, inode: u64, offset: u64, size: u32) -> io::Result<Vec<u8>> {
+        self.inner.read(VirtualInode::from(inode), offset, size)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,6 +131,23 @@ mod tests {
         fn getattr(&self, inode: VirtualInode) -> io::Result<(bindings::stat64, Duration)> {
             assert_eq!(u64::from(inode), 2);
             Ok((virtual_file_entry(2, 19).attr, Duration::from_secs(1)))
+        }
+
+        fn readdir(&self, inode: VirtualInode) -> io::Result<Vec<VirtioFsDirEntry>> {
+            assert_eq!(u64::from(inode), 1);
+            Ok(vec![VirtioFsDirEntry {
+                inode: 2,
+                type_: libc::DT_REG as u32,
+                name: b"status.json".to_vec(),
+            }])
+        }
+
+        fn read(&self, inode: VirtualInode, offset: u64, size: u32) -> io::Result<Vec<u8>> {
+            assert_eq!(u64::from(inode), 2);
+            let contents = b"{\"status\":\"ready\"}\n";
+            let start = usize::try_from(offset).unwrap();
+            let end = contents.len().min(start + size as usize);
+            Ok(contents[start..end].to_vec())
         }
     }
 
@@ -165,20 +177,16 @@ mod tests {
     #[test]
     fn adapter_delegates_lookup_and_getattr_to_host_filesystem() {
         let adapter = VirtualFsAdapter::new(Arc::new(FixtureFs));
-        let ctx = VirtioFsContext {
-            uid: 1_000,
-            gid: 1_000,
-            pid: 123,
-        };
         let name = CString::new("status.json").unwrap();
 
-        let entry = adapter
-            .lookup(ctx, VirtualInode::from(1), name.as_c_str())
-            .unwrap();
+        let entry = adapter.lookup(1, name.as_c_str()).unwrap();
         assert_eq!(entry.inode, 2);
 
-        let (attr, timeout) = adapter.getattr(ctx, VirtualInode::from(2), None).unwrap();
+        let (attr, timeout) = adapter.getattr(2).unwrap();
         assert_eq!(attr.st_size, 19);
         assert_eq!(timeout, Duration::from_secs(1));
+
+        assert_eq!(adapter.readdir(1).unwrap()[0].name, b"status.json");
+        assert_eq!(adapter.read(2, 0, 19).unwrap(), b"{\"status\":\"ready\"}\n");
     }
 }
