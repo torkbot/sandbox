@@ -134,7 +134,7 @@ Evidence:
 
 ## Test Harness Shape
 
-Use a TypeScript e2e runner as the orchestration layer because the public library is Node-facing and policy hooks are TypeScript. Run it directly on Node.js 24+ using the built-in type-stripping support, matching the neighboring TorkBot repositories. The runner should call the signed `sandbox-host` binary for VM launch on macOS, and may use native bindings for host-only primitives or platforms where the embedding process is allowed to own the hypervisor. It should collect structured evidence into `test-results/e2e/<run-id>/`.
+Use a TypeScript e2e runner as the orchestration layer because the public library is Node-facing and policy hooks are TypeScript. Run it directly on Node.js 24+ using the built-in type-stripping support, matching the neighboring TorkBot repositories. The runner should call the `sandbox-host` binary for VM launch on every platform so VM lifetime is bounded by a process that can be terminated by `close()`. It should collect structured evidence into `test-results/e2e/<run-id>/`.
 
 Each e2e test should emit:
 

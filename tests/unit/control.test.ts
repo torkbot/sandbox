@@ -185,6 +185,46 @@ test("HostControlTransport exec is not starved by incoming consumers", async () 
   await control.close();
 });
 
+test("HostControlTransport rejects duplicate in-flight exec ids", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const first = control.exec({ id: "duplicate", argv: ["/bin/true"] });
+
+  await assert.rejects(
+    control.exec({ id: "duplicate", argv: ["/bin/true"] }),
+    /sandbox exec id is already in flight: duplicate/,
+  );
+
+  channel.reads.push(
+    encodePacket({
+      type: "guest.exec.complete",
+      id: "duplicate",
+      exitCode: 0,
+      stdout: new Binary(new TextEncoder().encode("ok")),
+      stderr: new Binary(new Uint8Array()),
+    }),
+  );
+
+  assert.equal((await first).stdout, "ok");
+  await control.close();
+});
+
+test("HostControlTransport closes and rejects pending execs on malformed frames", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const iterator = control.incoming[Symbol.asyncIterator]();
+  const exec = control.exec({ id: "pending", argv: ["/bin/true"] });
+
+  channel.reads.push(encodePacket({ type: "unknown.control.frame" }));
+
+  await assert.rejects(exec, /unknown control frame type: unknown.control.frame/);
+  await assert.rejects(iterator.next(), /unknown control frame type: unknown.control.frame/);
+  await assert.rejects(
+    control.exec({ id: "after-failure", argv: ["/bin/true"] }),
+    /sandbox control is closed/,
+  );
+});
+
 class MemoryControlChannel implements HostControlChannel {
   readonly writes: Uint8Array[] = [];
   readonly reads: Uint8Array[] = [];

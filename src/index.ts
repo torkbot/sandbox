@@ -1,4 +1,3 @@
-import { loadNativeBinding } from "./native.ts";
 import { HostControlTransport } from "./control.ts";
 import { HostProcessSandboxVm } from "./host-process.ts";
 import { createSandboxHostFileSystemTools } from "./host-filesystem-tools.ts";
@@ -307,16 +306,8 @@ export function binding(path: string, fileSystem: SandboxVirtualFileSystem): Fil
 export async function spawnSandbox(options: SandboxOptions): Promise<SandboxVm> {
   validateSandboxOptions(options);
   const nativeOptions = toNativeSpawnOptions(options);
-  const nativeVm = shouldUseHostProcess(options)
-    ? await HostProcessSandboxVm.spawn(options, nativeOptions)
-    : await loadNativeBinding().spawnSandbox(nativeOptions);
+  const nativeVm = await HostProcessSandboxVm.spawn(options, nativeOptions);
   return new NativeBackedSandboxVm(nativeVm, options);
-}
-
-function shouldUseHostProcess(options: SandboxOptions): boolean {
-  return process.platform === "darwin"
-    || options.network?.http !== undefined
-    || (options.mounts ?? []).some((mount) => mount.kind === "virtual-fs");
 }
 
 class NativeBackedSandboxVm implements SandboxVm {

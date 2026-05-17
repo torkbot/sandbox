@@ -60,6 +60,9 @@ export class HostControlTransport implements SandboxControl {
   }): Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>> {
     this.#assertOpen();
     const id = input.id ?? crypto.randomUUID();
+    if (this.#pendingExec.has(id)) {
+      throw new Error(`sandbox exec id is already in flight: ${id}`);
+    }
     const completion = new Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>>((resolve, reject) => {
       this.#pendingExec.set(id, { resolve, reject });
     });
@@ -110,16 +113,21 @@ export class HostControlTransport implements SandboxControl {
         if (this.#closed) {
           return;
         }
-        this.#closed = true;
-        this.#rejectPendingExec(error);
-        this.#events.close(error);
+        this.#fail(error);
         return;
       }
       if (packet !== null) {
         if (this.#closed) {
           return;
         }
-        this.#dispatchEvent(decodeControlEvent(packet));
+        let event: SandboxControlEvent;
+        try {
+          event = decodeControlEvent(packet);
+        } catch (error) {
+          this.#fail(error);
+          return;
+        }
+        this.#dispatchEvent(event);
         continue;
       }
 
@@ -138,6 +146,16 @@ export class HostControlTransport implements SandboxControl {
     }
     this.#pendingExec.delete(event.id);
     pending.resolve(event);
+  }
+
+  #fail(error: unknown): void {
+    if (this.#closed) {
+      return;
+    }
+
+    this.#closed = true;
+    this.#rejectPendingExec(error);
+    this.#events.close(error);
   }
 
   #rejectPendingExec(error: unknown): void {

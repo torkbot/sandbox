@@ -66,16 +66,57 @@ async function validateCodesign(artifactPath: string): Promise<boolean> {
 }
 
 async function readDynamicLibraries(artifactPath: string): Promise<string[]> {
-  if (platform() !== "darwin") {
-    return [];
+  if (platform() === "darwin") {
+    const { stdout } = await execFileAsync("otool", ["-L", artifactPath]);
+    return stdout
+      .split("\n")
+      .slice(1)
+      .map((line) => line.trim().split(/\s+/, 1)[0])
+      .filter((library): library is string => library !== undefined && library.length > 0);
   }
 
-  const { stdout } = await execFileAsync("otool", ["-L", artifactPath]);
-  return stdout
+  if (platform() === "linux") {
+    try {
+      const { stdout } = await execFileAsync("ldd", [artifactPath]);
+      return parseLddOutput(stdout);
+    } catch (error) {
+      const output = commandOutput(error);
+      if (/not a dynamic executable|statically linked/i.test(output)) {
+        return [];
+      }
+      throw error;
+    }
+  }
+
+  return [];
+}
+
+function parseLddOutput(output: string): string[] {
+  return output
     .split("\n")
-    .slice(1)
-    .map((line) => line.trim().split(/\s+/, 1)[0])
-    .filter((library): library is string => library !== undefined && library.length > 0);
+    .map((line) => line.trim())
+    .filter((line) =>
+      line.length > 0
+      && !/not a dynamic executable|statically linked/i.test(line)
+    )
+    .map((line) => {
+      const linked = line.match(/^\S+\s+=>\s+(\S+)/);
+      if (linked?.[1] !== undefined && linked[1] !== "not") {
+        return linked[1];
+      }
+      return line.split(/\s+/, 1)[0] ?? "";
+    })
+    .filter((library) => library.length > 0);
+}
+
+function commandOutput(error: unknown): string {
+  if (typeof error !== "object" || error === null) {
+    return "";
+  }
+
+  const stdout = "stdout" in error && typeof error.stdout === "string" ? error.stdout : "";
+  const stderr = "stderr" in error && typeof error.stderr === "string" ? error.stderr : "";
+  return `${stdout}\n${stderr}`;
 }
 
 async function readCodesignEntitlements(
