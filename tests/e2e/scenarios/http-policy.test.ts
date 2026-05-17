@@ -905,8 +905,70 @@ test("upstream connection refused returns a deterministic guest-visible failure"
   assert.deepEqual(policyUrls, [refusedUrl]);
 });
 
-test("upstream timeout returns a deterministic guest-visible failure", () => {
-  assert.fail("timed out upstream connections must produce a stable guest-visible failure");
+test("upstream timeout returns a deterministic guest-visible failure", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+  const ca = await createTestCertificateAuthority();
+  t.after(async () => {
+    await ca.close();
+  });
+  const policyUrls: string[] = [];
+
+  const origin = await startTestHttpOrigin({
+    async respond() {
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
+      return { status: 200, body: "too late" };
+    },
+  });
+
+  t.after(async () => {
+    await origin.close();
+  });
+
+  const vm = await spawnSandbox({
+    name: "http-upstream-timeout",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      http: {
+        ca,
+        async policy(request) {
+          policyUrls.push(request.url);
+          return { action: "allow" };
+        },
+      },
+    },
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const url = `${origin.url}/timeout`;
+  const result = await execGuest(vm, {
+    id: "curl-upstream-timeout",
+    argv: [
+      "curl",
+      "--max-time",
+      "6",
+      "-sS",
+      "-o",
+      "/dev/null",
+      "-w",
+      "%{http_code}",
+      ...interceptedHttpArgs(url),
+    ],
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, "502");
+  assert.deepEqual(policyUrls, [url]);
 });
 
 test("upstream reset mid-body returns a deterministic guest-visible failure", () => {

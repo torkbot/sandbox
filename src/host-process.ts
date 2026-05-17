@@ -489,6 +489,9 @@ async function requestUpstream(url: string, input: {
         });
       });
     });
+    request.setTimeout(2_000, () => {
+      request.destroy(new Error("upstream request timed out"));
+    });
     request.once("error", reject);
     if (input.body !== undefined) {
       request.write(input.body);
