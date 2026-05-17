@@ -258,7 +258,9 @@ export async function spawnSandbox(options: SandboxOptions): Promise<SandboxVm> 
 }
 
 function shouldUseHostProcess(options: SandboxOptions): boolean {
-  return process.platform === "darwin" || (options.mounts ?? []).some((mount) => mount.kind === "virtual-fs");
+  return process.platform === "darwin"
+    || options.network?.http !== undefined
+    || (options.mounts ?? []).some((mount) => mount.kind === "virtual-fs");
 }
 
 class NativeBackedSandboxVm implements SandboxVm {

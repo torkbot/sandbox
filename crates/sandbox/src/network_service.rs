@@ -7,15 +7,37 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use smoltcp::iface::{Config, Interface, SocketSet};
+use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
 
 const HOST_HTTP_PROBE_PORT: u16 = 8080;
+const HOST_HTTP_PORT: u16 = 80;
+const HTTP_LISTENERS_PER_PORT: usize = 4;
 const HOST_HTTP_PROBE_RESPONSE: &[u8] =
     b"HTTP/1.1 200 OK\r\ncontent-length: 25\r\nconnection: close\r\n\r\nsandbox explicit network\n";
+
+#[derive(Debug, Clone)]
+pub struct HostHttpRequest {
+    pub method: String,
+    pub url: String,
+    pub destination_ip: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HostHttpResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+pub trait HostHttpHandler: Send + Sync + 'static {
+    fn handle_http_request(&self, request: HostHttpRequest) -> io::Result<HostHttpResponse>;
+}
 
 /// Host-owned endpoint for libkrun's explicit virtio-net unixstream backend.
 #[derive(Debug)]
@@ -26,11 +48,12 @@ pub struct HostNetwork {
 }
 
 impl HostNetwork {
-    pub fn new() -> io::Result<Self> {
+    pub fn new(http_handler: Option<Arc<dyn HostHttpHandler>>) -> io::Result<Self> {
         let (host, guest) = UnixStream::pair()?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = shutdown.clone();
-        let worker = thread::spawn(move || run_network_service(host, worker_shutdown));
+        let worker =
+            thread::spawn(move || run_network_service(host, worker_shutdown, http_handler));
         Ok(Self {
             guest_fd: guest.into_raw_fd(),
             shutdown,
@@ -52,7 +75,11 @@ impl Drop for HostNetwork {
     }
 }
 
-fn run_network_service(stream: UnixStream, shutdown: Arc<AtomicBool>) {
+fn run_network_service(
+    stream: UnixStream,
+    shutdown: Arc<AtomicBool>,
+    http_handler: Option<Arc<dyn HostHttpHandler>>,
+) {
     let _ = stream.set_nonblocking(true);
     let tx = match stream.try_clone() {
         Ok(tx) => tx,
@@ -68,23 +95,60 @@ fn run_network_service(stream: UnixStream, shutdown: Arc<AtomicBool>) {
         let _ = addresses.push(IpCidr::new(Ipv4Address::new(10, 0, 2, 1).into(), 24));
     });
     let mut sockets = SocketSet::new(Vec::new());
-    let http_probe = sockets.add(tcp::Socket::new(
-        tcp::SocketBuffer::new(vec![0; 4096]),
-        tcp::SocketBuffer::new(vec![0; 4096]),
-    ));
+    let mut http_sockets = HashMap::new();
+    add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTP_PORT);
+    add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTP_PROBE_PORT);
 
     while !shutdown.load(Ordering::Acquire) {
         let timestamp = Instant::now();
         let _ = iface.poll(timestamp, &mut device, &mut sockets);
-        poll_http_probe(&mut sockets, http_probe);
+        for port in device.nat.host_ports() {
+            add_http_listener(&mut sockets, &mut http_sockets, port);
+        }
+        for (port, handle) in http_sockets
+            .iter()
+            .flat_map(|(port, handles)| handles.iter().map(|handle| (*port, *handle)))
+            .collect::<Vec<_>>()
+        {
+            poll_http_socket(
+                &mut sockets,
+                handle,
+                port,
+                http_handler.as_deref(),
+                &device.nat,
+            );
+        }
         thread::sleep(Duration::from_millis(1));
     }
 }
 
-fn poll_http_probe(sockets: &mut SocketSet<'_>, handle: smoltcp::iface::SocketHandle) {
+fn add_http_listener(
+    sockets: &mut SocketSet<'_>,
+    http_sockets: &mut HashMap<u16, Vec<SocketHandle>>,
+    port: u16,
+) {
+    http_sockets.entry(port).or_insert_with(|| {
+        (0..HTTP_LISTENERS_PER_PORT)
+            .map(|_| {
+                sockets.add(tcp::Socket::new(
+                    tcp::SocketBuffer::new(vec![0; 4096]),
+                    tcp::SocketBuffer::new(vec![0; 4096]),
+                ))
+            })
+            .collect()
+    });
+}
+
+fn poll_http_socket(
+    sockets: &mut SocketSet<'_>,
+    handle: SocketHandle,
+    port: u16,
+    handler: Option<&dyn HostHttpHandler>,
+    nat: &TransparentTcpNat,
+) {
     let socket = sockets.get_mut::<tcp::Socket>(handle);
     if !socket.is_active() {
-        let _ = socket.listen(HOST_HTTP_PROBE_PORT);
+        let _ = socket.listen(port);
         return;
     }
 
@@ -92,10 +156,81 @@ fn poll_http_probe(sockets: &mut SocketSet<'_>, handle: smoltcp::iface::SocketHa
         let mut request = [0; 4096];
         let received = socket.recv_slice(&mut request).unwrap_or(0);
         if received > 0 {
-            let _ = socket.send_slice(HOST_HTTP_PROBE_RESPONSE);
+            let response = handler
+                .and_then(|handler| {
+                    parse_http_request(socket, nat, &request[..received])
+                        .and_then(|request| handler.handle_http_request(request).ok())
+                })
+                .map(encode_http_response)
+                .unwrap_or_else(|| HOST_HTTP_PROBE_RESPONSE.to_vec());
+            let _ = socket.send_slice(&response);
             socket.close();
         }
     }
+}
+
+fn parse_http_request(
+    socket: &tcp::Socket<'_>,
+    nat: &TransparentTcpNat,
+    bytes: &[u8],
+) -> Option<HostHttpRequest> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text, ""));
+    let mut lines = head.split("\r\n");
+    let request_line = lines.next()?;
+    let mut request_parts = request_line.split_ascii_whitespace();
+    let method = request_parts.next()?.to_string();
+    let target = request_parts.next()?.to_string();
+    let remote = socket.remote_endpoint()?;
+    let local = socket.local_endpoint()?;
+    let destination_ip = nat.original_destination(remote.addr, remote.port, local.port)?;
+    let mut headers = Vec::new();
+    let mut host = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        let value = value.trim().to_string();
+        if name == "host" {
+            host = Some(value.clone());
+        }
+        headers.push((name, value));
+    }
+    let authority = host.unwrap_or_else(|| destination_ip.clone());
+    let url = if target.starts_with("http://") || target.starts_with("https://") {
+        target
+    } else {
+        format!("http://{authority}{target}")
+    };
+
+    Some(HostHttpRequest {
+        method,
+        url,
+        destination_ip,
+        headers,
+        body: body.as_bytes().to_vec(),
+    })
+}
+
+fn encode_http_response(response: HostHttpResponse) -> Vec<u8> {
+    let mut bytes = format!("HTTP/1.1 {} OK\r\n", response.status).into_bytes();
+    let has_content_length = response
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("content-length"));
+    for (name, value) in response.headers {
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.extend_from_slice(b": ");
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.extend_from_slice(b"\r\n");
+    }
+    if !has_content_length {
+        bytes.extend_from_slice(format!("content-length: {}\r\n", response.body.len()).as_bytes());
+    }
+    bytes.extend_from_slice(b"connection: close\r\n\r\n");
+    bytes.extend_from_slice(&response.body);
+    bytes
 }
 
 struct LibkrunNetDevice {
@@ -239,6 +374,29 @@ impl TransparentTcpNat {
         };
         packet.set_source_ip(frame, original_destination);
         packet.recompute_checksums(frame);
+    }
+
+    fn original_destination(
+        &self,
+        guest_ip: IpAddress,
+        guest_port: u16,
+        host_port: u16,
+    ) -> Option<String> {
+        let guest_ip = match guest_ip {
+            IpAddress::Ipv4(guest_ip) => guest_ip.octets(),
+        };
+        let flow = TcpFlow {
+            guest_ip,
+            guest_port,
+            host_port,
+        };
+        self.flows.get(&flow).map(|address| {
+            Ipv4Address::new(address[0], address[1], address[2], address[3]).to_string()
+        })
+    }
+
+    fn host_ports(&self) -> impl Iterator<Item = u16> + '_ {
+        self.flows.keys().map(|flow| flow.host_port)
     }
 }
 

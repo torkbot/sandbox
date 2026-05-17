@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use bson::{Bson, Document, doc};
+use sandbox::network_service::{HostHttpHandler, HostHttpRequest, HostHttpResponse};
 use sandbox::vfs::{
     VirtioFsDirEntry, VirtioFsEntry, VirtioVirtualFsBackend, VirtualFsAdapter, VirtualInode,
     bindings, virtual_directory_entry, virtual_file_entry,
@@ -70,7 +71,9 @@ impl HostIoBridge {
     }
 
     pub fn route_response(&self, document: Document) -> bool {
-        if document.get_str("type").ok() != Some("host.vfs.response") {
+        let response_type = document.get_str("type").ok();
+        if response_type != Some("host.vfs.response") && response_type != Some("host.http.response")
+        {
             return false;
         }
         let Ok(id) = document.get_str("id") else {
@@ -85,6 +88,51 @@ impl HostIoBridge {
             let _ = tx.send(document);
         }
         true
+    }
+}
+
+impl HostHttpHandler for HostIoBridge {
+    fn handle_http_request(&self, request: HostHttpRequest) -> io::Result<HostHttpResponse> {
+        let response = self.request(doc! {
+            "type": "host.http.request",
+            "method": request.method,
+            "url": request.url,
+            "destinationIp": request.destination_ip,
+            "headers": request.headers.into_iter().map(|(name, value)| doc! {
+                "name": name,
+                "value": value,
+            }).collect::<Vec<_>>(),
+            "body": Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: request.body,
+            }),
+        })?;
+        let status = response.get_i32("status").map_err(to_io_error)?;
+        let headers = response
+            .get_array("headers")
+            .map_err(to_io_error)?
+            .iter()
+            .map(|value| {
+                let document = value.as_document().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "HTTP header must be a document")
+                })?;
+                Ok((
+                    document.get_str("name").map_err(to_io_error)?.to_string(),
+                    document.get_str("value").map_err(to_io_error)?.to_string(),
+                ))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let body = response
+            .get_binary_generic("body")
+            .cloned()
+            .map_err(to_io_error)?;
+
+        Ok(HostHttpResponse {
+            status: u16::try_from(status)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP status"))?,
+            headers,
+            body,
+        })
     }
 }
 

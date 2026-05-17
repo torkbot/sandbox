@@ -25,7 +25,7 @@ test("HTTP networking transparently intercepts guest TCP over explicit virtio-ne
     network: {
       http: {
         async policy() {
-          return { action: "allow" };
+          return { action: "deny", reason: "sandbox explicit network" };
         },
       },
     },
@@ -44,7 +44,7 @@ test("HTTP networking transparently intercepts guest TCP over explicit virtio-ne
       test -d /sys/class/net/eth0
       ip addr show dev eth0
       ip route show default
-      curl --connect-timeout 2 --fail --silent http://203.0.113.10:8080/
+      curl --max-time 3 --connect-timeout 2 --silent http://203.0.113.10/
     `,
   });
 

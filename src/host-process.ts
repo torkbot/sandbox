@@ -5,12 +5,17 @@ import { resolve } from "node:path";
 import { BSON } from "bson";
 import type { HostControlChannel } from "./control.ts";
 import type { NativeSpawnSandboxOptions } from "./native.ts";
-import type { SandboxOptions, SandboxVirtualFileSystem } from "./index.ts";
+import type {
+  HttpPolicyRequest,
+  SandboxOptions,
+  SandboxVirtualFileSystem,
+} from "./index.ts";
 
 export class HostProcessSandboxVm implements HostControlChannel {
   readonly hasControlSocket = true;
 
   readonly #child: ChildProcessWithoutNullStreams;
+  readonly #options: SandboxOptions;
   readonly #packets: Uint8Array[] = [];
   readonly #virtualFs = new Map<string, SandboxVirtualFileSystem>();
   #buffer = new Uint8Array();
@@ -23,6 +28,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
     options: SandboxOptions,
   ) {
     this.#child = child;
+    this.#options = options;
     for (const mount of options.mounts ?? []) {
       if (mount.kind === "virtual-fs") {
         this.#virtualFs.set(mount.path, mount.fileSystem);
@@ -147,6 +153,11 @@ export class HostProcessSandboxVm implements HostControlChannel {
     }
 
     const type = document.type;
+    if (type === "host.http.request") {
+      void this.#handleHttpRequest(document);
+      return true;
+    }
+
     if (type !== "host.vfs.stat" && type !== "host.vfs.list" && type !== "host.vfs.read") {
       return false;
     }
@@ -210,6 +221,62 @@ export class HostProcessSandboxVm implements HostControlChannel {
       }));
     }
   }
+
+  async #handleHttpRequest(document: Record<string, unknown>): Promise<void> {
+    const id = typeof document.id === "string" ? document.id : "";
+    try {
+      const http = this.#options.network?.http;
+      if (http === undefined) {
+        throw new Error("HTTP interception is not configured");
+      }
+
+      const headers = headersFromWire(document.headers);
+      const request: HttpPolicyRequest = {
+        method: assertString(document.method, "method"),
+        url: assertString(document.url, "url"),
+        destinationIp: assertString(document.destinationIp, "destinationIp"),
+        headers,
+      };
+      const decision = await http.policy(request);
+      if (decision.action === "deny") {
+        this.#child.stdin.write(encodePacket({
+          type: "host.http.response",
+          id,
+          ok: true,
+          status: 451,
+          headers: [{ name: "content-type", value: "text/plain" }],
+          body: new TextEncoder().encode(decision.reason),
+        }));
+        return;
+      }
+
+      const outboundHeaders = http.modifyRequestHeaders === undefined
+        ? headers
+        : await http.modifyRequestHeaders(headers);
+      const upstream = await fetch(request.url, {
+        method: request.method,
+        headers: outboundHeaders,
+        body: request.method === "GET" || request.method === "HEAD"
+          ? undefined
+          : binaryField(document.body, "body"),
+      });
+      this.#child.stdin.write(encodePacket({
+        type: "host.http.response",
+        id,
+        ok: true,
+        status: upstream.status,
+        headers: responseHeadersFromFetch(upstream.headers),
+        body: new Uint8Array(await upstream.arrayBuffer()),
+      }));
+    } catch (error) {
+      this.#child.stdin.write(encodePacket({
+        type: "host.http.response",
+        id,
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    }
+  }
 }
 
 export function hostBinaryPath(): string {
@@ -232,6 +299,46 @@ function assertNumber(value: unknown, field: string): number {
     throw new Error(`host vfs request ${field} must be a non-negative safe integer`);
   }
   return value;
+}
+
+function headersFromWire(value: unknown): Record<string, string> {
+  if (!Array.isArray(value)) {
+    throw new Error("host HTTP request headers must be an array");
+  }
+
+  const headers: Record<string, string> = {};
+  for (const entry of value) {
+    if (typeof entry !== "object" || entry === null) {
+      throw new Error("host HTTP request header must be an object");
+    }
+    const record = entry as Record<string, unknown>;
+    headers[assertString(record.name, "header.name")] = assertString(record.value, "header.value");
+  }
+  return headers;
+}
+
+function binaryField(value: unknown, field: string): Uint8Array {
+  if (value instanceof Uint8Array) {
+    return value;
+  }
+  throw new Error(`host HTTP request ${field} must be binary`);
+}
+
+function responseHeadersFromFetch(headers: Headers): { name: string; value: string }[] {
+  const hopByHop = new Set([
+    "connection",
+    "content-length",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+  ]);
+  return Array.from(headers.entries())
+    .filter(([name]) => !hopByHop.has(name.toLowerCase()))
+    .map(([name, value]) => ({ name, value }));
 }
 
 function delay(milliseconds: number): Promise<void> {

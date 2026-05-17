@@ -7,7 +7,7 @@ pub mod config;
 pub mod control;
 pub mod mounts;
 pub mod network;
-mod network_service;
+pub mod network_service;
 pub mod runtime;
 pub mod vfs;
 

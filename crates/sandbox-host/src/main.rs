@@ -8,7 +8,7 @@ use std::time::Duration;
 use bson::Document;
 use sandbox::config::MountSpec;
 use sandbox::config::{HttpSpecInput, MicroVmSpecInput, MountSpecInput};
-use sandbox::runtime::VirtualFsDevice;
+use sandbox::runtime::{HostServices, VirtualFsDevice};
 
 mod host_vfs;
 
@@ -60,7 +60,16 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
     let spec = sandbox::MicroVmSpec::build(parse_spawn(spawn_document)?)?;
     let bridge = HostIoBridge::new();
     let virtual_fs = virtual_fs_devices(&spec, bridge.clone());
-    let mut vm = sandbox::runtime::KrunVm::create_with_virtual_fs(&spec, virtual_fs)?;
+    let services = HostServices {
+        http_handler: spec
+            .network
+            .as_ref()
+            .and_then(|network| network.http.as_ref())
+            .map(|_| {
+                bridge.clone() as std::sync::Arc<dyn sandbox::network_service::HostHttpHandler>
+            }),
+    };
+    let mut vm = sandbox::runtime::KrunVm::create_with_services(&spec, virtual_fs, services)?;
     vm.start()?;
 
     let (command_tx, command_rx) = mpsc::channel::<Vec<u8>>();

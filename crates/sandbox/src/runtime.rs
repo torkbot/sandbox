@@ -10,13 +10,18 @@ use std::thread::{self, JoinHandle};
 use crate::MicroVmSpec;
 use crate::config::{KernelFormat, RootfsFormat};
 use crate::control::INIT_CONTROL_PORT;
-use crate::network_service::HostNetwork;
+use crate::network_service::{HostHttpHandler, HostNetwork};
 use crate::vfs::VirtioVirtualFsBackend;
 
 #[derive(Debug)]
 pub struct KrunContext {
     id: u32,
     _networks: Vec<HostNetwork>,
+}
+
+#[derive(Default, Clone)]
+pub struct HostServices {
+    pub http_handler: Option<Arc<dyn HostHttpHandler>>,
 }
 
 #[derive(Debug)]
@@ -48,6 +53,14 @@ impl KrunContext {
         spec: &MicroVmSpec,
         virtual_fs: &[VirtualFsDevice],
     ) -> Result<Self, KrunError> {
+        Self::create_with_services(spec, virtual_fs, HostServices::default())
+    }
+
+    pub fn create_with_services(
+        spec: &MicroVmSpec,
+        virtual_fs: &[VirtualFsDevice],
+        services: HostServices,
+    ) -> Result<Self, KrunError> {
         init_krun_logging();
         let raw_id = krun::krun_create_ctx();
         if raw_id < 0 {
@@ -65,7 +78,7 @@ impl KrunContext {
         context.apply_console_output()?;
         context.apply_kernel(spec)?;
         context.apply_rootfs(spec)?;
-        context.apply_network(spec)?;
+        context.apply_network(spec, &services)?;
         for device in virtual_fs {
             context.add_virtual_fs(device)?;
         }
@@ -85,7 +98,11 @@ impl KrunContext {
         )
     }
 
-    fn apply_network(&mut self, spec: &MicroVmSpec) -> Result<(), KrunError> {
+    fn apply_network(
+        &mut self,
+        spec: &MicroVmSpec,
+        services: &HostServices,
+    ) -> Result<(), KrunError> {
         let Some(network) = &spec.network else {
             return Ok(());
         };
@@ -93,8 +110,8 @@ impl KrunContext {
             return Ok(());
         }
 
-        let network =
-            HostNetwork::new().map_err(|_| KrunError::new("HostNetwork::new", -libc::EIO))?;
+        let network = HostNetwork::new(services.http_handler.clone())
+            .map_err(|_| KrunError::new("HostNetwork::new", -libc::EIO))?;
         let guest_fd = network.guest_fd();
         let mac = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xef];
         let features = 0;
@@ -307,7 +324,15 @@ impl KrunVm {
         spec: &MicroVmSpec,
         virtual_fs: Vec<VirtualFsDevice>,
     ) -> Result<Self, KrunError> {
-        let context = KrunContext::create_with_virtual_fs(spec, &virtual_fs)?;
+        Self::create_with_services(spec, virtual_fs, HostServices::default())
+    }
+
+    pub fn create_with_services(
+        spec: &MicroVmSpec,
+        virtual_fs: Vec<VirtualFsDevice>,
+        services: HostServices,
+    ) -> Result<Self, KrunError> {
+        let context = KrunContext::create_with_services(spec, &virtual_fs, services)?;
         let (host_socket, guest_socket) =
             UnixStream::pair().map_err(|_| KrunError::new("UnixStream::pair", -libc::EIO))?;
 
