@@ -135,9 +135,11 @@ The first build entrypoint is `npm run build:kernel`, which assumes a local Dock
 
 ## Static Linking And macOS Signing
 
-The desired output is a statically linked Sandbox host binary or native Node module, including the libkrun pieces we depend on. Dynamic dependencies should be treated as build failures unless they are unavoidable platform system libraries.
+The desired output is a statically linked Sandbox VM-host binary, including the libkrun pieces we depend on. Dynamic dependencies should be treated as build failures unless they are unavoidable platform system libraries.
 
-macOS needs a separate signing track. HVF requires the correct Hypervisor entitlement on the host executable process, not on the Node native addon alone. Sandbox signs the addon as a build artifact so it can be loaded, but TorkBot or any other host executable that actually launches VMs must be signed with the Hypervisor entitlement before launch. This is part of the runtime contract, not a release-only afterthought.
+macOS needs a separate signing track. HVF requires the correct Hypervisor entitlement on the executable process that opens Hypervisor.framework. That process must be a Sandbox-owned helper executable, not `node`. The Node package remains the ergonomic TypeScript API, but macOS VM launch is delegated to the signed `sandbox-host` binary over a local control transport. Signing the napi addon or a dylib is not sufficient for HVF because the entitlement is process-scoped.
+
+The napi-rs addon can still provide efficient local primitives, validation, and non-HVF fast paths, but it must not be the only VM launch path on macOS unless the embedding executable is known to be signed with the HVF entitlement.
 
 ## Phased Implementation
 

@@ -128,14 +128,14 @@ Runs on macOS only.
 
 Evidence:
 
-- the final executable or native module that opens Hypervisor.framework is signed.
+- the `sandbox-host` executable that opens Hypervisor.framework is signed.
 - the signature contains the HVF entitlement.
-- a smoke VM boots under the signed artifact.
-- the same artifact fails the entitlement check if signing is skipped, proving the test is meaningful.
+- a smoke VM boots through the signed helper artifact.
+- unsigned Node is not treated as an acceptable HVF host process.
 
 ## Test Harness Shape
 
-Use a TypeScript e2e runner as the orchestration layer because the public library is Node-facing and policy hooks are TypeScript. Run it directly on Node.js 24+ using the built-in type-stripping support, matching the neighboring TorkBot repositories. The runner should call Rust binaries or native bindings as implementation details and collect structured evidence into `test-results/e2e/<run-id>/`.
+Use a TypeScript e2e runner as the orchestration layer because the public library is Node-facing and policy hooks are TypeScript. Run it directly on Node.js 24+ using the built-in type-stripping support, matching the neighboring TorkBot repositories. The runner should call the signed `sandbox-host` binary for VM launch on macOS, and may use native bindings for host-only primitives or platforms where the embedding process is allowed to own the hypervisor. It should collect structured evidence into `test-results/e2e/<run-id>/`.
 
 Each e2e test should emit:
 
@@ -158,7 +158,7 @@ Detected capabilities:
 - Linux KVM access.
 - macOS HVF access.
 - macOS codesign availability and entitlement verification.
-- EROFS tooling once EROFS image generation lands.
+- EROFS image generation through the Docker-based `build:rootfs:erofs` fixture.
 
 ## Success Criteria By Project Goal
 
@@ -172,7 +172,7 @@ Detected capabilities:
 - HTTP interception: TLS traffic is intercepted with guest-trusted CA, policy hooks run in Node.js, headers are modified, and forwarding is transparent.
 - Network policy: protected host and private ranges are blocked with deterministic evidence.
 - Host/guest transport: bidirectional messages preserve ordering, errors, and close semantics.
-- macOS support: HVF entitlement signing is verified and a signed artifact boots.
+- macOS support: HVF entitlement signing is verified on `sandbox-host` and VM boot goes through that signed helper, not through a signed copy of Node.
 
 ## First Implementation Slice
 

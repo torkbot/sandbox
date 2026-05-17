@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/sandbox",
+    "crates/sandbox-host",
     "crates/sandbox-init",
     "crates/sandbox-node",
     "crates/sandbox-protocol",

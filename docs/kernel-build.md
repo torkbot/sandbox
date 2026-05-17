@@ -46,9 +46,10 @@ The project also has build-time fixture helpers:
 ```sh
 npm run build:init
 npm run build:rootfs
+npm run build:rootfs:erofs
 ```
 
-`build:init` cross-builds `crates/sandbox-init` as a static Linux guest binary. `build:rootfs` exports a simple Alpine rootfs and copies that init binary into it as `/sandbox-init`. These are development and CI fixtures, not runtime APIs.
+`build:init` cross-builds `crates/sandbox-init` as a static Linux guest binary. `build:rootfs` exports a simple Alpine rootfs and copies that init binary into it as `/sandbox-init`. `build:rootfs:erofs` packs that directory into `dist/rootfs/alpine-3.20.erofs` with `mkfs.erofs` in Docker. These are development and CI fixtures, not runtime APIs.
 
 There is also a temporary compatibility helper:
 
@@ -60,12 +61,12 @@ That builds libkrun's legacy C init so current libkrun can mount the root and ex
 
 ## Static Link Handoff
 
-The lowest-level runtime handoff is the generated `kernel.c` bundle, not the `libkrunfw` dynamic library. To compile the Sandbox Rust crate with that bundle linked into the native module:
+The lowest-level runtime handoff is the generated `kernel.c` bundle, not the `libkrunfw` dynamic library. To compile the Sandbox Rust crate with that bundle linked into the VM host:
 
 ```sh
-SANDBOX_KERNEL_BUNDLE_C=dist/kernel/libkrunfw/arm64/kernel.c cargo test -p sandbox
+SANDBOX_KERNEL_BUNDLE_C=dist/kernel/libkrunfw/arm64/kernel.c npm run build:host
 ```
 
-The build script compiles that C bundle into the crate and enables the `sandbox_static_kernel` cfg. At runtime, Sandbox calls the raw kernel-bundle setter in the `torkbot/libkrun` fork with host address, guest load address, entry address, and size.
+The build script compiles that C bundle into the crate and enables the `sandbox_static_kernel` cfg. At runtime, `sandbox-host` calls the raw kernel-bundle setter in the `torkbot/libkrun` fork with host address, guest load address, entry address, and size.
 
 This avoids a runtime dependency on `libkrunfw` and avoids resolving a kernel path during VM creation. Paths remain build inputs and package artifacts only; VM instantiation should not require building or discovering kernels dynamically.

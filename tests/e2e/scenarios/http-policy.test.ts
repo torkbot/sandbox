@@ -10,15 +10,20 @@ import {
 import { collectAsync, writeEvidence } from "../support/evidence.ts";
 import { execGuest } from "../support/guest-control.ts";
 import { startTestHttpsOrigin } from "../support/http-origin.ts";
+import { requireVmLaunchSupport } from "../support/capabilities.ts";
 
 test("HTTPS traffic is intercepted, policy checked, rewritten, and protected ranges are blocked", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
   const decisions: Pick<HttpPolicyRequest, "url" | "destinationIp" | "tls">[] = [];
 
   const vm = await spawnSandbox({
     name: "http-policy",
     kernel: projectKernel(),
     init: projectInit(),
-    rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
       format: "erofs",
     }),
     network: {

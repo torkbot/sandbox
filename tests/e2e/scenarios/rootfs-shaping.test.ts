@@ -8,13 +8,18 @@ import {
 } from "../../../src/index.ts";
 import { collectAsync, writeEvidence } from "../support/evidence.ts";
 import { execGuestShell } from "../support/guest-control.ts";
+import { requireVmLaunchSupport } from "../support/capabilities.ts";
 
 test("a VM can run with a writable root overlay and publish a new EROFS rootfs", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
   const vm = await spawnSandbox({
     name: "rootfs-shaping",
     kernel: projectKernel(),
     init: projectInit(),
-    rootfs: prebuiltRootfs("test-fixtures/rootfs/base.erofs", {
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
       format: "erofs",
     }),
     rootfsOverlay: {

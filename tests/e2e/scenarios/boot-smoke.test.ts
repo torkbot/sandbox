@@ -9,12 +9,17 @@ import {
 } from "../../../src/index.ts";
 import { collectAsync, writeEvidence } from "../support/evidence.ts";
 import { execGuest } from "../support/guest-control.ts";
+import { requireVmLaunchSupport } from "../support/capabilities.ts";
 
 function isInitReady(event: SandboxControlEvent): event is Extract<SandboxControlEvent, { type: "init.ready" }> {
   return event.type === "init.ready";
 }
 
 test("Node can boot a sandbox VM and exchange control messages", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
   const vm = await spawnSandbox({
     name: "boot-smoke",
     cpu: { vcpus: 1 },

@@ -4,7 +4,7 @@ import { platform } from "node:os";
 import { inspectNativeArtifact } from "../support/artifact.ts";
 import { writeEvidence } from "../support/evidence.ts";
 
-test("host artifact has no libkrun/libkrunfw dynamic dependency and is signed on macOS", async () => {
+test("VM host artifact has no libkrun/libkrunfw dynamic dependency and is signed on macOS", async () => {
   const artifact = await inspectNativeArtifact({
     forbiddenDynamicLibraries: ["libkrun", "libkrunfw"],
     macosEntitlements: platform() === "darwin"
@@ -17,6 +17,7 @@ test("host artifact has no libkrun/libkrunfw dynamic dependency and is signed on
 
   if (platform() === "darwin") {
     assert.equal(artifact.codesign.valid, true);
+    assert.equal(artifact.codesign.hostExecutableHasRequiredEntitlements, true);
   }
 
   await writeEvidence("linkage.json", artifact);

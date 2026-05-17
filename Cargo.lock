@@ -1129,6 +1129,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandbox-host"
+version = "0.1.0"
+dependencies = [
+ "sandbox",
+]
+
+[[package]]
 name = "sandbox-init"
 version = "0.1.0"
 dependencies = [

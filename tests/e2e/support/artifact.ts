@@ -6,6 +6,7 @@ import { nativeBindingPath } from "../../../src/native.ts";
 const execFileAsync = promisify(execFile);
 
 export interface ArtifactInspection {
+  readonly vmHostPath: string;
   readonly staticLinkage: { readonly ok: boolean };
   readonly dynamicLibraries: readonly string[];
   readonly codesign: {
@@ -21,11 +22,15 @@ export async function inspectNativeArtifact(input: {
   readonly macosEntitlements: readonly string[];
 }): Promise<ArtifactInspection> {
   const artifactPath = nativeBindingPath();
-  const dynamicLibraries = await readDynamicLibraries(artifactPath);
-  const codesignValid = platform() !== "darwin" || await validateCodesign(artifactPath);
-  const entitlements = platform() === "darwin" ? await readCodesignEntitlements(artifactPath) : {};
+  const vmHostPath = hostBinaryPath();
+  const dynamicLibraries = [
+    ...await readDynamicLibraries(artifactPath),
+    ...await readDynamicLibraries(vmHostPath),
+  ];
+  const codesignValid = platform() !== "darwin" || await validateCodesign(vmHostPath);
+  const entitlements = platform() === "darwin" ? await readCodesignEntitlements(vmHostPath) : {};
   const hostExecutableEntitlements = platform() === "darwin"
-    ? await readCodesignEntitlements(process.execPath)
+    ? entitlements
     : {};
   const forbidden = input.forbiddenDynamicLibraries.some((pattern) =>
     dynamicLibraries.some((library) => library.includes(pattern))
@@ -35,6 +40,7 @@ export async function inspectNativeArtifact(input: {
   );
 
   return {
+    vmHostPath,
     staticLinkage: { ok: !forbidden },
     dynamicLibraries,
     codesign: {
@@ -44,6 +50,10 @@ export async function inspectNativeArtifact(input: {
       hostExecutableHasRequiredEntitlements: requiredHostEntitlementsPresent,
     },
   };
+}
+
+function hostBinaryPath(): string {
+  return new URL("../../../target/release/sandbox-host", import.meta.url).pathname;
 }
 
 async function validateCodesign(artifactPath: string): Promise<boolean> {
@@ -80,9 +90,8 @@ async function readCodesignEntitlements(
     ]);
     const output = `${stdout}\n${stderr}`;
     return Object.fromEntries(
-      output
-        .split("\n")
-        .map((line) => line.trim().match(/^<key>(.+)<\/key>$/)?.[1])
+      [...output.matchAll(/<key>([^<]+)<\/key>/g)]
+        .map((match) => match[1])
         .filter((name): name is string => name !== undefined)
         .map((name) => [name, true] as const),
     );
