@@ -4,6 +4,8 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::{Arc, Mutex, Once};
+use std::thread::{self, JoinHandle};
 
 use crate::MicroVmSpec;
 use crate::config::{KernelFormat, RootfsFormat};
@@ -16,9 +18,11 @@ pub struct KrunContext {
 
 #[derive(Debug)]
 pub struct KrunVm {
-    context: KrunContext,
+    context: Option<KrunContext>,
     control_socket: ControlSocket,
     guest_control_socket: UnixStream,
+    worker: Option<JoinHandle<Result<(), KrunError>>>,
+    start_status: Arc<Mutex<Option<Result<(), KrunError>>>>,
 }
 
 #[derive(Debug)]
@@ -34,6 +38,7 @@ pub struct KrunError {
 
 impl KrunContext {
     pub fn create(spec: &MicroVmSpec) -> Result<Self, KrunError> {
+        init_krun_logging();
         let raw_id = krun::krun_create_ctx();
         if raw_id < 0 {
             return Err(KrunError {
@@ -46,6 +51,7 @@ impl KrunContext {
         context.apply_vm_config(spec)?;
         context.apply_kernel(spec)?;
         context.apply_rootfs(spec)?;
+        context.apply_init(spec)?;
         Ok(context)
     }
 
@@ -117,6 +123,27 @@ impl KrunContext {
             }
         }
     }
+
+    fn apply_init(&self, _spec: &MicroVmSpec) -> Result<(), KrunError> {
+        // Temporary bridge: current libkrun still injects its own stage-0 init,
+        // which then execs our Rust init after the root is mounted. The target
+        // is direct Rust init injection through the libkrun fork.
+        let exec_path = CString::new("/sandbox-init").unwrap();
+        let argv = [exec_path.as_ptr(), std::ptr::null()];
+        let envp = [std::ptr::null()];
+        check_krun("krun_set_exec", unsafe {
+            krun::krun_set_exec(self.id, exec_path.as_ptr(), argv.as_ptr(), envp.as_ptr())
+        })
+    }
+}
+
+fn init_krun_logging() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        if std::env::var_os("SANDBOX_KRUN_LOG").is_some() {
+            let _ = krun::krun_set_log_level(4);
+        }
+    });
 }
 
 #[cfg(sandbox_static_kernel)]
@@ -165,16 +192,48 @@ impl KrunVm {
 
         context.add_control_socket_fd(guest_socket.as_raw_fd())?;
         Ok(Self {
-            context,
+            context: Some(context),
             control_socket: ControlSocket {
                 stream: host_socket,
             },
             guest_control_socket: guest_socket,
+            worker: None,
+            start_status: Arc::new(Mutex::new(None)),
         })
     }
 
+    pub fn start(&mut self) -> Result<(), KrunError> {
+        if self.worker.is_some() {
+            return Ok(());
+        }
+
+        let context = self
+            .context
+            .take()
+            .ok_or_else(|| KrunError::new("krun_start_enter", -libc::EINVAL))?;
+        let context_id = context.id();
+        std::mem::forget(context);
+
+        let start_status = Arc::clone(&self.start_status);
+        self.worker = Some(thread::spawn(move || {
+            let result = check_krun("krun_start_enter", krun::krun_start_enter(context_id));
+            *start_status.lock().expect("start status lock poisoned") = Some(result.clone());
+            result
+        }));
+        Ok(())
+    }
+
+    pub fn start_status(&self) -> Option<Result<(), KrunError>> {
+        self.start_status
+            .lock()
+            .expect("start status lock poisoned")
+            .clone()
+    }
+
     pub fn context(&self) -> &KrunContext {
-        &self.context
+        self.context
+            .as_ref()
+            .expect("KrunContext is not available after VM start")
     }
 
     pub fn control_socket(&self) -> &ControlSocket {

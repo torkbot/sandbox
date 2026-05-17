@@ -11,7 +11,9 @@ fn main() {
 
 fn run() -> Result<(), InitError> {
     let packet = init_ready_packet()?;
-    send_init_ready(&packet)?;
+    let mut control = connect_control()?;
+    send_init_ready(&mut control, &packet)?;
+    run_control_loop(&mut control)?;
     Ok(())
 }
 
@@ -25,8 +27,7 @@ fn init_ready_packet() -> Result<Vec<u8>, InitError> {
 }
 
 #[cfg(target_os = "linux")]
-fn send_init_ready(packet: &[u8]) -> Result<(), InitError> {
-    use std::io::Write;
+fn connect_control() -> Result<std::fs::File, InitError> {
     use std::os::fd::FromRawFd;
 
     const VMADDR_CID_HOST: u32 = 2;
@@ -59,16 +60,75 @@ fn send_init_ready(packet: &[u8]) -> Result<(), InitError> {
         return Err(error);
     }
 
-    let mut stream = unsafe { std::fs::File::from_raw_fd(fd) };
-    stream
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn connect_control() -> Result<std::fs::File, InitError> {
+    eprintln!("sandbox-init control connect is only available in the Linux guest");
+    Err(InitError(
+        "sandbox-init control connect is only available in the Linux guest".to_string(),
+    ))
+}
+
+fn send_init_ready(control: &mut std::fs::File, packet: &[u8]) -> Result<(), InitError> {
+    use std::io::Write;
+
+    control
         .write_all(packet)
         .map_err(|error| InitError(format!("write init.ready: {error}")))
 }
 
-#[cfg(not(target_os = "linux"))]
-fn send_init_ready(_packet: &[u8]) -> Result<(), InitError> {
-    eprintln!("sandbox-init control connect is only available in the Linux guest");
-    Ok(())
+fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
+    loop {
+        let frame = match ControlFrame::decode_packet_from_reader(control) {
+            Ok(frame) => frame,
+            Err(error) if error.is_eof() => return Ok(()),
+            Err(error) => return Err(InitError(format!("read control packet: {error}"))),
+        };
+
+        match frame {
+            ControlFrame::GuestExec { id, argv } => {
+                let response = run_guest_exec(id, argv)?;
+                let packet = response
+                    .encode_packet()
+                    .map_err(|error| InitError(format!("encode exec completion: {error}")))?;
+                send_packet(control, &packet)?;
+            }
+            ControlFrame::InitReady { .. } | ControlFrame::GuestExecComplete { .. } => {}
+        }
+    }
+}
+
+fn run_guest_exec(id: String, argv: Vec<String>) -> Result<ControlFrame, InitError> {
+    if argv.is_empty() {
+        return Ok(ControlFrame::GuestExecComplete {
+            id,
+            exit_code: 127,
+            stdout: Vec::new(),
+            stderr: b"guest.exec argv must not be empty".to_vec(),
+        });
+    }
+
+    let output = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .output()
+        .map_err(|error| InitError(format!("spawn guest command {}: {error}", argv[0])))?;
+
+    Ok(ControlFrame::GuestExecComplete {
+        id,
+        exit_code: output.status.code().unwrap_or(128),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
+}
+
+fn send_packet(control: &mut std::fs::File, packet: &[u8]) -> Result<(), InitError> {
+    use std::io::Write;
+
+    control
+        .write_all(packet)
+        .map_err(|error| InitError(format!("write control packet: {error}")))
 }
 
 #[derive(Debug)]

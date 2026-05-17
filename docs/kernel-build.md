@@ -39,6 +39,25 @@ Environment knobs:
 
 The build is intentionally not part of `spawnSandbox`. Runtime VM creation should receive a prebuilt kernel/rootfs artifact set.
 
+## Init And Rootfs Fixtures
+
+The project also has build-time fixture helpers:
+
+```sh
+npm run build:init
+npm run build:rootfs
+```
+
+`build:init` cross-builds `crates/sandbox-init` as a static Linux guest binary. `build:rootfs` exports a simple Alpine rootfs and copies that init binary into it as `/sandbox-init`. These are development and CI fixtures, not runtime APIs.
+
+There is also a temporary compatibility helper:
+
+```sh
+npm run build:libkrun-init
+```
+
+That builds libkrun's legacy C init so current libkrun can mount the root and exec `/sandbox-init`. This is not the desired architecture. The target is to fold the direct Rust init direction from `containers/libkrun#670` into our libkrun fork so Sandbox boots our Rust init directly.
+
 ## Static Link Handoff
 
 The lowest-level runtime handoff is the generated `kernel.c` bundle, not the `libkrunfw` dynamic library. To compile the Sandbox Rust crate with that bundle linked into the native module:

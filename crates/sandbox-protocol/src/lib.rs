@@ -5,6 +5,7 @@
 //! either side's implementation dependencies.
 
 use std::fmt;
+use std::io::{self, Read};
 
 /// Reserved guest vsock port for the init control plane.
 pub const INIT_CONTROL_PORT: u32 = 1024;
@@ -156,6 +157,24 @@ impl ControlFrame {
 
         Self::decode(frame)
     }
+
+    pub fn decode_packet_from_reader(reader: &mut impl Read) -> Result<Self, ControlFrameError> {
+        let mut len = [0; 4];
+        match reader.read_exact(&mut len) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(ControlFrameError::eof());
+            }
+            Err(error) => return Err(ControlFrameError::new(error.to_string())),
+        }
+
+        let frame_len = u32::from_le_bytes(len) as usize;
+        let mut frame = vec![0; frame_len];
+        reader
+            .read_exact(&mut frame)
+            .map_err(|error| ControlFrameError::new(error.to_string()))?;
+        Self::decode(&frame)
+    }
 }
 
 impl ControlFrameError {
@@ -163,6 +182,14 @@ impl ControlFrameError {
         Self {
             message: message.into(),
         }
+    }
+
+    fn eof() -> Self {
+        Self::new("control stream ended")
+    }
+
+    pub fn is_eof(&self) -> bool {
+        self.message == "control stream ended"
     }
 }
 

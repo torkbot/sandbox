@@ -21,8 +21,8 @@ test("Node can boot a sandbox VM and exchange control messages", async (t) => {
     memory: { mib: 512 },
     kernel: projectKernel(),
     init: projectInit(),
-    rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
-      format: "erofs",
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20", {
+      format: "directory",
     }),
   });
 

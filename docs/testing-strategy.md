@@ -56,6 +56,7 @@ Evidence:
 - host sends a command and receives an acknowledged response.
 - guest sees the expected kernel command line and mounted root.
 - guest shutdown is clean and host observes the exit status.
+- no required C `init.krun` stage remains once the libkrun fork supports direct Rust init injection.
 
 ### Tier 3: Filesystem E2E
 
@@ -162,7 +163,7 @@ Detected capabilities:
 ## Success Criteria By Project Goal
 
 - Spawn microVMs from Node.js: Node e2e creates a VM, receives readiness, sends commands, and shuts down cleanly.
-- Custom init: guest init performs setup, reports readiness, and supervises a test workload.
+- Custom init: the Rust guest init from this repository performs setup, reports readiness, and supervises a test workload. Any libkrun-provided init stage is a temporary bridge and should be removed from the passing target suite once direct Rust init injection lands.
 - Static linking: linkage report shows no dynamic `libkrun` or `libkrunfw` dependency.
 - Immutable root: root hash remains stable and guest root writes fail.
 - Rootfs shaping: explicit writable-overlay mode can capture deltas and publish a new EROFS rootfs artifact.

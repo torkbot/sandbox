@@ -11,7 +11,10 @@
   },
   "scripts": {
     "build": "npm run build:native && tsgo --project tsconfig.build.json --pretty",
+    "build:init": "node ./scripts/build-init.ts",
+    "build:libkrun-init": "node ./scripts/build-libkrun-init.ts",
     "build:kernel": "node ./scripts/build-kernel.ts",
+    "build:rootfs": "node ./scripts/build-rootfs.ts",
     "build:native": "napi build --platform --release --manifest-path crates/sandbox-node/Cargo.toml && node ./scripts/sign-native.ts",
     "check:rust": "cargo check --workspace",
     "test:e2e": "node ./tests/e2e/run.ts",

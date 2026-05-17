@@ -5,9 +5,9 @@ import {
   projectInit,
   projectKernel,
   spawnSandbox,
+  sqliteFsMount,
   virtualFsMount,
 } from "../../src/index.ts";
-import { loadNativeBinding } from "../../src/native.ts";
 
 test("spawnSandbox rejects invalid CPU config before runtime launch", async () => {
   await assert.rejects(
@@ -119,7 +119,7 @@ test("spawnSandbox rejects invalid protected CIDR ranges before runtime launch",
   );
 });
 
-test("spawnSandbox returns an owned VM handle before guest launch is implemented", async () => {
+test("virtualFsMount preserves the host filesystem object", () => {
   const virtualFs = {
     async stat() {
       return {
@@ -137,42 +137,37 @@ test("spawnSandbox returns an owned VM handle before guest launch is implemented
     },
   };
 
-  const vm = await spawnSandbox({
-    kernel: projectKernel(),
-    init: projectInit(),
-    rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
-      format: "erofs",
-    }),
-    mounts: [virtualFsMount("/sandbox", virtualFs)],
-  });
+  const mount = virtualFsMount("/sandbox", virtualFs);
 
-  assert.equal(vm.mounts.virtualFs("/sandbox"), virtualFs);
-  await vm.control.send({
-    type: "guest.exec",
-    id: "test",
-    argv: ["/bin/true"],
-  });
-  await vm.close();
-  await vm.close();
+  assert.equal(mount.kind, "virtual-fs");
+  assert.equal(mount.path, "/sandbox");
+  assert.equal(mount.fileSystem, virtualFs);
 });
 
-test("native spawn owns a host control socket", async () => {
-  const nativeVm = await loadNativeBinding().spawnSandbox({
-    kernel: {},
-    init: { crateName: "sandbox-init" },
-    rootfs: {
-      path: "test-fixtures/rootfs/alpine-3.20.erofs",
-      readonly: true,
-      format: "erofs",
+test("sqliteFsMount requires a supplied database handle", () => {
+  const database = {
+    open: true,
+    prepare() {
+      throw new Error("not reached");
     },
+    async exec() {
+      throw new Error("not reached");
+    },
+    transaction<TArgs extends readonly unknown[], TResult>(
+      fn: (...args: TArgs) => Promise<TResult>,
+    ) {
+      return fn;
+    },
+  };
+
+  const mount = sqliteFsMount({
+    path: "/data",
+    name: "state",
+    database,
   });
 
-  assert.equal(nativeVm.hasControlSocket, true);
-  assert.equal(nativeVm.tryReadControlPacket(), null);
-  await nativeVm.close();
-  assert.equal(nativeVm.hasControlSocket, false);
-  assert.throws(
-    () => nativeVm.tryReadControlPacket(),
-    /sandbox VM is closed/,
-  );
+  assert.equal(mount.kind, "sqlite-fs");
+  assert.equal(mount.path, "/data");
+  assert.equal(mount.name, "state");
+  assert.equal(mount.database, database);
 });

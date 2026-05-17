@@ -45,6 +45,12 @@ impl NativeSandboxVm {
             .vm
             .as_mut()
             .ok_or_else(|| Error::new(Status::InvalidArg, "sandbox VM is closed"))?;
+        if let Some(Err(error)) = vm.start_status() {
+            return Err(Error::new(
+                Status::GenericFailure,
+                format!("libkrun VM exited before control packet was available: {error}"),
+            ));
+        }
         vm.control_socket_mut()
             .try_read_packet()
             .map(|packet| packet.map(Uint8Array::from))
@@ -127,10 +133,16 @@ pub async fn spawn_sandbox(options: NativeSpawnSandboxOptions) -> Result<NativeS
             format!("invalid spawnSandbox options: {error}"),
         )
     })?;
-    let vm = sandbox::runtime::KrunVm::create(&spec).map_err(|error| {
+    let mut vm = sandbox::runtime::KrunVm::create(&spec).map_err(|error| {
         Error::new(
             Status::GenericFailure,
             format!("failed to initialize libkrun context: {error}"),
+        )
+    })?;
+    vm.start().map_err(|error| {
+        Error::new(
+            Status::GenericFailure,
+            format!("failed to start libkrun VM: {error}"),
         )
     })?;
 
