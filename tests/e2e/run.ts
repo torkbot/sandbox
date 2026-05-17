@@ -18,6 +18,7 @@ const manifest = {
     "boot-smoke",
     "filesystem",
     "filesystem-posix-hardening",
+    "guest-hardening",
     "http-policy",
     "http-production-hardening",
     "libkrun-contract",

@@ -89,6 +89,27 @@ Failing:
 
 - No remaining known failures in this scenario file.
 
+## `guest-hardening.test.ts`
+
+This file owns hostile guest behavior. These tests should prove that untrusted code can exhaust or pressure guest resources without wedging the host API, escaping its VM, or carrying state into later sandbox instances.
+
+Passing:
+
+- `guest memory exhaustion is contained and the host can launch a fresh VM`
+  - Drive guest memory to OOM and assert the VM/API failure is deterministic and a later VM still boots.
+- `guest CPU exhaustion can be stopped without wedging the host API`
+  - Saturate the guest vCPU with hot loops and assert `close()` still completes.
+- `guest fork pressure can be stopped without wedging the host API`
+  - Spawn guest processes aggressively and assert `close()` still completes.
+- `guest disk exhaustion is bounded to the sandbox upper filesystem`
+  - Fill the writable overlay and assert the guest hits a sandbox quota without leaking state to the next VM.
+- `guest kernel object pressure can be stopped without wedging the host API`
+  - Drive kernel object/file-descriptor pressure inside the guest and assert `close()` still completes.
+
+Failing:
+
+- No remaining known failures in this scenario file.
+
 ## `rootfs-shaping.test.ts`
 
 This file owns root filesystem composition. Runtime VMs should stay immutable by default unless the root is explicitly composed with `linuxOverlayFs(...)`.
