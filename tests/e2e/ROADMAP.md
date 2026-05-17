@@ -170,7 +170,7 @@ Failing:
 
 This file owns fork-specific contracts that are too important to leave as comments in architecture docs.
 
-Failing:
+Passing:
 
 - `Sandbox integrates libkrun through Rust/static build outputs, not the C header surface`
   - Reject accidental C API binding or dynamic library paths.
@@ -178,6 +178,9 @@ Failing:
   - Prove fd-oriented network/control surfaces where the fork supports them.
 - `virtual filesystem operations use libkrun virtual filesystem traits`
   - Keep writable VFS e2e tied to the libkrun trait/backend path.
+
+Failing:
+
 - `direct Rust init injection boots without libkrun stage-1 init`
   - Boot `sandbox-init` directly without relying on libkrun stage-1 init.
 
