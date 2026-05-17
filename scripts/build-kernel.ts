@@ -23,7 +23,7 @@ await run("docker", [
   "-lc",
   [
     "apt-get update",
-    "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential bc bison ca-certificates curl flex libelf-dev libssl-dev python3 python3-pyelftools xz-utils",
+    "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential bc bison ca-certificates cpio curl flex libelf-dev libssl-dev python3 python3-pyelftools xz-utils",
     `make -j$(nproc) ARCH=${shellArg(arch)}`,
   ].join(" && "),
 ]);

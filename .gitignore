@@ -1,6 +1,7 @@
 crates/sandbox-node/index.js
 crates/sandbox-node/*.node
 crates/sandbox-node/index.d.ts
+dist/
 node_modules/
 test-results/
 target/
