@@ -1,7 +1,9 @@
 use std::ffi::CString;
 use std::fmt;
+use std::os::fd::RawFd;
 use std::path::Path;
 
+use crate::control::INIT_CONTROL_PORT;
 use crate::config::RootfsFormat;
 use crate::MicroVmSpec;
 
@@ -30,6 +32,13 @@ impl KrunContext {
         context.apply_vm_config(spec)?;
         context.apply_rootfs(spec)?;
         Ok(context)
+    }
+
+    pub fn add_control_listener_fd(&self, fd: RawFd) -> Result<(), KrunError> {
+        check_krun(
+            "krun_add_vsock_port_fd",
+            krun::krun_add_vsock_port_fd(self.id, INIT_CONTROL_PORT, fd),
+        )
     }
 
     pub fn id(&self) -> u32 {
@@ -164,6 +173,36 @@ mod tests {
 
         let context = KrunContext::create(&spec).unwrap();
         let _ = context.id();
+    }
+
+    #[test]
+    fn configures_control_listener_by_fd() {
+        let spec = MicroVmSpec::build(MicroVmSpecInput {
+            name: Some("control-fd".to_string()),
+            vcpus: Some(1),
+            memory_mib: Some(128),
+            kernel_format: None,
+            init_crate: "sandbox-init".to_string(),
+            rootfs_path: "rootfs.erofs".to_string(),
+            rootfs_readonly: Some(true),
+            rootfs_format: "erofs".to_string(),
+            rootfs_overlay_mode: None,
+            mounts: Vec::new(),
+            network_http: None,
+        })
+        .unwrap();
+
+        let context = KrunContext::create(&spec).unwrap();
+        let mut fds = [0; 2];
+        let pipe_result = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(pipe_result, 0);
+
+        context.add_control_listener_fd(fds[0]).unwrap();
+
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
     }
 
     #[test]
