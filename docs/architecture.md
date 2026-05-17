@@ -90,7 +90,7 @@ The likely path is: start with conventional virtio-net connected to a Rust host 
 HTTP interception requires explicit guest trust injection. The guest init should mount or receive the generated CA certificate and update the guest trust store before starting the workload. Host policy must cover:
 
 - destination allow/deny rules,
-- protected host and private network ranges,
+- protected host and private network ranges, with RFC1918, carrier-grade NAT, and link-local destinations blocked before JavaScript policy by default,
 - loopback and link-local handling,
 - DNS policy,
 - CONNECT and TLS interception behavior,

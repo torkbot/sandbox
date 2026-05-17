@@ -135,6 +135,7 @@ The guest contract is intentionally narrow:
 - `/` is read-only.
 - `/sandbox/proc` is implemented by the host.
 - HTTP policy and header rewriting happen in TypeScript on the host.
+- RFC1918, carrier-grade NAT, and link-local destinations are blocked before JavaScript policy.
 
 ## Design Targets
 
@@ -146,6 +147,7 @@ The guest contract is intentionally narrow:
 - build-time rootfs shaping, with prebuilt rootfs artifacts supplied at VM instantiation,
 - programmable virtual filesystems backed by TypeScript callbacks,
 - transparent HTTP interception with TypeScript policy hooks,
+- protected network ranges enforced before policy, with private/link-local ranges blocked by default,
 - Rust-native or statically linkable networking components; sidecar network daemons are references, not default runtime dependencies,
 - macOS HVF entitlement signing verified as part of the integration test flow.
 

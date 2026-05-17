@@ -32,7 +32,7 @@ Runs without a hypervisor.
 Evidence:
 
 - HTTP policy hooks receive normalized request metadata and can allow, deny, and rewrite headers.
-- protected network ranges are blocked before forwarding.
+- default protected network ranges and caller-supplied protected ranges are blocked before forwarding or JavaScript policy.
 - virtual filesystem callbacks are deterministic and return expected metadata, directory entries, and file contents.
 - mounted filesystems are inspectable from JavaScript with the same `stat` / `list` / `read` shape exposed to the host runtime.
 - the `Transport` adapter preserves message order, close behavior, and backpressure.
@@ -103,7 +103,7 @@ Evidence:
 - Node.js policy sees method, URL, destination IP, headers, and TLS metadata.
 - allowed requests reach the test origin with expected header rewrites.
 - denied requests fail with a deterministic guest-visible error.
-- requests to protected host, loopback, link-local, and configured private ranges are blocked.
+- requests to protected host, link-local, default private ranges, and configured private ranges are blocked.
 - DNS policy is observable in the proxy trace.
 
 ### Tier 5: libkrun Fork Contract Tests
@@ -166,7 +166,7 @@ Detected capabilities:
 - Rootfs shaping: explicit writable-overlay mode can capture deltas and publish a new EROFS rootfs artifact.
 - Virtual filesystem: guest reads host-generated files and metadata through a mounted virtual tree.
 - HTTP interception: TLS traffic is intercepted with guest-trusted CA, policy hooks run in Node.js, headers are modified, and forwarding is transparent.
-- Network policy: protected host and private ranges are blocked with deterministic evidence.
+- Network policy: default protected ranges and configured protected ranges are blocked with deterministic evidence before JavaScript policy.
 - Host/guest transport: bidirectional messages preserve ordering, errors, and close semantics.
 - macOS support: HVF entitlement signing is verified on `sandbox-host` and VM boot goes through that signed helper, not through a signed copy of Node.
 

@@ -255,6 +255,67 @@ test("HTTPS traffic is intercepted, policy checked, rewritten, and protected ran
   assert.ok(!decisions.some((decision) => decision.destinationIp === "169.254.169.254"));
 });
 
+test("protected host and private network destinations are blocked before JavaScript policy", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+  const ca = await createTestCertificateAuthority();
+  t.after(async () => {
+    await ca.close();
+  });
+  const policyDestinations: string[] = [];
+
+  const vm = await spawnSandbox({
+    name: "default-protected-ranges",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      http: {
+        ca,
+        async policy(request) {
+          policyDestinations.push(request.destinationIp);
+          return { action: "allow" };
+        },
+      },
+    },
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const protectedDestinations = [
+    "10.1.2.3",
+    "172.16.0.1",
+    "192.168.1.1",
+    "169.254.169.254",
+  ];
+  for (const destination of protectedDestinations) {
+    const result = await execGuest(vm, {
+      id: `curl-protected-${destination}`,
+      argv: [
+        "curl",
+        "--max-time",
+        "5",
+        "-sS",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        `http://${destination}/protected`,
+      ],
+    });
+    assert.equal(result.stdout, "403", `${destination} should be blocked before policy`);
+  }
+
+  assert.deepEqual(policyDestinations, []);
+});
+
 test("transparent HTTPS generates a trusted leaf cert for the requested SNI hostname", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
@@ -456,8 +517,8 @@ test("HTTP interception forwards request and response bodies larger than a singl
   t.after(async () => {
     await ca.close();
   });
-  const requestBodyBytes = 16 * 1024;
-  const responseBodyBytes = 48 * 1024;
+  const requestBodyBytes = 32 * 1024;
+  const responseBodyBytes = 384 * 1024;
   const responseBody = Buffer.alloc(responseBodyBytes, "b");
   const decisions: Pick<HttpPolicyRequest, "method" | "url" | "headers">[] = [];
 
@@ -613,6 +674,173 @@ test("HTTP interception handles concurrent guest requests without dropping polic
   );
   for (let index = 0; index < urls.length; index += 1) {
     assert.match(result.stdout, new RegExp(`/concurrent-${index}`));
+  }
+  assert.equal(policyUrls.length, urls.length);
+  assert.deepEqual([...requestedPaths].sort(), urls.map((url) => new URL(url).pathname).sort());
+});
+
+test("HTTPS interception forwards request and response bodies larger than a single TLS record", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+  const ca = await createTestCertificateAuthority();
+  t.after(async () => {
+    await ca.close();
+  });
+  const requestBodyBytes = 16 * 1024;
+  const responseBodyBytes = 48 * 1024;
+  const responseBody = Buffer.alloc(responseBodyBytes, "s");
+  const decisions: Pick<HttpPolicyRequest, "method" | "url" | "tls">[] = [];
+
+  const origin = await startTestHttpsOrigin({
+    ca,
+    respond(request) {
+      return {
+        status: request.body.byteLength === requestBodyBytes ? 200 : 400,
+        headers: {
+          "content-type": "application/octet-stream",
+          "x-request-bytes": String(request.body.byteLength),
+        },
+        body: responseBody,
+      };
+    },
+  });
+
+  t.after(async () => {
+    await origin.close();
+  });
+
+  const vm = await spawnSandbox({
+    name: "https-large-bodies",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      http: {
+        ca,
+        async policy(request) {
+          decisions.push({
+            method: request.method,
+            url: request.url,
+            tls: request.tls,
+          });
+          return { action: "allow" };
+        },
+      },
+    },
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuest(vm, {
+    id: "curl-large-https-bodies",
+    argv: [
+      "sh",
+      "-lc",
+      [
+        `dd if=/dev/zero of=/run/large-https-request.bin bs=${requestBodyBytes} count=1 status=none &&`,
+        "curl --max-time 10 -fsS",
+        "-X POST",
+        "--data-binary @/run/large-https-request.bin",
+        "-o /run/large-https-response.bin",
+        ...interceptedHttpsArgs(`${origin.url}/large`),
+        "&& wc -c < /run/large-https-response.bin",
+      ].join(" "),
+    ],
+  });
+
+  assert.equal(
+    result.exitCode,
+    0,
+    `large HTTPS body transfer failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+  );
+  assert.equal(Number(result.stdout.trim()), responseBodyBytes);
+  assert.equal(decisions.length, 1);
+  assert.equal(decisions[0]?.method, "POST");
+  assert.ok(decisions[0]?.tls);
+  assert.match(decisions[0]?.tls?.protocol ?? "", /TLS/);
+});
+
+test("HTTPS interception handles concurrent guest requests without dropping TLS policy calls", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+  const ca = await createTestCertificateAuthority();
+  t.after(async () => {
+    await ca.close();
+  });
+  const requestedPaths: string[] = [];
+  const policyUrls: string[] = [];
+
+  const origin = await startTestHttpsOrigin({
+    ca,
+    respond(request) {
+      requestedPaths.push(request.url);
+      return {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+        body: request.url,
+      };
+    },
+  });
+
+  t.after(async () => {
+    await origin.close();
+  });
+
+  const vm = await spawnSandbox({
+    name: "https-concurrent-requests",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      http: {
+        ca,
+        async policy(request) {
+          policyUrls.push(request.url);
+          return { action: "allow" };
+        },
+      },
+    },
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const urls = Array.from({ length: 8 }, (_, index) => `${origin.url}/secure-concurrent-${index}`);
+  const script = [
+    "set -eu",
+    "rm -f /run/sandbox-secure-concurrent-*",
+    ...urls.map((url, index) =>
+      `curl --max-time 10 -fsS ${interceptedHttpsArgs(url).map(shellQuote).join(" ")} > /run/sandbox-secure-concurrent-${index} &`,
+    ),
+    "wait",
+    "cat /run/sandbox-secure-concurrent-*",
+  ].join("\n");
+
+  const result = await execGuest(vm, {
+    id: "curl-concurrent-https",
+    argv: ["sh", "-lc", script],
+  });
+
+  assert.equal(
+    result.exitCode,
+    0,
+    `concurrent HTTPS requests failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+  );
+  for (let index = 0; index < urls.length; index += 1) {
+    assert.match(result.stdout, new RegExp(`/secure-concurrent-${index}`));
   }
   assert.equal(policyUrls.length, urls.length);
   assert.deepEqual([...requestedPaths].sort(), urls.map((url) => new URL(url).pathname).sort());

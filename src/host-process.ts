@@ -15,6 +15,14 @@ import type {
   SandboxFileSystem,
 } from "./index.ts";
 
+const DEFAULT_PROTECTED_RANGES = [
+  "10.0.0.0/8",
+  "100.64.0.0/10",
+  "169.254.0.0/16",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+] as const;
+
 export class HostProcessSandboxVm implements HostControlChannel {
   readonly hasControlSocket = true;
 
@@ -297,7 +305,10 @@ export class HostProcessSandboxVm implements HostControlChannel {
         headers,
         tls: tlsFromWire(document.tls),
       };
-      if (isProtectedDestination(request.destinationIp, interception.protectedRanges ?? [])) {
+      if (isProtectedDestination(request.destinationIp, [
+        ...DEFAULT_PROTECTED_RANGES,
+        ...(interception.protectedRanges ?? []),
+      ])) {
         this.#child.stdin.write(encodePacket({
           type: "host.http.response",
           id,
