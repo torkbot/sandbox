@@ -111,11 +111,11 @@ Passing:
   - Allows policy to a refused origin and asserts the guest sees a stable `502`.
 - `upstream timeout returns a deterministic guest-visible failure`
   - Origin accepts but delays response past the host upstream timeout; guest sees a stable `502`.
+- `upstream reset mid-body returns a deterministic guest-visible failure`
+  - Origin closes mid-response and the guest observes a stable `502`.
 
 Failing:
 
-- `upstream reset mid-body returns a deterministic guest-visible failure`
-  - Origin closes mid-response and the guest observes a stable failure.
 - `TLS without SNI has deterministic certificate and policy metadata`
   - Connect by IP literal and assert the documented no-SNI behavior.
 - `dynamic MITM certificates are reused or bounded intentionally`

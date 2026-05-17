@@ -1044,8 +1044,76 @@ test("upstream timeout returns a deterministic guest-visible failure", async (t)
   assert.deepEqual(policyUrls, [url]);
 });
 
-test("upstream reset mid-body returns a deterministic guest-visible failure", () => {
-  assert.fail("mid-body upstream resets must produce a stable guest-visible failure");
+test("upstream reset mid-body returns a deterministic guest-visible failure", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+  const ca = await createTestCertificateAuthority();
+  t.after(async () => {
+    await ca.close();
+  });
+  const policyUrls: string[] = [];
+
+  const origin = await startTestHttpOrigin({
+    respond() {
+      return {
+        status: 200,
+        headers: {
+          "content-length": "1024",
+          "x-test-reset": "mid-body",
+        },
+        body: Buffer.from("partial"),
+      };
+    },
+  });
+
+  t.after(async () => {
+    await origin.close();
+  });
+
+  const vm = await spawnSandbox({
+    name: "http-upstream-reset",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      http: {
+        ca,
+        async policy(request) {
+          policyUrls.push(request.url);
+          return { action: "allow" };
+        },
+      },
+    },
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const url = `${origin.url}/reset`;
+  const result = await execGuest(vm, {
+    id: "curl-upstream-reset",
+    argv: [
+      "curl",
+      "--max-time",
+      "5",
+      "-sS",
+      "-o",
+      "/dev/null",
+      "-w",
+      "%{http_code}",
+      ...interceptedHttpArgs(url),
+    ],
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, "502");
+  assert.deepEqual(policyUrls, [url]);
 });
 
 test("TLS without SNI has deterministic certificate and policy metadata", () => {

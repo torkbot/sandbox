@@ -481,6 +481,10 @@ async function requestUpstream(url: string, input: {
       response.on("data", (chunk: Uint8Array) => {
         chunks.push(chunk);
       });
+      response.once("aborted", () => {
+        reject(new Error("upstream response aborted"));
+      });
+      response.once("error", reject);
       response.on("end", () => {
         resolvePromise({
           status: response.statusCode ?? 502,
