@@ -337,13 +337,41 @@ fn run_guest_exec(
         .envs(env)
         .output()
         .map_err(|error| InitError(format!("spawn guest command {}: {error}", argv[0])))?;
+    let (exit_code, stderr) = exec_status(output.status, output.stderr);
 
     Ok(ControlFrame::GuestExecComplete {
         id,
-        exit_code: output.status.code().unwrap_or(128),
+        exit_code,
         stdout: output.stdout,
-        stderr: output.stderr,
+        stderr,
     })
+}
+
+fn exec_status(status: std::process::ExitStatus, mut stderr: Vec<u8>) -> (i32, Vec<u8>) {
+    if let Some(code) = status.code() {
+        return (code, stderr);
+    }
+    let signal = terminating_signal(status);
+    if let Some(signal) = signal {
+        if !stderr.is_empty() && !stderr.ends_with(b"\n") {
+            stderr.push(b'\n');
+        }
+        stderr.extend_from_slice(format!("killed by signal {signal}\n").as_bytes());
+        return (128 + signal, stderr);
+    }
+    (128, stderr)
+}
+
+#[cfg(unix)]
+fn terminating_signal(status: std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn terminating_signal(_status: std::process::ExitStatus) -> Option<i32> {
+    None
 }
 
 fn install_http_ca(certificate: Option<String>) -> Result<(), InitError> {
