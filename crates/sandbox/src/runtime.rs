@@ -34,7 +34,7 @@ impl KrunContext {
         Ok(context)
     }
 
-    pub fn add_control_listener_fd(&self, fd: RawFd) -> Result<(), KrunError> {
+    pub fn add_control_socket_fd(&self, fd: RawFd) -> Result<(), KrunError> {
         check_krun(
             "krun_add_vsock_port_fd",
             krun::krun_add_vsock_port_fd(self.id, INIT_CONTROL_PORT, fd),
@@ -176,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn configures_control_listener_by_fd() {
+    fn configures_control_port_by_connected_fd() {
         let spec = MicroVmSpec::build(MicroVmSpecInput {
             name: Some("control-fd".to_string()),
             vcpus: Some(1),
@@ -194,10 +194,17 @@ mod tests {
 
         let context = KrunContext::create(&spec).unwrap();
         let mut fds = [0; 2];
-        let pipe_result = unsafe { libc::pipe(fds.as_mut_ptr()) };
-        assert_eq!(pipe_result, 0);
+        let socketpair_result = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        assert_eq!(socketpair_result, 0);
 
-        context.add_control_listener_fd(fds[0]).unwrap();
+        context.add_control_socket_fd(fds[0]).unwrap();
 
         unsafe {
             libc::close(fds[0]);
