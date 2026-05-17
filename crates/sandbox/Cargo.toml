@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64 = "0.22"
 krun-devices = { path = "../../deps/libkrun/src/devices", default-features = false, features = ["blk", "net"] }
 krun = { package = "libkrun", path = "../../deps/libkrun/src/libkrun", default-features = false, features = ["blk", "net"] }
 libc = "0.2"

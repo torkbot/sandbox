@@ -91,6 +91,7 @@ mod tests {
     fn parses_ipv4_and_ipv6_protected_ranges() {
         let plan = NetworkPlan::from_http(Some(&HttpSpec {
             protected_ranges: vec!["127.0.0.0/8".to_string(), "::1/128".to_string()],
+            ca_certificate_pem: None,
         }))
         .unwrap()
         .unwrap();
@@ -102,6 +103,7 @@ mod tests {
     fn rejects_invalid_cidr_prefix() {
         let err = NetworkPlan::from_http(Some(&HttpSpec {
             protected_ranges: vec!["127.0.0.0/33".to_string()],
+            ca_certificate_pem: None,
         }))
         .unwrap_err();
 

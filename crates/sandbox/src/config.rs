@@ -66,6 +66,7 @@ pub struct NetworkSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpSpec {
     pub protected_ranges: Vec<String>,
+    pub ca_certificate_pem: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +144,7 @@ impl MicroVmSpec {
         let network = input.network_http.map(|http| NetworkSpec {
             http: Some(HttpSpec {
                 protected_ranges: http.protected_ranges,
+                ca_certificate_pem: http.ca_certificate_pem,
             }),
         });
         crate::network::NetworkPlan::from_http(
@@ -251,6 +253,7 @@ pub struct MountSpecInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpSpecInput {
     pub protected_ranges: Vec<String>,
+    pub ca_certificate_pem: Option<String>,
 }
 
 #[cfg(test)]
@@ -303,6 +306,9 @@ mod tests {
         ];
         input.network_http = Some(HttpSpecInput {
             protected_ranges: vec!["127.0.0.0/8".to_string()],
+            ca_certificate_pem: Some(
+                "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----".to_string(),
+            ),
         });
 
         let spec = MicroVmSpec::build(input).unwrap();

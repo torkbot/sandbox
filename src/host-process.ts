@@ -412,6 +412,7 @@ function encodeHostSpawn(options: NativeSpawnSandboxOptions): Uint8Array {
       ? undefined
       : {
           protectedRanges: options.network.http.protectedRanges ?? [],
+          caCertificatePem: options.network.http.caCertificatePem,
         },
   });
 }

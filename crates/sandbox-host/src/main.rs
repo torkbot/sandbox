@@ -202,7 +202,10 @@ fn parse_network_http(
         })
         .unwrap_or_else(|_| Ok(Vec::new()))?;
 
-    Ok(Some(HttpSpecInput { protected_ranges }))
+    Ok(Some(HttpSpecInput {
+        protected_ranges,
+        ca_certificate_pem: optional_string(document, "caCertificatePem"),
+    }))
 }
 
 fn optional_string(document: &Document, key: &str) -> Option<String> {

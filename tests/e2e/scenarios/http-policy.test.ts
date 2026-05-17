@@ -28,6 +28,10 @@ test("plain HTTP traffic is intercepted, policy checked, rewritten, and forwarde
     network: {
       http: {
         protectedRanges: ["169.254.169.254/32"],
+        ca: {
+          certificatePem: TEST_CA_CERTIFICATE,
+          privateKeyPem: "unused in this e2e slice",
+        },
         async policy(request) {
           decisions.push({
             url: request.url,
@@ -56,6 +60,13 @@ test("plain HTTP traffic is intercepted, policy checked, rewritten, and forwarde
   });
 
   await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const injectedCa = await execGuest(vm, {
+    id: "injected-ca",
+    argv: ["sh", "-lc", "test \"$SSL_CERT_FILE\" = /run/sandbox/http-ca.pem && cat /run/sandbox/http-ca.pem"],
+  });
+  assert.equal(injectedCa.exitCode, 0);
+  assert.equal(injectedCa.stdout, TEST_CA_CERTIFICATE);
 
   const origin = await startTestHttpOrigin({
     respond(request) {
@@ -121,6 +132,13 @@ test("plain HTTP traffic is intercepted, policy checked, rewritten, and forwarde
     origin: origin.url,
   });
 });
+
+const TEST_CA_CERTIFICATE = [
+  "-----BEGIN CERTIFICATE-----",
+  "MIIBtestSandboxHttpCa",
+  "-----END CERTIFICATE-----",
+  "",
+].join("\n");
 
 function interceptedHttpArgs(url: string): string[] {
   const parsed = new URL(url);

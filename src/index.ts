@@ -420,6 +420,9 @@ function toNativeSpawnOptions(options: SandboxOptions): NativeSpawnSandboxOption
             ? undefined
             : {
                 protectedRanges: options.network.http.protectedRanges,
+                caCertificatePem: options.network.http.ca === "ephemeral"
+                  ? undefined
+                  : options.network.http.ca?.certificatePem,
               },
         },
   };

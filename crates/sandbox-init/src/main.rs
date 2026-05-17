@@ -13,6 +13,7 @@ fn main() {
 fn run() -> Result<(), InitError> {
     mount_kernel_filesystems()?;
     configure_http_network(std::env::args().skip(1))?;
+    install_http_ca(std::env::var("SANDBOX_HTTP_CA_PEM_B64").ok())?;
     mount_virtual_filesystems(
         std::env::args().skip(1),
         std::env::var("SANDBOX_VIRTIOFS_MOUNTS").ok(),
@@ -64,6 +65,7 @@ fn mount_kernel_filesystems() -> Result<(), InitError> {
     mount_fs("proc", "/proc", "proc", 0)?;
     mount_fs("sysfs", "/sys", "sysfs", 0)?;
     mount_fs("devtmpfs", "/dev", "devtmpfs", 0)?;
+    mount_fs("tmpfs", "/run", "tmpfs", 0)?;
     Ok(())
 }
 
@@ -288,8 +290,13 @@ fn run_guest_exec(
 
     prepare_exec_environment(&env)?;
 
-    let output = std::process::Command::new(&argv[0])
-        .args(&argv[1..])
+    let mut command = std::process::Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    if std::path::Path::new("/run/sandbox/http-ca.pem").exists() {
+        command.env("SSL_CERT_FILE", "/run/sandbox/http-ca.pem");
+        command.env("CURL_CA_BUNDLE", "/run/sandbox/http-ca.pem");
+    }
+    let output = command
         .envs(env)
         .output()
         .map_err(|error| InitError(format!("spawn guest command {}: {error}", argv[0])))?;
@@ -302,17 +309,33 @@ fn run_guest_exec(
     })
 }
 
+fn install_http_ca(certificate: Option<String>) -> Result<(), InitError> {
+    let Some(certificate) = certificate else {
+        return Ok(());
+    };
+
+    let certificate = base64::engine::general_purpose::STANDARD
+        .decode(certificate)
+        .map_err(|error| InitError(format!("decode boot HTTP CA certificate: {error}")))?;
+    write_http_ca(&certificate)
+}
+
 fn prepare_exec_environment(env: &[(String, String)]) -> Result<(), InitError> {
     let Some((_, certificate)) = env.iter().find(|(key, _)| key == "SANDBOX_HTTP_CA_PEM_B64")
     else {
         return Ok(());
     };
 
-    std::fs::create_dir_all("/run/sandbox")
-        .map_err(|error| InitError(format!("create /run/sandbox: {error}")))?;
     let certificate = base64::engine::general_purpose::STANDARD
         .decode(certificate)
         .map_err(|error| InitError(format!("decode host HTTP CA certificate: {error}")))?;
+    write_http_ca(&certificate)?;
+    Ok(())
+}
+
+fn write_http_ca(certificate: &[u8]) -> Result<(), InitError> {
+    std::fs::create_dir_all("/run/sandbox")
+        .map_err(|error| InitError(format!("create /run/sandbox: {error}")))?;
     std::fs::write("/run/sandbox/http-ca.pem", certificate)
         .map_err(|error| InitError(format!("write host HTTP CA certificate: {error}")))?;
     Ok(())
