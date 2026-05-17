@@ -211,6 +211,9 @@ impl MountSpec {
         if !input.path.starts_with('/') {
             return Err(SpecError::new("mount.path must be absolute"));
         }
+        if input.path.contains('=') || input.path.contains(';') {
+            return Err(SpecError::new("mount.path must not contain '=' or ';'"));
+        }
 
         match input.kind.as_str() {
             "virtual-fs" => Ok(Self::VirtualFs {

@@ -124,6 +124,24 @@ test("plain HTTP traffic is intercepted, policy checked, rewritten, and forwarde
   });
   assert.equal(protectedDestination.stdout, "403");
 
+  const protectedUrlViaAllowedFlow = await execGuest(vm, {
+    id: "curl-protected-url-via-allowed-flow",
+    argv: [
+      "curl",
+      "--max-time",
+      "5",
+      "-sS",
+      "-o",
+      "/dev/null",
+      "-w",
+      "%{http_code}",
+      "--connect-to",
+      "169.254.169.254:80:203.0.113.10:80",
+      "http://169.254.169.254/protected",
+    ],
+  });
+  assert.equal(protectedUrlViaAllowedFlow.stdout, "403");
+
   assert.ok(decisions.some((decision) => decision.url.endsWith("/allowed")));
   assert.ok(decisions.some((decision) => decision.url.endsWith("/blocked")));
   assert.ok(!decisions.some((decision) => decision.destinationIp === "169.254.169.254"));

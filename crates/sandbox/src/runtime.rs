@@ -38,6 +38,7 @@ pub struct KrunVm {
 #[derive(Debug)]
 pub struct ControlSocket {
     stream: UnixStream,
+    read_buffer: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -374,6 +375,7 @@ impl KrunVm {
             context: Some(context),
             control_socket: ControlSocket {
                 stream: host_socket,
+                read_buffer: Vec::new(),
             },
             guest_control_socket: guest_socket,
             worker: None,
@@ -439,19 +441,31 @@ impl ControlSocket {
 
     pub fn try_read_packet(&mut self) -> io::Result<Option<Vec<u8>>> {
         self.stream.set_nonblocking(true)?;
-        let mut len = [0; 4];
-        match self.stream.read_exact(&mut len) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
-            Err(error) => return Err(error),
+        loop {
+            let mut chunk = [0; 4096];
+            match self.stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => self.read_buffer.extend_from_slice(&chunk[..read]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
         }
 
+        if self.read_buffer.len() < 4 {
+            return Ok(None);
+        }
+        let len = [
+            self.read_buffer[0],
+            self.read_buffer[1],
+            self.read_buffer[2],
+            self.read_buffer[3],
+        ];
         let frame_len = u32::from_le_bytes(len) as usize;
-        let mut packet = Vec::with_capacity(4 + frame_len);
-        packet.extend_from_slice(&len);
-        packet.resize(4 + frame_len, 0);
-        self.stream.set_nonblocking(false)?;
-        self.stream.read_exact(&mut packet[4..])?;
+        let packet_len = 4 + frame_len;
+        if self.read_buffer.len() < packet_len {
+            return Ok(None);
+        }
+        let packet = self.read_buffer.drain(..packet_len).collect();
         Ok(Some(packet))
     }
 }
@@ -601,6 +615,7 @@ mod tests {
         let (host_socket, mut guest_socket) = UnixStream::pair().unwrap();
         let mut control_socket = ControlSocket {
             stream: host_socket,
+            read_buffer: Vec::new(),
         };
 
         assert!(control_socket.try_read_packet().unwrap().is_none());
@@ -612,6 +627,27 @@ mod tests {
         .encode_packet()
         .unwrap();
         guest_socket.write_all(&packet).unwrap();
+
+        assert_eq!(control_socket.try_read_packet().unwrap(), Some(packet));
+    }
+
+    #[test]
+    fn control_socket_preserves_partial_nonblocking_packets() {
+        let (host_socket, mut guest_socket) = UnixStream::pair().unwrap();
+        let mut control_socket = ControlSocket {
+            stream: host_socket,
+            read_buffer: Vec::new(),
+        };
+        let packet = crate::control::ControlFrame::InitReady {
+            root_readonly: true,
+            init_name: "sandbox-init".to_string(),
+        }
+        .encode_packet()
+        .unwrap();
+
+        guest_socket.write_all(&packet[..2]).unwrap();
+        assert!(control_socket.try_read_packet().unwrap().is_none());
+        guest_socket.write_all(&packet[2..]).unwrap();
 
         assert_eq!(control_socket.try_read_packet().unwrap(), Some(packet));
     }

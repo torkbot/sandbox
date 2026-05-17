@@ -170,6 +170,7 @@ test("writable virtual filesystem preserves POSIX rename edge semantics", async 
 
   const fileSystem = createPosixMemoryFileSystem();
   await fileSystem.mkdir("/src");
+  await fileSystem.mkdir("/tree");
   await fileSystem.mkdir("/non-empty");
   await fileSystem.createFile("/non-empty/child.txt");
   await fileSystem.write({
@@ -188,6 +189,12 @@ test("writable virtual filesystem preserves POSIX rename edge semantics", async 
     path: "/src/next.txt",
     offset: 0,
     contents: Buffer.from("new"),
+  });
+  await fileSystem.createFile("/tree/child.txt");
+  await fileSystem.write({
+    path: "/tree/child.txt",
+    offset: 0,
+    contents: Buffer.from("cached child"),
   });
 
   const vm = await spawnSandbox({
@@ -221,6 +228,9 @@ test("writable virtual filesystem preserves POSIX rename edge semantics", async 
       fi
       test -d /workspace/empty
       test "$(cat /workspace/non-empty/child.txt)" = "child"
+      ls /workspace/tree/child.txt >/dev/null
+      mv /workspace/tree /workspace/renamed-tree
+      test "$(cat /workspace/renamed-tree/child.txt)" = "cached child"
     `,
   });
 
@@ -391,6 +401,20 @@ function createPosixMemoryFileSystem(): PosixMemoryFileSystem {
       }
       entries.delete(normalizedFrom);
       entries.set(normalizedTo, entry);
+      if (entry.type === "directory") {
+        const fromPrefix = `${normalizedFrom}/`;
+        const moved = [...entries.entries()]
+          .filter(([entryPath]) => entryPath.startsWith(fromPrefix))
+          .map(([entryPath, child]) => [
+            `${normalizedTo}/${entryPath.slice(fromPrefix.length)}`,
+            child,
+            entryPath,
+          ] as const);
+        for (const [nextPath, child, previousPath] of moved) {
+          entries.delete(previousPath);
+          entries.set(nextPath, child);
+        }
+      }
     },
     async symlink(target, path) {
       const normalized = normalizePath(path);

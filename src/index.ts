@@ -173,7 +173,7 @@ export type HttpPolicyDecision =
   | { readonly action: "deny"; readonly reason: string };
 
 export interface HttpInterceptionConfig {
-  readonly ca?: "ephemeral" | { readonly certificatePem: string; readonly privateKeyPem: string };
+  readonly ca?: { readonly certificatePem: string; readonly privateKeyPem: string };
   readonly protectedRanges?: readonly string[];
   policy(request: HttpPolicyRequest): Promise<HttpPolicyDecision>;
 }
@@ -441,12 +441,8 @@ function toNativeSpawnOptions(options: SandboxOptions): NativeSpawnSandboxOption
             ? undefined
             : {
                 protectedRanges: options.network.http.protectedRanges,
-                caCertificatePem: options.network.http.ca === "ephemeral"
-                  ? undefined
-                  : options.network.http.ca?.certificatePem,
-                caPrivateKeyPem: options.network.http.ca === "ephemeral"
-                  ? undefined
-                  : options.network.http.ca?.privateKeyPem,
+                caCertificatePem: options.network.http.ca?.certificatePem,
+                caPrivateKeyPem: options.network.http.ca?.privateKeyPem,
               },
         },
   };
@@ -489,6 +485,9 @@ function validateSandboxOptions(options: SandboxOptions): void {
   for (const mount of options.mounts ?? []) {
     if (!mount.path.startsWith("/")) {
       throw new Error("invalid spawnSandbox options: mount.path must be absolute");
+    }
+    if (mount.path.includes("=") || mount.path.includes(";")) {
+      throw new Error("invalid spawnSandbox options: mount.path must not contain '=' or ';'");
     }
     if (mountPaths.has(mount.path)) {
       throw new Error(`invalid spawnSandbox options: duplicate mount path: ${mount.path}`);

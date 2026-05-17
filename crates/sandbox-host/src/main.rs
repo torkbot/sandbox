@@ -1,7 +1,7 @@
 use std::env;
 use std::io::{self, Read};
 use std::process::ExitCode;
-use std::sync::mpsc;
+use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
@@ -91,8 +91,12 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
             result?;
         }
 
-        while let Ok(packet) = command_rx.try_recv() {
-            vm.control_socket_mut().write_packet(&packet)?;
+        loop {
+            match command_rx.try_recv() {
+                Ok(packet) => vm.control_socket_mut().write_packet(&packet)?,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return Ok(()),
+            }
         }
 
         if let Some(packet) = vm.control_socket_mut().try_read_packet()? {

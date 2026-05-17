@@ -458,11 +458,25 @@ impl NodeVirtualFs {
 
     fn rename_path(&self, from: &str, to: &str) {
         let mut state = self.state.lock().expect("vfs inode state lock poisoned");
-        let Some(inode) = state.inodes_by_path.remove(from) else {
-            return;
-        };
-        state.inodes_by_path.insert(to.to_string(), inode);
-        state.paths_by_inode.insert(inode, to.to_string());
+        let prefix = format!("{from}/");
+        let replacements = state
+            .paths_by_inode
+            .iter()
+            .filter_map(|(inode, path)| {
+                if path == from {
+                    Some((*inode, to.to_string()))
+                } else {
+                    path.strip_prefix(&prefix)
+                        .map(|suffix| (*inode, format!("{to}/{suffix}")))
+                }
+            })
+            .collect::<Vec<_>>();
+        for (inode, next_path) in replacements {
+            if let Some(previous_path) = state.paths_by_inode.insert(inode, next_path.clone()) {
+                state.inodes_by_path.remove(&previous_path);
+            }
+            state.inodes_by_path.insert(next_path, inode);
+        }
     }
 }
 

@@ -110,6 +110,28 @@ test("guest exec receives explicit environment variables", async (t) => {
   assert.equal(result.stderr, "");
 });
 
+test("guest exec reports missing commands without killing init", async (t) => {
+  const vm = await spawnBootVm(t, "guest-exec-missing-command");
+  if (vm === null) {
+    return;
+  }
+
+  const missing = await execGuest(vm, {
+    id: "guest-exec-missing-command",
+    argv: ["/definitely-not-a-command"],
+  });
+
+  assert.equal(missing.exitCode, 127);
+  assert.match(missing.stderr, /spawn guest command/);
+
+  const followup = await execGuestShell(vm, {
+    id: "guest-exec-after-missing-command",
+    script: "printf alive",
+  });
+  assert.equal(followup.exitCode, 0);
+  assert.equal(followup.stdout, "alive");
+});
+
 test("guest exec preserves stderr and non-zero exit status", async (t) => {
   const vm = await spawnBootVm(t, "guest-exec-status");
   if (vm === null) {

@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { lookup } from "node:dns/promises";
 import { once } from "node:events";
 import { existsSync } from "node:fs";
 import http from "node:http";
@@ -401,10 +402,11 @@ export class HostProcessSandboxVm implements HostControlChannel {
         headers,
         ...(tls === undefined ? {} : { tls }),
       };
-      if (isProtectedDestination(request.destinationIp, [
+      const protectedRanges = [
         ...DEFAULT_PROTECTED_RANGES,
         ...(interception.protectedRanges ?? []),
-      ])) {
+      ];
+      if (await isProtectedHttpRequest(request, protectedRanges)) {
         this.#child.stdin.write(encodePacket({
           type: "host.http.response",
           id,
@@ -448,9 +450,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
         body: request.method === "GET" || request.method === "HEAD"
           ? undefined
           : binaryField(document.body, "body"),
-        extraCaCertificatePem: interception.ca === "ephemeral"
-          ? undefined
-          : interception.ca?.certificatePem,
+        extraCaCertificatePem: interception.ca?.certificatePem,
       });
       this.#child.stdin.write(encodePacket({
         type: "host.http.response",
@@ -702,6 +702,37 @@ function isProtectedDestination(destinationIp: string, ranges: readonly string[]
     const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
     return (destination & mask) === (network & mask);
   });
+}
+
+async function isProtectedHttpRequest(
+  request: HttpPolicyRequest,
+  ranges: readonly string[],
+): Promise<boolean> {
+  if (isProtectedDestination(request.destinationIp, ranges)) {
+    return true;
+  }
+
+  for (const address of await resolveUrlAddresses(request.url)) {
+    if (isProtectedDestination(address, ranges)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function resolveUrlAddresses(url: string): Promise<string[]> {
+  const parsed = new URL(url);
+  const literal = ipv4ToInt(parsed.hostname);
+  if (literal !== null) {
+    return [parsed.hostname];
+  }
+
+  try {
+    const records = await lookup(parsed.hostname, { all: true });
+    return records.map((record) => record.address);
+  } catch {
+    return [];
+  }
 }
 
 function ipv4ToInt(address: string): number | null {

@@ -428,10 +428,17 @@ fn run_guest_exec(
         command.env("SSL_CERT_FILE", "/run/sandbox/http-ca.pem");
         command.env("CURL_CA_BUNDLE", "/run/sandbox/http-ca.pem");
     }
-    let output = command
-        .envs(env)
-        .output()
-        .map_err(|error| InitError(format!("spawn guest command {}: {error}", argv[0])))?;
+    let output = match command.envs(env).output() {
+        Ok(output) => output,
+        Err(error) => {
+            return Ok(ControlFrame::GuestExecComplete {
+                id,
+                exit_code: 127,
+                stdout: Vec::new(),
+                stderr: format!("spawn guest command {}: {error}", argv[0]).into_bytes(),
+            });
+        }
+    };
     let (exit_code, stderr) = exec_status(output.status, output.stderr);
 
     Ok(ControlFrame::GuestExecComplete {

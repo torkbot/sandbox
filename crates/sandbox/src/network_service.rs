@@ -884,6 +884,7 @@ struct LibkrunNetDevice {
     rx: UnixStream,
     tx: UnixStream,
     nat: TransparentTcpNat,
+    rx_buffer: Vec<u8>,
     pending_tx: Vec<u8>,
 }
 
@@ -893,8 +894,36 @@ impl LibkrunNetDevice {
             rx,
             tx,
             nat: TransparentTcpNat::new(host_ip),
+            rx_buffer: Vec::new(),
             pending_tx: Vec::new(),
         }
+    }
+
+    fn read_frame(&mut self) -> io::Result<Option<Vec<u8>>> {
+        loop {
+            let mut chunk = [0; 16 * 1024];
+            match self.rx.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => self.rx_buffer.extend_from_slice(&chunk[..read]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+        if self.rx_buffer.len() < 4 {
+            return Ok(None);
+        }
+        let frame_len = u32::from_be_bytes([
+            self.rx_buffer[0],
+            self.rx_buffer[1],
+            self.rx_buffer[2],
+            self.rx_buffer[3],
+        ]) as usize;
+        let packet_len = 4 + frame_len;
+        if self.rx_buffer.len() < packet_len {
+            return Ok(None);
+        }
+        self.rx_buffer.drain(..4);
+        Ok(Some(self.rx_buffer.drain(..frame_len).collect()))
     }
 
     fn flush_pending_tx(&mut self) {
@@ -920,8 +949,9 @@ impl Device for LibkrunNetDevice {
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         self.flush_pending_tx();
-        match read_ethernet_frame(&mut self.rx) {
-            Ok(mut frame) => {
+        match self.read_frame() {
+            Ok(frame) => {
+                let mut frame = frame?;
                 self.nat.rewrite_guest_frame(&mut frame);
                 Some((
                     LibkrunRxToken { frame },
@@ -1294,6 +1324,7 @@ fn internet_checksum(bytes: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+#[cfg(test)]
 fn read_ethernet_frame(reader: &mut impl Read) -> io::Result<Vec<u8>> {
     let mut len = [0; 4];
     reader.read_exact(&mut len)?;
@@ -1339,5 +1370,23 @@ mod tests {
 
         assert_eq!(&bytes[..4], &(ethernet.len() as u32).to_be_bytes());
         assert_eq!(&bytes[4..], ethernet);
+    }
+
+    #[test]
+    fn libkrun_net_device_preserves_partial_nonblocking_frames() {
+        let (rx, mut rx_writer) = UnixStream::pair().unwrap();
+        let (tx, _tx_reader) = UnixStream::pair().unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let mut device = LibkrunNetDevice::new(rx, tx, Ipv4Address::new(10, 0, 2, 1));
+        let ethernet = [0u8; 14];
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&(ethernet.len() as u32).to_be_bytes());
+        packet.extend_from_slice(&ethernet);
+
+        rx_writer.write_all(&packet[..2]).unwrap();
+        assert!(device.read_frame().unwrap().is_none());
+        rx_writer.write_all(&packet[2..]).unwrap();
+
+        assert_eq!(device.read_frame().unwrap(), Some(ethernet.to_vec()));
     }
 }

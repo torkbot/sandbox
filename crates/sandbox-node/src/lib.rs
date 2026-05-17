@@ -128,7 +128,15 @@ pub struct NativeSpawnSandboxOptions {
 }
 
 #[napi]
-pub async fn spawn_sandbox(options: NativeSpawnSandboxOptions) -> Result<NativeSandboxVm> {
+pub async fn spawn_sandbox(_options: NativeSpawnSandboxOptions) -> Result<NativeSandboxVm> {
+    Err(Error::new(
+        Status::GenericFailure,
+        "direct native VM launch is disabled; use the sandbox-host process",
+    ))
+}
+
+#[allow(dead_code)]
+async fn spawn_sandbox_direct(options: NativeSpawnSandboxOptions) -> Result<NativeSandboxVm> {
     let spec = sandbox::MicroVmSpec::build(options.into_spec_input()).map_err(|error| {
         Error::new(
             Status::InvalidArg,

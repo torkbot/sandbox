@@ -82,6 +82,37 @@ test("spawnSandbox rejects duplicate mount paths before runtime launch", async (
   );
 });
 
+test("spawnSandbox rejects mount paths that cannot be encoded for guest init", async () => {
+  await assert.rejects(
+    spawnSandbox({
+      kernel: projectKernel(),
+      init: projectInit(),
+      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
+        format: "erofs",
+      }),
+      mounts: [
+        virtualFsMount("/bad=path", {
+          async stat() {
+            return {
+              type: "directory",
+              sizeBytes: null,
+              mediaType: null,
+              modifiedAtMs: null,
+            };
+          },
+          async list() {
+            return [];
+          },
+          async read() {
+            return new Uint8Array();
+          },
+        }),
+      ],
+    }),
+    /invalid spawnSandbox options: mount\.path must not contain '=' or ';'/,
+  );
+});
+
 test("spawnSandbox rejects relative binding paths before runtime launch", async () => {
   await assert.rejects(
     spawnSandbox({
