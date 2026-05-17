@@ -21,7 +21,7 @@ await run("docker", [
   image,
   "sh",
   "-lc",
-  "cd / && tar --exclude=out --exclude=proc --exclude=sys --exclude=dev --exclude=tmp -cf - . | tar -C /out -xf -",
+  "apk add --no-cache curl && cd / && tar --exclude=out --exclude=proc --exclude=sys --exclude=dev --exclude=tmp -cf - . | tar -C /out -xf -",
 ]);
 
 await assertExists(initPath);

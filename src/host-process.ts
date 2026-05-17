@@ -18,7 +18,10 @@ export class HostProcessSandboxVm implements HostControlChannel {
   #closed = false;
   #exitError: Error | null = null;
 
-  private constructor(child: ChildProcessWithoutNullStreams, options: SandboxOptions) {
+  private constructor(
+    child: ChildProcessWithoutNullStreams,
+    options: SandboxOptions,
+  ) {
     this.#child = child;
     for (const mount of options.mounts ?? []) {
       if (mount.kind === "virtual-fs") {

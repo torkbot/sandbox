@@ -10,11 +10,13 @@ use std::thread::{self, JoinHandle};
 use crate::MicroVmSpec;
 use crate::config::{KernelFormat, RootfsFormat};
 use crate::control::INIT_CONTROL_PORT;
+use crate::network_service::HostNetwork;
 use crate::vfs::VirtioVirtualFsBackend;
 
 #[derive(Debug)]
 pub struct KrunContext {
     id: u32,
+    _networks: Vec<HostNetwork>,
 }
 
 #[derive(Debug)]
@@ -55,11 +57,15 @@ impl KrunContext {
             });
         }
 
-        let context = Self { id: raw_id as u32 };
+        let mut context = Self {
+            id: raw_id as u32,
+            _networks: Vec::new(),
+        };
         context.apply_vm_config(spec)?;
         context.apply_console_output()?;
         context.apply_kernel(spec)?;
         context.apply_rootfs(spec)?;
+        context.apply_network(spec)?;
         for device in virtual_fs {
             context.add_virtual_fs(device)?;
         }
@@ -79,7 +85,40 @@ impl KrunContext {
         )
     }
 
+    fn apply_network(&mut self, spec: &MicroVmSpec) -> Result<(), KrunError> {
+        let Some(network) = &spec.network else {
+            return Ok(());
+        };
+        if network.http.is_none() {
+            return Ok(());
+        }
+
+        let network =
+            HostNetwork::new().map_err(|_| KrunError::new("HostNetwork::new", -libc::EIO))?;
+        let guest_fd = network.guest_fd();
+        let mac = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xef];
+        let features = 0;
+        let flags = 0;
+        check_krun("krun_add_net_unixstream", unsafe {
+            krun::krun_add_net_unixstream(
+                self.id,
+                std::ptr::null(),
+                guest_fd,
+                mac.as_ptr(),
+                features,
+                flags,
+            )
+        })?;
+        self._networks.push(network);
+        Ok(())
+    }
+
     pub fn add_control_socket_fd(&self, fd: RawFd) -> Result<(), KrunError> {
+        check_krun(
+            "krun_disable_implicit_vsock",
+            krun::krun_disable_implicit_vsock(self.id),
+        )?;
+        check_krun("krun_add_vsock", krun::krun_add_vsock(self.id, 0))?;
         check_krun(
             "krun_add_vsock_port_fd",
             krun::krun_add_vsock_port_fd(self.id, INIT_CONTROL_PORT, fd),
@@ -163,7 +202,7 @@ impl KrunContext {
 
     fn apply_init(
         &self,
-        _spec: &MicroVmSpec,
+        spec: &MicroVmSpec,
         virtual_fs: &[VirtualFsDevice],
     ) -> Result<(), KrunError> {
         // Keep exec metadata populated for directory-root compatibility. EROFS
@@ -171,9 +210,22 @@ impl KrunContext {
         let exec_path = CString::new("/sandbox-init").unwrap();
         let encoded_mounts = encode_virtual_fs_mounts(virtual_fs);
         let mount_arg = CString::new(format!("--virtiofs-mounts={encoded_mounts}")).unwrap();
+        let http_network_arg = CString::new("--http-network").unwrap();
+        let http_network_enabled = spec
+            .network
+            .as_ref()
+            .and_then(|network| network.http.as_ref())
+            .is_some();
         let mount_env = CString::new(format!("SANDBOX_VIRTIOFS_MOUNTS={encoded_mounts}")).unwrap();
-        let argv = [exec_path.as_ptr(), mount_arg.as_ptr(), std::ptr::null()];
-        let envp = [mount_env.as_ptr(), std::ptr::null()];
+        let http_network_env = CString::new("SANDBOX_HTTP_NETWORK=1").unwrap();
+        let mut argv = vec![exec_path.as_ptr(), mount_arg.as_ptr()];
+        let mut envp = vec![mount_env.as_ptr()];
+        if http_network_enabled {
+            argv.push(http_network_arg.as_ptr());
+            envp.push(http_network_env.as_ptr());
+        }
+        argv.push(std::ptr::null());
+        envp.push(std::ptr::null());
         check_krun("krun_set_exec", unsafe {
             krun::krun_set_exec(self.id, exec_path.as_ptr(), argv.as_ptr(), envp.as_ptr())
         })

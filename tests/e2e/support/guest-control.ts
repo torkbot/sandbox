@@ -13,6 +13,7 @@ export async function execGuest(
   input: {
     readonly id: string;
     readonly argv: readonly string[];
+    readonly env?: Record<string, string>;
   },
 ): Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>> {
   return await vm.control.exec(input);
@@ -23,10 +24,12 @@ export async function execGuestShell(
   input: {
     readonly id: string;
     readonly script: string;
+    readonly env?: Record<string, string>;
   },
 ): Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>> {
   return await execGuest(vm, {
     id: input.id,
     argv: ["/bin/sh", "-lc", input.script],
+    env: input.env,
   });
 }

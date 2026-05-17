@@ -67,6 +67,7 @@ test("HostControlTransport sends commands as packets", async () => {
     type: "guest.exec",
     id: "test",
     argv: ["/bin/true"],
+    env: [],
   });
   await control.close();
 });

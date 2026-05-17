@@ -8,6 +8,7 @@ export function encodeControlCommand(command: SandboxControlCommand): Uint8Array
         type: "guest.exec",
         id: command.id,
         argv: [...command.argv],
+        env: Object.entries(command.env ?? {}).map(([key, value]) => ({ key, value })),
       });
   }
 }

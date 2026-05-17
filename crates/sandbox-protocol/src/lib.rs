@@ -19,6 +19,7 @@ pub enum ControlFrame {
     GuestExec {
         id: String,
         argv: Vec<String>,
+        env: Vec<(String, String)>,
     },
     GuestExecComplete {
         id: String,
@@ -44,10 +45,14 @@ impl ControlFrame {
                 "rootReadonly": *root_readonly,
                 "initName": init_name,
             },
-            Self::GuestExec { id, argv } => bson::doc! {
+            Self::GuestExec { id, argv, env } => bson::doc! {
                 "type": "guest.exec",
                 "id": id,
                 "argv": argv,
+                "env": env.iter().map(|(key, value)| bson::doc! {
+                    "key": key,
+                    "value": value,
+                }).collect::<Vec<_>>(),
             },
             Self::GuestExecComplete {
                 id,
@@ -106,6 +111,40 @@ impl ControlFrame {
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?,
+                env: document
+                    .get_array("env")
+                    .ok()
+                    .map(|values| {
+                        values
+                            .iter()
+                            .map(|value| {
+                                let document = value.as_document().ok_or_else(|| {
+                                    ControlFrameError::new(
+                                        "guest.exec env entries must be documents",
+                                    )
+                                })?;
+                                let key = document
+                                    .get_str("key")
+                                    .map_err(|_| {
+                                        ControlFrameError::new(
+                                            "guest.exec env key must be a string",
+                                        )
+                                    })?
+                                    .to_string();
+                                let value = document
+                                    .get_str("value")
+                                    .map_err(|_| {
+                                        ControlFrameError::new(
+                                            "guest.exec env value must be a string",
+                                        )
+                                    })?
+                                    .to_string();
+                                Ok((key, value))
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default(),
             }),
             "guest.exec.complete" => Ok(Self::GuestExecComplete {
                 id: document
@@ -210,6 +249,7 @@ mod tests {
         let frame = ControlFrame::GuestExec {
             id: "test".to_string(),
             argv: vec!["/bin/true".to_string()],
+            env: vec![("FOO".to_string(), "bar".to_string())],
         };
 
         let encoded = frame.encode().unwrap();
@@ -255,6 +295,7 @@ mod tests {
         let frame = ControlFrame::GuestExec {
             id: "test".to_string(),
             argv: vec!["/bin/true".to_string()],
+            env: Vec::new(),
         };
         let mut packet = frame.encode_packet().unwrap();
 

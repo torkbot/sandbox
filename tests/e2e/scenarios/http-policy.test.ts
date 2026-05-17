@@ -16,10 +16,9 @@ test("HTTPS traffic is intercepted, policy checked, rewritten, and protected ran
   if (!requireVmLaunchSupport(t)) {
     return;
   }
-  if (!skipUntilImplemented(t, "HTTP interception and host policy")) {
+  if (!skipUntilImplemented(t, "HTTP interception over explicit virtio-net")) {
     return;
   }
-
   const decisions: Pick<HttpPolicyRequest, "url" | "destinationIp" | "tls">[] = [];
 
   const vm = await spawnSandbox({

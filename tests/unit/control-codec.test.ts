@@ -11,6 +11,7 @@ test("control command codec emits length-prefixed BSON", () => {
     type: "guest.exec",
     id: "test",
     argv: ["/bin/true"],
+    env: { FOO: "bar" },
   });
 
   const frameLength = new DataView(packet.buffer, packet.byteOffset, 4).getUint32(0, true);
@@ -19,6 +20,7 @@ test("control command codec emits length-prefixed BSON", () => {
     type: "guest.exec",
     id: "test",
     argv: ["/bin/true"],
+    env: [{ key: "FOO", value: "bar" }],
   });
 });
 

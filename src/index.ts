@@ -174,12 +174,14 @@ export type SandboxControlCommand = {
   readonly type: "guest.exec";
   readonly id: string;
   readonly argv: readonly string[];
+  readonly env?: Record<string, string>;
 };
 
 export interface SandboxControl extends Transport<SandboxControlEvent, SandboxControlCommand> {
   exec(input: {
     readonly id?: string;
     readonly argv: readonly string[];
+    readonly env?: Record<string, string>;
   }): Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>>;
 }
 

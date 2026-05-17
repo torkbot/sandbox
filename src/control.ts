@@ -52,6 +52,7 @@ export class HostControlTransport implements SandboxControl {
   async exec(input: {
     readonly id?: string;
     readonly argv: readonly string[];
+    readonly env?: Record<string, string>;
   }): Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>> {
     this.#assertOpen();
     const id = input.id ?? crypto.randomUUID();
@@ -60,6 +61,7 @@ export class HostControlTransport implements SandboxControl {
       type: "guest.exec",
       id,
       argv: input.argv,
+      env: input.env,
     });
     return await completion;
   }

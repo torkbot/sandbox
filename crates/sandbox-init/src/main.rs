@@ -1,3 +1,4 @@
+use base64::Engine;
 use sandbox_protocol::ControlFrame;
 #[cfg(target_os = "linux")]
 use sandbox_protocol::INIT_CONTROL_PORT;
@@ -11,6 +12,7 @@ fn main() {
 
 fn run() -> Result<(), InitError> {
     mount_kernel_filesystems()?;
+    configure_http_network(std::env::args().skip(1))?;
     mount_virtual_filesystems(
         std::env::args().skip(1),
         std::env::var("SANDBOX_VIRTIOFS_MOUNTS").ok(),
@@ -20,6 +22,41 @@ fn run() -> Result<(), InitError> {
     send_init_ready(&mut control, &packet)?;
     run_control_loop(&mut control)?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn configure_http_network(args: impl Iterator<Item = String>) -> Result<(), InitError> {
+    let enabled = args.into_iter().any(|arg| arg == "--http-network")
+        || read_flag_from_proc_cmdline("SANDBOX_HTTP_NETWORK");
+    if !enabled {
+        return Ok(());
+    }
+
+    run_setup_command("/sbin/ip", &["link", "set", "eth0", "up"])?;
+    run_setup_command("/sbin/ip", &["addr", "add", "10.0.2.2/24", "dev", "eth0"])?;
+    run_setup_command("/sbin/ip", &["route", "add", "default", "via", "10.0.2.1"])?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_http_network(_args: impl Iterator<Item = String>) -> Result<(), InitError> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn run_setup_command(program: &str, args: &[&str]) -> Result<(), InitError> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|error| InitError(format!("run setup command {program}: {error}")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(InitError(format!(
+        "setup command failed: {program} {}: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    )))
 }
 
 #[cfg(target_os = "linux")]
@@ -141,6 +178,17 @@ fn read_mounts_from_proc_cmdline() -> Option<String> {
     None
 }
 
+#[cfg(target_os = "linux")]
+fn read_flag_from_proc_cmdline(flag: &str) -> bool {
+    let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") else {
+        return false;
+    };
+    cmdline
+        .split_ascii_whitespace()
+        .map(|token| token.trim_matches('"'))
+        .any(|token| token == flag || token == format!("{flag}=1"))
+}
+
 fn init_ready_packet() -> Result<Vec<u8>, InitError> {
     ControlFrame::InitReady {
         root_readonly: true,
@@ -212,8 +260,8 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
         };
 
         match frame {
-            ControlFrame::GuestExec { id, argv } => {
-                let response = run_guest_exec(id, argv)?;
+            ControlFrame::GuestExec { id, argv, env } => {
+                let response = run_guest_exec(id, argv, env)?;
                 let packet = response
                     .encode_packet()
                     .map_err(|error| InitError(format!("encode exec completion: {error}")))?;
@@ -224,7 +272,11 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
     }
 }
 
-fn run_guest_exec(id: String, argv: Vec<String>) -> Result<ControlFrame, InitError> {
+fn run_guest_exec(
+    id: String,
+    argv: Vec<String>,
+    env: Vec<(String, String)>,
+) -> Result<ControlFrame, InitError> {
     if argv.is_empty() {
         return Ok(ControlFrame::GuestExecComplete {
             id,
@@ -234,8 +286,11 @@ fn run_guest_exec(id: String, argv: Vec<String>) -> Result<ControlFrame, InitErr
         });
     }
 
+    prepare_exec_environment(&env)?;
+
     let output = std::process::Command::new(&argv[0])
         .args(&argv[1..])
+        .envs(env)
         .output()
         .map_err(|error| InitError(format!("spawn guest command {}: {error}", argv[0])))?;
 
@@ -245,6 +300,22 @@ fn run_guest_exec(id: String, argv: Vec<String>) -> Result<ControlFrame, InitErr
         stdout: output.stdout,
         stderr: output.stderr,
     })
+}
+
+fn prepare_exec_environment(env: &[(String, String)]) -> Result<(), InitError> {
+    let Some((_, certificate)) = env.iter().find(|(key, _)| key == "SANDBOX_HTTP_CA_PEM_B64")
+    else {
+        return Ok(());
+    };
+
+    std::fs::create_dir_all("/run/sandbox")
+        .map_err(|error| InitError(format!("create /run/sandbox: {error}")))?;
+    let certificate = base64::engine::general_purpose::STANDARD
+        .decode(certificate)
+        .map_err(|error| InitError(format!("decode host HTTP CA certificate: {error}")))?;
+    std::fs::write("/run/sandbox/http-ca.pem", certificate)
+        .map_err(|error| InitError(format!("write host HTTP CA certificate: {error}")))?;
+    Ok(())
 }
 
 fn send_packet(control: &mut std::fs::File, packet: &[u8]) -> Result<(), InitError> {
