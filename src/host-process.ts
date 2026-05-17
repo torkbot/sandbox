@@ -448,7 +448,7 @@ async function requestUpstream(url: string, input: {
       port: parsed.port,
       path: `${parsed.pathname}${parsed.search}`,
       method: input.method,
-      headers: input.headers,
+      headers: outboundRequestHeaders(input.headers),
       ca: parsed.protocol === "https:" && input.extraCaCertificatePem !== undefined
         ? [...rootCertificates, input.extraCaCertificatePem]
         : undefined,
@@ -471,6 +471,27 @@ async function requestUpstream(url: string, input: {
     }
     request.end();
   });
+}
+
+function outboundRequestHeaders(headers: Record<string, string>): Record<string, string> {
+  const hopByHop = new Set([
+    "connection",
+    "content-length",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+  ]);
+  const result: Record<string, string> = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (!hopByHop.has(name.toLowerCase())) {
+      result[name] = value;
+    }
+  }
+  return result;
 }
 
 function concatBytes(chunks: readonly Uint8Array[]): Uint8Array {

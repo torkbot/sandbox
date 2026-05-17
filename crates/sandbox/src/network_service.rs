@@ -21,7 +21,8 @@ use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
 const HOST_HTTP_PROBE_PORT: u16 = 8080;
 const HOST_HTTP_PORT: u16 = 80;
 const HOST_HTTPS_PORT: u16 = 443;
-const HTTP_LISTENERS_PER_PORT: usize = 4;
+const HTTP_LISTENERS_PER_PORT: usize = 16;
+const HTTP_SOCKET_BUFFER_BYTES: usize = 256 * 1024;
 const HOST_HTTP_PROBE_RESPONSE: &[u8] =
     b"HTTP/1.1 200 OK\r\ncontent-length: 25\r\nconnection: close\r\n\r\nsandbox explicit network\n";
 
@@ -122,6 +123,7 @@ fn run_network_service(
     });
     let mut sockets = SocketSet::new(Vec::new());
     let mut http_sockets = HashMap::new();
+    let mut http_connections = HashMap::new();
     add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTP_PORT);
     add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTP_PROBE_PORT);
     if tls_acceptor.is_some() {
@@ -147,6 +149,7 @@ fn run_network_service(
                 http_handler.as_deref(),
                 &device.nat,
                 tls_acceptor.as_ref(),
+                &mut http_connections,
                 &mut tls_connections,
             );
         }
@@ -163,8 +166,8 @@ fn add_http_listener(
         (0..HTTP_LISTENERS_PER_PORT)
             .map(|_| {
                 sockets.add(tcp::Socket::new(
-                    tcp::SocketBuffer::new(vec![0; 4096]),
-                    tcp::SocketBuffer::new(vec![0; 4096]),
+                    tcp::SocketBuffer::new(vec![0; HTTP_SOCKET_BUFFER_BYTES]),
+                    tcp::SocketBuffer::new(vec![0; HTTP_SOCKET_BUFFER_BYTES]),
                 ))
             })
             .collect()
@@ -178,12 +181,19 @@ fn poll_http_socket(
     handler: Option<&dyn HostHttpHandler>,
     nat: &TransparentTcpNat,
     tls_acceptor: Option<&TlsAcceptor>,
+    http_connections: &mut HashMap<SocketHandle, HttpConnection>,
     tls_connections: &mut HashMap<SocketHandle, TlsConnection>,
 ) {
     let socket = sockets.get_mut::<tcp::Socket>(handle);
     if !socket.is_active() {
+        http_connections.remove(&handle);
         tls_connections.remove(&handle);
         let _ = socket.listen(port);
+        return;
+    }
+
+    if port != HOST_HTTPS_PORT {
+        poll_plain_http_socket(socket, handle, nat, handler, http_connections);
         return;
     }
 
@@ -191,28 +201,77 @@ fn poll_http_socket(
         let mut request = [0; 4096];
         let received = socket.recv_slice(&mut request).unwrap_or(0);
         if received > 0 {
-            if port == HOST_HTTPS_PORT {
-                poll_tls_http_socket(
-                    socket,
-                    handle,
-                    nat,
-                    handler,
-                    tls_acceptor,
-                    tls_connections,
-                    &request[..received],
-                );
-            } else {
-                let response = handler
-                    .and_then(|handler| {
-                        parse_http_request(socket, nat, &request[..received], None)
-                            .and_then(|request| handler.handle_http_request(request).ok())
-                    })
-                    .map(encode_http_response)
-                    .unwrap_or_else(|| HOST_HTTP_PROBE_RESPONSE.to_vec());
-                let _ = socket.send_slice(&response);
-                socket.close();
-            }
+            poll_tls_http_socket(
+                socket,
+                handle,
+                nat,
+                handler,
+                tls_acceptor,
+                tls_connections,
+                &request[..received],
+            );
         }
+    }
+}
+
+fn poll_plain_http_socket(
+    socket: &mut tcp::Socket<'_>,
+    handle: SocketHandle,
+    nat: &TransparentTcpNat,
+    handler: Option<&dyn HostHttpHandler>,
+    http_connections: &mut HashMap<SocketHandle, HttpConnection>,
+) {
+    let connection = http_connections.entry(handle).or_default();
+    flush_plain_http_response(socket, connection);
+    if connection.close_after_response && connection.response.is_empty() {
+        socket.close();
+        return;
+    }
+
+    while socket.can_recv() {
+        let mut chunk = [0; 8192];
+        let received = socket.recv_slice(&mut chunk).unwrap_or(0);
+        if received == 0 {
+            break;
+        }
+        connection.request.extend_from_slice(&chunk[..received]);
+    }
+
+    if http_expects_continue(&connection.request) && !connection.continue_sent {
+        connection
+            .response
+            .extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
+        connection.continue_sent = true;
+        flush_plain_http_response(socket, connection);
+    }
+
+    if !http_request_ready(&connection.request) {
+        return;
+    }
+
+    let response = handler
+        .and_then(|handler| {
+            parse_http_request(socket, nat, &connection.request, None)
+                .and_then(|request| handler.handle_http_request(request).ok())
+        })
+        .map(encode_http_response)
+        .unwrap_or_else(|| HOST_HTTP_PROBE_RESPONSE.to_vec());
+    connection.request.clear();
+    connection.response = response;
+    connection.close_after_response = true;
+    flush_plain_http_response(socket, connection);
+    if connection.close_after_response && connection.response.is_empty() {
+        socket.close();
+    }
+}
+
+fn flush_plain_http_response(socket: &mut tcp::Socket<'_>, connection: &mut HttpConnection) {
+    while socket.can_send() && !connection.response.is_empty() {
+        let sent = socket.send_slice(&connection.response).unwrap_or(0);
+        if sent == 0 {
+            break;
+        }
+        connection.response.drain(..sent);
     }
 }
 
@@ -279,8 +338,9 @@ fn parse_http_request(
     bytes: &[u8],
     tls: Option<HostTlsMetadata>,
 ) -> Option<HostHttpRequest> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text, ""));
+    let header_end = http_header_end(bytes)?;
+    let head = std::str::from_utf8(&bytes[..header_end]).ok()?;
+    let body = decode_http_body(head, &bytes[header_end + 4..])?;
     let mut lines = head.split("\r\n");
     let request_line = lines.next()?;
     let mut request_parts = request_line.split_ascii_whitespace();
@@ -317,9 +377,99 @@ fn parse_http_request(
         url,
         destination_ip,
         headers,
-        body: body.as_bytes().to_vec(),
+        body,
         tls,
     })
+}
+
+fn http_request_ready(bytes: &[u8]) -> bool {
+    let Some(header_end) = http_header_end(bytes) else {
+        return false;
+    };
+    let Ok(head) = std::str::from_utf8(&bytes[..header_end]) else {
+        return false;
+    };
+    let body = &bytes[header_end + 4..];
+    if http_header_value(head, "transfer-encoding")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
+    {
+        return chunked_body_complete(body);
+    }
+    let content_length = http_header_value(head, "content-length")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    body.len() >= content_length
+}
+
+fn http_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn http_expects_continue(bytes: &[u8]) -> bool {
+    let Some(header_end) = http_header_end(bytes) else {
+        return false;
+    };
+    let Ok(head) = std::str::from_utf8(&bytes[..header_end]) else {
+        return false;
+    };
+    http_header_value(head, "expect")
+        .is_some_and(|value| value.eq_ignore_ascii_case("100-continue"))
+}
+
+fn http_header_value<'a>(head: &'a str, header: &str) -> Option<&'a str> {
+    head.split("\r\n")
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .find_map(|(name, value)| name.eq_ignore_ascii_case(header).then_some(value.trim()))
+}
+
+fn decode_http_body(head: &str, body: &[u8]) -> Option<Vec<u8>> {
+    if http_header_value(head, "transfer-encoding")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
+    {
+        return decode_chunked_body(body);
+    }
+    let content_length = http_header_value(head, "content-length")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    (body.len() >= content_length).then(|| body[..content_length].to_vec())
+}
+
+fn chunked_body_complete(body: &[u8]) -> bool {
+    decode_chunked_body(body).is_some()
+}
+
+fn decode_chunked_body(body: &[u8]) -> Option<Vec<u8>> {
+    let mut offset = 0;
+    let mut decoded = Vec::new();
+    loop {
+        let line_end = find_crlf(&body[offset..])?;
+        let size_line = std::str::from_utf8(&body[offset..offset + line_end]).ok()?;
+        let size_hex = size_line.split(';').next()?.trim();
+        let size = usize::from_str_radix(size_hex, 16).ok()?;
+        offset += line_end + 2;
+        if size == 0 {
+            let trailer_end = body[offset..]
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .or_else(|| body[offset..].starts_with(b"\r\n").then_some(0))?;
+            let _ = trailer_end;
+            return Some(decoded);
+        }
+        if body.len() < offset + size + 2 {
+            return None;
+        }
+        decoded.extend_from_slice(&body[offset..offset + size]);
+        offset += size;
+        if body.get(offset..offset + 2) != Some(b"\r\n") {
+            return None;
+        }
+        offset += 2;
+    }
+}
+
+fn find_crlf(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(2).position(|window| window == b"\r\n")
 }
 
 fn tls_metadata(connection: &rustls::ServerConnection) -> Option<HostTlsMetadata> {
@@ -358,6 +508,7 @@ struct LibkrunNetDevice {
     rx: UnixStream,
     tx: UnixStream,
     nat: TransparentTcpNat,
+    pending_tx: Vec<u8>,
 }
 
 impl LibkrunNetDevice {
@@ -366,6 +517,23 @@ impl LibkrunNetDevice {
             rx,
             tx,
             nat: TransparentTcpNat::new(host_ip),
+            pending_tx: Vec::new(),
+        }
+    }
+
+    fn flush_pending_tx(&mut self) {
+        while !self.pending_tx.is_empty() {
+            match self.tx.write(&self.pending_tx) {
+                Ok(0) => return,
+                Ok(written) => {
+                    self.pending_tx.drain(..written);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
+                Err(_) => {
+                    self.pending_tx.clear();
+                    return;
+                }
+            }
         }
     }
 }
@@ -375,13 +543,14 @@ impl Device for LibkrunNetDevice {
     type TxToken<'a> = LibkrunTxToken<'a>;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        self.flush_pending_tx();
         match read_ethernet_frame(&mut self.rx) {
             Ok(mut frame) => {
                 self.nat.rewrite_guest_frame(&mut frame);
                 Some((
                     LibkrunRxToken { frame },
                     LibkrunTxToken {
-                        stream: &mut self.tx,
+                        pending_tx: &mut self.pending_tx,
                         nat: &mut self.nat,
                     },
                 ))
@@ -392,8 +561,9 @@ impl Device for LibkrunNetDevice {
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+        self.flush_pending_tx();
         Some(LibkrunTxToken {
-            stream: &mut self.tx,
+            pending_tx: &mut self.pending_tx,
             nat: &mut self.nat,
         })
     }
@@ -421,7 +591,7 @@ impl phy::RxToken for LibkrunRxToken {
 }
 
 struct LibkrunTxToken<'a> {
-    stream: &'a mut UnixStream,
+    pending_tx: &'a mut Vec<u8>,
     nat: &'a mut TransparentTcpNat,
 }
 
@@ -433,13 +603,24 @@ impl phy::TxToken for LibkrunTxToken<'_> {
         let mut frame = vec![0; len];
         let result = f(&mut frame);
         self.nat.rewrite_host_frame(&mut frame);
-        let _ = write_ethernet_frame(self.stream, &frame);
+        if let Ok(frame_len) = u32::try_from(frame.len()) {
+            self.pending_tx.extend_from_slice(&frame_len.to_be_bytes());
+            self.pending_tx.extend_from_slice(&frame);
+        }
         result
     }
 }
 
 struct TlsAcceptor {
     config: Arc<rustls::ServerConfig>,
+}
+
+#[derive(Default)]
+struct HttpConnection {
+    request: Vec<u8>,
+    response: Vec<u8>,
+    close_after_response: bool,
+    continue_sent: bool,
 }
 
 struct TlsConnection {
@@ -741,6 +922,7 @@ fn read_ethernet_frame(reader: &mut impl Read) -> io::Result<Vec<u8>> {
     Ok(frame)
 }
 
+#[cfg(test)]
 fn write_ethernet_frame(writer: &mut impl Write, frame: &[u8]) -> io::Result<()> {
     let frame_len = u32::try_from(frame.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "ethernet frame too large"))?;

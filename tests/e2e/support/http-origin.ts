@@ -29,16 +29,23 @@ export interface TestHttpOrigin {
 
 export async function startTestHttpOrigin(input: {
   respond(request: {
+    readonly body: Uint8Array;
     readonly headers: Record<string, string>;
     readonly url: string;
-  }): {
+  }): Promise<{
     readonly status: number;
     readonly headers?: Record<string, string>;
-    readonly body?: string;
+    readonly body?: string | Uint8Array;
+  }> | {
+    readonly status: number;
+    readonly headers?: Record<string, string>;
+    readonly body?: string | Uint8Array;
   };
 }): Promise<TestHttpOrigin> {
-  const server = http.createServer((request, response) => {
-    const result = input.respond({
+  const server = http.createServer(async (request, response) => {
+    const body = await collectBody(request);
+    const result = await input.respond({
+      body,
       headers: normalizeHeaders(request.headers),
       url: request.url ?? "/",
     });
@@ -64,12 +71,17 @@ export async function startTestHttpsOrigin(input: {
   readonly ca: Pick<TestCertificateAuthority, "certificatePem" | "privateKeyPem">;
   readonly hostname?: string;
   respond(request: {
+    readonly body: Uint8Array;
     readonly headers: Record<string, string>;
     readonly url: string;
-  }): {
+  }): Promise<{
     readonly status: number;
     readonly headers?: Record<string, string>;
-    readonly body?: string;
+    readonly body?: string | Uint8Array;
+  }> | {
+    readonly status: number;
+    readonly headers?: Record<string, string>;
+    readonly body?: string | Uint8Array;
   };
 }): Promise<TestHttpsOrigin> {
   const workDir = await mkdtemp(join(tmpdir(), "sandbox-origin-"));
@@ -131,8 +143,10 @@ export async function startTestHttpsOrigin(input: {
   const server = https.createServer({
     key: await readFile(keyPath),
     cert: await readFile(certPath),
-  }, (request, response) => {
-    const result = input.respond({
+  }, async (request, response) => {
+    const body = await collectBody(request);
+    const result = await input.respond({
+      body,
       headers: normalizeHeaders(request.headers),
       url: request.url ?? "/",
     });
@@ -167,6 +181,21 @@ function publicKeyPin(certificatePem: string): string {
 
 function isIpv4Address(value: string): boolean {
   return /^\d+\.\d+\.\d+\.\d+$/.test(value);
+}
+
+async function collectBody(request: http.IncomingMessage): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of request) {
+    chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+  }
+  const size = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
+  const body = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
 }
 
 export async function createTestCertificateAuthority(): Promise<TestCertificateAuthority> {

@@ -5,7 +5,6 @@ Sandbox is a TypeScript-first Node.js library for spawning libkrun-backed microV
 The target shape is:
 
 - boot a guest from a prebuilt read-only rootfs artifact, likely EROFS,
-- mount writable SQLite-backed filesystems from the host,
 - mount host-implemented virtual filesystems,
 - intercept guest HTTP traffic through host TypeScript policy,
 - communicate with guest init over a bidirectional transport,
@@ -17,11 +16,8 @@ import {
   projectInit,
   projectKernel,
   spawnSandbox,
-  sqliteFsMount,
   virtualFsMount,
 } from "@torkbot/sandbox";
-
-const sqliteFsDatabase = await openSqliteDatabase(":memory:");
 
 await using vm = await spawnSandbox({
   kernel: projectKernel(),
@@ -29,12 +25,6 @@ await using vm = await spawnSandbox({
   rootfs: prebuiltRootfs("dist/rootfs/sandbox.erofs", { format: "erofs" }),
 
   mounts: [
-    sqliteFsMount({
-      path: "/workspace",
-      name: "workspace",
-      database: sqliteFsDatabase,
-    }),
-
     virtualFsMount("/sandbox/proc", {
       async stat(path) {
         if (path === "/") {
@@ -143,7 +133,6 @@ const shaped = await vm.rootfs.snapshot({
 The guest contract is intentionally narrow:
 
 - `/` is read-only.
-- `/workspace` is a writable SQLite-backed mount persisted through a connected host database handle.
 - `/sandbox/proc` is implemented by the host.
 - HTTP policy and header rewriting happen in TypeScript on the host.
 
@@ -155,7 +144,6 @@ The guest contract is intentionally narrow:
 - implicit fd-backed host control sockets owned by Sandbox,
 - avoid host filesystem coordination unless it is intrinsic to the artifact; prefer file descriptors, database handles, bytes, and async iterables over paths,
 - build-time rootfs shaping, with prebuilt rootfs artifacts supplied at VM instantiation,
-- multiple SQLite-backed mounts can share one database handle by using distinct mount names,
 - programmable virtual filesystems backed by TypeScript callbacks,
 - transparent HTTP interception with TypeScript policy hooks,
 - Rust-native or statically linkable networking components; sidecar network daemons are references, not default runtime dependencies,

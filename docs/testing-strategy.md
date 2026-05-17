@@ -33,7 +33,6 @@ Evidence:
 
 - HTTP policy hooks receive normalized request metadata and can allow, deny, and rewrite headers.
 - protected network ranges are blocked before forwarding.
-- SQLite-backed mount operations persist through a supplied connected database handle and replay into the same tree after restart.
 - virtual filesystem callbacks are deterministic and return expected metadata, directory entries, and file contents.
 - mounted filesystems are inspectable from JavaScript with the same `stat` / `list` / `read` shape exposed to the host runtime.
 - the `Transport` adapter preserves message order, close behavior, and backpressure.
@@ -65,17 +64,15 @@ Runs with a real VM.
 Fixture:
 
 - immutable read-only root, initially from extracted Docker rootfs and eventually from EROFS.
-- writable mount backed by a connected SQLite database handle.
 - virtual procfs-like mount implemented by host callbacks.
 
 Evidence:
 
 - guest cannot write to the root mount.
-- guest can create, read, rename, and delete files under a SQLite-backed mount.
-- host database state reflects guest mutations without opaque block-device state.
-- after VM restart, SQLite-backed mount contents persist and the immutable root hash is unchanged.
+- guest can read host-generated virtual files and directories.
+- writable virtual filesystem behavior is covered through generic host filesystem hooks once that mode lands.
 - virtual files show host-generated contents and directory metadata.
-- JavaScript can inspect the mounted virtual and SQLite-backed filesystems through stable mount handles without entering the guest.
+- JavaScript can inspect mounted virtual filesystems through stable mount handles without entering the guest.
 
 ### Tier 3b: Rootfs Shaping E2E
 
@@ -167,7 +164,6 @@ Detected capabilities:
 - Static linking: linkage report shows no dynamic `libkrun` or `libkrunfw` dependency.
 - Immutable root: root hash remains stable and guest root writes fail.
 - Rootfs shaping: explicit writable-overlay mode can capture deltas and publish a new EROFS rootfs artifact.
-- SQLite-backed mounts: guest writes persist through the supplied connected database handle and survive VM restart when that handle is durable. The API must also accept a connected `:memory:` handle for tests, and multiple mounts may share one handle using distinct mount names.
 - Virtual filesystem: guest reads host-generated files and metadata through a mounted virtual tree.
 - HTTP interception: TLS traffic is intercepted with guest-trusted CA, policy hooks run in Node.js, headers are modified, and forwarding is transparent.
 - Network policy: protected host and private ranges are blocked with deterministic evidence.
@@ -177,7 +173,7 @@ Detected capabilities:
 ## First Implementation Slice
 
 1. Add the e2e runner with capability detection and result-directory creation.
-2. Add host-only tests for `Transport`, HTTP policy, and SQLite-backed mount persistence.
+2. Add host-only tests for `Transport`, HTTP policy, and virtual filesystem behavior.
 3. Add build-time Docker export/extract rootfs fixture generation.
 4. Add the first boot smoke test with guest `init.ready`.
 5. Add static-link and macOS entitlement checks as soon as a host artifact exists.
@@ -187,7 +183,7 @@ Detected capabilities:
 The first executable scenario files live under `tests/e2e/scenarios/` as `.test.ts` files. They intentionally describe the desired Node.js developer experience before the implementation exists:
 
 - `boot-smoke.test.ts`: boots a VM, waits for `init.ready`, sends a control command, and checks command output.
-- `filesystem.test.ts`: boots with an immutable root, SQLite-backed writable mount, and host-backed virtual filesystem using the same `stat` / `list` / `read` shape as TorkBot plugin filesystems.
+- `filesystem.test.ts`: boots with an immutable root and host-backed virtual filesystem using the same `stat` / `list` / `read` shape as TorkBot plugin filesystems.
 - `rootfs-shaping.test.ts`: opts into writable root overlay mode, runs incremental guest commands, and snapshots the result as an EROFS artifact.
 - `http-policy.test.ts`: injects CA trust, intercepts HTTPS, runs Node policy hooks, rewrites headers, and blocks protected destinations.
 - `linkage-and-signing.test.ts`: verifies static linkage, absence of dynamic libkrun/libkrunfw dependencies, and macOS HVF entitlement signing.

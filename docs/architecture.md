@@ -64,7 +64,7 @@ Build the guest root filesystem before VM instantiation. The runtime API should 
 
 The build-time tooling can use a simple Docker image create/export/extract flow to shape the rootfs. That flow belongs in packaging or fixture-generation tools, not in the hot runtime path.
 
-The target shape is an immutable read-only root volume, likely EROFS, produced from that extracted rootfs. Writable guest state should come from explicit SQLite-backed mounts rather than by making the root filesystem writable. That keeps the base environment content-addressable and makes all mutable state visible to the host-side filesystem layer.
+The target shape is an immutable read-only root volume, likely EROFS, produced from that extracted rootfs. Writable guest state should come from explicit programmable filesystem mounts rather than by making the root filesystem writable. That keeps the base environment content-addressable and makes all mutable state visible to the host-side filesystem layer.
 
 Rootfs shaping is a separate build-time mode. Normal VM instantiation should boot an immutable root by default, but authoring tools may opt into a writable root overlay. In that mode the host can run incremental guest commands, capture rootfs deltas, and produce a new EROFS artifact programmatically. The low-level snapshot API should return artifact bytes and a digest, not force a host filesystem write. The output becomes the next prebuilt rootfs input; it should not turn normal runtime VMs into mutable-root machines.
 
@@ -101,12 +101,12 @@ HTTP interception requires explicit guest trust injection. The guest init should
 Sandbox needs three filesystem modes:
 
 - Static or read-only host directory mounts through libkrun virtio-fs, and eventually immutable root volumes such as EROFS.
-- Writable SQLite-backed mounts persisted through connected database handles.
 - Fully virtual filesystems implemented by host Node.js code, including procfs-like control trees.
+- Writable virtual filesystems implemented through the same host filesystem hooks.
 
 Path-backed virtio-fs is adequate for immutable roots and simple mounts, but it does not provide a programmable per-operation host API. The programmable filesystem should be a vhost-user backend owned by this project, with Node.js callbacks behind a Rust service boundary. That keeps guest filesystem traffic on a virtio device instead of inventing a guest agent protocol for normal file operations.
 
-Writable mounts should be represented as structured database state rather than opaque disk images. Sandbox must receive a connected, ready database handle instead of an SQLite file path, and that handle may be backed by `:memory:`. The public type should align with the database handle TorkBot already uses: prepare statements, execute SQL, and run transactions. Multiple guest mounts may share the same database handle, so each `sqliteFsMount` has an explicit mount `name` used to partition filesystem state inside the database. A practical MVP can materialize a writable upperdir and sync deltas through the handle, but the target architecture is a direct host filesystem service backed by tables for nodes, versions, content blobs, and operations.
+Durable filesystem implementations should be layered on top of the generic user-space filesystem hooks, not built into Sandbox as first-class mount types. Sandbox's responsibility is to provide correct guest filesystem operations and a stable JavaScript mount handle; storage engines belong above that boundary.
 
 ## libkrun Fork
 
@@ -151,6 +151,5 @@ The first helper protocol is deliberately small. Node starts `sandbox-host --std
 4. Add build-time Docker image export/extract rootfs tooling, then consume a prebuilt immutable read-only root volume at VM instantiation.
 5. Add rootfs overlay shaping mode that can run incremental guest operations and publish a new EROFS artifact.
 6. Add CA injection and a host HTTP proxy with Node.js policy callbacks.
-7. Prototype SQLite-backed mounts with materialized deltas persisted through the supplied database handle.
-8. Add a vhost-user filesystem backend for virtual and SQLite-backed mounts.
-9. Move any required libkrun changes into `torkbot/libkrun` and keep them upstream-shaped.
+7. Add a vhost-user filesystem backend for virtual and writable host-implemented mounts.
+8. Move any required libkrun changes into `torkbot/libkrun` and keep them upstream-shaped.

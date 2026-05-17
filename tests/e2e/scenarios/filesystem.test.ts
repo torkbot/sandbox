@@ -1,12 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { connect } from "@tursodatabase/database";
 import {
   prebuiltRootfs,
   projectInit,
   projectKernel,
   spawnSandbox,
-  sqliteFsMount,
   virtualFsMount,
 } from "../../../src/index.ts";
 import { collectAsync, writeEvidence } from "../support/evidence.ts";
@@ -102,61 +100,5 @@ test("virtual filesystem mounts are backed by host JavaScript callbacks", async 
 
   await writeEvidence("fs.json", {
     virtualRead: Buffer.from(virtualRead).toString("utf8"),
-  });
-});
-
-test("immutable root and SQLite-backed filesystem mounts behave as designed", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
-    return;
-  }
-  const database = await connect(":memory:");
-  t.after(async () => {
-    await database.close();
-  });
-
-  const vm = await spawnSandbox({
-    name: "sqlite-filesystem",
-    kernel: projectKernel(),
-    init: projectInit(),
-    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
-      format: "erofs",
-    }),
-    mounts: [
-      sqliteFsMount({
-        path: "/workspace",
-        name: "workspace",
-        database,
-      }),
-    ],
-  });
-
-  t.after(async () => {
-    await vm.close();
-  });
-
-  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
-
-  const checks = await execGuestShell(vm, {
-    id: "sqlite-filesystem-checks",
-    script: `
-      set -eu
-      if touch /sandbox-root-write-test 2>/dev/null; then
-        exit 10
-      fi
-      echo hello > /workspace/hello.txt
-      test "$(cat /workspace/hello.txt)" = "hello"
-    `,
-  });
-
-  assert.equal(
-    checks.exitCode,
-    0,
-    `guest sqlite filesystem checks failed\nstdout:\n${checks.stdout}\nstderr:\n${checks.stderr}`,
-  );
-
-  const snapshot = await vm.mounts.sqliteFs("/workspace").snapshot();
-  assert.deepEqual(snapshot.files["/hello.txt"], {
-    type: "file",
-    contents: "hello\n",
   });
 });
