@@ -1121,15 +1121,25 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 name = "sandbox"
 version = "0.1.0"
 dependencies = [
- "bson",
  "krun-devices",
  "libc",
  "libkrun",
+ "sandbox-protocol",
 ]
 
 [[package]]
 name = "sandbox-init"
 version = "0.1.0"
+dependencies = [
+ "sandbox-protocol",
+]
+
+[[package]]
+name = "sandbox-protocol"
+version = "0.1.0"
+dependencies = [
+ "bson",
+]
 
 [[package]]
 name = "sandbox_node"

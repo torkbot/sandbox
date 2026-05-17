@@ -1,9 +1,12 @@
 [package]
-name = "sandbox-init"
+name = "sandbox-protocol"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-sandbox-protocol = { path = "../sandbox-protocol" }
+bson = "3.1"
+
+[lib]
+crate-type = ["rlib"]

@@ -9,7 +9,7 @@ repository.workspace = true
 krun-devices = { path = "../../deps/libkrun/src/devices", default-features = false, features = ["blk"] }
 krun = { package = "libkrun", path = "../../deps/libkrun/src/libkrun", default-features = false, features = ["blk"] }
 libc = "0.2"
-bson = "3.1"
+sandbox-protocol = { path = "../sandbox-protocol" }
 
 [lib]
 crate-type = ["rlib"]

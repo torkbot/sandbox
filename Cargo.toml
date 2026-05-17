@@ -3,6 +3,7 @@ members = [
     "crates/sandbox",
     "crates/sandbox-init",
     "crates/sandbox-node",
+    "crates/sandbox-protocol",
 ]
 exclude = ["deps/libkrun"]
 resolver = "2"
