@@ -27,3 +27,23 @@ test("VM host artifact has no libkrun/libkrunfw dynamic dependency and is signed
 
   await writeEvidence("linkage.json", artifact);
 });
+
+test("unsigned Node is acceptable because VM launch goes through sandbox-host", () => {
+  assert.fail("the hypervisor-owning process must be sandbox-host, not the embedding Node process");
+});
+
+test("project kernel and init artifacts are selected explicitly", () => {
+  assert.fail("runtime must use projectKernel() and projectInit() artifacts without dynamic discovery");
+});
+
+test("Linux host CI runs the core VM/control/network contract", () => {
+  assert.fail("GitHub Actions must run the core VM/control/network e2e subset on a Linux host with KVM");
+});
+
+test("rootfs fixture builds reproducibly", () => {
+  assert.fail("rootfs fixture builds must be reproducible and produce stable digest metadata");
+});
+
+test("kernel fixture builds reproducibly", () => {
+  assert.fail("kernel fixture builds must be reproducible and produce stable digest metadata");
+});

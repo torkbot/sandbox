@@ -146,7 +146,7 @@ Each e2e test should emit:
 
 ## Capability Detection
 
-The runner should skip, not fail, tests whose host prerequisites are absent. It must still fail if a prerequisite is present but the runtime cannot use it.
+The runner may decline to run tests whose host prerequisites are absent. It must still fail if a prerequisite is present but the runtime cannot use it.
 
 Detected capabilities:
 

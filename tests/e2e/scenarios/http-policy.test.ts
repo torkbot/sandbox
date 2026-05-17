@@ -846,6 +846,34 @@ test("HTTPS interception handles concurrent guest requests without dropping TLS 
   assert.deepEqual([...requestedPaths].sort(), urls.map((url) => new URL(url).pathname).sort());
 });
 
+test("HTTP keep-alive behavior is explicit and deterministic", () => {
+  assert.fail("HTTP keep-alive must either support connection reuse or return a documented deterministic close behavior");
+});
+
+test("upstream connection refused returns a deterministic guest-visible failure", () => {
+  assert.fail("refused upstream connections must produce a stable guest-visible curl status and stderr shape");
+});
+
+test("upstream timeout returns a deterministic guest-visible failure", () => {
+  assert.fail("timed out upstream connections must produce a stable guest-visible failure");
+});
+
+test("upstream reset mid-body returns a deterministic guest-visible failure", () => {
+  assert.fail("mid-body upstream resets must produce a stable guest-visible failure");
+});
+
+test("TLS without SNI has deterministic certificate and policy metadata", () => {
+  assert.fail("IP-literal TLS without SNI must have documented certificate behavior and policy metadata");
+});
+
+test("dynamic MITM certificates are reused or bounded intentionally", () => {
+  assert.fail("MITM certificate generation must expose evidence that cache or bound behavior is intentional");
+});
+
+test("HTTP/2 ALPN behavior is explicit", () => {
+  assert.fail("HTTP/2-capable clients must observe documented downgrade, denial, or implemented HTTP/2 behavior");
+});
+
 function interceptedHttpsArgs(url: string): string[] {
   const parsed = new URL(url);
   return interceptedHttpsAuthorityArgs(url, "203.0.113.10", `${parsed.hostname}:${parsed.port}`);

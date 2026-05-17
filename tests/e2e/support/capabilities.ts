@@ -25,11 +25,6 @@ export function requireVmLaunchSupport(t: TestContext): boolean {
   return true;
 }
 
-export function skipUntilImplemented(t: TestContext, feature: string): boolean {
-  t.skip(`${feature} is not implemented through sandbox-host yet`);
-  return false;
-}
-
 export function requireHostArtifact(t: TestContext): boolean {
   try {
     hostBinaryPath();

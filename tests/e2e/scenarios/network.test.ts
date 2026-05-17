@@ -57,3 +57,27 @@ test("HTTP networking transparently intercepts guest TCP over explicit virtio-ne
   assert.match(result.stdout, /default via 10\.0\.2\.1/);
   assert.match(result.stdout, /sandbox explicit network/);
 });
+
+test("caller protected ranges extend the default network deny set", () => {
+  assert.fail("custom protected CIDRs must be blocked before JavaScript policy");
+});
+
+test("public destinations reach JavaScript policy", () => {
+  assert.fail("non-protected public destinations must reach the JavaScript policy callback");
+});
+
+test("DNS-dependent traffic is observable and cannot bypass policy", () => {
+  assert.fail("hostname-based guest traffic must be observable and unable to bypass HTTP policy");
+});
+
+test("DNS resolution to a protected IP is still blocked before policy", () => {
+  assert.fail("hostnames resolving to protected IPs must be blocked before JavaScript policy");
+});
+
+test("IPv6 behavior is explicit", () => {
+  assert.fail("IPv6 traffic must be either implemented or rejected with deterministic behavior");
+});
+
+test("UDP and non-HTTP traffic cannot silently bypass policy", () => {
+  assert.fail("UDP and non-HTTP traffic must have documented enforcement behavior and cannot silently bypass policy");
+});

@@ -8,13 +8,10 @@ import {
 } from "../../../src/index.ts";
 import { collectAsync, writeEvidence } from "../support/evidence.ts";
 import { execGuestShell } from "../support/guest-control.ts";
-import { requireVmLaunchSupport, skipUntilImplemented } from "../support/capabilities.ts";
+import { requireVmLaunchSupport } from "../support/capabilities.ts";
 
 test("a VM can run with a writable root overlay and publish a new EROFS rootfs", async (t) => {
   if (!requireVmLaunchSupport(t)) {
-    return;
-  }
-  if (!skipUntilImplemented(t, "writable root overlay snapshots")) {
     return;
   }
 
@@ -61,4 +58,20 @@ test("a VM can run with a writable root overlay and publish a new EROFS rootfs",
       digest: snapshot.digest,
     },
   });
+});
+
+test("immutable root remains the default when overlay mode is absent", () => {
+  assert.fail("runtime rootfs writes must fail unless writable overlay mode is explicitly requested");
+});
+
+test("writable root overlay captures guest mutations", () => {
+  assert.fail("writable root overlay must capture guest mutations without changing the supplied base rootfs");
+});
+
+test("rootfs snapshot returns bytes and digest without forcing a host output path", () => {
+  assert.fail("rootfs snapshot must return an EROFS byte blob and digest without requiring an output path");
+});
+
+test("a VM can boot from a produced rootfs snapshot", () => {
+  assert.fail("a rootfs snapshot produced by one VM must boot a second VM as a read-only rootfs");
 });

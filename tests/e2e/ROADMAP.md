@@ -2,12 +2,7 @@
 
 This is the roadmap for the Sandbox e2e suite. The goal is not to maintain a spreadsheet of capabilities; the goal is to grow a small set of scenario files whose test names read like the contract we need from a production sandboxing primitive.
 
-Status language:
-
-- `passing`: implemented as a required e2e test and passing.
-- `skipped`: implemented but intentionally skipped until that slice is picked back up.
-- `todo`: should become an e2e test.
-- `blocked`: depends on a fork/platform/design decision before it can be meaningfully tested.
+Roadmap rule: if a behavior is listed here, it should exist as an executable e2e test. Tests for behavior we have not implemented yet should fail clearly and should never disappear into prose.
 
 ## `boot-smoke.test.ts`
 
@@ -17,8 +12,10 @@ Passing:
 
 - `Node can boot a sandbox VM and exchange control messages`
   - Covers VM creation, `init.ready`, root/init metadata, and a basic guest command.
+- `guest command lockup can be cleaned up by closing the VM`
+  - Starts a non-returning guest command, closes the VM, and asserts cleanup completes without leaking the host API.
 
-Todo:
+Failing:
 
 - `guest exec receives explicit environment variables`
   - Run a shell command that prints a host-supplied env var.
@@ -30,6 +27,12 @@ Todo:
   - Start several execs concurrently and verify completions match request IDs.
 - `closing a VM terminates resources and rejects later operations`
   - Close the VM, then assert later `exec` and mount operations fail deterministically.
+- `closing a VM while a host callback is locked up cleans up the sandbox`
+  - Start guest work that reaches a never-resolving host callback, close the VM, and assert close completes and in-flight work rejects.
+- `host process exit is surfaced through the VM API`
+  - Terminate `sandbox-host` underneath an active VM and assert the next host operation rejects with an idiomatic closed/crashed error.
+- `guest OOM is surfaced through the VM API`
+  - Trigger an intentional guest OOM and assert the host observes VM failure deterministically.
 
 ## `filesystem.test.ts`
 
@@ -42,7 +45,7 @@ Passing:
 - `writable virtual filesystem mounts persist guest mutations through host callbacks`
   - Covers guest create, write, overwrite, truncate, and JS inspection through `vm.mounts.get()`.
 
-Todo:
+Failing:
 
 - `virtual filesystem range reads pass correct offsets to host callbacks`
   - Guest reads slices from a larger virtual file and the host records requested ranges.
@@ -53,21 +56,14 @@ Todo:
 - `virtual filesystem handles larger file reads without truncation`
   - Read a file larger than the current small fixture and assert exact content.
 
-Skipped:
-
-- Rootfs overlay/snapshot behavior lives in `rootfs-shaping.test.ts`, not here.
-
 ## `rootfs-shaping.test.ts`
 
 This file owns build-time rootfs mutation and artifact publishing. Runtime VMs should stay immutable by default.
 
-Skipped:
+Failing:
 
 - `a VM can run with a writable root overlay and publish a new EROFS rootfs`
-  - This is intentionally skipped until rootfs overlay and EROFS snapshotting are designed and implemented through `sandbox-host`.
-
-Todo:
-
+  - This exists as a required e2e test and should fail until rootfs overlay and EROFS snapshotting are implemented.
 - `immutable root remains the default when overlay mode is absent`
   - Assert root writes fail in normal runtime mode.
 - `writable root overlay captures guest mutations`
@@ -104,7 +100,7 @@ Passing:
 - `HTTPS interception handles concurrent guest requests without dropping TLS policy calls`
   - Covers concurrent HTTPS request accounting.
 
-Todo:
+Failing:
 
 - `HTTP keep-alive behavior is explicit and deterministic`
   - Use one client connection for two requests and assert either supported reuse or documented close behavior.
@@ -130,7 +126,7 @@ Passing:
 - `HTTP networking transparently intercepts guest TCP over explicit virtio-net`
   - Covers guest interface, route, and transparent TCP interception through the in-process backend.
 
-Todo:
+Failing:
 
 - `caller protected ranges extend the default network deny set`
   - Configure a custom CIDR and assert pre-policy block.
@@ -154,7 +150,7 @@ Passing:
 - `VM host artifact has no libkrun/libkrunfw dynamic dependency and is signed on macOS`
   - Covers dynamic dependency rejection and macOS HVF entitlement checks on `sandbox-host`.
 
-Todo:
+Failing:
 
 - `unsigned Node is acceptable because VM launch goes through sandbox-host`
   - Assert the hypervisor-owning process is the helper, not the Node process.
@@ -169,9 +165,9 @@ Todo:
 
 ## `libkrun-contract.test.ts`
 
-This file does not exist yet. It should own fork-specific contracts that are too important to leave as comments in architecture docs.
+This file owns fork-specific contracts that are too important to leave as comments in architecture docs.
 
-Todo:
+Failing:
 
 - `Sandbox integrates libkrun through Rust/static build outputs, not the C header surface`
   - Reject accidental C API binding or dynamic library paths.
@@ -179,14 +175,11 @@ Todo:
   - Prove fd-oriented network/control surfaces where the fork supports them.
 - `virtual filesystem operations use libkrun virtual filesystem traits`
   - Keep writable VFS e2e tied to the libkrun trait/backend path.
-
-Blocked:
-
 - `direct Rust init injection boots without libkrun stage-1 init`
-  - Requires the fork/direct-init design to land before this can be a meaningful e2e.
+  - Boot `sandbox-init` directly without relying on libkrun stage-1 init.
 
 ## Required Suite Today
 
-`npm run test:e2e` currently requires all tests listed as passing above and carries one intentional skip in `rootfs-shaping.test.ts`.
+`npm run test:e2e` should include passing tests and known failing roadmap tests. Host capability detection may decline to run the suite on machines that cannot launch VMs, but roadmap behavior should never be hidden behind implementation placeholders.
 
-The roadmap is broader than the required suite on purpose. New hardening slices should promote one or more `todo` items into real tests with idiomatic test names, then make those tests pass without adding compatibility layers or speculative options.
+New hardening slices should add or refine real tests with idiomatic test names, then make those tests pass without adding compatibility layers or speculative options.

@@ -33,3 +33,26 @@ export async function execGuestShell(
     env: input.env,
   });
 }
+
+export async function withTimeout<T>(
+  promise: Promise<T>,
+  milliseconds: number,
+  label: string,
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => {
+          reject(new Error(`${label} timed out after ${milliseconds}ms`));
+        }, milliseconds);
+        timeout.unref();
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) {
+      clearTimeout(timeout);
+    }
+  }
+}

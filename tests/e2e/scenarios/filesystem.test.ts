@@ -11,7 +11,7 @@ import {
   virtualFsMount,
 } from "../../../src/index.ts";
 import { collectAsync, writeEvidence } from "../support/evidence.ts";
-import { execGuestShell } from "../support/guest-control.ts";
+import { execGuestShell, withTimeout } from "../support/guest-control.ts";
 import { requireVmLaunchSupport } from "../support/capabilities.ts";
 
 test("virtual filesystem mounts are backed by host JavaScript callbacks", async (t) => {
@@ -158,6 +158,89 @@ test("writable virtual filesystem mounts persist guest mutations through host ca
     signal: AbortSignal.timeout(1_000),
   });
   assert.equal(Buffer.from(contents).toString("utf8"), "hello");
+});
+
+test("closing a VM while a host filesystem callback is locked up cleans up the sandbox", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  let unblockRead: (() => void) | undefined;
+  let readStartedResolve: (() => void) | undefined;
+  const readStarted = new Promise<void>((resolve) => {
+    readStartedResolve = resolve;
+  });
+
+  const vm = await spawnSandbox({
+    name: "locked-host-filesystem",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    mounts: [
+      virtualFsMount("/locked", {
+        async stat(path) {
+          if (path === "/") {
+            return directoryStat(false);
+          }
+          if (path === "/stuck.txt") {
+            return fileStat(5, false);
+          }
+          throw new Error(`missing path ${path}`);
+        },
+        async list(path) {
+          if (path !== "/") {
+            throw new Error(`missing directory ${path}`);
+          }
+          return [{ name: "stuck.txt", type: "file" }];
+        },
+        async read() {
+          readStartedResolve?.();
+          await new Promise<void>((resolve) => {
+            unblockRead = resolve;
+          });
+          return Buffer.from("stuck");
+        },
+      }),
+    ],
+  });
+
+  t.after(async () => {
+    unblockRead?.();
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const read = execGuestShell(vm, {
+    id: "locked-vfs-read",
+    script: "cat /locked/stuck.txt",
+  });
+  const readRejects = assert.rejects(
+    withTimeout(read, 5_000, "locked filesystem guest command"),
+    /closed|exited|sandbox VM|sandbox-host/i,
+  );
+  await withTimeout(readStarted, 2_000, "host filesystem read callback");
+
+  await withTimeout(vm.close(), 3_000, "close locked filesystem VM");
+  await readRejects;
+});
+
+test("virtual filesystem range reads pass correct offsets to host callbacks", () => {
+  assert.fail("guest range reads must reach the host VFS callback with exact offset and length");
+});
+
+test("virtual filesystem metadata is reflected in guest stat output", () => {
+  assert.fail("guest stat output must reflect host VFS file type, directory type, size, and writable bits");
+});
+
+test("virtual filesystem errors surface deterministically to the guest", () => {
+  assert.fail("missing files, read-only writes, and host callback failures must have stable guest-visible errors");
+});
+
+test("virtual filesystem handles larger file reads without truncation", () => {
+  assert.fail("virtual filesystem reads must preserve content larger than the current smoke fixture");
 });
 
 function createMemoryWritableFileSystem(): SandboxWritableFileSystem {
