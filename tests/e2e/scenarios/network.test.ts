@@ -10,7 +10,7 @@ import { collectAsync } from "../support/evidence.ts";
 import { execGuestShell } from "../support/guest-control.ts";
 import { requireVmLaunchSupport } from "../support/capabilities.ts";
 
-test("HTTP networking uses an explicit virtio-net device, not TSI", async (t) => {
+test("HTTP networking transparently intercepts guest TCP over explicit virtio-net", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
   }
@@ -44,7 +44,7 @@ test("HTTP networking uses an explicit virtio-net device, not TSI", async (t) =>
       test -d /sys/class/net/eth0
       ip addr show dev eth0
       ip route show default
-      curl --fail --silent http://10.0.2.1:8080/
+      curl --connect-timeout 2 --fail --silent http://203.0.113.10:8080/
     `,
   });
 
