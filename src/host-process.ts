@@ -237,6 +237,18 @@ export class HostProcessSandboxVm implements HostControlChannel {
         destinationIp: assertString(document.destinationIp, "destinationIp"),
         headers,
       };
+      if (isProtectedDestination(request.destinationIp, http.protectedRanges ?? [])) {
+        this.#child.stdin.write(encodePacket({
+          type: "host.http.response",
+          id,
+          ok: true,
+          status: 403,
+          headers: [{ name: "content-type", value: "text/plain" }],
+          body: new TextEncoder().encode("protected destination"),
+        }));
+        return;
+      }
+
       const decision = await http.policy(request);
       if (decision.action === "deny") {
         this.#child.stdin.write(encodePacket({
@@ -339,6 +351,44 @@ function responseHeadersFromFetch(headers: Headers): { name: string; value: stri
   return Array.from(headers.entries())
     .filter(([name]) => !hopByHop.has(name.toLowerCase()))
     .map(([name, value]) => ({ name, value }));
+}
+
+function isProtectedDestination(destinationIp: string, ranges: readonly string[]): boolean {
+  const destination = ipv4ToInt(destinationIp);
+  if (destination === null) {
+    return false;
+  }
+
+  return ranges.some((range) => {
+    const [address, prefixText] = range.split("/");
+    if (address === undefined || prefixText === undefined) {
+      return false;
+    }
+    const network = ipv4ToInt(address);
+    const prefix = Number(prefixText);
+    if (network === null || !Number.isInteger(prefix) || prefix < 0 || prefix > 32) {
+      return false;
+    }
+    const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+    return (destination & mask) === (network & mask);
+  });
+}
+
+function ipv4ToInt(address: string): number | null {
+  const parts = address.split(".");
+  if (parts.length !== 4) {
+    return null;
+  }
+
+  let value = 0;
+  for (const part of parts) {
+    const octet = Number(part);
+    if (!Number.isInteger(octet) || octet < 0 || octet > 255) {
+      return null;
+    }
+    value = ((value << 8) | octet) >>> 0;
+  }
+  return value;
 }
 
 function delay(milliseconds: number): Promise<void> {

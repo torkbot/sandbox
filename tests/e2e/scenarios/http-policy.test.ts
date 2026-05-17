@@ -27,6 +27,7 @@ test("plain HTTP traffic is intercepted, policy checked, rewritten, and forwarde
     }),
     network: {
       http: {
+        protectedRanges: ["169.254.169.254/32"],
         async policy(request) {
           decisions.push({
             url: request.url,
@@ -95,8 +96,25 @@ test("plain HTTP traffic is intercepted, policy checked, rewritten, and forwarde
   });
   assert.equal(denied.stdout, "451");
 
+  const protectedDestination = await execGuest(vm, {
+    id: "curl-protected-destination",
+    argv: [
+      "curl",
+      "--max-time",
+      "5",
+      "-sS",
+      "-o",
+      "/dev/null",
+      "-w",
+      "%{http_code}",
+      "http://169.254.169.254/protected",
+    ],
+  });
+  assert.equal(protectedDestination.stdout, "403");
+
   assert.ok(decisions.some((decision) => decision.url.endsWith("/allowed")));
   assert.ok(decisions.some((decision) => decision.url.endsWith("/blocked")));
+  assert.ok(!decisions.some((decision) => decision.destinationIp === "169.254.169.254"));
 
   await writeEvidence("proxy.json", {
     decisions,
