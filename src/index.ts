@@ -545,6 +545,11 @@ function validateSandboxOptions(options: SandboxOptions): void {
     if (mountPaths.has(mount.path)) {
       throw new Error(`invalid spawnSandbox options: duplicate mount path: ${mount.path}`);
     }
+    for (const existing of mountPaths) {
+      if (isNestedGuestPath(mount.path, existing) || isNestedGuestPath(existing, mount.path)) {
+        throw new Error(`invalid spawnSandbox options: nested mount paths are not supported: ${existing}, ${mount.path}`);
+      }
+    }
     mountPaths.add(mount.path);
   }
 
@@ -582,6 +587,10 @@ function validateGuestPath(path: string, field: "mount.path" | "binding.path"): 
   if (path.includes("=") || path.includes(";")) {
     throw new Error(`invalid spawnSandbox options: ${field} must not contain '=' or ';'`);
   }
+}
+
+function isNestedGuestPath(path: string, parent: string): boolean {
+  return parent !== "/" && path.startsWith(`${parent}/`);
 }
 
 function validateOutboundPorts(ports: readonly number[] | undefined): void {

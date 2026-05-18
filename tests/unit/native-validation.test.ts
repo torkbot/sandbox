@@ -96,6 +96,25 @@ test("spawnSandbox rejects duplicate mount paths before runtime launch", async (
   );
 });
 
+test("spawnSandbox rejects nested mount paths before runtime launch", async () => {
+  const fileSystem = unreachableFileSystem();
+
+  await assert.rejects(
+    spawnSandbox({
+      kernel: projectKernel(),
+      init: projectInit(),
+      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
+        format: "erofs",
+      }),
+      mounts: [
+        virtualFsMount("/workspace", fileSystem),
+        virtualFsMount("/workspace/cache", fileSystem),
+      ],
+    }),
+    /invalid spawnSandbox options: nested mount paths are not supported: \/workspace, \/workspace\/cache/,
+  );
+});
+
 test("spawnSandbox rejects mount paths that cannot be encoded for guest init", async () => {
   await assert.rejects(
     spawnSandbox({

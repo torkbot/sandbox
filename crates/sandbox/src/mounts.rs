@@ -34,6 +34,16 @@ impl MountTable {
             if table.insert(path.to_string(), planned).is_some() {
                 return Err(MountError::new(format!("duplicate mount path: {path}")));
             }
+
+            if table.keys().any(|existing| {
+                existing != path
+                    && (is_nested_guest_path(path, existing)
+                        || is_nested_guest_path(existing, path))
+            }) {
+                return Err(MountError::new(format!(
+                    "nested mount paths are not supported: {path}"
+                )));
+            }
         }
 
         Ok(Self { mounts: table })
@@ -50,6 +60,10 @@ impl MountTable {
     pub fn is_empty(&self) -> bool {
         self.mounts.is_empty()
     }
+}
+
+fn is_nested_guest_path(path: &str, parent: &str) -> bool {
+    parent != "/" && path.starts_with(&format!("{parent}/"))
 }
 
 impl MountError {
@@ -110,5 +124,25 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.to_string(), "mount.path must not be /");
+    }
+
+    #[test]
+    fn rejects_nested_mount_paths() {
+        let err = MountTable::plan(&[
+            MountSpec::VirtualFs {
+                path: "/workspace".to_string(),
+                writable: false,
+            },
+            MountSpec::VirtualFs {
+                path: "/workspace/cache".to_string(),
+                writable: true,
+            },
+        ])
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "nested mount paths are not supported: /workspace/cache"
+        );
     }
 }
