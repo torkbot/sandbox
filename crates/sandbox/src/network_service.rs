@@ -666,15 +666,21 @@ fn dns_response(request: &[u8]) -> Option<Vec<u8>> {
     let qtype = u16::from_be_bytes([request[question_end], request[question_end + 1]]);
     let qclass = u16::from_be_bytes([request[question_end + 2], request[question_end + 3]]);
 
-    let answer = if qclass == 1 && qtype == 1 {
+    let supported_question = qclass == 1 && qtype == 1;
+    let answer = if supported_question {
         dns_address(&name)
     } else {
         None
     };
+    let name_exists = if supported_question {
+        answer.is_some()
+    } else {
+        dns_address(&name).is_some()
+    };
 
     let mut response = Vec::new();
     response.extend_from_slice(&request[0..2]);
-    response.extend_from_slice(if answer.is_some() {
+    response.extend_from_slice(if answer.is_some() || name_exists {
         &[0x81, 0x80]
     } else {
         &[0x81, 0x83]
@@ -719,6 +725,9 @@ fn dns_address(name: &str) -> Option<[u8; 4]> {
     }
     if name == "public.sandbox.test" {
         return Some(DNS_PUBLIC_TEST_IP);
+    }
+    if name.ends_with(".sandbox.test") {
+        return None;
     }
     (name, 0)
         .to_socket_addrs()
@@ -1547,6 +1556,22 @@ mod tests {
         assert!(buffer.is_empty());
     }
 
+    #[test]
+    fn dns_unsupported_query_type_returns_nodata_for_known_name() {
+        let response = dns_response(&dns_query("public.sandbox.test", 28)).unwrap();
+
+        assert_eq!(&response[2..4], &[0x81, 0x80]);
+        assert_eq!(&response[6..8], &[0, 0]);
+    }
+
+    #[test]
+    fn dns_unknown_name_returns_nxdomain() {
+        let response = dns_response(&dns_query("missing.sandbox.test", 1)).unwrap();
+
+        assert_eq!(&response[2..4], &[0x81, 0x83]);
+        assert_eq!(&response[6..8], &[0, 0]);
+    }
+
     struct PartialWouldBlockWriter {
         first_write_len: usize,
         writes: Vec<Vec<u8>>,
@@ -1567,6 +1592,24 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    fn dns_query(name: &str, qtype: u16) -> Vec<u8> {
+        let mut query = Vec::new();
+        query.extend_from_slice(&0x1234u16.to_be_bytes());
+        query.extend_from_slice(&0x0100u16.to_be_bytes());
+        query.extend_from_slice(&1u16.to_be_bytes());
+        query.extend_from_slice(&0u16.to_be_bytes());
+        query.extend_from_slice(&0u16.to_be_bytes());
+        query.extend_from_slice(&0u16.to_be_bytes());
+        for label in name.split('.') {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.push(0);
+        query.extend_from_slice(&qtype.to_be_bytes());
+        query.extend_from_slice(&1u16.to_be_bytes());
+        query
     }
 
     fn tcp_frame(

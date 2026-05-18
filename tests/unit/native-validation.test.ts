@@ -26,6 +26,20 @@ test("spawnSandbox rejects invalid CPU config before runtime launch", async () =
   );
 });
 
+test("spawnSandbox rejects CPU counts the native spec cannot represent before runtime launch", async () => {
+  await assert.rejects(
+    spawnSandbox({
+      kernel: projectKernel(),
+      init: projectInit(),
+      cpu: { vcpus: 256 },
+      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
+        format: "erofs",
+      }),
+    }),
+    /invalid spawnSandbox options: cpu\.vcpus must be less than or equal to 255/,
+  );
+});
+
 test("spawnSandbox rejects fractional resource config before runtime launch", async () => {
   await assert.rejects(
     spawnSandbox({
@@ -173,37 +187,6 @@ test("spawnSandbox rejects root and dot-component mount paths before runtime lau
   );
 });
 
-test("spawnSandbox rejects mount paths that cannot be encoded for guest init", async () => {
-  await assert.rejects(
-    spawnSandbox({
-      kernel: projectKernel(),
-      init: projectInit(),
-      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
-        format: "erofs",
-      }),
-      mounts: [
-        virtualFsMount("/bad=path", {
-          async stat() {
-            return {
-              type: "directory",
-              sizeBytes: null,
-              mediaType: null,
-              modifiedAtMs: null,
-            };
-          },
-          async list() {
-            return [];
-          },
-          async read() {
-            return new Uint8Array();
-          },
-        }),
-      ],
-    }),
-    /invalid spawnSandbox options: mount\.path must not contain '=' or ';'/,
-  );
-});
-
 test("spawnSandbox rejects mount paths with NUL bytes before runtime launch", async () => {
   await assert.rejects(
     spawnSandbox({
@@ -289,6 +272,26 @@ test("spawnSandbox rejects unsupported init crates before runtime launch", async
       }),
     }),
     /invalid spawnSandbox options: unsupported init crate: other-init/,
+  );
+});
+
+test("spawnSandbox rejects HTTP interception without an explicit outbound policy", async () => {
+  await assert.rejects(
+    spawnSandbox({
+      kernel: projectKernel(),
+      init: projectInit(),
+      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
+        format: "erofs",
+      }),
+      network: {
+        http: {
+          async policy(request) {
+            return { action: "allow", headers: request.headers };
+          },
+        },
+      },
+    }),
+    /invalid spawnSandbox options: network\.http requires network\.outbound/,
   );
 });
 

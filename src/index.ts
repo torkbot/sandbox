@@ -524,6 +524,9 @@ function validateSandboxOptions(options: SandboxOptions): void {
   if (options.cpu?.vcpus !== undefined && (!Number.isInteger(options.cpu.vcpus) || options.cpu.vcpus <= 0)) {
     throw new Error("invalid spawnSandbox options: cpu.vcpus must be greater than zero");
   }
+  if (options.cpu?.vcpus !== undefined && options.cpu.vcpus > 255) {
+    throw new Error("invalid spawnSandbox options: cpu.vcpus must be less than or equal to 255");
+  }
   if (options.memory?.mib !== undefined && (!Number.isInteger(options.memory.mib) || options.memory.mib <= 0)) {
     throw new Error("invalid spawnSandbox options: memory.mib must be greater than zero");
   }
@@ -555,6 +558,9 @@ function validateSandboxOptions(options: SandboxOptions): void {
 
   if (options.network?.outbound?.policy !== undefined && options.network.outbound.policy !== "deny") {
     throw new Error("invalid spawnSandbox options: network.outbound.policy must be deny");
+  }
+  if (options.network?.http !== undefined && options.network.outbound === undefined) {
+    throw new Error("invalid spawnSandbox options: network.http requires network.outbound");
   }
 
   for (const rule of options.network?.outbound?.rules ?? []) {
@@ -599,9 +605,6 @@ function validateGuestPath(path: string, field: "mount.path" | "binding.path"): 
   }
   if (path.includes("\0")) {
     throw new Error(`invalid spawnSandbox options: ${field} must not contain NUL bytes`);
-  }
-  if (path.includes("=") || path.includes(";")) {
-    throw new Error(`invalid spawnSandbox options: ${field} must not contain '=' or ';'`);
   }
   if (path.split("/").some((component) => component === "." || component === "..")) {
     throw new Error(`invalid spawnSandbox options: ${field} must not contain '.' or '..' components`);

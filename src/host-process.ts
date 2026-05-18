@@ -123,7 +123,10 @@ class HostHttpProxy {
         headers,
         ...(metadata.tls === undefined ? {} : { tls: metadata.tls }),
       };
-      const protection = await inspectHttpProtection(policyRequest, this.#options.network?.outbound?.rules ?? []);
+      const outboundRules = this.#options.network?.outbound?.rules;
+      const protection = outboundRules === undefined
+        ? { blocked: false as const }
+        : await inspectHttpProtection(policyRequest, outboundRules);
       if (protection.blocked) {
         response.writeHead(403, { "content-type": "text/plain" });
         response.end("outbound denied");
@@ -852,7 +855,7 @@ function isPublicIpv4Destination(address: string): boolean {
 }
 
 function portMatches(ports: readonly number[] | undefined, port: number): boolean {
-  return ports === undefined || ports.includes(port);
+  return ports === undefined || ports.length === 0 || ports.includes(port);
 }
 
 async function resolveUrlAddresses(url: string): Promise<string[]> {
@@ -864,7 +867,9 @@ async function resolveUrlAddresses(url: string): Promise<string[]> {
 
   try {
     const records = await lookup(parsed.hostname, { all: true });
-    return records.map((record) => record.address);
+    return records
+      .map((record) => record.address)
+      .filter((address) => ipFamily(address) === "ipv4");
   } catch {
     return [];
   }
