@@ -441,6 +441,7 @@ impl ControlSocket {
     }
 
     pub fn write_packet(&mut self, packet: &[u8]) -> io::Result<()> {
+        self.stream.set_nonblocking(false)?;
         self.stream.write_all(packet)
     }
 
@@ -661,6 +662,29 @@ mod tests {
         guest_socket.write_all(&packet[2..]).unwrap();
 
         assert_eq!(control_socket.try_read_packet().unwrap(), Some(packet));
+    }
+
+    #[test]
+    fn control_socket_writes_after_nonblocking_poll() {
+        let (host_socket, mut guest_socket) = UnixStream::pair().unwrap();
+        let mut control_socket = ControlSocket {
+            stream: host_socket,
+            read_buffer: Vec::new(),
+        };
+        let packet = crate::control::ControlFrame::GuestExec {
+            id: "write-after-poll".to_string(),
+            argv: vec!["true".to_string()],
+            env: Vec::new(),
+        }
+        .encode_packet()
+        .unwrap();
+
+        assert!(control_socket.try_read_packet().unwrap().is_none());
+        control_socket.write_packet(&packet).unwrap();
+
+        let mut received = vec![0; packet.len()];
+        guest_socket.read_exact(&mut received).unwrap();
+        assert_eq!(received, packet);
     }
 
     #[test]

@@ -155,14 +155,14 @@ impl sandbox::vfs::HostVirtualFileSystem for NodeVirtualFs {
         let stat = self
             .stat_path(&path)
             .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
-        Ok(entry_from_stat(self.inode_for_path(&path), &stat))
+        entry_from_stat(self.inode_for_path(&path), &stat)
     }
 
     fn getattr(&self, inode: VirtualInode) -> io::Result<(bindings::stat64, Duration)> {
         let path = self.path_for_inode(inode)?;
         let stat = self.stat_path(&path)?;
         Ok((
-            entry_from_stat(u64::from(inode), &stat).attr,
+            entry_from_stat(u64::from(inode), &stat)?.attr,
             Duration::from_secs(1),
         ))
     }
@@ -221,7 +221,7 @@ impl sandbox::vfs::HostVirtualFileSystem for NodeVirtualFs {
             "mode": mode as i64,
         })?;
         let stat = response.get_document("stat").map_err(to_io_error)?;
-        Ok(entry_from_stat(self.inode_for_path(&path), stat))
+        entry_from_stat(self.inode_for_path(&path), stat)
     }
 
     fn write(&self, inode: VirtualInode, offset: u64, data: &[u8]) -> io::Result<usize> {
@@ -251,7 +251,7 @@ impl sandbox::vfs::HostVirtualFileSystem for NodeVirtualFs {
         })?;
         let stat = response.get_document("stat").map_err(to_io_error)?;
         Ok((
-            entry_from_stat(u64::from(inode), stat).attr,
+            entry_from_stat(u64::from(inode), stat)?.attr,
             Duration::from_secs(1),
         ))
     }
@@ -269,7 +269,7 @@ impl sandbox::vfs::HostVirtualFileSystem for NodeVirtualFs {
             "mode": mode as i64,
         })?;
         let stat = response.get_document("stat").map_err(to_io_error)?;
-        Ok(entry_from_stat(self.inode_for_path(&path), stat))
+        entry_from_stat(self.inode_for_path(&path), stat)
     }
 
     fn unlink(&self, parent: VirtualInode, name: &CStr) -> io::Result<()> {
@@ -352,7 +352,7 @@ impl sandbox::vfs::HostVirtualFileSystem for NodeVirtualFs {
             "path": &path,
         })?;
         let stat = response.get_document("stat").map_err(to_io_error)?;
-        Ok(entry_from_stat(self.inode_for_path(&path), stat))
+        entry_from_stat(self.inode_for_path(&path), stat)
     }
 
     fn readlink(&self, inode: VirtualInode) -> io::Result<Vec<u8>> {
@@ -468,23 +468,27 @@ fn flush_retrying_would_block(writer: &mut impl Write) -> io::Result<()> {
     }
 }
 
-fn entry_from_stat(inode: u64, stat: &Document) -> VirtioFsEntry {
+fn entry_from_stat(inode: u64, stat: &Document) -> io::Result<VirtioFsEntry> {
     let writable = stat.get_bool("writable").unwrap_or(false);
-    match (stat.get_str("type").unwrap_or("file"), writable) {
+    let entry = match (stat.get_str("type").unwrap_or("file"), writable) {
         ("directory", true) => virtual_writable_directory_entry(inode),
         ("directory", false) => virtual_directory_entry(inode),
-        ("symlink", _) => virtual_symlink_entry(inode, stat_size(stat)),
-        (_, true) => virtual_writable_file_entry(inode, stat_size(stat)),
-        (_, false) => virtual_file_entry(inode, stat_size(stat)),
-    }
+        ("symlink", _) => virtual_symlink_entry(inode, stat_size(stat)?),
+        (_, true) => virtual_writable_file_entry(inode, stat_size(stat)?),
+        (_, false) => virtual_file_entry(inode, stat_size(stat)?),
+    };
+    Ok(entry)
 }
 
-fn stat_size(stat: &Document) -> u64 {
+fn stat_size(stat: &Document) -> io::Result<u64> {
     match stat.get("sizeBytes") {
-        Some(Bson::Int32(value)) => (*value).max(0) as u64,
-        Some(Bson::Int64(value)) => (*value).max(0) as u64,
-        Some(Bson::Double(value)) if value.is_finite() && *value > 0.0 => *value as u64,
-        _ => 0,
+        Some(Bson::Int32(value)) => Ok((*value).max(0) as u64),
+        Some(Bson::Int64(value)) => Ok((*value).max(0) as u64),
+        Some(Bson::Double(value)) if value.is_finite() && *value >= 0.0 => Ok(*value as u64),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "virtual files and symlinks mounted in the guest must report sizeBytes",
+        )),
     }
 }
 
@@ -522,4 +526,37 @@ fn encode_document_packet(document: &Document) -> io::Result<Vec<u8>> {
 
 fn to_io_error(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mounted_regular_files_must_report_size() {
+        let stat = doc! {
+            "type": "file",
+            "sizeBytes": Bson::Null,
+            "writable": false,
+        };
+
+        let error = match entry_from_stat(2, &stat) {
+            Ok(_) => panic!("unknown-size regular file should be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("must report sizeBytes"));
+    }
+
+    #[test]
+    fn mounted_directories_may_have_unknown_size() {
+        let stat = doc! {
+            "type": "directory",
+            "sizeBytes": Bson::Null,
+            "writable": false,
+        };
+
+        let entry = entry_from_stat(2, &stat).unwrap();
+        assert_eq!(entry.attr.st_ino, 2);
+    }
 }

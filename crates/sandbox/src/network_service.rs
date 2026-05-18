@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant as StdInstant};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -35,6 +35,8 @@ const DNS_PACKET_BUFFER_BYTES: usize = 4096;
 const DNS_PROTECTED_TEST_IP: [u8; 4] = [10, 1, 2, 3];
 const DNS_PUBLIC_TEST_IP: [u8; 4] = [93, 184, 216, 34];
 const MITM_CERT_CACHE_LIMIT: usize = 256;
+const NAT_FLOW_IDLE_TTL: Duration = Duration::from_secs(300);
+const NAT_FLOW_CLOSING_TTL: Duration = Duration::from_secs(30);
 const HOST_HTTP_PROBE_RESPONSE: &[u8] =
     b"HTTP/1.1 200 OK\r\ncontent-length: 25\r\nconnection: close\r\n\r\nsandbox explicit network\n";
 const OUTBOUND_DENIED_RESPONSE: &[u8] =
@@ -1036,7 +1038,7 @@ impl MitmCertIssuer {
 #[derive(Debug)]
 struct TransparentTcpNat {
     host_ip: [u8; 4],
-    flows: HashMap<TcpFlow, [u8; 4]>,
+    flows: HashMap<TcpFlow, NatFlow>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1044,6 +1046,13 @@ struct TcpFlow {
     guest_ip: [u8; 4],
     guest_port: u16,
     host_port: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NatFlow {
+    destination_ip: [u8; 4],
+    last_seen: StdInstant,
+    closing: bool,
 }
 
 impl TransparentTcpNat {
@@ -1055,6 +1064,7 @@ impl TransparentTcpNat {
     }
 
     fn rewrite_guest_frame(&mut self, frame: &mut [u8]) {
+        self.prune_expired_flows();
         let Some(packet) = Ipv4TcpPacket::parse(frame) else {
             return;
         };
@@ -1067,12 +1077,25 @@ impl TransparentTcpNat {
             guest_port: packet.source_port(frame),
             host_port: packet.destination_port(frame),
         };
-        self.flows.insert(flow, packet.destination_ip(frame));
+        let flags = packet.tcp_flags(frame);
+        if flags.rst {
+            self.flows.remove(&flow);
+        } else {
+            self.flows.insert(
+                flow,
+                NatFlow {
+                    destination_ip: packet.destination_ip(frame),
+                    last_seen: StdInstant::now(),
+                    closing: flags.fin,
+                },
+            );
+        }
         packet.set_destination_ip(frame, self.host_ip);
         packet.recompute_checksums(frame);
     }
 
     fn rewrite_host_frame(&mut self, frame: &mut [u8]) {
+        self.prune_expired_flows();
         let Some(packet) = Ipv4TcpPacket::parse(frame) else {
             return;
         };
@@ -1085,11 +1108,17 @@ impl TransparentTcpNat {
             guest_port: packet.destination_port(frame),
             host_port: packet.source_port(frame),
         };
-        let Some(original_destination) = self.flows.get(&flow).copied() else {
+        let Some(nat_flow) = self.flows.get_mut(&flow) else {
             return;
         };
+        nat_flow.last_seen = StdInstant::now();
+        let original_destination = nat_flow.destination_ip;
+        let flags = packet.tcp_flags(frame);
         packet.set_source_ip(frame, original_destination);
         packet.recompute_checksums(frame);
+        if flags.fin || flags.rst {
+            self.flows.remove(&flow);
+        }
     }
 
     fn original_destination(
@@ -1106,13 +1135,26 @@ impl TransparentTcpNat {
             guest_port,
             host_port,
         };
-        self.flows.get(&flow).map(|address| {
+        self.flows.get(&flow).map(|flow| {
+            let address = flow.destination_ip;
             Ipv4Address::new(address[0], address[1], address[2], address[3]).to_string()
         })
     }
 
     fn host_ports(&self) -> impl Iterator<Item = u16> + '_ {
         self.flows.keys().map(|flow| flow.host_port)
+    }
+
+    fn prune_expired_flows(&mut self) {
+        let now = StdInstant::now();
+        self.flows.retain(|_, flow| {
+            now.duration_since(flow.last_seen)
+                < if flow.closing {
+                    NAT_FLOW_CLOSING_TTL
+                } else {
+                    NAT_FLOW_IDLE_TTL
+                }
+        });
     }
 }
 
@@ -1184,6 +1226,14 @@ impl Ipv4TcpPacket {
         u16::from_be_bytes([frame[self.tcp_start + 2], frame[self.tcp_start + 3]])
     }
 
+    fn tcp_flags(self, frame: &[u8]) -> TcpFlags {
+        let flags = frame[self.tcp_start + 13];
+        TcpFlags {
+            fin: flags & 0x01 != 0,
+            rst: flags & 0x04 != 0,
+        }
+    }
+
     fn recompute_checksums(self, frame: &mut [u8]) {
         let total_len = usize::from(u16::from_be_bytes([
             frame[self.ip_start + 2],
@@ -1206,6 +1256,12 @@ impl Ipv4TcpPacket {
         frame[self.tcp_start + 16..self.tcp_start + 18]
             .copy_from_slice(&tcp_checksum.to_be_bytes());
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TcpFlags {
+    fin: bool,
+    rst: bool,
 }
 
 fn tcp_ipv4_checksum(source: [u8; 4], destination: [u8; 4], tcp: &[u8]) -> u16 {
@@ -1350,5 +1406,49 @@ mod tests {
         ] {
             assert!(!is_allowed_outbound_tcp(address, 80, &rules), "{address}");
         }
+    }
+
+    #[test]
+    fn transparent_nat_prunes_flow_after_host_fin() {
+        let mut nat = TransparentTcpNat::new(Ipv4Address::new(10, 0, 2, 1));
+        let mut guest_frame = tcp_frame([10, 0, 2, 15], [93, 184, 216, 34], 50_000, 443, 0x02);
+
+        nat.rewrite_guest_frame(&mut guest_frame);
+        assert_eq!(
+            nat.original_destination(IpAddress::v4(10, 0, 2, 15), 50_000, 443),
+            Some("93.184.216.34".to_string()),
+        );
+
+        let mut host_frame = tcp_frame([10, 0, 2, 1], [10, 0, 2, 15], 443, 50_000, 0x01);
+        nat.rewrite_host_frame(&mut host_frame);
+
+        assert_eq!(
+            nat.original_destination(IpAddress::v4(10, 0, 2, 15), 50_000, 443),
+            None
+        );
+        assert_eq!(nat.host_ports().count(), 0);
+    }
+
+    fn tcp_frame(
+        source_ip: [u8; 4],
+        destination_ip: [u8; 4],
+        source_port: u16,
+        destination_port: u16,
+        tcp_flags: u8,
+    ) -> Vec<u8> {
+        let mut frame = vec![0; 14 + 20 + 20];
+        frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        let ip_start = 14;
+        frame[ip_start] = 0x45;
+        frame[ip_start + 2..ip_start + 4].copy_from_slice(&40u16.to_be_bytes());
+        frame[ip_start + 9] = 6;
+        frame[ip_start + 12..ip_start + 16].copy_from_slice(&source_ip);
+        frame[ip_start + 16..ip_start + 20].copy_from_slice(&destination_ip);
+        let tcp_start = ip_start + 20;
+        frame[tcp_start..tcp_start + 2].copy_from_slice(&source_port.to_be_bytes());
+        frame[tcp_start + 2..tcp_start + 4].copy_from_slice(&destination_port.to_be_bytes());
+        frame[tcp_start + 12] = 5 << 4;
+        frame[tcp_start + 13] = tcp_flags;
+        frame
     }
 }

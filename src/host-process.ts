@@ -243,18 +243,23 @@ export class HostProcessSandboxVm implements HostControlChannel {
     const httpProxy = options.network?.http === undefined
       ? undefined
       : await HostHttpProxy.start(options);
-    const child = spawn(hostBinaryPath(), ["--stdio"], {
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    const vm = new HostProcessSandboxVm(child, options, httpProxy);
-    await Promise.race([
-      once(child, "spawn"),
-      once(child, "error").then(([error]) => {
-        throw error;
-      }),
-    ]);
-    vm.#writeToHost(encodeHostSpawn(withHostProxyPort(nativeOptions, httpProxy?.port)));
-    return vm;
+    try {
+      const child = spawn(hostBinaryPath(), ["--stdio"], {
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      const vm = new HostProcessSandboxVm(child, options, httpProxy);
+      await Promise.race([
+        once(child, "spawn"),
+        once(child, "error").then(([error]) => {
+          throw error;
+        }),
+      ]);
+      vm.#writeToHost(encodeHostSpawn(withHostProxyPort(nativeOptions, httpProxy?.port)));
+      return vm;
+    } catch (error) {
+      await httpProxy?.close();
+      throw error;
+    }
   }
 
   writeControlPacket(packet: Uint8Array): void {

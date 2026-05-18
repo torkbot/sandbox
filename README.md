@@ -48,9 +48,10 @@ await using vm = await spawnSandbox({
         }
 
         if (path === "/status.json") {
+          const body = JSON.stringify({ ready: true });
           return {
             type: "file",
-            sizeBytes: null,
+            sizeBytes: Buffer.byteLength(body),
             mediaType: "application/json",
             modifiedAtMs: null,
           };

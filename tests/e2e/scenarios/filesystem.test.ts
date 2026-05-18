@@ -667,6 +667,75 @@ test("virtual filesystem errors surface deterministically to the guest", async (
   assert.match(result.stdout, /throws=[1-9][0-9]*/);
 });
 
+test("virtual filesystem rejects guest-mounted regular files with unknown size", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  let readCount = 0;
+  const vm = await spawnSandbox({
+    name: "virtual-filesystem-unknown-size",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    mounts: [
+      virtualFsMount("/sandbox", {
+        async stat(path) {
+          if (path === "/") {
+            return directoryStat(false);
+          }
+          if (path === "/dynamic.txt") {
+            return {
+              type: "file",
+              sizeBytes: null,
+              mediaType: "text/plain",
+              modifiedAtMs: null,
+              writable: false,
+            };
+          }
+          throw new Error(`missing path ${path}`);
+        },
+        async list(path) {
+          if (path !== "/") {
+            throw new Error(`missing directory ${path}`);
+          }
+          return [{ name: "dynamic.txt", type: "file" }];
+        },
+        async read() {
+          readCount += 1;
+          return Buffer.from("dynamic content");
+        },
+      }),
+    ],
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuestShell(vm, {
+    id: "virtual-filesystem-unknown-size",
+    script: `
+      set +e
+      cat /sandbox/dynamic.txt >/dev/null 2>&1
+      status=$?
+      echo "status=$status"
+      test "$status" != "0"
+    `,
+  });
+
+  assert.equal(
+    result.exitCode,
+    0,
+    `unknown-size file should fail closed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+  );
+  assert.equal(readCount, 0);
+});
+
 test("virtual filesystem handles larger file reads without truncation", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
