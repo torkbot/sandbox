@@ -217,6 +217,8 @@ Passing:
   - Configure no matching accept rule and assert a pre-policy block.
 - `public destinations reach JavaScript policy`
   - Request a destination allowed by `acceptTcp(...)` and assert policy evidence.
+- `outbound-only policy creates the guest network device`
+  - `network.outbound` without `network.http` still creates the guest interface and route.
 - `DNS-dependent traffic is observable and cannot bypass policy`
   - Guest requests a hostname without `--connect-to`; assert DNS behavior and policy evidence.
 - `DNS resolution to a denied IP is blocked before policy`

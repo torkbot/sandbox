@@ -88,6 +88,35 @@ pub struct HttpSpec {
     pub ca_private_key_pem: Option<String>,
 }
 
+impl HttpSpec {
+    fn from_input(input: HttpSpecInput) -> Result<Self, rcgen::Error> {
+        let (ca_certificate_pem, ca_private_key_pem) =
+            match (input.ca_certificate_pem, input.ca_private_key_pem) {
+                (Some(certificate), Some(private_key)) => (Some(certificate), Some(private_key)),
+                _ => {
+                    let (certificate, private_key) = generate_http_ca()?;
+                    (Some(certificate), Some(private_key))
+                }
+            };
+
+        Ok(Self {
+            protected_ranges: input.protected_ranges,
+            ca_certificate_pem,
+            ca_private_key_pem,
+        })
+    }
+}
+
+fn generate_http_ca() -> Result<(String, String), rcgen::Error> {
+    let key = rcgen::KeyPair::generate()?;
+    let mut params = rcgen::CertificateParams::new(vec![
+        "Sandbox HTTP Interception CA".to_string(),
+    ])?;
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let certificate = params.self_signed(&key)?;
+    Ok((certificate.pem(), key.serialize_pem()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpecError {
     message: String,
@@ -168,11 +197,11 @@ impl MicroVmSpec {
         let network = if input.network_outbound.is_some() || input.network_http.is_some() {
             Some(NetworkSpec {
                 outbound: input.network_outbound,
-                http: input.network_http.map(|http| HttpSpec {
-                    protected_ranges: http.protected_ranges,
-                    ca_certificate_pem: http.ca_certificate_pem,
-                    ca_private_key_pem: http.ca_private_key_pem,
-                }),
+                http: input
+                    .network_http
+                    .map(HttpSpec::from_input)
+                    .transpose()
+                    .map_err(|error| SpecError::new(error.to_string()))?,
             })
         } else {
             None

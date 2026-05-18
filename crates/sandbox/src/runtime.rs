@@ -109,9 +109,6 @@ impl KrunContext {
         let Some(network) = &spec.network else {
             return Ok(());
         };
-        if network.http.is_none() {
-            return Ok(());
-        }
 
         let tls_config = network.http.as_ref().and_then(|http| {
             Some(MitmTlsConfig {
@@ -238,11 +235,7 @@ impl KrunContext {
         let mount_arg = CString::new(format!("--virtiofs-mounts={encoded_mounts}")).unwrap();
         let http_network_arg = CString::new("--http-network").unwrap();
         let rootfs_overlay_arg = CString::new("--rootfs-overlay=writable").unwrap();
-        let http_network_enabled = spec
-            .network
-            .as_ref()
-            .and_then(|network| network.http.as_ref())
-            .is_some();
+        let network_enabled = spec.network.is_some();
         let mount_env = CString::new(format!("SANDBOX_VIRTIOFS_MOUNTS={encoded_mounts}")).unwrap();
         let http_network_env = CString::new("SANDBOX_HTTP_NETWORK=1").unwrap();
         let rootfs_overlay_env = CString::new("SANDBOX_ROOTFS_OVERLAY=writable").unwrap();
@@ -261,7 +254,7 @@ impl KrunContext {
             .map_err(|_| KrunError::new("krun_set_exec", -libc::EINVAL))?;
         let mut argv = vec![exec_path.as_ptr(), mount_arg.as_ptr()];
         let mut envp = vec![mount_env.as_ptr()];
-        if http_network_enabled {
+        if network_enabled {
             argv.push(http_network_arg.as_ptr());
             envp.push(http_network_env.as_ptr());
         }

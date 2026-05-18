@@ -149,6 +149,47 @@ test("public destinations reach JavaScript policy", async (t) => {
   assert.deepEqual(policyUrls, ["http://203.0.113.10/public"]);
 });
 
+test("outbound-only policy creates the guest network device", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const vm = await spawnSandbox({
+    name: "outbound-only-network",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      outbound: {
+        policy: "deny",
+        rules: [acceptTcp({ cidr: "203.0.113.10/32", ports: [80] })],
+      },
+    },
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuestShell(vm, {
+    id: "outbound-only-network",
+    script: `
+      set -eu
+      test -d /sys/class/net/eth0
+      ip route show default
+      curl --max-time 3 --connect-timeout 2 --silent http://203.0.113.10/
+    `,
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.match(result.stdout, /default via 10\.0\.2\.1/);
+  assert.match(result.stdout, /sandbox explicit network/);
+});
+
 test("DNS-dependent traffic is observable and cannot bypass policy", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
