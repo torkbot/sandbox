@@ -320,12 +320,7 @@ impl sandbox::vfs::HostVirtualFileSystem for NodeVirtualFs {
         })?;
         let from = join_guest_path(&olddir, oldname);
         let to = join_guest_path(&newdir, newname);
-        if flags != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "virtual filesystem rename flags are not supported",
-            ));
-        }
+        validate_rename_flags(flags)?;
         self.bridge.request(doc! {
             "type": "host.vfs.rename",
             "mountPath": &self.mount_path,
@@ -518,6 +513,17 @@ fn join_guest_path(parent: &str, name: &str) -> String {
     }
 }
 
+fn validate_rename_flags(flags: u32) -> io::Result<()> {
+    if flags == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "virtual filesystem rename flags are not supported",
+        ))
+    }
+}
+
 fn encode_document_packet(document: &Document) -> io::Result<Vec<u8>> {
     let frame = document
         .to_vec()
@@ -564,5 +570,17 @@ mod tests {
 
         let entry = entry_from_stat(2, &stat).unwrap();
         assert_eq!(entry.attr.st_ino, 2);
+    }
+
+    #[test]
+    fn rename_flags_fail_closed_until_explicitly_supported() {
+        validate_rename_flags(0).unwrap();
+
+        let error = match validate_rename_flags(1) {
+            Ok(_) => panic!("rename flags should be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("rename flags"));
     }
 }

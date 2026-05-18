@@ -6,6 +6,18 @@ Provide a Node.js library that starts libkrun microVMs and lets the host program
 
 The library is not a generic VM manager. It is a constrained runtime for running untrusted workloads with explicit host-mediated capabilities.
 
+## Boundary Invariants
+
+Sandbox should make whole classes of bugs unrepresentable at the boundary where they enter the system:
+
+- Public configuration is validated recursively before any helper process, native runtime, or libkrun context is created. Invalid rootfs compositions, unsupported backing types, and impossible mount specs must fail before launch.
+- Guest-visible filesystem metadata is concrete where the kernel needs concrete values. Regular files and symlinks need known sizes; unknown-size streaming semantics require a separate explicit contract.
+- Unsupported filesystem operation flags fail closed before crossing into JavaScript callbacks. If a POSIX variant such as exchange rename is needed later, it should be implemented as a named capability with matching inode-cache semantics and tests.
+- Nonblocking I/O owns pending bytes explicitly. `WouldBlock` is a scheduling event, not permission to drop proxy prefaces, guest request bytes, or encrypted TLS response bytes.
+- Long-lived per-flow host state has an owner and a reclamation path. NAT flows, dynamic listeners, proxy connections, callback waiters, and child processes should not outlive the VM lifecycle that created them.
+- Host callback responses are lifecycle-aware. API/control writes fail strictly after close, while late service callback responses from in-flight filesystem or policy work are ignored once the VM is already closing.
+- Network reachability is decided by `network.outbound` before JavaScript HTTP policy. HTTP policy can deny or rewrite egress headers, but it cannot grant reachability outside the default-deny firewall rules.
+
 ## Upstream Grounding
 
 Current libkrun has the key extension points this project should build around, but Sandbox should not bind to the C API or treat `include/libkrun.h` as the integration surface. The host crate should integrate with libkrun as Rust code and keep the final deliverable statically linked. If upstream's crate boundaries or build outputs do not support that cleanly, carry small patches in `torkbot/libkrun`.

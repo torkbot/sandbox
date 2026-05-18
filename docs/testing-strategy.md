@@ -8,6 +8,18 @@ The test suite should produce artifacts that are easy to inspect after failure: 
 
 ## Test Tiers
 
+## Invariant Coverage
+
+Review feedback should normally become coverage for the design boundary that allowed the issue:
+
+- Recursive API validation tests prove invalid rootfs composition fails before helper launch.
+- Filesystem contract tests prove guest-visible regular files and symlinks cannot have unknown size, while directories may.
+- Filesystem operation tests prove unsupported rename flags fail closed until the cache and host callback semantics support them.
+- Network service unit tests prove pending nonblocking writes preserve unwritten bytes across `WouldBlock`.
+- HTTP e2e tests prove TLS interception buffers encrypted response bytes until the guest socket accepts them.
+- Lifecycle e2e tests prove closing a VM while host callbacks are locked up cleans up the helper and suppresses late callback writes.
+- Network e2e tests prove NAT flow and dynamic listener state is reclaimed when flows close or expire.
+
 ### Tier 0: Build And Static Artifact Checks
 
 Runs on every developer machine.
