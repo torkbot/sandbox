@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  acceptTcp,
   prebuiltRootfs,
   projectInit,
   projectKernel,
@@ -16,10 +17,6 @@ test("plain HTTP traffic is intercepted, policy checked, rewritten, and forwarde
   if (!requireVmLaunchSupport(t)) {
     return;
   }
-  const ca = await createTestCertificateAuthority();
-  t.after(async () => {
-    await ca.close();
-  });
   const decisions: Pick<HttpPolicyRequest, "url" | "destinationIp" | "headers">[] = [];
 
   const vm = await spawnSandbox({
@@ -30,9 +27,11 @@ test("plain HTTP traffic is intercepted, policy checked, rewritten, and forwarde
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: localHttpOutboundRules(),
+      },
       http: {
-        protectedRanges: ["169.254.169.254/32"],
-        ca,
         async policy(request) {
           decisions.push({
             url: request.url,
@@ -67,7 +66,7 @@ test("plain HTTP traffic is intercepted, policy checked, rewritten, and forwarde
     argv: ["sh", "-lc", "test \"$SSL_CERT_FILE\" = /run/sandbox/http-ca.pem && cat /run/sandbox/http-ca.pem"],
   });
   assert.equal(injectedCa.exitCode, 0);
-  assert.equal(injectedCa.stdout, ca.certificatePem);
+  assert.match(injectedCa.stdout, /-----BEGIN CERTIFICATE-----/);
 
   const origin = await startTestHttpOrigin({
     respond(request) {
@@ -108,8 +107,8 @@ test("plain HTTP traffic is intercepted, policy checked, rewritten, and forwarde
   });
   assert.equal(denied.stdout, "451");
 
-  const protectedDestination = await execGuest(vm, {
-    id: "curl-protected-destination",
+  const deniedDestination = await execGuest(vm, {
+    id: "curl-denied-destination",
     argv: [
       "curl",
       "--max-time",
@@ -122,10 +121,10 @@ test("plain HTTP traffic is intercepted, policy checked, rewritten, and forwarde
       "http://169.254.169.254/protected",
     ],
   });
-  assert.equal(protectedDestination.stdout, "403");
+  assert.equal(deniedDestination.stdout, "403");
 
-  const protectedUrlViaAllowedFlow = await execGuest(vm, {
-    id: "curl-protected-url-via-allowed-flow",
+  const deniedUrlViaAllowedFlow = await execGuest(vm, {
+    id: "curl-denied-url-via-allowed-flow",
     argv: [
       "curl",
       "--max-time",
@@ -140,7 +139,7 @@ test("plain HTTP traffic is intercepted, policy checked, rewritten, and forwarde
       "http://169.254.169.254/protected",
     ],
   });
-  assert.equal(protectedUrlViaAllowedFlow.stdout, "403");
+  assert.equal(deniedUrlViaAllowedFlow.stdout, "403");
 
   assert.ok(decisions.some((decision) => decision.url.endsWith("/allowed")));
   assert.ok(decisions.some((decision) => decision.url.endsWith("/blocked")));
@@ -161,7 +160,14 @@ function interceptedHttpArgs(url: string): string[] {
   ];
 }
 
-test("HTTPS traffic is intercepted, policy checked, rewritten, and protected ranges are blocked", async (t) => {
+function localHttpOutboundRules() {
+  return [
+    acceptTcp({ cidr: "203.0.113.10/32", ports: [80, 443] }),
+    acceptTcp({ cidr: "127.0.0.1/32" }),
+  ];
+}
+
+test("HTTPS traffic is intercepted, policy checked, rewritten, and outbound-denied destinations are blocked", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
   }
@@ -179,9 +185,11 @@ test("HTTPS traffic is intercepted, policy checked, rewritten, and protected ran
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: localHttpOutboundRules(),
+      },
       http: {
-        protectedRanges: ["169.254.169.254/32"],
-        ca,
         async policy(request) {
           decisions.push({
             url: request.url,
@@ -251,8 +259,8 @@ test("HTTPS traffic is intercepted, policy checked, rewritten, and protected ran
   });
   assert.equal(denied.stdout, "451");
 
-  const protectedDestination = await execGuest(vm, {
-    id: "curl-https-protected-destination",
+  const deniedDestination = await execGuest(vm, {
+    id: "curl-https-denied-destination",
     argv: [
       "curl",
       "--max-time",
@@ -266,14 +274,14 @@ test("HTTPS traffic is intercepted, policy checked, rewritten, and protected ran
       "https://169.254.169.254/protected",
     ],
   });
-  assert.equal(protectedDestination.stdout, "403");
+  assert.equal(deniedDestination.stdout, "403");
 
   assert.ok(decisions.some((decision) => decision.url.endsWith("/allowed")));
   assert.ok(decisions.some((decision) => decision.url.endsWith("/blocked")));
   assert.ok(!decisions.some((decision) => decision.destinationIp === "169.254.169.254"));
 });
 
-test("protected host and private network destinations are blocked before JavaScript policy", async (t) => {
+test("outbound default-deny blocks private and host destinations before JavaScript policy", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
   }
@@ -284,15 +292,18 @@ test("protected host and private network destinations are blocked before JavaScr
   const policyDestinations: string[] = [];
 
   const vm = await spawnSandbox({
-    name: "default-protected-ranges",
+    name: "default-denied-ranges",
     kernel: projectKernel(),
     init: projectInit(),
     rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: localHttpOutboundRules(),
+      },
       http: {
-        ca,
         async policy(request) {
           policyDestinations.push(request.destinationIp);
           return { action: "allow" };
@@ -307,15 +318,15 @@ test("protected host and private network destinations are blocked before JavaScr
 
   await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
 
-  const protectedDestinations = [
+  const deniedDestinations = [
     "10.1.2.3",
     "172.16.0.1",
     "192.168.1.1",
     "169.254.169.254",
   ];
-  for (const destination of protectedDestinations) {
+  for (const destination of deniedDestinations) {
     const result = await execGuest(vm, {
-      id: `curl-protected-${destination}`,
+      id: `curl-denied-${destination}`,
       argv: [
         "curl",
         "--max-time",
@@ -352,8 +363,11 @@ test("transparent HTTPS generates a trusted leaf cert for the requested SNI host
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: localHttpOutboundRules(),
+      },
       http: {
-        ca,
         async policy(request) {
           decisions.push({
             url: request.url,
@@ -417,8 +431,11 @@ test("transparent HTTPS exposes SNI and Host mismatch to one policy call", async
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: localHttpOutboundRules(),
+      },
       http: {
-        ca,
         async policy(request) {
           decisions.push({
             url: request.url,
@@ -482,8 +499,11 @@ test("certificate pinning rejects MITM and fails closed before HTTP policy", asy
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: localHttpOutboundRules(),
+      },
       http: {
-        ca,
         async policy() {
           policyCalls += 1;
           return { action: "allow" };
@@ -565,8 +585,11 @@ test("HTTP interception forwards request and response bodies larger than a singl
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: localHttpOutboundRules(),
+      },
       http: {
-        ca,
         async policy(request) {
           decisions.push({
             method: request.method,
@@ -653,8 +676,11 @@ test("HTTP interception handles concurrent guest requests without dropping polic
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: localHttpOutboundRules(),
+      },
       http: {
-        ca,
         async policy(request) {
           policyUrls.push(request.url);
           return { action: "allow" };
@@ -736,8 +762,11 @@ test("HTTPS interception forwards request bodies and larger TLS responses", asyn
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: localHttpOutboundRules(),
+      },
       http: {
-        ca,
         async policy(request) {
           decisions.push({
             method: request.method,
@@ -821,8 +850,11 @@ test("HTTPS interception handles concurrent guest requests without dropping TLS 
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: localHttpOutboundRules(),
+      },
       http: {
-        ca,
         async policy(request) {
           policyUrls.push(request.url);
           return { action: "allow" };
@@ -899,8 +931,11 @@ test("HTTP keep-alive behavior is explicit and deterministic", async (t) => {
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: localHttpOutboundRules(),
+      },
       http: {
-        ca,
         async policy(request) {
           policyUrls.push(request.url);
           return { action: "allow" };
@@ -961,8 +996,11 @@ test("upstream connection refused returns a deterministic guest-visible failure"
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: localHttpOutboundRules(),
+      },
       http: {
-        ca,
         async policy(request) {
           policyUrls.push(request.url);
           return { action: "allow" };
@@ -1026,8 +1064,11 @@ test("upstream timeout returns a deterministic guest-visible failure", async (t)
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: localHttpOutboundRules(),
+      },
       http: {
-        ca,
         async policy(request) {
           policyUrls.push(request.url);
           return { action: "allow" };
@@ -1098,8 +1139,11 @@ test("upstream reset mid-body is passed through as a truncated response", async 
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: localHttpOutboundRules(),
+      },
       http: {
-        ca,
         async policy(request) {
           policyUrls.push(request.url);
           return { action: "allow" };
@@ -1153,8 +1197,11 @@ test("TLS without SNI has deterministic certificate and policy metadata", async 
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: localHttpOutboundRules(),
+      },
       http: {
-        ca,
         async policy(request) {
           decisions.push({
             url: request.url,
@@ -1213,8 +1260,11 @@ test("dynamic MITM certificates are reused or bounded intentionally", async (t) 
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: localHttpOutboundRules(),
+      },
       http: {
-        ca,
         async policy() {
           return { action: "deny", reason: "cert cache probe" };
         },
@@ -1259,8 +1309,11 @@ test("HTTP/2 ALPN behavior is explicit", async (t) => {
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: localHttpOutboundRules(),
+      },
       http: {
-        ca,
         async policy(request) {
           decisions.push({
             url: request.url,

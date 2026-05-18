@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import {
+  acceptTcp,
   prebuiltRootfs,
   projectInit,
   projectKernel,
@@ -36,8 +37,11 @@ test("HTTP interception streams response bodies without waiting for upstream com
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: localHttpOutboundRules(),
+      },
       http: {
-        ca,
         async policy() {
           return { action: "allow" };
         },
@@ -111,8 +115,11 @@ test("closing a VM while HTTP policy is locked up cleans up the sandbox", async 
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: localHttpOutboundRules(),
+      },
       http: {
-        ca,
         async policy() {
           policyStartedResolve?.();
           return await new Promise<never>(() => {});
@@ -188,8 +195,11 @@ test("plain HTTP egress header rewrite does not expose or modify request bodies"
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: localHttpOutboundRules(),
+      },
       http: {
-        ca,
         async policy(request) {
           policyEvidence.push({
             url: request.url,
@@ -297,8 +307,11 @@ test("HTTPS egress header rewrite does not expose or modify request bodies", asy
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: localHttpOutboundRules(),
+      },
       http: {
-        ca,
         async policy(request) {
           policyEvidence.push({
             url: request.url,
@@ -359,7 +372,7 @@ test("HTTPS egress header rewrite does not expose or modify request bodies", asy
   assert.match(headers.stdout, /x-origin-response: passthrough/i);
 });
 
-test("redirects to protected destinations are blocked before JavaScript policy", async (t) => {
+test("redirects to outbound-denied destinations are blocked before JavaScript policy", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
   }
@@ -386,15 +399,18 @@ test("redirects to protected destinations are blocked before JavaScript policy",
   });
 
   const vm = await spawnSandbox({
-    name: "http-redirect-protected",
+    name: "http-redirect-denied",
     kernel: projectKernel(),
     init: projectInit(),
     rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: localHttpOutboundRules(),
+      },
       http: {
-        ca,
         async policy(request) {
           policyUrls.push(request.url);
           return { action: "allow" };
@@ -409,7 +425,7 @@ test("redirects to protected destinations are blocked before JavaScript policy",
   await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
 
   const result = await execGuest(vm, {
-    id: "curl-redirect-protected",
+    id: "curl-redirect-denied",
     argv: [
       "curl",
       "--max-time",
@@ -470,8 +486,11 @@ test("HTTPS interception buffers fragmented TLS plaintext before policy", async 
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: localHttpOutboundRules(),
+      },
       http: {
-        ca,
         async policy(request) {
           policyUrls.push(request.url);
           return { action: "allow" };
@@ -543,8 +562,11 @@ test("HTTPS interception handles forwarded TLS ports without remapping to 443", 
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: localHttpOutboundRules(),
+      },
       http: {
-        ca,
         async policy(request) {
           policyUrls.push(request.url);
           return { action: "allow" };
@@ -583,6 +605,13 @@ function interceptedHttpArgs(url: string): string[] {
     "--connect-to",
     `${parsed.hostname}:${parsed.port}:203.0.113.10:80`,
     url,
+  ];
+}
+
+function localHttpOutboundRules() {
+  return [
+    acceptTcp({ cidr: "203.0.113.10/32", ports: [80, 443] }),
+    acceptTcp({ cidr: "127.0.0.1/32" }),
   ];
 }
 

@@ -142,11 +142,11 @@ This file owns L7 interception: HTTP parsing, TLS MITM, JavaScript policy, heade
 Passing:
 
 - `plain HTTP traffic is intercepted, policy checked, rewritten, and forwarded`
-  - Covers allow, deny, header rewrite, protected range handling, and policy metadata.
-- `HTTPS traffic is intercepted, policy checked, rewritten, and protected ranges are blocked`
-  - Covers CA trust, TLS MITM, allow, deny, rewrite, and protected ranges.
-- `protected host and private network destinations are blocked before JavaScript policy`
-  - Covers default RFC1918, carrier-grade NAT, and link-local pre-policy blocks.
+  - Covers allow, deny, header rewrite, outbound policy handling, and policy metadata.
+- `HTTPS traffic is intercepted, policy checked, rewritten, and outbound-denied destinations are blocked`
+  - Covers CA trust, TLS MITM, allow, deny, rewrite, and outbound-denied destinations.
+- `outbound default-deny blocks destinations before JavaScript policy`
+  - Covers default-deny outbound enforcement before policy.
 - `transparent HTTPS generates a trusted leaf cert for the requested SNI hostname`
   - Covers dynamic per-SNI leaf certificate issuance.
 - `transparent HTTPS exposes SNI and Host mismatch to one policy call`
@@ -194,8 +194,8 @@ Passing:
   - JavaScript policy sees request metadata and headers only; Rust forwards the original body and the upstream response unchanged.
 - `HTTPS egress header rewrite does not expose or modify request bodies`
   - The same egress-only header contract holds under TLS MITM with SNI metadata.
-- `redirects to protected destinations are blocked before JavaScript policy`
-  - A public origin redirecting to metadata/private infrastructure cannot bypass the protected range deny set.
+- `redirects to outbound-denied destinations are blocked before JavaScript policy`
+  - A public origin redirecting to metadata/private infrastructure cannot bypass the outbound policy.
 - `HTTPS interception buffers fragmented TLS plaintext before policy`
   - TLS headers and bodies split across records are buffered until a complete HTTP request is available.
 - `HTTPS interception handles forwarded TLS ports without remapping to 443`
@@ -213,14 +213,14 @@ Passing:
 
 - `HTTP networking transparently intercepts guest TCP over explicit virtio-net`
   - Covers guest interface, route, and transparent TCP interception through the in-process backend.
-- `caller protected ranges extend the default network deny set`
-  - Configure a custom CIDR and assert pre-policy block.
+- `outbound default deny blocks destinations before JavaScript policy`
+  - Configure no matching accept rule and assert a pre-policy block.
 - `public destinations reach JavaScript policy`
-  - Request a non-protected destination and assert policy evidence.
+  - Request a destination allowed by `acceptTcp(...)` and assert policy evidence.
 - `DNS-dependent traffic is observable and cannot bypass policy`
   - Guest requests a hostname without `--connect-to`; assert DNS behavior and policy evidence.
-- `DNS resolution to a protected IP is still blocked before policy`
-  - Host-controlled hostname resolves to private/link-local IP and is blocked.
+- `DNS resolution to a denied IP is blocked before policy`
+  - Host-controlled hostname resolves to a destination without an accept rule and is blocked.
 - `IPv6 behavior is explicit`
   - Attempt IPv6 HTTP destination and assert deterministic unsupported or implemented behavior.
 - `UDP and non-HTTP traffic cannot silently bypass policy`

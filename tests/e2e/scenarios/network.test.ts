@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  acceptPublicInternet,
+  acceptTcp,
   prebuiltRootfs,
   projectInit,
   projectKernel,
@@ -23,6 +25,10 @@ test("HTTP networking transparently intercepts guest TCP over explicit virtio-ne
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: [acceptTcp({ cidr: "203.0.113.10/32", ports: [80] })],
+      },
       http: {
         async policy() {
           return { action: "deny", reason: "sandbox explicit network" };
@@ -58,22 +64,25 @@ test("HTTP networking transparently intercepts guest TCP over explicit virtio-ne
   assert.match(result.stdout, /sandbox explicit network/);
 });
 
-test("caller protected ranges extend the default network deny set", async (t) => {
+test("outbound default deny blocks destinations before JavaScript policy", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
   }
 
   let policyCalls = 0;
   const vm = await spawnSandbox({
-    name: "custom-protected-network",
+    name: "outbound-default-deny",
     kernel: projectKernel(),
     init: projectInit(),
     rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: [],
+      },
       http: {
-        protectedRanges: ["203.0.113.0/24"],
         async policy() {
           policyCalls += 1;
           return { action: "allow" };
@@ -89,7 +98,7 @@ test("caller protected ranges extend the default network deny set", async (t) =>
   await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
 
   const result = await execGuestShell(vm, {
-    id: "custom-protected-network",
+    id: "outbound-default-deny",
     script: "curl --max-time 3 --connect-timeout 2 --silent --output /dev/null --write-out '%{http_code}' http://203.0.113.10/",
   });
 
@@ -111,6 +120,10 @@ test("public destinations reach JavaScript policy", async (t) => {
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: [acceptTcp({ cidr: "203.0.113.10/32", ports: [80] })],
+      },
       http: {
         async policy(request) {
           policyUrls.push(request.url);
@@ -150,6 +163,10 @@ test("DNS-dependent traffic is observable and cannot bypass policy", async (t) =
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: [acceptPublicInternet({ ports: [80] })],
+      },
       http: {
         async policy(request) {
           policyUrls.push(`${request.destinationIp} ${request.url}`);
@@ -176,20 +193,24 @@ test("DNS-dependent traffic is observable and cannot bypass policy", async (t) =
   assert.match(policyUrls[0] ?? "", /^\d+\.\d+\.\d+\.\d+ http:\/\/example\.com\/hostname$/);
 });
 
-test("DNS resolution to a protected IP is still blocked before policy", async (t) => {
+test("DNS resolution to a denied IP is blocked before policy", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
   }
 
   let policyCalls = 0;
   const vm = await spawnSandbox({
-    name: "dns-protected",
+    name: "dns-denied",
     kernel: projectKernel(),
     init: projectInit(),
     rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: [acceptPublicInternet({ ports: [80] })],
+      },
       http: {
         async policy() {
           policyCalls += 1;
@@ -206,7 +227,7 @@ test("DNS resolution to a protected IP is still blocked before policy", async (t
   await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
 
   const result = await execGuestShell(vm, {
-    id: "dns-protected",
+    id: "dns-denied",
     script: "curl --max-time 4 --connect-timeout 2 --silent --output /dev/null --write-out '%{http_code}' http://protected.sandbox.test/",
   });
 
@@ -229,6 +250,10 @@ test("IPv6 behavior is explicit", async (t) => {
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: [],
+      },
       http: {
         async policy() {
           policyCalls += 1;
@@ -267,6 +292,10 @@ test("UDP and non-HTTP traffic cannot silently bypass policy", async (t) => {
       format: "erofs",
     }),
     network: {
+      outbound: {
+        policy: "deny",
+        rules: [],
+      },
       http: {
         async policy() {
           policyCalls += 1;

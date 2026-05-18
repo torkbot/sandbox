@@ -173,12 +173,35 @@ export type HttpPolicyDecision =
   | { readonly action: "deny"; readonly reason: string };
 
 export interface HttpInterceptionConfig {
-  readonly ca?: { readonly certificatePem: string; readonly privateKeyPem: string };
-  readonly protectedRanges?: readonly string[];
   policy(request: HttpPolicyRequest): Promise<HttpPolicyDecision>;
 }
 
+export type OutboundNetworkRule =
+  | {
+      readonly action: "accept";
+      readonly protocol: "tcp";
+      readonly cidr: string;
+      readonly ports?: readonly number[];
+    }
+  | {
+      readonly action: "accept";
+      readonly protocol: "udp";
+      readonly cidr: string;
+      readonly ports?: readonly number[];
+    }
+  | {
+      readonly action: "accept";
+      readonly scope: "public-internet";
+      readonly ports?: readonly number[];
+    };
+
+export interface OutboundNetworkPolicy {
+  readonly policy: "deny";
+  readonly rules: readonly OutboundNetworkRule[];
+}
+
 export interface NetworkConfig {
+  readonly outbound?: OutboundNetworkPolicy;
   readonly http?: HttpInterceptionConfig;
 }
 
@@ -300,6 +323,40 @@ export function binding(path: string, fileSystem: SandboxVirtualFileSystem): Fil
     kind: "filesystem-binding",
     path,
     fileSystem,
+  };
+}
+
+export function acceptTcp(input: {
+  readonly cidr: string;
+  readonly ports?: readonly number[];
+}): OutboundNetworkRule {
+  return {
+    action: "accept",
+    protocol: "tcp",
+    cidr: input.cidr,
+    ports: input.ports,
+  };
+}
+
+export function acceptUdp(input: {
+  readonly cidr: string;
+  readonly ports?: readonly number[];
+}): OutboundNetworkRule {
+  return {
+    action: "accept",
+    protocol: "udp",
+    cidr: input.cidr,
+    ports: input.ports,
+  };
+}
+
+export function acceptPublicInternet(input: {
+  readonly ports?: readonly number[];
+} = {}): OutboundNetworkRule {
+  return {
+    action: "accept",
+    scope: "public-internet",
+    ports: input.ports,
   };
 }
 
@@ -439,11 +496,7 @@ function toNativeSpawnOptions(options: SandboxOptions): NativeSpawnSandboxOption
       : {
           http: options.network.http === undefined
             ? undefined
-            : {
-                protectedRanges: options.network.http.protectedRanges,
-                caCertificatePem: options.network.http.ca?.certificatePem,
-                caPrivateKeyPem: options.network.http.ca?.privateKeyPem,
-              },
+            : {},
         },
   };
 }
@@ -512,8 +565,23 @@ function validateSandboxOptions(options: SandboxOptions): void {
     bindingPaths.add(binding.path);
   }
 
-  for (const range of options.network?.http?.protectedRanges ?? []) {
-    validateCidr(range);
+  if (options.network?.outbound?.policy !== undefined && options.network.outbound.policy !== "deny") {
+    throw new Error("invalid spawnSandbox options: network.outbound.policy must be deny");
+  }
+
+  for (const rule of options.network?.outbound?.rules ?? []) {
+    if ("cidr" in rule) {
+      validateCidr(rule.cidr);
+    }
+    validateOutboundPorts(rule.ports);
+  }
+}
+
+function validateOutboundPorts(ports: readonly number[] | undefined): void {
+  for (const port of ports ?? []) {
+    if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+      throw new Error(`invalid spawnSandbox options: invalid outbound network port: ${port}`);
+    }
   }
 }
 

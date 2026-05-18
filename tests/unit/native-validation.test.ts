@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  acceptTcp,
   binding,
   prebuiltRootfs,
   projectInit,
@@ -198,7 +199,7 @@ test("spawnSandbox rejects unsupported init crates before runtime launch", async
   );
 });
 
-test("spawnSandbox rejects invalid protected CIDR ranges before runtime launch", async () => {
+test("spawnSandbox rejects invalid outbound CIDR ranges before runtime launch", async () => {
   await assert.rejects(
     spawnSandbox({
       kernel: projectKernel(),
@@ -207,11 +208,9 @@ test("spawnSandbox rejects invalid protected CIDR ranges before runtime launch",
         format: "erofs",
       }),
       network: {
-        http: {
-          protectedRanges: ["127.0.0.0/33"],
-          async policy() {
-            return { action: "allow" };
-          },
+        outbound: {
+          policy: "deny",
+          rules: [acceptTcp({ cidr: "127.0.0.0/33" })],
         },
       },
     }),

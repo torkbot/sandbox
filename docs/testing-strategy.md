@@ -33,7 +33,7 @@ Runs without a hypervisor.
 Evidence:
 
 - HTTP policy hooks receive normalized request metadata and can allow, deny, and rewrite headers.
-- default protected network ranges and caller-supplied protected ranges are blocked before forwarding or JavaScript policy.
+- outbound network policy is default-deny, and explicit accept rules are enforced before forwarding or JavaScript policy.
 - virtual filesystem callbacks are deterministic and return expected metadata, directory entries, and file contents.
 - mounted filesystems are inspectable from JavaScript with the same `stat` / `list` / `read` shape exposed to the host runtime.
 - the `Transport` adapter preserves message order, close behavior, and backpressure.
@@ -97,7 +97,7 @@ Fixture:
 - guest CA trust injected by init.
 - guest HTTP client and HTTPS client.
 - host test origin server.
-- blocked host/private-range endpoints.
+- denied destinations and allowed local/public endpoints.
 
 Evidence:
 
@@ -105,7 +105,8 @@ Evidence:
 - Node.js policy sees method, URL, destination IP, headers, and TLS metadata.
 - allowed requests reach the test origin with expected header rewrites.
 - denied requests fail with a deterministic guest-visible error.
-- requests to protected host, link-local, default private ranges, and configured private ranges are blocked.
+- destinations without matching outbound accept rules are blocked before JavaScript policy.
+- public-internet, loopback, and port-specific accept rules are enforced consistently for DNS results, CONNECT targets, redirects, and final upstream dials.
 - DNS policy is observable in the proxy trace.
 
 ### Tier 5: libkrun Fork Contract Tests
@@ -167,7 +168,7 @@ Detected capabilities:
 - Rootfs composition: explicit `linuxOverlayFs(...)` can compose a prebuilt lower and scratch upper without mutating the lower.
 - Virtual filesystem: guest reads host-generated files and metadata through a mounted virtual tree.
 - HTTP interception: TLS traffic is intercepted with guest-trusted CA, policy hooks run in Node.js, headers are modified, and forwarding is transparent.
-- Network policy: default protected ranges and configured protected ranges are blocked with deterministic evidence before JavaScript policy.
+- Network policy: default-deny outbound rules block unmatched destinations with deterministic evidence before JavaScript policy.
 - Host/guest transport: bidirectional messages preserve ordering, errors, and close semantics.
 - macOS support: HVF entitlement signing is verified on `sandbox-host` and VM boot goes through that signed helper, not through a signed copy of Node.
 
@@ -186,8 +187,8 @@ The runtime scenario files live under `tests/e2e/scenarios/` as `.test.ts` files
 - `boot-smoke.test.ts`: boots a VM, waits for `init.ready`, sends a control command, and checks command output.
 - `filesystem.test.ts`: boots with an immutable root and host-backed virtual filesystem using the same `stat` / `list` / `read` shape as TorkBot plugin filesystems.
 - `rootfs-shaping.test.ts`: expresses immutable roots, Linux overlayfs root composition, scratch isolation, and guest-visible mount boundaries.
-- `http-policy.test.ts`: injects CA trust, intercepts HTTPS, runs Node policy hooks, rewrites headers, and blocks protected destinations.
-- `network.test.ts`: covers transparent TCP interception, DNS behavior, protected ranges, IPv6 behavior, and non-HTTP denial.
+- `http-policy.test.ts`: injects internal CA trust, intercepts HTTPS, runs Node policy hooks, rewrites headers, and blocks destinations denied by outbound policy.
+- `network.test.ts`: covers transparent TCP interception, DNS behavior, default-deny outbound rules, IPv6 behavior, and non-HTTP denial.
 - `libkrun-contract.test.ts`: boots the VM with direct Rust init injection.
 
 Cheap artifact tests live under `tests/artifact/`:

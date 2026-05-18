@@ -86,7 +86,7 @@ Sandbox needs two networking layers:
 - A packet/socket layer that connects the guest to the host.
 - An HTTP interception layer that terminates TLS, runs Node.js policy and header transforms, then forwards traffic.
 
-The first implementation should prefer virtio-net connected to a userspace backend that we control, because HTTP interception and protected-range policy are clearer when traffic passes through a host process. libkrun's TSI path remains useful for host control sockets or later transparent socket work, but TSI makes the VMM itself the network proxy and should be treated carefully.
+The first implementation should prefer virtio-net connected to a userspace backend that we control, because HTTP interception and outbound policy are clearer when traffic passes through a host process. libkrun's TSI path remains useful for host control sockets or later transparent socket work, but TSI makes the VMM itself the network proxy and should be treated carefully.
 
 Candidate directions:
 
@@ -98,14 +98,36 @@ Candidate directions:
 
 The likely path is: start with conventional virtio-net connected to a Rust host networking service compiled into Sandbox. Avoid a required external network helper process. Any networking component we choose should fit the static artifact strategy or be treated as reference material only.
 
-HTTP interception requires explicit guest trust injection. The guest init should mount or receive the generated CA certificate and update the guest trust store before starting the workload. Host policy must cover:
+Outbound networking is default-deny. The public API should look like a small firewall ruleset, not a bag of proxy options:
 
-- destination allow/deny rules,
-- protected host and private network ranges, with RFC1918, carrier-grade NAT, and link-local destinations blocked before JavaScript policy by default,
+```ts
+network: {
+  outbound: {
+    policy: "deny",
+    rules: [
+      acceptTcp({ cidr: "127.0.0.1/32", ports: [origin.port] }),
+      acceptPublicInternet({ ports: [443] }),
+    ],
+  },
+  http: {
+    async policy(request) {
+      return { action: "allow", headers: request.headers };
+    },
+  },
+}
+```
+
+`network.outbound` decides reachability. `network.http.policy` can deny requests and rewrite egress headers, but it cannot grant network reachability that the outbound rules did not already provide. The host must enforce outbound rules before invoking JavaScript policy, and it must re-check them for DNS results, CONNECT targets, TLS SNI routing, redirects, and the final upstream dial target.
+
+The HTTP interception CA is Sandbox infrastructure, not public API. Guest init should receive Sandbox-generated CA material and update the guest trust store before starting the workload. Callers should only provide the HTTP policy callback. If a future caller needs bring-your-own CA, that should be designed as a separate explicit capability rather than leaking certificate plumbing into the first API.
+
+Host policy must cover:
+
+- default-deny outbound reachability with explicit accept rules for protocol, CIDR or public-internet scope, and ports,
 - loopback and link-local handling,
-- DNS policy,
+- DNS policy and post-resolution enforcement,
 - CONNECT and TLS interception behavior,
-- request/response header modification hooks in Node.js.
+- egress request header modification in Node.js with request bodies and responses passed through.
 
 ## Filesystems
 

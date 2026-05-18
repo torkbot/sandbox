@@ -12,6 +12,8 @@ The target shape is:
 
 ```ts
 import {
+  acceptPublicInternet,
+  acceptTcp,
   binding,
   linuxOverlayFs,
   mount,
@@ -77,6 +79,13 @@ await using vm = await spawnSandbox({
   ],
 
   network: {
+    outbound: {
+      policy: "deny",
+      rules: [
+        acceptTcp({ cidr: "127.0.0.1/32", ports: [8080] }),
+        acceptPublicInternet({ ports: [443] }),
+      ],
+    },
     http: {
       async policy(request) {
         if (request.url.includes("/blocked")) {
@@ -169,7 +178,8 @@ The guest contract is intentionally narrow:
 - `/` is read-only unless the rootfs is a `linuxOverlayFs(...)` composition.
 - `/sandbox/proc` is implemented by the host.
 - HTTP policy and header rewriting happen in TypeScript on the host.
-- RFC1918, carrier-grade NAT, and link-local destinations are blocked before JavaScript policy.
+- Network egress starts from deny; outbound rules opt in the exact protocols, ranges, and ports the guest can reach.
+- The HTTP interception CA is generated and injected by Sandbox. Callers provide policy, not certificate plumbing.
 
 ## Design Targets
 
@@ -183,7 +193,7 @@ The guest contract is intentionally narrow:
 - `mount(...)` only for guest-visible mounts; `binding(...)` only for host-side attachment points,
 - programmable virtual filesystems backed by TypeScript callbacks,
 - transparent HTTP interception with TypeScript policy hooks,
-- protected network ranges enforced before policy, with private/link-local ranges blocked by default,
+- default-deny outbound networking with explicit accept rules for protocols, CIDR ranges, public internet reachability, and ports,
 - Rust-native or statically linkable networking components; sidecar network daemons are references, not default runtime dependencies,
 - macOS HVF entitlement signing verified as part of the integration test flow.
 

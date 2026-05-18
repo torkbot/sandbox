@@ -37,11 +37,7 @@ export type NativeSpawnSandboxOptions = {
       }
   )[];
   readonly network?: {
-    readonly http?: {
-      readonly protectedRanges?: readonly string[];
-      readonly caCertificatePem?: string;
-      readonly caPrivateKeyPem?: string;
-    };
+    readonly http?: Record<string, never>;
   };
 };
 

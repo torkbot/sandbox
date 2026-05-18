@@ -13,6 +13,7 @@ import type { NativeSpawnSandboxOptions } from "./native.ts";
 import { isSandboxWritableFileSystem } from "./vfs.ts";
 import type {
   HttpPolicyRequest,
+  OutboundNetworkRule,
   SandboxOptions,
   SandboxFileSystem,
   SandboxPosixFileSystem,
@@ -403,11 +404,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
         headers,
         ...(tls === undefined ? {} : { tls }),
       };
-      const protectedRanges = [
-        ...DEFAULT_PROTECTED_RANGES,
-        ...(interception.protectedRanges ?? []),
-      ];
-      const protection = await inspectHttpProtection(request, protectedRanges);
+      const protection = await inspectHttpProtection(request, this.#options.network?.outbound?.rules ?? []);
       if (protection.blocked) {
         this.#child.stdin.write(encodePacket({
           type: "host.http.response",
@@ -415,7 +412,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
           ok: true,
           status: 403,
           headers: [{ name: "content-type", value: "text/plain" }],
-          body: new TextEncoder().encode("protected destination"),
+          body: new TextEncoder().encode("outbound denied"),
         }));
         return;
       }
@@ -453,7 +450,6 @@ export class HostProcessSandboxVm implements HostControlChannel {
         body: request.method === "GET" || request.method === "HEAD"
           ? undefined
           : binaryField(document.body, "body"),
-        extraCaCertificatePem: interception.ca?.certificatePem,
         upstreamIp: protection.upstreamIp,
       });
       this.#child.stdin.write(encodePacket({
@@ -714,15 +710,20 @@ function isProtectedDestination(destinationIp: string, ranges: readonly string[]
 
 async function inspectHttpProtection(
   request: HttpPolicyRequest,
-  ranges: readonly string[],
+  rules: readonly OutboundNetworkRule[],
 ): Promise<{ readonly blocked: boolean; readonly upstreamIp?: string }> {
-  if (isProtectedDestination(request.destinationIp, ranges)) {
+  const parsed = new URL(request.url);
+  const port = parsed.port.length === 0
+    ? (parsed.protocol === "https:" ? 443 : 80)
+    : Number(parsed.port);
+
+  if (!isAllowedTcpDestination(request.destinationIp, port, rules)) {
     return { blocked: true };
   }
 
   const addresses = await resolveUrlAddresses(request.url);
   for (const address of addresses) {
-    if (isProtectedDestination(address, ranges)) {
+    if (!isAllowedTcpDestination(address, port, rules)) {
       return { blocked: true };
     }
   }
@@ -730,6 +731,28 @@ async function inspectHttpProtection(
     blocked: false,
     ...(addresses[0] === undefined ? {} : { upstreamIp: addresses[0] }),
   };
+}
+
+function isAllowedTcpDestination(
+  address: string,
+  port: number,
+  rules: readonly OutboundNetworkRule[],
+): boolean {
+  return rules.some((rule) => {
+    if (!portMatches(rule.ports, port)) {
+      return false;
+    }
+
+    if ("scope" in rule) {
+      return !isProtectedDestination(address, DEFAULT_PROTECTED_RANGES);
+    }
+
+    return rule.protocol === "tcp" && isProtectedDestination(address, [rule.cidr]);
+  });
+}
+
+function portMatches(ports: readonly number[] | undefined, port: number): boolean {
+  return ports === undefined || ports.includes(port);
 }
 
 async function resolveUrlAddresses(url: string): Promise<string[]> {
@@ -783,11 +806,7 @@ function encodeHostSpawn(options: NativeSpawnSandboxOptions): Uint8Array {
     mounts: options.mounts ?? [],
     networkHttp: options.network?.http === undefined
       ? undefined
-      : {
-          protectedRanges: options.network.http.protectedRanges ?? [],
-          caCertificatePem: options.network.http.caCertificatePem,
-          caPrivateKeyPem: options.network.http.caPrivateKeyPem,
-        },
+      : {},
   });
 }
 
