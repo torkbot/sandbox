@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   acceptPublicInternet,
   acceptTcp,
+  acceptUdp,
   prebuiltRootfs,
   projectInit,
   projectKernel,
@@ -240,7 +241,10 @@ test("DNS-dependent traffic is observable and cannot bypass policy", async (t) =
     network: {
       outbound: {
         policy: "deny",
-        rules: [acceptPublicInternet({ ports: [80] })],
+        rules: [
+          acceptUdp({ cidr: "10.0.2.1/32", ports: [53] }),
+          acceptPublicInternet({ ports: [80] }),
+        ],
       },
       http: {
         async policy(request) {
@@ -265,7 +269,7 @@ test("DNS-dependent traffic is observable and cannot bypass policy", async (t) =
   assert.equal(result.exitCode, 0);
   assert.match(result.stdout, /dns policy observed/);
   assert.equal(policyUrls.length, 1);
-  assert.equal(policyUrls[0], "203.0.113.10 http://public.sandbox.test/hostname");
+  assert.equal(policyUrls[0], "93.184.216.34 http://public.sandbox.test/hostname");
 });
 
 test("DNS resolution to a denied IP is blocked before policy", async (t) => {
@@ -284,7 +288,10 @@ test("DNS resolution to a denied IP is blocked before policy", async (t) => {
     network: {
       outbound: {
         policy: "deny",
-        rules: [acceptPublicInternet({ ports: [80] })],
+        rules: [
+          acceptUdp({ cidr: "10.0.2.1/32", ports: [53] }),
+          acceptPublicInternet({ ports: [80] }),
+        ],
       },
       http: {
         async policy() {

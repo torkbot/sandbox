@@ -17,7 +17,7 @@
     "build:kernel": "node ./scripts/build-kernel.ts",
     "build:rootfs": "node ./scripts/build-rootfs.ts",
     "build:rootfs:erofs": "node ./scripts/build-rootfs-erofs.ts",
-    "build:native": "napi build --platform --release --manifest-path crates/sandbox-node/Cargo.toml && node ./scripts/sign-native.ts",
+    "build:native": "napi build --platform --release --manifest-path crates/sandbox-node/Cargo.toml --package sandbox_node && node ./scripts/sign-native.ts",
     "check:rust": "cargo check --workspace",
     "test:artifact": "node --test tests/artifact/*.test.ts",
     "test:e2e": "node ./tests/e2e/run.ts",

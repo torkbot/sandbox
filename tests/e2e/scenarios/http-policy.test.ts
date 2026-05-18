@@ -167,6 +167,68 @@ function localHttpOutboundRules() {
   ];
 }
 
+test("invalid HTTP policy actions fail closed", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+  const origin = await startTestHttpOrigin({
+    respond() {
+      return {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+        body: "origin reached",
+      };
+    },
+  });
+  t.after(async () => {
+    await origin.close();
+  });
+
+  const vm = await spawnSandbox({
+    name: "http-policy-invalid-action",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      outbound: {
+        policy: "deny",
+        rules: localHttpOutboundRules(),
+      },
+      http: {
+        async policy() {
+          return { action: "passthrough" } as never;
+        },
+      },
+    },
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuest(vm, {
+    id: "curl-invalid-policy-action",
+    argv: [
+      "curl",
+      "--max-time",
+      "5",
+      "-sS",
+      "-o",
+      "/dev/null",
+      "-w",
+      "%{http_code}",
+      ...interceptedHttpArgs(`${origin.url}/invalid-action`),
+    ],
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, "502");
+});
+
 test("HTTPS traffic is intercepted, policy checked, and outbound-denied destinations are blocked", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;

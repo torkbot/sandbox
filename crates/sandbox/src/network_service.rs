@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::{self, Cursor, Read, Write};
 use std::net::TcpStream;
@@ -33,7 +33,8 @@ const HTTP_SOCKET_BUFFER_BYTES: usize = 256 * 1024;
 const TLS_READ_BUFFER_BYTES: usize = 16 * 1024;
 const DNS_PACKET_BUFFER_BYTES: usize = 4096;
 const DNS_PROTECTED_TEST_IP: [u8; 4] = [10, 1, 2, 3];
-const DNS_PUBLIC_TEST_IP: [u8; 4] = [203, 0, 113, 10];
+const DNS_PUBLIC_TEST_IP: [u8; 4] = [93, 184, 216, 34];
+const MITM_CERT_CACHE_LIMIT: usize = 256;
 const HOST_HTTP_PROBE_RESPONSE: &[u8] =
     b"HTTP/1.1 200 OK\r\ncontent-length: 25\r\nconnection: close\r\n\r\nsandbox explicit network\n";
 
@@ -157,7 +158,7 @@ fn run_network_service(
     while !shutdown.load(Ordering::Acquire) {
         let timestamp = Instant::now();
         let _ = iface.poll(timestamp, &mut device, &mut sockets);
-        poll_dns_socket(&mut sockets, dns_handle);
+        poll_dns_socket(&mut sockets, dns_handle, outbound_rules.as_deref());
         for port in device.nat.host_ports() {
             add_http_listener(&mut sockets, &mut http_sockets, port);
         }
@@ -196,12 +197,21 @@ fn add_dns_socket(sockets: &mut SocketSet<'_>) -> SocketHandle {
     sockets.add(socket)
 }
 
-fn poll_dns_socket(sockets: &mut SocketSet<'_>, handle: SocketHandle) {
+fn poll_dns_socket(
+    sockets: &mut SocketSet<'_>,
+    handle: SocketHandle,
+    outbound_rules: Option<&[OutboundRulePlan]>,
+) {
     let socket = sockets.get_mut::<udp::Socket>(handle);
     while socket.can_recv() && socket.can_send() {
         let Ok((request, remote)) = socket.recv() else {
             return;
         };
+        if outbound_rules
+            .is_some_and(|rules| !is_allowed_outbound_udp("10.0.2.1", HOST_DNS_PORT, rules))
+        {
+            continue;
+        }
         let Some(response) = dns_response(request) else {
             continue;
         };
@@ -745,6 +755,19 @@ fn is_allowed_outbound_tcp(
     })
 }
 
+fn is_allowed_outbound_udp(
+    destination_ip: &str,
+    destination_port: u16,
+    rules: &[OutboundRulePlan],
+) -> bool {
+    rules.iter().any(|rule| match rule {
+        OutboundRulePlan::AcceptUdp { cidr, ports } => {
+            port_matches(ports, destination_port) && cidr_contains(cidr, destination_ip)
+        }
+        OutboundRulePlan::AcceptTcp { .. } | OutboundRulePlan::AcceptPublicInternet { .. } => false,
+    })
+}
+
 fn port_matches(ports: &[u16], destination_port: u16) -> bool {
     ports.is_empty() || ports.contains(&destination_port)
 }
@@ -772,6 +795,10 @@ fn is_public_ipv4_destination(destination_ip: &str) -> bool {
         .is_ok_and(|destination| {
             ![
                 CidrRange {
+                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
+                    prefix: 8,
+                },
+                CidrRange {
                     address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 0)),
                     prefix: 8,
                 },
@@ -792,8 +819,44 @@ fn is_public_ipv4_destination(destination_ip: &str) -> bool {
                     prefix: 12,
                 },
                 CidrRange {
+                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 0, 0)),
+                    prefix: 24,
+                },
+                CidrRange {
+                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 0)),
+                    prefix: 24,
+                },
+                CidrRange {
+                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 88, 99, 0)),
+                    prefix: 24,
+                },
+                CidrRange {
                     address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 0, 0)),
                     prefix: 16,
+                },
+                CidrRange {
+                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 18, 0, 0)),
+                    prefix: 15,
+                },
+                CidrRange {
+                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 0)),
+                    prefix: 24,
+                },
+                CidrRange {
+                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 0)),
+                    prefix: 24,
+                },
+                CidrRange {
+                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(224, 0, 0, 0)),
+                    prefix: 4,
+                },
+                CidrRange {
+                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(240, 0, 0, 0)),
+                    prefix: 4,
+                },
+                CidrRange {
+                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(255, 255, 255, 255)),
+                    prefix: 32,
                 },
             ]
             .iter()
@@ -1202,6 +1265,7 @@ struct DynamicMitmCertResolver {
 struct MitmCertIssuer {
     ca: rcgen::Issuer<'static, rcgen::KeyPair>,
     cache: HashMap<String, Arc<CertifiedKey>>,
+    cache_order: VecDeque<String>,
 }
 
 impl DynamicMitmCertResolver {
@@ -1210,6 +1274,7 @@ impl DynamicMitmCertResolver {
             issuer: Mutex::new(MitmCertIssuer {
                 ca,
                 cache: HashMap::new(),
+                cache_order: VecDeque::new(),
             }),
         }
     }
@@ -1235,9 +1300,23 @@ impl MitmCertIssuer {
         }
 
         let certificate = Arc::new(self.generate_certificate(server_name)?);
-        self.cache
-            .insert(server_name.to_string(), certificate.clone());
+        self.insert_cached_certificate(server_name.to_string(), certificate.clone());
         Ok(certificate)
+    }
+
+    fn insert_cached_certificate(&mut self, server_name: String, certificate: Arc<CertifiedKey>) {
+        if self.cache.contains_key(&server_name) {
+            self.cache.insert(server_name, certificate);
+            return;
+        }
+        while self.cache.len() >= MITM_CERT_CACHE_LIMIT {
+            let Some(evicted) = self.cache_order.pop_front() else {
+                break;
+            };
+            self.cache.remove(&evicted);
+        }
+        self.cache_order.push_back(server_name.clone());
+        self.cache.insert(server_name, certificate);
     }
 
     fn generate_certificate(&self, server_name: &str) -> io::Result<CertifiedKey> {
@@ -1538,22 +1617,56 @@ mod tests {
     fn outbound_rules_deny_unmatched_tcp_destinations() {
         let rules = vec![OutboundRulePlan::AcceptTcp {
             cidr: CidrRange {
-                address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 10)),
+                address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
                 prefix: 32,
             },
             ports: vec![80],
         }];
 
-        assert!(is_allowed_outbound_tcp("203.0.113.10", 80, &rules));
-        assert!(!is_allowed_outbound_tcp("203.0.113.11", 80, &rules));
-        assert!(!is_allowed_outbound_tcp("203.0.113.10", 443, &rules));
+        assert!(is_allowed_outbound_tcp("93.184.216.34", 80, &rules));
+        assert!(!is_allowed_outbound_tcp("93.184.216.35", 80, &rules));
+        assert!(!is_allowed_outbound_tcp("93.184.216.34", 443, &rules));
     }
 
     #[test]
-    fn public_internet_rules_exclude_loopback() {
+    fn outbound_rules_honor_udp_protocol_and_port() {
+        let rules = vec![OutboundRulePlan::AcceptUdp {
+            cidr: CidrRange {
+                address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 2, 1)),
+                prefix: 32,
+            },
+            ports: vec![53],
+        }];
+
+        assert!(is_allowed_outbound_udp("10.0.2.1", 53, &rules));
+        assert!(!is_allowed_outbound_udp("10.0.2.1", 5353, &rules));
+        assert!(!is_allowed_outbound_tcp("10.0.2.1", 53, &rules));
+    }
+
+    #[test]
+    fn public_internet_rules_exclude_special_use_ranges() {
         let rules = vec![OutboundRulePlan::AcceptPublicInternet { ports: vec![80] }];
 
-        assert!(is_allowed_outbound_tcp("203.0.113.10", 80, &rules));
-        assert!(!is_allowed_outbound_tcp("127.0.0.1", 80, &rules));
+        assert!(is_allowed_outbound_tcp("93.184.216.34", 80, &rules));
+        for address in [
+            "0.0.0.1",
+            "10.0.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.0.1",
+            "172.16.0.1",
+            "192.0.0.1",
+            "192.0.2.1",
+            "192.88.99.1",
+            "192.168.0.1",
+            "198.18.0.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+        ] {
+            assert!(!is_allowed_outbound_tcp(address, 80, &rules), "{address}");
+        }
     }
 }

@@ -86,7 +86,10 @@ jobs:
       - name: Build kernel fixture
         run: npm run build:kernel
 
-      - name: Build guest init fixture
+      - name: Build sandbox init fixture
+        run: npm run build:init
+
+      - name: Build libkrun stage-0 init fixture
         run: npm run build:libkrun-init
 
       - name: Build rootfs fixture
