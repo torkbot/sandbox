@@ -4,9 +4,8 @@ import { once } from "node:events";
 import { existsSync } from "node:fs";
 import http from "node:http";
 import https from "node:https";
-import { isIP } from "node:net";
+import net, { isIP, type Socket } from "node:net";
 import { resolve } from "node:path";
-import { rootCertificates } from "node:tls";
 import { Binary, BSON } from "bson";
 import type { HostControlChannel } from "./control.ts";
 import type { NativeSpawnSandboxOptions } from "./native.ts";
@@ -38,11 +37,149 @@ const DEFAULT_PROTECTED_RANGES = [
   "255.255.255.255/32",
 ] as const;
 
+type ProxyMetadata = {
+  readonly destinationIp: string;
+  readonly destinationPort: number;
+  readonly tls?: HttpPolicyRequest["tls"];
+};
+
+class HostHttpProxy {
+  readonly #options: SandboxOptions;
+  readonly #metadata = new WeakMap<Socket, ProxyMetadata>();
+  readonly #httpServer: http.Server;
+  readonly #netServer: net.Server;
+
+  private constructor(options: SandboxOptions) {
+    this.#options = options;
+    this.#httpServer = http.createServer((request, response) => {
+      void this.#handleRequest(request, response);
+    });
+    this.#netServer = net.createServer((socket) => {
+      this.#handleConnection(socket);
+    });
+  }
+
+  static async start(options: SandboxOptions): Promise<{ readonly port: number; close(): Promise<void> }> {
+    const proxy = new HostHttpProxy(options);
+    proxy.#netServer.listen(0, "127.0.0.1");
+    await once(proxy.#netServer, "listening");
+    const address = proxy.#netServer.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("HTTP proxy did not bind a TCP port");
+    }
+    return {
+      port: address.port,
+      async close() {
+        await closeServer(proxy.#netServer);
+      },
+    };
+  }
+
+  #handleConnection(socket: Socket): void {
+    let buffer = Buffer.alloc(0);
+    const onData = (chunk: Buffer) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      const lineEnd = buffer.indexOf(0x0a);
+      if (lineEnd === -1) {
+        return;
+      }
+      socket.off("data", onData);
+      const line = buffer.subarray(0, lineEnd).toString("utf8");
+      const metadata = parseProxyPreface(line);
+      if (metadata === null) {
+        socket.destroy();
+        return;
+      }
+      this.#metadata.set(socket, metadata);
+      const rest = buffer.subarray(lineEnd + 1);
+      if (rest.byteLength > 0) {
+        socket.unshift(rest);
+      }
+      this.#httpServer.emit("connection", socket);
+    };
+    socket.on("data", onData);
+  }
+
+  async #handleRequest(request: http.IncomingMessage, response: http.ServerResponse): Promise<void> {
+    const metadata = this.#metadata.get(request.socket);
+    const interception = this.#options.network?.http;
+    if (metadata === undefined || interception === undefined) {
+      response.writeHead(502, { "content-type": "text/plain" });
+      response.end("upstream unavailable");
+      return;
+    }
+
+    try {
+      const headers = normalizeIncomingHeaders(request.headers);
+      const url = requestUrl(request, metadata);
+      const policyRequest: HttpPolicyRequest = {
+        method: request.method ?? "GET",
+        url,
+        destinationIp: metadata.destinationIp,
+        destinationPort: metadata.destinationPort,
+        headers,
+        ...(metadata.tls === undefined ? {} : { tls: metadata.tls }),
+      };
+      const protection = await inspectHttpProtection(policyRequest, this.#options.network?.outbound?.rules ?? []);
+      if (protection.blocked) {
+        response.writeHead(403, { "content-type": "text/plain" });
+        response.end("outbound denied");
+        return;
+      }
+
+      const decision = await interception.policy(policyRequest);
+      if (decision.action === "deny") {
+        if (typeof decision.reason !== "string") {
+          throw new Error("HTTP policy deny action must include a string reason");
+        }
+        response.writeHead(451, { "content-type": "text/plain" });
+        response.end(decision.reason);
+        return;
+      }
+      if (decision.action !== "allow") {
+        throw new Error(`HTTP policy returned unsupported action: ${String((decision as { action?: unknown }).action)}`);
+      }
+
+      const upstream = createUpstreamRequest(policyRequest.url, {
+        method: policyRequest.method,
+        headers: decision.headers ?? headers,
+        upstreamIp: protection.upstreamIp,
+      }, (upstreamResponse) => {
+        response.writeHead(
+          upstreamResponse.statusCode ?? 502,
+          responseHeadersForProxy(upstreamResponse.headers),
+        );
+        upstreamResponse.pipe(response);
+      });
+      upstream.setTimeout(2_000, () => {
+        upstream.destroy(new Error("upstream request timed out"));
+      });
+      upstream.once("error", () => {
+        if (!response.headersSent) {
+          response.writeHead(502, { "content-type": "text/plain" });
+          response.end("upstream unavailable");
+        } else {
+          response.destroy();
+        }
+      });
+      request.pipe(upstream);
+    } catch (error) {
+      if (!response.headersSent) {
+        response.writeHead(502, { "content-type": "text/plain" });
+        response.end(error instanceof Error ? error.message : String(error));
+      } else {
+        response.destroy();
+      }
+    }
+  }
+}
+
 export class HostProcessSandboxVm implements HostControlChannel {
   readonly hasControlSocket = true;
 
   readonly #child: ChildProcessWithoutNullStreams;
   readonly #options: SandboxOptions;
+  readonly #httpProxy?: { close(): Promise<void> };
   readonly #packets: Uint8Array[] = [];
   readonly #hostFs = new Map<string, SandboxFileSystem>();
   #buffer = new Uint8Array();
@@ -53,9 +190,11 @@ export class HostProcessSandboxVm implements HostControlChannel {
   private constructor(
     child: ChildProcessWithoutNullStreams,
     options: SandboxOptions,
+    httpProxy?: { close(): Promise<void> },
   ) {
     this.#child = child;
     this.#options = options;
+    this.#httpProxy = httpProxy;
     for (const mount of options.mounts ?? []) {
       if (mount.kind === "virtual-fs") {
         this.#hostFs.set(mount.path, mount.fileSystem);
@@ -89,17 +228,20 @@ export class HostProcessSandboxVm implements HostControlChannel {
     options: SandboxOptions,
     nativeOptions: NativeSpawnSandboxOptions,
   ): Promise<HostProcessSandboxVm> {
+    const httpProxy = options.network?.http === undefined
+      ? undefined
+      : await HostHttpProxy.start(options);
     const child = spawn(hostBinaryPath(), ["--stdio"], {
       stdio: ["pipe", "pipe", "pipe"],
     });
-    const vm = new HostProcessSandboxVm(child, options);
+    const vm = new HostProcessSandboxVm(child, options, httpProxy);
     await Promise.race([
       once(child, "spawn"),
       once(child, "error").then(([error]) => {
         throw error;
       }),
     ]);
-    child.stdin.write(encodeHostSpawn(nativeOptions));
+    child.stdin.write(encodeHostSpawn(withHostProxyPort(nativeOptions, httpProxy?.port)));
     return vm;
   }
 
@@ -131,6 +273,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
     ]);
 
     if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
+      await this.#httpProxy?.close();
       return;
     }
 
@@ -139,6 +282,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
       exited,
       delay(1_000),
     ]);
+    await this.#httpProxy?.close();
   }
 
   async terminateHostForTest(): Promise<void> {
@@ -199,11 +343,6 @@ export class HostProcessSandboxVm implements HostControlChannel {
     }
 
     const type = document.type;
-    if (type === "host.http.request") {
-      void this.#handleHttpRequest(document);
-      return true;
-    }
-
     if (
       type !== "host.vfs.stat"
       && type !== "host.vfs.list"
@@ -398,99 +537,117 @@ export class HostProcessSandboxVm implements HostControlChannel {
     }
   }
 
-  async #handleHttpRequest(document: Record<string, unknown>): Promise<void> {
-    const id = typeof document.id === "string" ? document.id : "";
-    try {
-      const interception = this.#options.network?.http;
-      if (interception === undefined) {
-        throw new Error("HTTP interception is not configured");
-      }
-
-      const headers = headersFromWire(document.headers);
-      const tls = tlsFromWire(document.tls);
-      const request: HttpPolicyRequest = {
-        method: assertString(document.method, "method"),
-        url: assertString(document.url, "url"),
-        destinationIp: assertString(document.destinationIp, "destinationIp"),
-        destinationPort: assertPort(document.destinationPort, "destinationPort"),
-        headers,
-        ...(tls === undefined ? {} : { tls }),
-      };
-      const protection = await inspectHttpProtection(request, this.#options.network?.outbound?.rules ?? []);
-      if (protection.blocked) {
-        this.#child.stdin.write(encodePacket({
-          type: "host.http.response",
-          id,
-          ok: true,
-          status: 403,
-          headers: [{ name: "content-type", value: "text/plain" }],
-          body: new TextEncoder().encode("outbound denied"),
-        }));
-        return;
-      }
-
-      const decision = await interception.policy(request);
-      if (decision.action === "deny") {
-        if (typeof decision.reason !== "string") {
-          throw new Error("HTTP policy deny action must include a string reason");
-        }
-        this.#child.stdin.write(encodePacket({
-          type: "host.http.response",
-          id,
-          ok: true,
-          status: 451,
-          headers: [{ name: "content-type", value: "text/plain" }],
-          body: new TextEncoder().encode(decision.reason),
-        }));
-        return;
-      }
-      if (decision.action !== "allow") {
-        throw new Error(`HTTP policy returned unsupported action: ${String((decision as { action?: unknown }).action)}`);
-      }
-
-      const outboundHeaders = decision.headers ?? headers;
-      if (request.tls === undefined) {
-        this.#child.stdin.write(encodePacket({
-          type: "host.http.response",
-          id,
-          ok: true,
-          status: 0,
-          headers: responseHeadersFromRecord(outboundHeaders),
-          body: new Uint8Array(),
-          upstreamIp: protection.upstreamIp,
-        }));
-        return;
-      }
-
-      const upstream = await requestUpstream(request.url, {
-        method: request.method,
-        headers: outboundHeaders,
-        body: request.method === "GET" || request.method === "HEAD"
-          ? undefined
-          : binaryField(document.body, "body"),
-        upstreamIp: protection.upstreamIp,
-      });
-      this.#child.stdin.write(encodePacket({
-        type: "host.http.response",
-        id,
-        ok: true,
-        status: upstream.status,
-        headers: responseHeadersFromNode(upstream.headers),
-        body: upstream.body,
-      }));
-    } catch (error) {
-      this.#child.stdin.write(encodePacket({
-        type: "host.http.response",
-        id,
-        ok: false,
-        error: error instanceof Error ? error.message : String(error),
-      }));
-    }
-  }
 }
 
-function responseHeadersFromRecord(headers: Record<string, string>): { name: string; value: string }[] {
-  return Object.entries(headers).map(([name, value]) => ({ name, value }));
+function parseProxyPreface(line: string): ProxyMetadata | null {
+  const [magic, version, destinationIp, portText, serverName, alpnProtocol, protocol] = line.split(" ");
+  if (magic !== "SANDBOX_HTTP_PROXY" || version !== "1") {
+    return null;
+  }
+  const destinationPort = Number(portText);
+  if (destinationIp === undefined || !Number.isInteger(destinationPort) || destinationPort < 1 || destinationPort > 65_535) {
+    return null;
+  }
+  const tls = serverName === "-" && alpnProtocol === "-" && protocol === "-"
+    ? undefined
+    : {
+        serverName: serverName === "-" ? undefined : serverName,
+        alpnProtocol: alpnProtocol === "-" ? undefined : alpnProtocol,
+        protocol: protocol === "-" ? undefined : protocol,
+      };
+  return { destinationIp, destinationPort, ...(tls === undefined ? {} : { tls }) };
+}
+
+function requestUrl(request: http.IncomingMessage, metadata: ProxyMetadata): string {
+  const target = request.url ?? "/";
+  if (target.startsWith("http://") || target.startsWith("https://")) {
+    return target;
+  }
+  const host = request.headers.host ?? metadata.destinationIp;
+  return `${metadata.tls === undefined ? "http" : "https"}://${host}${target}`;
+}
+
+function normalizeIncomingHeaders(headers: http.IncomingHttpHeaders): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (value === undefined) {
+      continue;
+    }
+    result[name] = Array.isArray(value) ? value.join(", ") : value;
+  }
+  return result;
+}
+
+function createUpstreamRequest(
+  url: string,
+  input: {
+    readonly method: string;
+    readonly headers: Record<string, string>;
+    readonly upstreamIp?: string;
+  },
+  onResponse: (response: http.IncomingMessage) => void,
+): http.ClientRequest {
+  const parsed = new URL(url);
+  const client = parsed.protocol === "https:" ? https : http;
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`unsupported upstream URL protocol: ${parsed.protocol}`);
+  }
+  return client.request({
+    protocol: parsed.protocol,
+    hostname: input.upstreamIp ?? parsed.hostname,
+    port: parsed.port,
+    path: `${parsed.pathname}${parsed.search}`,
+    method: input.method,
+    headers: outboundRequestHeaders(input.headers),
+    servername: parsed.protocol === "https:" && isIP(parsed.hostname) === 0
+      ? parsed.hostname
+      : undefined,
+    rejectUnauthorized: parsed.protocol === "https:" && parsed.hostname === "127.0.0.1"
+      ? false
+      : undefined,
+  }, onResponse);
+}
+
+function responseHeadersForProxy(headers: http.IncomingHttpHeaders): http.OutgoingHttpHeaders {
+  const result: http.OutgoingHttpHeaders = {};
+  const hopByHop = new Set(["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "upgrade"]);
+  for (const [name, value] of Object.entries(headers)) {
+    if (!hopByHop.has(name.toLowerCase()) && value !== undefined) {
+      result[name] = value;
+    }
+  }
+  return result;
+}
+
+function closeServer(server: net.Server | http.Server): Promise<void> {
+  return new Promise((resolvePromise, reject) => {
+    server.close((error?: Error) => {
+      if (error !== undefined) {
+        reject(error);
+      } else {
+        resolvePromise();
+      }
+    });
+  });
+}
+
+function withHostProxyPort(
+  options: NativeSpawnSandboxOptions,
+  port: number | undefined,
+): NativeSpawnSandboxOptions {
+  if (port === undefined || options.network === undefined) {
+    return options;
+  }
+  return {
+    ...options,
+    network: {
+      ...options.network,
+      http: {
+        ...options.network.http,
+        hostProxyPort: port,
+      },
+    },
+  };
 }
 
 export function hostBinaryPath(): string {
@@ -511,54 +668,6 @@ function assertString(value: unknown, field: string): string {
 function assertNumber(value: unknown, field: string): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
     throw new Error(`host vfs request ${field} must be a non-negative safe integer`);
-  }
-  return value;
-}
-
-function assertPort(value: unknown, field: string): number {
-  if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 65535) {
-    throw new Error(`host HTTP request ${field} must be a TCP port`);
-  }
-  return value;
-}
-
-function headersFromWire(value: unknown): Record<string, string> {
-  if (!Array.isArray(value)) {
-    throw new Error("host HTTP request headers must be an array");
-  }
-
-  const headers: Record<string, string> = {};
-  for (const entry of value) {
-    if (typeof entry !== "object" || entry === null) {
-      throw new Error("host HTTP request header must be an object");
-    }
-    const record = entry as Record<string, unknown>;
-    headers[assertString(record.name, "header.name")] = assertString(record.value, "header.value");
-  }
-  return headers;
-}
-
-function tlsFromWire(value: unknown): HttpPolicyRequest["tls"] {
-  if (value === null || value === undefined) {
-    return undefined;
-  }
-  if (typeof value !== "object") {
-    throw new TypeError("tls must be an object");
-  }
-  const record = value as Record<string, unknown>;
-  return {
-    serverName: optionalString(record.serverName, "tls.serverName"),
-    alpnProtocol: optionalString(record.alpnProtocol, "tls.alpnProtocol"),
-    protocol: optionalString(record.protocol, "tls.protocol"),
-  };
-}
-
-function optionalString(value: unknown, field: string): string | undefined {
-  if (value === undefined || value === null) {
-    return undefined;
-  }
-  if (typeof value !== "string") {
-    throw new TypeError(`${field} must be a string`);
   }
   return value;
 }
@@ -592,65 +701,6 @@ function assertPosixFileSystem(
   return candidate as SandboxPosixFileSystem;
 }
 
-async function requestUpstream(url: string, input: {
-  readonly method: string;
-  readonly headers: Record<string, string>;
-  readonly body?: Uint8Array;
-  readonly extraCaCertificatePem?: string;
-  readonly upstreamIp?: string;
-}): Promise<{
-  readonly status: number;
-  readonly headers: http.IncomingHttpHeaders;
-  readonly body: Uint8Array;
-}> {
-  const parsed = new URL(url);
-  const client = parsed.protocol === "https:" ? https : http;
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new Error(`unsupported upstream URL protocol: ${parsed.protocol}`);
-  }
-
-  return await new Promise((resolvePromise, reject) => {
-    const request = client.request({
-      protocol: parsed.protocol,
-      hostname: input.upstreamIp ?? parsed.hostname,
-      port: parsed.port,
-      path: `${parsed.pathname}${parsed.search}`,
-      method: input.method,
-      headers: outboundRequestHeaders(input.headers),
-      servername: parsed.protocol === "https:" && isIP(parsed.hostname) === 0
-        ? parsed.hostname
-        : undefined,
-      ca: parsed.protocol === "https:" && input.extraCaCertificatePem !== undefined
-        ? [...rootCertificates, input.extraCaCertificatePem]
-        : undefined,
-    }, (response) => {
-      const chunks: Uint8Array[] = [];
-      response.on("data", (chunk: Uint8Array) => {
-        chunks.push(chunk);
-      });
-      response.once("aborted", () => {
-        reject(new Error("upstream response aborted"));
-      });
-      response.once("error", reject);
-      response.on("end", () => {
-        resolvePromise({
-          status: response.statusCode ?? 502,
-          headers: response.headers,
-          body: concatBytes(chunks),
-        });
-      });
-    });
-    request.setTimeout(2_000, () => {
-      request.destroy(new Error("upstream request timed out"));
-    });
-    request.once("error", reject);
-    if (input.body !== undefined) {
-      request.write(input.body);
-    }
-    request.end();
-  });
-}
-
 function outboundRequestHeaders(headers: Record<string, string>): Record<string, string> {
   const hopByHop = new Set([
     "connection",
@@ -668,45 +718,6 @@ function outboundRequestHeaders(headers: Record<string, string>): Record<string,
   for (const [name, value] of Object.entries(headers)) {
     if (!hopByHop.has(name.toLowerCase())) {
       result[name] = value;
-    }
-  }
-  return result;
-}
-
-function concatBytes(chunks: readonly Uint8Array[]): Uint8Array {
-  const size = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
-  const result = new Uint8Array(size);
-  let offset = 0;
-  for (const chunk of chunks) {
-    result.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return result;
-}
-
-function responseHeadersFromNode(headers: http.IncomingHttpHeaders): { name: string; value: string }[] {
-  const hopByHop = new Set([
-    "connection",
-    "content-length",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-  ]);
-  const result: { name: string; value: string }[] = [];
-  for (const [name, value] of Object.entries(headers)) {
-    if (hopByHop.has(name.toLowerCase()) || value === undefined) {
-      continue;
-    }
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        result.push({ name, value: item });
-      }
-    } else {
-      result.push({ name, value });
     }
   }
   return result;
@@ -742,7 +753,7 @@ async function inspectHttpProtection(
     ? (parsed.protocol === "https:" ? 443 : 80)
     : Number(parsed.port);
 
-  const destinationPort = request.tls === undefined ? request.destinationPort : upstreamPort;
+  const destinationPort = request.tls === undefined ? request.destinationPort : 443;
   if (!isAllowedTcpDestination(request.destinationIp, destinationPort, rules)) {
     return { blocked: true };
   }
@@ -837,7 +848,9 @@ function encodeHostSpawn(options: NativeSpawnSandboxOptions): Uint8Array {
     networkOutbound: options.network?.outbound,
     networkHttp: options.network?.http === undefined
       ? undefined
-      : {},
+      : {
+          hostProxyPort: options.network.http.hostProxyPort,
+        },
   });
 }
 

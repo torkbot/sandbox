@@ -7,9 +7,6 @@ use std::thread;
 use std::time::Duration;
 
 use bson::{Bson, Document, doc};
-use sandbox::network_service::{
-    HostHttpHandler, HostHttpRequest, HostHttpResponse, HostTlsMetadata,
-};
 use sandbox::vfs::{
     VirtioFsDirEntry, VirtioFsEntry, VirtioVirtualFsBackend, VirtualFsAdapter, VirtualInode,
     bindings, virtual_directory_entry, virtual_file_entry, virtual_symlink_entry,
@@ -76,8 +73,7 @@ impl HostIoBridge {
 
     pub fn route_response(&self, document: Document) -> bool {
         let response_type = document.get_str("type").ok();
-        if response_type != Some("host.vfs.response") && response_type != Some("host.http.response")
-        {
+        if response_type != Some("host.vfs.response") {
             return false;
         }
         let Ok(id) = document.get_str("id") else {
@@ -93,72 +89,6 @@ impl HostIoBridge {
         }
         true
     }
-}
-
-impl HostHttpHandler for HostIoBridge {
-    fn handle_http_request(&self, request: HostHttpRequest) -> io::Result<HostHttpResponse> {
-        let response = self.request(doc! {
-            "type": "host.http.request",
-            "method": request.method,
-            "url": request.url,
-            "destinationIp": request.destination_ip,
-            "destinationPort": i32::from(request.destination_port),
-            "headers": request.headers.into_iter().map(|(name, value)| doc! {
-                "name": name,
-                "value": value,
-            }).collect::<Vec<_>>(),
-            "tls": tls_metadata_to_bson(request.tls),
-            "body": Bson::Binary(bson::Binary {
-                subtype: bson::spec::BinarySubtype::Generic,
-                bytes: request.body,
-            }),
-        })?;
-        let status = response.get_i32("status").map_err(to_io_error)?;
-        let headers = response
-            .get_array("headers")
-            .map_err(to_io_error)?
-            .iter()
-            .map(|value| {
-                let document = value.as_document().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "HTTP header must be a document")
-                })?;
-                Ok((
-                    document.get_str("name").map_err(to_io_error)?.to_string(),
-                    document.get_str("value").map_err(to_io_error)?.to_string(),
-                ))
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        let body = response
-            .get_binary_generic("body")
-            .cloned()
-            .map_err(to_io_error)?;
-        let upstream_ip = response.get_str("upstreamIp").ok().map(str::to_string);
-
-        Ok(HostHttpResponse {
-            status: u16::try_from(status)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP status"))?,
-            headers,
-            body,
-            upstream_ip,
-        })
-    }
-}
-
-fn tls_metadata_to_bson(tls: Option<HostTlsMetadata>) -> Bson {
-    let Some(tls) = tls else {
-        return Bson::Null;
-    };
-    let mut document = Document::new();
-    if let Some(server_name) = tls.server_name {
-        document.insert("serverName", server_name);
-    }
-    if let Some(alpn_protocol) = tls.alpn_protocol {
-        document.insert("alpnProtocol", alpn_protocol);
-    }
-    if let Some(protocol) = tls.protocol {
-        document.insert("protocol", protocol);
-    }
-    Bson::Document(document)
 }
 
 #[derive(Clone)]

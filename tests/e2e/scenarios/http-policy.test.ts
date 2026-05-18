@@ -825,9 +825,9 @@ test("HTTP keep-alive behavior is explicit and deterministic", async (t) => {
     `keep-alive probe failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
   );
   assert.match(result.stdout, /\/first/);
-  assert.doesNotMatch(result.stdout, /\/second/);
-  assert.deepEqual(policyUrls, [`${origin.url}/first`]);
-  assert.deepEqual(requestedPaths, ["/first"]);
+  assert.match(result.stdout, /\/second/);
+  assert.deepEqual(policyUrls, [`${origin.url}/first`, `${origin.url}/second`]);
+  assert.deepEqual(requestedPaths, ["/first", "/second"]);
 });
 
 test("upstream connection refused returns a deterministic guest-visible failure", async (t) => {

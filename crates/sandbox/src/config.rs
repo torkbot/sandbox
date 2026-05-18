@@ -86,6 +86,7 @@ pub struct HttpSpec {
     pub protected_ranges: Vec<String>,
     pub ca_certificate_pem: Option<String>,
     pub ca_private_key_pem: Option<String>,
+    pub host_proxy_port: Option<u16>,
 }
 
 impl HttpSpec {
@@ -103,6 +104,7 @@ impl HttpSpec {
             protected_ranges: input.protected_ranges,
             ca_certificate_pem,
             ca_private_key_pem,
+            host_proxy_port: input.host_proxy_port,
         })
     }
 }
@@ -317,6 +319,7 @@ pub struct HttpSpecInput {
     pub protected_ranges: Vec<String>,
     pub ca_certificate_pem: Option<String>,
     pub ca_private_key_pem: Option<String>,
+    pub host_proxy_port: Option<u16>,
 }
 
 #[cfg(test)]
@@ -379,6 +382,7 @@ mod tests {
             ca_private_key_pem: Some(
                 "-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----".to_string(),
             ),
+            host_proxy_port: None,
         });
 
         let spec = MicroVmSpec::build(input).unwrap();

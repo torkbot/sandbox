@@ -157,6 +157,7 @@ mod tests {
             protected_ranges: vec!["127.0.0.0/8".to_string(), "::1/128".to_string()],
             ca_certificate_pem: None,
             ca_private_key_pem: None,
+            host_proxy_port: None,
         }))
         .unwrap()
         .unwrap();
@@ -195,6 +196,7 @@ mod tests {
             protected_ranges: vec!["127.0.0.0/33".to_string()],
             ca_certificate_pem: None,
             ca_private_key_pem: None,
+            host_proxy_port: None,
         }))
         .unwrap_err();
 

@@ -62,15 +62,7 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
     let spec = sandbox::MicroVmSpec::build(parse_spawn(spawn_document)?)?;
     let bridge = HostIoBridge::new();
     let virtual_fs = virtual_fs_devices(&spec, bridge.clone());
-    let services = HostServices {
-        http_handler: spec
-            .network
-            .as_ref()
-            .and_then(|network| network.http.as_ref())
-            .map(|_| {
-                bridge.clone() as std::sync::Arc<dyn sandbox::network_service::HostHttpHandler>
-            }),
-    };
+    let services = HostServices;
     let mut vm = sandbox::runtime::KrunVm::create_with_services(&spec, virtual_fs, services)?;
     vm.start()?;
 
@@ -268,6 +260,8 @@ fn parse_network_http(
         protected_ranges,
         ca_certificate_pem: optional_string(document, "caCertificatePem"),
         ca_private_key_pem: optional_string(document, "caPrivateKeyPem"),
+        host_proxy_port: optional_i32(document, "hostProxyPort")
+            .and_then(|port| u16::try_from(port).ok()),
     }))
 }
 

@@ -44,7 +44,9 @@ export type NativeSpawnSandboxOptions = {
       readonly policy: "deny";
       readonly rules: readonly OutboundNetworkRule[];
     };
-    readonly http?: Record<string, never>;
+    readonly http?: {
+      readonly hostProxyPort?: number;
+    };
   };
 };
 

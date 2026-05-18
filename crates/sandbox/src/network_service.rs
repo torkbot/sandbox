@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -38,6 +37,10 @@ const DNS_PUBLIC_TEST_IP: [u8; 4] = [93, 184, 216, 34];
 const MITM_CERT_CACHE_LIMIT: usize = 256;
 const HOST_HTTP_PROBE_RESPONSE: &[u8] =
     b"HTTP/1.1 200 OK\r\ncontent-length: 25\r\nconnection: close\r\n\r\nsandbox explicit network\n";
+const OUTBOUND_DENIED_RESPONSE: &[u8] =
+    b"HTTP/1.1 403 Forbidden\r\ncontent-length: 15\r\nconnection: close\r\n\r\noutbound denied";
+const UPSTREAM_FAILURE_RESPONSE: &[u8] =
+    b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 20\r\nconnection: close\r\n\r\nupstream unavailable";
 static SPECIAL_USE_IPV4_RANGES: LazyLock<Vec<CidrRange>> = LazyLock::new(|| {
     [
         "0.0.0.0/8",
@@ -63,33 +66,10 @@ static SPECIAL_USE_IPV4_RANGES: LazyLock<Vec<CidrRange>> = LazyLock::new(|| {
 });
 
 #[derive(Debug, Clone)]
-pub struct HostHttpRequest {
-    pub method: String,
-    pub url: String,
-    pub destination_ip: String,
-    pub destination_port: u16,
-    pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
-    pub tls: Option<HostTlsMetadata>,
-}
-
-#[derive(Debug, Clone)]
 pub struct HostTlsMetadata {
     pub server_name: Option<String>,
     pub alpn_protocol: Option<String>,
     pub protocol: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct HostHttpResponse {
-    pub status: u16,
-    pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
-    pub upstream_ip: Option<String>,
-}
-
-pub trait HostHttpHandler: Send + Sync + 'static {
-    fn handle_http_request(&self, request: HostHttpRequest) -> io::Result<HostHttpResponse>;
 }
 
 #[derive(Debug, Clone)]
@@ -108,7 +88,7 @@ pub struct HostNetwork {
 
 impl HostNetwork {
     pub fn new(
-        http_handler: Option<Arc<dyn HostHttpHandler>>,
+        http_proxy_port: Option<u16>,
         tls_config: Option<MitmTlsConfig>,
         outbound_rules: Option<Vec<OutboundRulePlan>>,
     ) -> io::Result<Self> {
@@ -120,7 +100,7 @@ impl HostNetwork {
             run_network_service(
                 host,
                 worker_shutdown,
-                http_handler,
+                http_proxy_port,
                 tls_acceptor,
                 outbound_rules,
             )
@@ -149,7 +129,7 @@ impl Drop for HostNetwork {
 fn run_network_service(
     stream: UnixStream,
     shutdown: Arc<AtomicBool>,
-    http_handler: Option<Arc<dyn HostHttpHandler>>,
+    http_proxy_port: Option<u16>,
     tls_acceptor: Option<TlsAcceptor>,
     outbound_rules: Option<Vec<OutboundRulePlan>>,
 ) {
@@ -195,7 +175,7 @@ fn run_network_service(
                 &mut sockets,
                 handle,
                 port,
-                http_handler.as_deref(),
+                http_proxy_port,
                 &device.nat,
                 tls_acceptor.as_ref(),
                 outbound_rules.as_deref(),
@@ -267,7 +247,7 @@ fn poll_http_socket(
     sockets: &mut SocketSet<'_>,
     handle: SocketHandle,
     port: u16,
-    handler: Option<&dyn HostHttpHandler>,
+    http_proxy_port: Option<u16>,
     nat: &TransparentTcpNat,
     tls_acceptor: Option<&TlsAcceptor>,
     outbound_rules: Option<&[OutboundRulePlan]>,
@@ -287,7 +267,7 @@ fn poll_http_socket(
             socket,
             handle,
             nat,
-            handler,
+            http_proxy_port,
             tls_acceptor,
             tls_connections,
             &[],
@@ -299,7 +279,7 @@ fn poll_http_socket(
             socket,
             handle,
             nat,
-            handler,
+            http_proxy_port,
             outbound_rules,
             http_connections,
             &[],
@@ -316,7 +296,7 @@ fn poll_http_socket(
                     socket,
                     handle,
                     nat,
-                    handler,
+                    http_proxy_port,
                     tls_acceptor,
                     tls_connections,
                     &request[..received],
@@ -337,7 +317,7 @@ fn poll_http_socket(
             socket,
             handle,
             nat,
-            handler,
+            http_proxy_port,
             tls_acceptor,
             tls_connections,
             &initial[..received],
@@ -348,7 +328,7 @@ fn poll_http_socket(
         socket,
         handle,
         nat,
-        handler,
+        http_proxy_port,
         outbound_rules,
         http_connections,
         &initial[..received],
@@ -363,97 +343,91 @@ fn is_prelistened_tls_port(port: u16) -> bool {
     port == HOST_HTTPS_PORT || port == HOST_ALT_HTTPS_PORT
 }
 
+#[derive(Clone)]
+struct HttpDestination {
+    ip: String,
+    port: u16,
+}
+
+fn original_http_destination(
+    socket: &tcp::Socket<'_>,
+    nat: &TransparentTcpNat,
+) -> Option<HttpDestination> {
+    let remote = socket.remote_endpoint()?;
+    let local = socket.local_endpoint()?;
+    let ip = nat.original_destination(remote.addr, remote.port, local.port)?;
+    Some(HttpDestination {
+        ip,
+        port: local.port,
+    })
+}
+
 fn poll_plain_http_socket(
     socket: &mut tcp::Socket<'_>,
     handle: SocketHandle,
     nat: &TransparentTcpNat,
-    handler: Option<&dyn HostHttpHandler>,
+    http_proxy_port: Option<u16>,
     outbound_rules: Option<&[OutboundRulePlan]>,
     http_connections: &mut HashMap<SocketHandle, HttpConnection>,
     received: &[u8],
 ) {
-    let connection = http_connections.entry(handle).or_default();
-    flush_plain_http_response(socket, connection);
-    poll_upstream_stream(connection);
-    if connection.close_after_response && connection.response.is_empty() {
+    let Some(destination) = original_http_destination(socket, nat) else {
         socket.close();
         return;
-    }
-
-    if !received.is_empty() {
-        connection.request.extend_from_slice(received);
-    }
-
-    while socket.can_recv() {
-        let mut chunk = [0; TLS_READ_BUFFER_BYTES];
-        let received = socket.recv_slice(&mut chunk).unwrap_or(0);
-        if received == 0 {
-            break;
-        }
-        connection.request.extend_from_slice(&chunk[..received]);
-    }
-
-    if http_expects_continue(&connection.request) && !connection.continue_sent {
+    };
+    if outbound_rules
+        .is_some_and(|rules| !is_allowed_outbound_tcp(&destination.ip, destination.port, rules))
+    {
+        let connection = http_connections.entry(handle).or_default();
         connection
-            .response
-            .extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
-        connection.continue_sent = true;
-        flush_plain_http_response(socket, connection);
-    }
-
-    if !http_request_ready(&connection.request) {
-        return;
-    }
-
-    let Some(request) = parse_http_request(socket, nat, &connection.request, None) else {
-        connection.request.clear();
-        connection.response = upstream_failure_response();
+            .to_guest
+            .extend_from_slice(OUTBOUND_DENIED_RESPONSE);
         connection.close_after_response = true;
-        flush_plain_http_response(socket, connection);
+        flush_plain_proxy_response(socket, connection);
+        if connection.to_guest.is_empty() {
+            socket.close();
+        }
+        return;
+    }
+
+    let Some(proxy_port) = http_proxy_port else {
+        let connection = http_connections.entry(handle).or_default();
+        connection
+            .to_guest
+            .extend_from_slice(HOST_HTTP_PROBE_RESPONSE);
+        connection.close_after_response = true;
+        flush_plain_proxy_response(socket, connection);
+        if connection.to_guest.is_empty() {
+            socket.close();
+        }
         return;
     };
-    connection.request.clear();
-    let response = match handler {
-        Some(handler) => {
-            let mut policy_request = request.clone();
-            policy_request.body.clear();
-            handler.handle_http_request(policy_request).ok()
+
+    let connection = http_connections.entry(handle).or_insert_with(|| {
+        HttpConnection::connect_proxy(proxy_port, destination, None)
+            .unwrap_or_else(|_| HttpConnection::failed())
+    });
+    if connection.failed {
+        connection
+            .to_guest
+            .extend_from_slice(UPSTREAM_FAILURE_RESPONSE);
+        connection.close_after_response = true;
+    } else {
+        if !received.is_empty() {
+            connection.write_to_proxy(received);
         }
-        None => {
-            if outbound_rules.is_some_and(|rules| {
-                !is_allowed_outbound_tcp(&request.destination_ip, request.destination_port, rules)
-            }) {
-                connection.response = outbound_denied_response();
-                connection.close_after_response = true;
-                flush_plain_http_response(socket, connection);
-                return;
+        while socket.can_recv() {
+            let mut chunk = [0; TLS_READ_BUFFER_BYTES];
+            let received = socket.recv_slice(&mut chunk).unwrap_or(0);
+            if received == 0 {
+                break;
             }
-            connection.response = HOST_HTTP_PROBE_RESPONSE.to_vec();
-            connection.close_after_response = true;
-            flush_plain_http_response(socket, connection);
-            return;
+            connection.write_to_proxy(&chunk[..received]);
         }
-    };
-    match response {
-        Some(response) if response.status == 0 => {
-            connection.upstream = Some(start_plain_upstream_stream(
-                request,
-                response.headers,
-                response.upstream_ip,
-            ));
-            poll_upstream_stream(connection);
-        }
-        Some(response) => {
-            connection.response = encode_http_response(response);
-            connection.close_after_response = true;
-        }
-        None => {
-            connection.response = upstream_failure_response();
-            connection.close_after_response = true;
-        }
+        connection.read_from_proxy();
     }
-    flush_plain_http_response(socket, connection);
-    if connection.close_after_response && connection.response.is_empty() {
+    flush_plain_proxy_response(socket, connection);
+    if connection.close_after_response && connection.to_guest.is_empty() {
         socket.close();
     }
 }
@@ -462,7 +436,7 @@ fn poll_tls_http_socket(
     socket: &mut tcp::Socket<'_>,
     handle: SocketHandle,
     nat: &TransparentTcpNat,
-    handler: Option<&dyn HostHttpHandler>,
+    http_proxy_port: Option<u16>,
     tls_acceptor: Option<&TlsAcceptor>,
     tls_connections: &mut HashMap<SocketHandle, TlsConnection>,
     received: &[u8],
@@ -471,7 +445,7 @@ fn poll_tls_http_socket(
         socket.close();
         return;
     };
-    let Some(handler) = handler else {
+    let Some(proxy_port) = http_proxy_port else {
         socket.close();
         return;
     };
@@ -503,44 +477,28 @@ fn poll_tls_http_socket(
     }
     let mut plaintext = Vec::new();
     let _ = connection.tls.reader().read_to_end(&mut plaintext);
-    connection.request.extend_from_slice(&plaintext);
-    if http_expects_continue(&connection.request) && !connection.continue_sent {
-        let _ = connection
-            .tls
-            .writer()
-            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
-        connection.continue_sent = true;
-    }
-    if !connection.request.is_empty() && http_request_ready(&connection.request) {
-        if let Some(request) = parse_http_request(
-            socket,
-            nat,
-            &connection.request,
-            tls_metadata(&connection.tls),
-        ) {
-            connection.request.clear();
-            if let Ok(response) = handler.handle_http_request(request) {
-                let _ = connection
-                    .tls
-                    .writer()
-                    .write_all(&encode_http_response(response));
-            }
-            let mut encrypted = Vec::new();
-            let _ = connection.tls.write_tls(&mut encrypted);
-            if !encrypted.is_empty() {
-                let _ = socket.send_slice(&encrypted);
-            }
-            connection.tls.send_close_notify();
-            let mut close_notify = Vec::new();
-            let _ = connection.tls.write_tls(&mut close_notify);
-            if !close_notify.is_empty() {
-                let _ = socket.send_slice(&close_notify);
-            }
+    if connection.proxy.is_none() {
+        let Some(destination) = original_http_destination(socket, nat) else {
             socket.close();
             return;
+        };
+        connection.proxy = Some(
+            HttpConnection::connect_proxy(proxy_port, destination, tls_metadata(&connection.tls))
+                .unwrap_or_else(|_| HttpConnection::failed()),
+        );
+    }
+    if let Some(proxy) = connection.proxy.as_mut() {
+        if !plaintext.is_empty() {
+            proxy.write_to_proxy(&plaintext);
         }
-        socket.close();
-        return;
+        proxy.read_from_proxy();
+        if !proxy.to_guest.is_empty() {
+            let _ = connection.tls.writer().write_all(&proxy.to_guest);
+            proxy.to_guest.clear();
+        }
+        if proxy.close_after_response {
+            connection.tls.send_close_notify();
+        }
     }
 
     let mut encrypted = Vec::new();
@@ -548,178 +506,23 @@ fn poll_tls_http_socket(
     if !encrypted.is_empty() {
         let _ = socket.send_slice(&encrypted);
     }
-}
-
-fn poll_upstream_stream(connection: &mut HttpConnection) {
-    let Some(receiver) = connection.upstream.take() else {
-        return;
-    };
-    let mut finished = false;
-    while let Ok(chunk) = receiver.try_recv() {
-        match chunk {
-            Some(chunk) => connection.response.extend_from_slice(&chunk),
-            None => {
-                finished = true;
-                break;
-            }
-        }
-    }
-    if finished {
-        connection.close_after_response = true;
-    } else {
-        connection.upstream = Some(receiver);
+    if connection
+        .proxy
+        .as_ref()
+        .is_some_and(|proxy| proxy.close_after_response)
+    {
+        socket.close();
     }
 }
 
-fn flush_plain_http_response(socket: &mut tcp::Socket<'_>, connection: &mut HttpConnection) {
-    while socket.can_send() && !connection.response.is_empty() {
-        let sent = socket.send_slice(&connection.response).unwrap_or(0);
+fn flush_plain_proxy_response(socket: &mut tcp::Socket<'_>, connection: &mut HttpConnection) {
+    while socket.can_send() && !connection.to_guest.is_empty() {
+        let sent = socket.send_slice(&connection.to_guest).unwrap_or(0);
         if sent == 0 {
             break;
         }
-        connection.response.drain(..sent);
+        connection.to_guest.drain(..sent);
     }
-}
-
-fn parse_http_request(
-    socket: &tcp::Socket<'_>,
-    nat: &TransparentTcpNat,
-    bytes: &[u8],
-    tls: Option<HostTlsMetadata>,
-) -> Option<HostHttpRequest> {
-    let header_end = http_header_end(bytes)?;
-    let head = std::str::from_utf8(&bytes[..header_end]).ok()?;
-    let body = decode_http_body(head, &bytes[header_end + 4..])?;
-    let mut lines = head.split("\r\n");
-    let request_line = lines.next()?;
-    let mut request_parts = request_line.split_ascii_whitespace();
-    let method = request_parts.next()?.to_string();
-    let target = request_parts.next()?.to_string();
-    let remote = socket.remote_endpoint()?;
-    let local = socket.local_endpoint()?;
-    let destination_ip = nat.original_destination(remote.addr, remote.port, local.port)?;
-    let mut headers = Vec::new();
-    let mut host = None;
-    for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let name = name.trim().to_ascii_lowercase();
-        let value = value.trim().to_string();
-        if name == "host" {
-            host = Some(value.clone());
-        }
-        headers.push((name, value));
-    }
-    let authority = host.unwrap_or_else(|| destination_ip.clone());
-    let url = if target.starts_with("http://") || target.starts_with("https://") {
-        target
-    } else {
-        format!(
-            "{}://{authority}{target}",
-            if tls.is_some() { "https" } else { "http" }
-        )
-    };
-
-    Some(HostHttpRequest {
-        method,
-        url,
-        destination_ip,
-        destination_port: local.port,
-        headers,
-        body,
-        tls,
-    })
-}
-
-fn http_request_ready(bytes: &[u8]) -> bool {
-    let Some(header_end) = http_header_end(bytes) else {
-        return false;
-    };
-    let Ok(head) = std::str::from_utf8(&bytes[..header_end]) else {
-        return false;
-    };
-    let body = &bytes[header_end + 4..];
-    if http_header_value(head, "transfer-encoding")
-        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
-    {
-        return chunked_body_complete(body);
-    }
-    let content_length = http_header_value(head, "content-length")
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(0);
-    body.len() >= content_length
-}
-
-fn http_header_end(bytes: &[u8]) -> Option<usize> {
-    bytes.windows(4).position(|window| window == b"\r\n\r\n")
-}
-
-fn http_expects_continue(bytes: &[u8]) -> bool {
-    let Some(header_end) = http_header_end(bytes) else {
-        return false;
-    };
-    let Ok(head) = std::str::from_utf8(&bytes[..header_end]) else {
-        return false;
-    };
-    http_header_value(head, "expect")
-        .is_some_and(|value| value.eq_ignore_ascii_case("100-continue"))
-}
-
-fn http_header_value<'a>(head: &'a str, header: &str) -> Option<&'a str> {
-    head.split("\r\n")
-        .skip(1)
-        .filter_map(|line| line.split_once(':'))
-        .find_map(|(name, value)| name.eq_ignore_ascii_case(header).then_some(value.trim()))
-}
-
-fn decode_http_body(head: &str, body: &[u8]) -> Option<Vec<u8>> {
-    if http_header_value(head, "transfer-encoding")
-        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
-    {
-        return decode_chunked_body(body);
-    }
-    let content_length = http_header_value(head, "content-length")
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(0);
-    (body.len() >= content_length).then(|| body[..content_length].to_vec())
-}
-
-fn chunked_body_complete(body: &[u8]) -> bool {
-    decode_chunked_body(body).is_some()
-}
-
-fn decode_chunked_body(body: &[u8]) -> Option<Vec<u8>> {
-    let mut offset = 0;
-    let mut decoded = Vec::new();
-    loop {
-        let line_end = find_crlf(&body[offset..])?;
-        let size_line = std::str::from_utf8(&body[offset..offset + line_end]).ok()?;
-        let size_hex = size_line.split(';').next()?.trim();
-        let size = usize::from_str_radix(size_hex, 16).ok()?;
-        offset += line_end + 2;
-        if size == 0 {
-            let trailer_end = body[offset..]
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
-                .or_else(|| body[offset..].starts_with(b"\r\n").then_some(0))?;
-            let _ = trailer_end;
-            return Some(decoded);
-        }
-        if body.len() < offset + size + 2 {
-            return None;
-        }
-        decoded.extend_from_slice(&body[offset..offset + size]);
-        offset += size;
-        if body.get(offset..offset + 2) != Some(b"\r\n") {
-            return None;
-        }
-        offset += 2;
-    }
-}
-
-fn find_crlf(bytes: &[u8]) -> Option<usize> {
-    bytes.windows(2).position(|window| window == b"\r\n")
 }
 
 fn tls_metadata(connection: &rustls::ServerConnection) -> Option<HostTlsMetadata> {
@@ -732,35 +535,6 @@ fn tls_metadata(connection: &rustls::ServerConnection) -> Option<HostTlsMetadata
             .protocol_version()
             .map(|version| format!("{version:?}")),
     })
-}
-
-fn encode_http_response(response: HostHttpResponse) -> Vec<u8> {
-    let mut bytes = format!("HTTP/1.1 {} OK\r\n", response.status).into_bytes();
-    let has_content_length = response
-        .headers
-        .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case("content-length"));
-    for (name, value) in response.headers {
-        bytes.extend_from_slice(name.as_bytes());
-        bytes.extend_from_slice(b": ");
-        bytes.extend_from_slice(value.as_bytes());
-        bytes.extend_from_slice(b"\r\n");
-    }
-    if !has_content_length {
-        bytes.extend_from_slice(format!("content-length: {}\r\n", response.body.len()).as_bytes());
-    }
-    bytes.extend_from_slice(b"connection: close\r\n\r\n");
-    bytes.extend_from_slice(&response.body);
-    bytes
-}
-
-fn upstream_failure_response() -> Vec<u8> {
-    b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 20\r\nconnection: close\r\n\r\nupstream unavailable".to_vec()
-}
-
-fn outbound_denied_response() -> Vec<u8> {
-    b"HTTP/1.1 403 Forbidden\r\ncontent-length: 15\r\nconnection: close\r\n\r\noutbound denied"
-        .to_vec()
 }
 
 fn is_allowed_outbound_tcp(
@@ -810,138 +584,6 @@ fn is_public_ipv4_destination(destination_ip: &str) -> bool {
                 .iter()
                 .any(|range| range.contains(std::net::IpAddr::V4(destination)))
         })
-}
-
-fn start_plain_upstream_stream(
-    request: HostHttpRequest,
-    headers: Vec<(String, String)>,
-    upstream_ip: Option<String>,
-) -> Receiver<Option<Vec<u8>>> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        if let Err(sent_any) = stream_plain_upstream(request, headers, upstream_ip, &tx) {
-            if sent_any {
-                let _ = tx.send(None);
-                return;
-            }
-            let _ = tx.send(Some(upstream_failure_response()));
-        }
-        let _ = tx.send(None);
-    });
-    rx
-}
-
-fn stream_plain_upstream(
-    request: HostHttpRequest,
-    headers: Vec<(String, String)>,
-    upstream_ip: Option<String>,
-    tx: &mpsc::Sender<Option<Vec<u8>>>,
-) -> Result<(), bool> {
-    let parsed = ParsedHttpUrl::parse(&request.url).map_err(|_| false)?;
-    let mut sent_any = false;
-    let dial_host = upstream_ip.as_deref().unwrap_or(parsed.host.as_str());
-    let mut stream = TcpStream::connect((dial_host, parsed.port)).map_err(|_| sent_any)?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .map_err(|_| sent_any)?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(2)))
-        .map_err(|_| sent_any)?;
-    let outbound = encode_upstream_http_request(&request, &headers, &parsed);
-    stream.write_all(&outbound).map_err(|_| sent_any)?;
-
-    let mut buffer = [0; 16 * 1024];
-    loop {
-        let read = stream.read(&mut buffer).map_err(|_| sent_any)?;
-        if read == 0 {
-            break;
-        }
-        sent_any = true;
-        if tx.send(Some(buffer[..read].to_vec())).is_err() {
-            break;
-        }
-    }
-    Ok(())
-}
-
-fn encode_upstream_http_request(
-    request: &HostHttpRequest,
-    headers: &[(String, String)],
-    parsed: &ParsedHttpUrl,
-) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(format!("{} {} HTTP/1.1\r\n", request.method, parsed.path).as_bytes());
-    let mut has_host = false;
-    for (name, value) in headers {
-        let lower = name.to_ascii_lowercase();
-        if matches!(
-            lower.as_str(),
-            "connection"
-                | "content-length"
-                | "keep-alive"
-                | "proxy-authenticate"
-                | "proxy-authorization"
-                | "te"
-                | "trailer"
-                | "transfer-encoding"
-                | "upgrade"
-        ) {
-            continue;
-        }
-        if lower == "host" {
-            has_host = true;
-        }
-        bytes.extend_from_slice(name.as_bytes());
-        bytes.extend_from_slice(b": ");
-        bytes.extend_from_slice(value.as_bytes());
-        bytes.extend_from_slice(b"\r\n");
-    }
-    if !has_host {
-        bytes.extend_from_slice(format!("host: {}\r\n", parsed.authority).as_bytes());
-    }
-    if !request.body.is_empty() {
-        bytes.extend_from_slice(format!("content-length: {}\r\n", request.body.len()).as_bytes());
-    }
-    bytes.extend_from_slice(b"connection: close\r\n\r\n");
-    bytes.extend_from_slice(&request.body);
-    bytes
-}
-
-struct ParsedHttpUrl {
-    host: String,
-    port: u16,
-    authority: String,
-    path: String,
-}
-
-impl ParsedHttpUrl {
-    fn parse(url: &str) -> io::Result<Self> {
-        let rest = url.strip_prefix("http://").ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "only plain HTTP URLs can be streamed",
-            )
-        })?;
-        let (authority, path) = match rest.split_once('/') {
-            Some((authority, path)) => (authority, format!("/{path}")),
-            None => (rest, "/".to_string()),
-        };
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((host, port)) => {
-                let port = port.parse::<u16>().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "invalid HTTP upstream port")
-                })?;
-                (host.to_string(), port)
-            }
-            None => (authority.to_string(), 80),
-        };
-        Ok(Self {
-            host,
-            port,
-            authority: authority.to_string(),
-            path,
-        })
-    }
 }
 
 fn dns_response(request: &[u8]) -> Option<Vec<u8>> {
@@ -1165,19 +807,118 @@ struct TlsAcceptor {
     config: Arc<rustls::ServerConfig>,
 }
 
-#[derive(Default)]
 struct HttpConnection {
-    request: Vec<u8>,
-    response: Vec<u8>,
+    proxy: Option<TcpStream>,
+    to_guest: Vec<u8>,
     close_after_response: bool,
-    continue_sent: bool,
-    upstream: Option<Receiver<Option<Vec<u8>>>>,
+    failed: bool,
+}
+
+impl Default for HttpConnection {
+    fn default() -> Self {
+        Self {
+            proxy: None,
+            to_guest: Vec::new(),
+            close_after_response: false,
+            failed: false,
+        }
+    }
 }
 
 struct TlsConnection {
     tls: rustls::ServerConnection,
-    request: Vec<u8>,
-    continue_sent: bool,
+    proxy: Option<HttpConnection>,
+}
+
+impl HttpConnection {
+    fn connect_proxy(
+        proxy_port: u16,
+        destination: HttpDestination,
+        tls: Option<HostTlsMetadata>,
+    ) -> io::Result<Self> {
+        let mut proxy = TcpStream::connect(("127.0.0.1", proxy_port))?;
+        proxy.set_nonblocking(true)?;
+        let preface = proxy_preface(destination, tls);
+        write_all_nonblocking(&mut proxy, preface.as_bytes())?;
+        Ok(Self {
+            proxy: Some(proxy),
+            to_guest: Vec::new(),
+            close_after_response: false,
+            failed: false,
+        })
+    }
+
+    fn failed() -> Self {
+        Self {
+            proxy: None,
+            to_guest: Vec::new(),
+            close_after_response: true,
+            failed: true,
+        }
+    }
+
+    fn write_to_proxy(&mut self, bytes: &[u8]) {
+        let Some(proxy) = self.proxy.as_mut() else {
+            return;
+        };
+        if write_all_nonblocking(proxy, bytes).is_err() {
+            self.close_after_response = true;
+        }
+    }
+
+    fn read_from_proxy(&mut self) {
+        let Some(proxy) = self.proxy.as_mut() else {
+            return;
+        };
+        let mut buffer = [0; 16 * 1024];
+        loop {
+            match proxy.read(&mut buffer) {
+                Ok(0) => {
+                    self.close_after_response = true;
+                    return;
+                }
+                Ok(read) => self.to_guest.extend_from_slice(&buffer[..read]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
+                Err(_) => {
+                    self.close_after_response = true;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn write_all_nonblocking(stream: &mut TcpStream, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        match stream.write(bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "proxy write closed",
+                ));
+            }
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => thread::yield_now(),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn proxy_preface(destination: HttpDestination, tls: Option<HostTlsMetadata>) -> String {
+    let tls = tls.unwrap_or(HostTlsMetadata {
+        server_name: None,
+        alpn_protocol: None,
+        protocol: None,
+    });
+    format!(
+        "SANDBOX_HTTP_PROXY 1 {} {} {} {} {}\n",
+        destination.ip,
+        destination.port,
+        tls.server_name.unwrap_or_else(|| "-".to_string()),
+        tls.alpn_protocol.unwrap_or_else(|| "-".to_string()),
+        tls.protocol.unwrap_or_else(|| "-".to_string()),
+    )
 }
 
 impl TlsAcceptor {
@@ -1200,8 +941,7 @@ impl TlsAcceptor {
         TlsConnection {
             tls: rustls::ServerConnection::new(self.config.clone())
                 .expect("TLS server config should create connections"),
-            request: Vec::new(),
-            continue_sent: false,
+            proxy: None,
         }
     }
 }
