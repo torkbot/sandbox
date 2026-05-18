@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "crates/sandbox",
+    "crates/sandbox-host",
+    "crates/sandbox-init",
+    "crates/sandbox-node",
+    "crates/sandbox-protocol",
+]
+exclude = ["deps/libkrun"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/torkbot/sandbox"

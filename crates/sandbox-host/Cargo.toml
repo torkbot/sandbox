@@ -1,0 +1,11 @@
+[package]
+name = "sandbox-host"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bson = "3.1"
+libc = "0.2"
+sandbox = { path = "../sandbox" }

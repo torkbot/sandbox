@@ -1,0 +1,12 @@
+[package]
+name = "sandbox-protocol"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bson = "3.1"
+
+[lib]
+crate-type = ["rlib"]

@@ -1,0 +1,247 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { Binary, BSON } from "bson";
+import {
+  HostControlTransport,
+  type HostControlChannel,
+} from "../../src/control.ts";
+
+test("HostControlTransport yields emitted events", async () => {
+  const control = new HostControlTransport();
+  const next = control.incoming[Symbol.asyncIterator]().next();
+
+  control.emit({
+    type: "init.ready",
+    guest: {
+      root: { readonly: true },
+      init: { name: "sandbox-init" },
+    },
+  });
+
+  assert.deepEqual(await next, {
+    done: false,
+    value: {
+      type: "init.ready",
+      guest: {
+        root: { readonly: true },
+        init: { name: "sandbox-init" },
+      },
+    },
+  });
+});
+
+test("HostControlTransport closes its event stream", async () => {
+  const control = new HostControlTransport();
+  const iterator = control.incoming[Symbol.asyncIterator]();
+
+  await control.close();
+
+  assert.deepEqual(await iterator.next(), {
+    done: true,
+    value: undefined,
+  });
+});
+
+test("HostControlTransport fails sends until native channel is connected", async () => {
+  const control = new HostControlTransport();
+
+  await assert.rejects(
+    control.exec({ id: "test", argv: ["/bin/true"] }),
+    /sandbox control send is not connected yet/,
+  );
+});
+
+test("HostControlTransport sends commands as packets", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+
+  await control.send({
+    type: "guest.exec",
+    id: "test",
+    argv: ["/bin/true"],
+  });
+
+  const write = channel.writes[0];
+  assert.ok(write);
+  assert.deepEqual(BSON.deserialize(write.subarray(4)), {
+    type: "guest.exec",
+    id: "test",
+    argv: ["/bin/true"],
+    env: [],
+  });
+  await control.close();
+});
+
+test("HostControlTransport pumps native packets into incoming events", async () => {
+  const channel = new MemoryControlChannel();
+  channel.reads.push(
+    encodePacket({
+      type: "init.ready",
+      rootReadonly: true,
+      initName: "sandbox-init",
+    }),
+  );
+  const control = new HostControlTransport({ channel });
+
+  assert.deepEqual(await control.incoming[Symbol.asyncIterator]().next(), {
+    done: false,
+    value: {
+      type: "init.ready",
+      guest: {
+        root: { readonly: true },
+        init: { name: "sandbox-init" },
+      },
+    },
+  });
+  await control.close();
+});
+
+test("HostControlTransport exec waits for matching completion", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const exec = control.exec({ id: "test", argv: ["/bin/true"] });
+
+  channel.reads.push(
+    encodePacket({
+      type: "guest.exec.complete",
+      id: "test",
+      exitCode: 0,
+      stdout: new Binary(new TextEncoder().encode("ok\n")),
+      stderr: new Binary(new Uint8Array()),
+    }),
+  );
+
+  assert.deepEqual(await exec, {
+    type: "guest.exec.complete",
+    id: "test",
+    exitCode: 0,
+    stdout: "ok\n",
+    stderr: "",
+  });
+  await control.close();
+});
+
+test("HostControlTransport demultiplexes concurrent exec completions", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const first = control.exec({ id: "first", argv: ["/bin/true"] });
+  const second = control.exec({ id: "second", argv: ["/bin/true"] });
+
+  channel.reads.push(
+    encodePacket({
+      type: "guest.exec.complete",
+      id: "second",
+      exitCode: 0,
+      stdout: new Binary(new TextEncoder().encode("second")),
+      stderr: new Binary(new Uint8Array()),
+    }),
+    encodePacket({
+      type: "guest.exec.complete",
+      id: "first",
+      exitCode: 0,
+      stdout: new Binary(new TextEncoder().encode("first")),
+      stderr: new Binary(new Uint8Array()),
+    }),
+  );
+
+  assert.equal((await first).stdout, "first");
+  assert.equal((await second).stdout, "second");
+  await control.close();
+});
+
+test("HostControlTransport exec is not starved by incoming consumers", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const iterator = control.incoming[Symbol.asyncIterator]();
+  const exec = control.exec({ id: "test", argv: ["/bin/true"] });
+
+  channel.reads.push(
+    encodePacket({
+      type: "guest.exec.complete",
+      id: "test",
+      exitCode: 0,
+      stdout: new Binary(new TextEncoder().encode("ok")),
+      stderr: new Binary(new Uint8Array()),
+    }),
+  );
+
+  assert.deepEqual(await exec, {
+    type: "guest.exec.complete",
+    id: "test",
+    exitCode: 0,
+    stdout: "ok",
+    stderr: "",
+  });
+  assert.deepEqual(await iterator.next(), {
+    done: false,
+    value: {
+      type: "guest.exec.complete",
+      id: "test",
+      exitCode: 0,
+      stdout: "ok",
+      stderr: "",
+    },
+  });
+  await control.close();
+});
+
+test("HostControlTransport rejects duplicate in-flight exec ids", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const first = control.exec({ id: "duplicate", argv: ["/bin/true"] });
+
+  await assert.rejects(
+    control.exec({ id: "duplicate", argv: ["/bin/true"] }),
+    /sandbox exec id is already in flight: duplicate/,
+  );
+
+  channel.reads.push(
+    encodePacket({
+      type: "guest.exec.complete",
+      id: "duplicate",
+      exitCode: 0,
+      stdout: new Binary(new TextEncoder().encode("ok")),
+      stderr: new Binary(new Uint8Array()),
+    }),
+  );
+
+  assert.equal((await first).stdout, "ok");
+  await control.close();
+});
+
+test("HostControlTransport closes and rejects pending execs on malformed frames", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const iterator = control.incoming[Symbol.asyncIterator]();
+  const exec = control.exec({ id: "pending", argv: ["/bin/true"] });
+
+  channel.reads.push(encodePacket({ type: "unknown.control.frame" }));
+
+  await assert.rejects(exec, /unknown control frame type: unknown.control.frame/);
+  await assert.rejects(iterator.next(), /unknown control frame type: unknown.control.frame/);
+  await assert.rejects(
+    control.exec({ id: "after-failure", argv: ["/bin/true"] }),
+    /sandbox control is closed/,
+  );
+});
+
+class MemoryControlChannel implements HostControlChannel {
+  readonly writes: Uint8Array[] = [];
+  readonly reads: Uint8Array[] = [];
+
+  writeControlPacket(packet: Uint8Array): void {
+    this.writes.push(packet);
+  }
+
+  tryReadControlPacket(): Uint8Array | null {
+    return this.reads.shift() ?? null;
+  }
+}
+
+function encodePacket(document: Record<string, unknown>): Uint8Array {
+  const frame = BSON.serialize(document);
+  const packet = new Uint8Array(4 + frame.byteLength);
+  new DataView(packet.buffer, packet.byteOffset, 4).setUint32(0, frame.byteLength, true);
+  packet.set(frame, 4);
+  return packet;
+}

@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: Typecheck and unit tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-15
+          - ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux host dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm pkg-config build-essential
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck TypeScript
+        run: npm run typecheck
+
+      - name: Check Rust workspace
+        run: cargo check --workspace
+
+      - name: Test Rust workspace
+        run: npm run test:rust
+
+      - name: Build native module
+        run: npm run build:native
+
+      - name: Run unit tests
+        run: npm run test:unit
+
+  e2e-linux:
+    name: Build fixtures and run e2e (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm pkg-config build-essential
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build kernel fixture
+        run: npm run build:kernel
+
+      - name: Build sandbox init fixture
+        run: npm run build:init
+
+      - name: Build libkrun stage-0 init fixture
+        run: npm run build:libkrun-init
+
+      - name: Build rootfs fixture
+        run: |
+          npm run build:rootfs
+          npm run build:rootfs:erofs
+
+      - name: Build package artifacts
+        run: npm run build
+
+      - name: Run artifact tests
+        run: npm run test:artifact
+
+      - name: Run e2e tests
+        run: npm run test:e2e
