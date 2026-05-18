@@ -398,6 +398,7 @@ impl NodeVirtualFs {
 
     fn rename_path(&self, from: &str, to: &str) {
         let mut state = self.state.lock().expect("vfs inode state lock poisoned");
+        forget_path_tree(&mut state, to);
         let prefix = format!("{from}/");
         let replacements = state
             .paths_by_inode
@@ -416,6 +417,22 @@ impl NodeVirtualFs {
                 state.inodes_by_path.remove(&previous_path);
             }
             state.inodes_by_path.insert(next_path, inode);
+        }
+    }
+}
+
+fn forget_path_tree(state: &mut NodeVirtualFsState, path: &str) {
+    let prefix = format!("{path}/");
+    let forgotten = state
+        .paths_by_inode
+        .iter()
+        .filter_map(|(inode, candidate)| {
+            (candidate == path || candidate.starts_with(&prefix)).then_some(*inode)
+        })
+        .collect::<Vec<_>>();
+    for inode in forgotten {
+        if let Some(path) = state.paths_by_inode.remove(&inode) {
+            state.inodes_by_path.remove(&path);
         }
     }
 }
@@ -466,6 +483,7 @@ fn stat_size(stat: &Document) -> u64 {
     match stat.get("sizeBytes") {
         Some(Bson::Int32(value)) => (*value).max(0) as u64,
         Some(Bson::Int64(value)) => (*value).max(0) as u64,
+        Some(Bson::Double(value)) if value.is_finite() && *value > 0.0 => *value as u64,
         _ => 0,
     }
 }

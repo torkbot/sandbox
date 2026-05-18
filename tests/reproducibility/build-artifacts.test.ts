@@ -2,13 +2,15 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { lstat, mkdtemp, readFile, readlink, readdir, rm } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readlink, readdir, rm } from "node:fs/promises";
 import { join, relative } from "node:path";
 
 const repoRoot = new URL("../..", import.meta.url);
 
 test("rootfs fixture builds reproducibly", async () => {
-  const workDir = await mkdtemp(join(repoRoot.pathname, "test-results/rootfs-repro-"));
+  const resultsDir = join(repoRoot.pathname, "test-results");
+  await mkdir(resultsDir, { recursive: true });
+  const workDir = await mkdtemp(join(resultsDir, "rootfs-repro-"));
   try {
     const firstDir = join(workDir, "rootfs-a");
     const secondDir = join(workDir, "rootfs-b");

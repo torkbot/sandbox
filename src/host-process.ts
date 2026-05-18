@@ -139,6 +139,11 @@ class HostHttpProxy {
       if (decision.action !== "allow") {
         throw new Error(`HTTP policy returned unsupported action: ${String((decision as { action?: unknown }).action)}`);
       }
+      if (protection.unresolved) {
+        response.writeHead(502, { "content-type": "text/plain" });
+        response.end("upstream unavailable");
+        return;
+      }
 
       const upstream = createUpstreamRequest(policyRequest.url, {
         method: policyRequest.method,
@@ -186,6 +191,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
   #stderr = "";
   #closed = false;
   #exitError: Error | null = null;
+  #stdinError: Error | null = null;
 
   private constructor(
     child: ChildProcessWithoutNullStreams,
@@ -207,6 +213,12 @@ export class HostProcessSandboxVm implements HostControlChannel {
       const text = chunk.toString("utf8").trim();
       if (text.length > 0) {
         this.#stderr = this.#stderr.length === 0 ? text : `${this.#stderr}\n${text}`;
+      }
+    });
+    child.stdin.on("error", (error: Error) => {
+      this.#stdinError = error;
+      if (this.#exitError === null) {
+        this.#exitError = new Error(`sandbox-host stdin failed: ${error.message}`);
       }
     });
     child.on("exit", (code, signal) => {
@@ -241,13 +253,13 @@ export class HostProcessSandboxVm implements HostControlChannel {
         throw error;
       }),
     ]);
-    child.stdin.write(encodeHostSpawn(withHostProxyPort(nativeOptions, httpProxy?.port)));
+    vm.#writeToHost(encodeHostSpawn(withHostProxyPort(nativeOptions, httpProxy?.port)));
     return vm;
   }
 
   writeControlPacket(packet: Uint8Array): void {
     this.#assertOpen();
-    this.#child.stdin.write(packet);
+    this.#writeToHost(packet);
   }
 
   tryReadControlPacket(): Uint8Array | null {
@@ -308,9 +320,27 @@ export class HostProcessSandboxVm implements HostControlChannel {
     if (this.#closed) {
       throw new Error("sandbox VM is closed");
     }
+    if (this.#stdinError !== null) {
+      throw this.#stdinError;
+    }
     if (this.#exitError !== null) {
       throw this.#exitError;
     }
+  }
+
+  #writeToHost(packet: Uint8Array): void {
+    this.#assertOpen();
+    if (!this.#child.stdin.writable) {
+      throw new Error("sandbox-host stdin is closed");
+    }
+    this.#child.stdin.write(packet, (error) => {
+      if (error !== null && error !== undefined) {
+        this.#stdinError = error;
+        if (this.#exitError === null) {
+          this.#exitError = new Error(`sandbox-host stdin failed: ${error.message}`);
+        }
+      }
+    });
   }
 
   #receive(chunk: Uint8Array): void {
@@ -747,18 +777,20 @@ function isProtectedDestination(destinationIp: string, ranges: readonly string[]
 async function inspectHttpProtection(
   request: HttpPolicyRequest,
   rules: readonly OutboundNetworkRule[],
-): Promise<{ readonly blocked: boolean; readonly upstreamIp?: string }> {
+): Promise<{ readonly blocked: boolean; readonly unresolved?: boolean; readonly upstreamIp?: string }> {
   const parsed = new URL(request.url);
   const upstreamPort = parsed.port.length === 0
     ? (parsed.protocol === "https:" ? 443 : 80)
     : Number(parsed.port);
 
-  const destinationPort = request.tls === undefined ? request.destinationPort : 443;
-  if (!isAllowedTcpDestination(request.destinationIp, destinationPort, rules)) {
+  if (!isAllowedTcpDestination(request.destinationIp, request.destinationPort, rules)) {
     return { blocked: true };
   }
 
   const addresses = await resolveUrlAddresses(request.url);
+  if (addresses.length === 0) {
+    return { blocked: false, unresolved: true };
+  }
   for (const address of addresses) {
     if (!isAllowedTcpDestination(address, upstreamPort, rules)) {
       return { blocked: true };

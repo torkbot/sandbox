@@ -130,6 +130,38 @@ test("spawnSandbox rejects nested mount paths before runtime launch", async () =
   );
 });
 
+test("spawnSandbox rejects root and dot-component mount paths before runtime launch", async () => {
+  const fileSystem = unreachableFileSystem();
+
+  await assert.rejects(
+    spawnSandbox({
+      kernel: projectKernel(),
+      init: projectInit(),
+      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
+        format: "erofs",
+      }),
+      mounts: [
+        virtualFsMount("/", fileSystem),
+      ],
+    }),
+    /invalid spawnSandbox options: mount\.path must not be root/,
+  );
+
+  await assert.rejects(
+    spawnSandbox({
+      kernel: projectKernel(),
+      init: projectInit(),
+      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
+        format: "erofs",
+      }),
+      mounts: [
+        virtualFsMount("/tmp/../proc", fileSystem),
+      ],
+    }),
+    /invalid spawnSandbox options: mount\.path must not contain '\.' or '\.\.' components/,
+  );
+});
+
 test("spawnSandbox rejects mount paths that cannot be encoded for guest init", async () => {
   await assert.rejects(
     spawnSandbox({

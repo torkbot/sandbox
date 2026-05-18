@@ -610,7 +610,7 @@ function interceptedHttpArgs(url: string): string[] {
 
 function localHttpOutboundRules() {
   return [
-    acceptTcp({ cidr: "203.0.113.10/32", ports: [80, 443] }),
+    acceptTcp({ cidr: "203.0.113.10/32", ports: [80, 443, 8443] }),
     acceptTcp({ cidr: "127.0.0.1/32" }),
   ];
 }

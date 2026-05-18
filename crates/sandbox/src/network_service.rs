@@ -898,7 +898,7 @@ fn write_all_nonblocking(stream: &mut TcpStream, mut bytes: &[u8]) -> io::Result
                 ));
             }
             Ok(written) => bytes = &bytes[written..],
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => thread::yield_now(),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Err(error),
             Err(error) => return Err(error),
         }
     }

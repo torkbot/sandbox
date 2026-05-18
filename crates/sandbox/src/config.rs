@@ -277,8 +277,20 @@ impl MountSpec {
         if !input.path.starts_with('/') {
             return Err(SpecError::new("mount.path must be absolute"));
         }
+        if input.path == "/" {
+            return Err(SpecError::new("mount.path must not be root"));
+        }
         if input.path.contains('=') || input.path.contains(';') {
             return Err(SpecError::new("mount.path must not contain '=' or ';'"));
+        }
+        if input
+            .path
+            .split('/')
+            .any(|component| component == "." || component == "..")
+        {
+            return Err(SpecError::new(
+                "mount.path must not contain '.' or '..' components",
+            ));
         }
 
         match input.kind.as_str() {

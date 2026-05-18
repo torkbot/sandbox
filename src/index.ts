@@ -581,11 +581,17 @@ function validateGuestPath(path: string, field: "mount.path" | "binding.path"): 
   if (!path.startsWith("/")) {
     throw new Error(`invalid spawnSandbox options: ${field} must be absolute`);
   }
+  if (path === "/") {
+    throw new Error(`invalid spawnSandbox options: ${field} must not be root`);
+  }
   if (path.includes("\0")) {
     throw new Error(`invalid spawnSandbox options: ${field} must not contain NUL bytes`);
   }
   if (path.includes("=") || path.includes(";")) {
     throw new Error(`invalid spawnSandbox options: ${field} must not contain '=' or ';'`);
+  }
+  if (path.split("/").some((component) => component === "." || component === "..")) {
+    throw new Error(`invalid spawnSandbox options: ${field} must not contain '.' or '..' components`);
   }
 }
 
