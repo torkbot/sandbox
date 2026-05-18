@@ -804,6 +804,7 @@ function encodeHostSpawn(options: NativeSpawnSandboxOptions): Uint8Array {
     rootfsFormat: options.rootfs.format,
     rootfsOverlayMode: options.rootfsOverlay?.mode,
     mounts: options.mounts ?? [],
+    networkOutbound: options.network?.outbound,
     networkHttp: options.network?.http === undefined
       ? undefined
       : {},

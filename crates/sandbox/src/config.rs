@@ -59,7 +59,26 @@ pub enum MountSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkSpec {
+    pub outbound: Option<OutboundSpec>,
     pub http: Option<HttpSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundSpec {
+    pub policy: OutboundPolicy,
+    pub rules: Vec<OutboundRuleSpec>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundPolicy {
+    Deny,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutboundRuleSpec {
+    AcceptTcp { cidr: String, ports: Vec<u16> },
+    AcceptUdp { cidr: String, ports: Vec<u16> },
+    AcceptPublicInternet { ports: Vec<u16> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,17 +165,20 @@ impl MicroVmSpec {
         crate::mounts::MountTable::plan(&mounts)
             .map_err(|error| SpecError::new(error.to_string()))?;
 
-        let network = input.network_http.map(|http| NetworkSpec {
-            http: Some(HttpSpec {
-                protected_ranges: http.protected_ranges,
-                ca_certificate_pem: http.ca_certificate_pem,
-                ca_private_key_pem: http.ca_private_key_pem,
-            }),
-        });
-        crate::network::NetworkPlan::from_http(
-            network.as_ref().and_then(|network| network.http.as_ref()),
-        )
-        .map_err(|error| SpecError::new(error.to_string()))?;
+        let network = if input.network_outbound.is_some() || input.network_http.is_some() {
+            Some(NetworkSpec {
+                outbound: input.network_outbound,
+                http: input.network_http.map(|http| HttpSpec {
+                    protected_ranges: http.protected_ranges,
+                    ca_certificate_pem: http.ca_certificate_pem,
+                    ca_private_key_pem: http.ca_private_key_pem,
+                }),
+            })
+        } else {
+            None
+        };
+        crate::network::NetworkPlan::from_spec(network.as_ref())
+            .map_err(|error| SpecError::new(error.to_string()))?;
 
         Ok(Self {
             name: input.name,
@@ -242,6 +264,7 @@ pub struct MicroVmSpecInput {
     pub rootfs_format: String,
     pub rootfs_overlay_mode: Option<String>,
     pub mounts: Vec<MountSpecInput>,
+    pub network_outbound: Option<OutboundSpec>,
     pub network_http: Option<HttpSpecInput>,
 }
 
@@ -275,6 +298,7 @@ mod tests {
             rootfs_format: "erofs".to_string(),
             rootfs_overlay_mode: None,
             mounts: Vec::new(),
+            network_outbound: None,
             network_http: None,
         }
     }
@@ -300,6 +324,16 @@ mod tests {
             path: "/sandbox".to_string(),
             writable: Some(true),
         }];
+        input.network_outbound = Some(OutboundSpec {
+            policy: OutboundPolicy::Deny,
+            rules: vec![
+                OutboundRuleSpec::AcceptTcp {
+                    cidr: "127.0.0.1/32".to_string(),
+                    ports: vec![80],
+                },
+                OutboundRuleSpec::AcceptPublicInternet { ports: vec![443] },
+            ],
+        });
         input.network_http = Some(HttpSpecInput {
             protected_ranges: vec!["127.0.0.0/8".to_string()],
             ca_certificate_pem: Some(
@@ -320,10 +354,18 @@ mod tests {
                 writable: true,
             }],
         );
+        let network = spec.network.unwrap();
         assert_eq!(
-            spec.network.unwrap().http.unwrap().protected_ranges,
-            vec!["127.0.0.0/8"],
+            network.outbound.unwrap().rules,
+            vec![
+                OutboundRuleSpec::AcceptTcp {
+                    cidr: "127.0.0.1/32".to_string(),
+                    ports: vec![80],
+                },
+                OutboundRuleSpec::AcceptPublicInternet { ports: vec![443] },
+            ],
         );
+        assert_eq!(network.http.unwrap().protected_ranges, vec!["127.0.0.0/8"]);
     }
 
     #[test]

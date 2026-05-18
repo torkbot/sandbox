@@ -1,3 +1,5 @@
+import type { OutboundNetworkRule } from "./index.ts";
+
 import { createRequire } from "node:module";
 
 type NativeSandboxVm = {
@@ -37,6 +39,10 @@ export type NativeSpawnSandboxOptions = {
       }
   )[];
   readonly network?: {
+    readonly outbound?: {
+      readonly policy: "deny";
+      readonly rules: readonly OutboundNetworkRule[];
+    };
     readonly http?: Record<string, never>;
   };
 };

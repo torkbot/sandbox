@@ -494,6 +494,7 @@ function toNativeSpawnOptions(options: SandboxOptions): NativeSpawnSandboxOption
     network: options.network === undefined
       ? undefined
       : {
+          outbound: options.network.outbound,
           http: options.network.http === undefined
             ? undefined
             : {},

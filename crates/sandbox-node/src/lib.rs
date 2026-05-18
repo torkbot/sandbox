@@ -1,6 +1,8 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use sandbox::config::{HttpSpecInput, MicroVmSpecInput, MountSpecInput};
+use sandbox::config::{
+    HttpSpecInput, MicroVmSpecInput, MountSpecInput, OutboundPolicy, OutboundRuleSpec, OutboundSpec,
+};
 
 #[napi]
 pub struct NativeSandboxVm {
@@ -110,7 +112,23 @@ pub struct NativeHttpOptions {
 }
 
 #[napi(object)]
+pub struct NativeOutboundOptions {
+    pub policy: String,
+    pub rules: Vec<NativeOutboundRuleOptions>,
+}
+
+#[napi(object)]
+pub struct NativeOutboundRuleOptions {
+    pub action: String,
+    pub protocol: Option<String>,
+    pub cidr: Option<String>,
+    pub scope: Option<String>,
+    pub ports: Option<Vec<u16>>,
+}
+
+#[napi(object)]
 pub struct NativeNetworkOptions {
+    pub outbound: Option<NativeOutboundOptions>,
     pub http: Option<NativeHttpOptions>,
 }
 
@@ -181,6 +199,30 @@ impl NativeSpawnSandboxOptions {
                     writable: mount.writable,
                 })
                 .collect(),
+            network_outbound: self.network.as_ref().and_then(|network| {
+                network.outbound.as_ref().map(|outbound| OutboundSpec {
+                    policy: match outbound.policy.as_str() {
+                        "deny" => OutboundPolicy::Deny,
+                        _ => OutboundPolicy::Deny,
+                    },
+                    rules: outbound
+                        .rules
+                        .iter()
+                        .filter_map(|rule| {
+                            let ports = rule.ports.clone().unwrap_or_default();
+                            if rule.scope.as_deref() == Some("public-internet") {
+                                return Some(OutboundRuleSpec::AcceptPublicInternet { ports });
+                            }
+                            let cidr = rule.cidr.clone()?;
+                            match rule.protocol.as_deref() {
+                                Some("tcp") => Some(OutboundRuleSpec::AcceptTcp { cidr, ports }),
+                                Some("udp") => Some(OutboundRuleSpec::AcceptUdp { cidr, ports }),
+                                _ => None,
+                            }
+                        })
+                        .collect(),
+                })
+            }),
             network_http: self.network.and_then(|network| {
                 network.http.map(|http| HttpSpecInput {
                     protected_ranges: http.protected_ranges.unwrap_or_default(),

@@ -1,11 +1,24 @@
 use std::fmt;
 use std::net::IpAddr;
 
-use crate::config::HttpSpec;
+use crate::config::{HttpSpec, NetworkSpec, OutboundRuleSpec};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkPlan {
+    pub outbound: Option<OutboundPlan>,
     pub http: Option<HttpPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundPlan {
+    pub rules: Vec<OutboundRulePlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutboundRulePlan {
+    AcceptTcp { cidr: CidrRange, ports: Vec<u16> },
+    AcceptUdp { cidr: CidrRange, ports: Vec<u16> },
+    AcceptPublicInternet { ports: Vec<u16> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,20 +38,69 @@ pub struct NetworkError {
 }
 
 impl NetworkPlan {
+    pub fn from_spec(network: Option<&NetworkSpec>) -> Result<Option<Self>, NetworkError> {
+        let Some(network) = network else {
+            return Ok(None);
+        };
+
+        Ok(Some(Self {
+            outbound: network
+                .outbound
+                .as_ref()
+                .map(|outbound| {
+                    outbound
+                        .rules
+                        .iter()
+                        .map(OutboundRulePlan::parse)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map(|rules| OutboundPlan { rules })
+                })
+                .transpose()?,
+            http: Self::http_plan(network.http.as_ref())?,
+        }))
+    }
+
     pub fn from_http(http: Option<&HttpSpec>) -> Result<Option<Self>, NetworkError> {
         let Some(http) = http else {
             return Ok(None);
         };
 
         Ok(Some(Self {
-            http: Some(HttpPlan {
-                protected_ranges: http
-                    .protected_ranges
-                    .iter()
-                    .map(|range| CidrRange::parse(range))
-                    .collect::<Result<Vec<_>, _>>()?,
-            }),
+            outbound: None,
+            http: Self::http_plan(Some(http))?,
         }))
+    }
+
+    fn http_plan(http: Option<&HttpSpec>) -> Result<Option<HttpPlan>, NetworkError> {
+        let Some(http) = http else {
+            return Ok(None);
+        };
+
+        Ok(Some(HttpPlan {
+            protected_ranges: http
+                .protected_ranges
+                .iter()
+                .map(|range| CidrRange::parse(range))
+                .collect::<Result<Vec<_>, _>>()?,
+        }))
+    }
+}
+
+impl OutboundRulePlan {
+    fn parse(rule: &OutboundRuleSpec) -> Result<Self, NetworkError> {
+        match rule {
+            OutboundRuleSpec::AcceptTcp { cidr, ports } => Ok(Self::AcceptTcp {
+                cidr: CidrRange::parse(cidr)?,
+                ports: ports.clone(),
+            }),
+            OutboundRuleSpec::AcceptUdp { cidr, ports } => Ok(Self::AcceptUdp {
+                cidr: CidrRange::parse(cidr)?,
+                ports: ports.clone(),
+            }),
+            OutboundRuleSpec::AcceptPublicInternet { ports } => Ok(Self::AcceptPublicInternet {
+                ports: ports.clone(),
+            }),
+        }
     }
 }
 
@@ -86,6 +148,7 @@ impl std::error::Error for NetworkError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{NetworkSpec, OutboundPolicy, OutboundSpec};
 
     #[test]
     fn parses_ipv4_and_ipv6_protected_ranges() {
@@ -98,6 +161,31 @@ mod tests {
         .unwrap();
 
         assert_eq!(plan.http.unwrap().protected_ranges.len(), 2);
+    }
+
+    #[test]
+    fn parses_outbound_rules() {
+        let plan = NetworkPlan::from_spec(Some(&NetworkSpec {
+            outbound: Some(OutboundSpec {
+                policy: OutboundPolicy::Deny,
+                rules: vec![
+                    OutboundRuleSpec::AcceptTcp {
+                        cidr: "127.0.0.1/32".to_string(),
+                        ports: vec![80],
+                    },
+                    OutboundRuleSpec::AcceptUdp {
+                        cidr: "10.0.2.0/24".to_string(),
+                        ports: vec![53],
+                    },
+                    OutboundRuleSpec::AcceptPublicInternet { ports: vec![443] },
+                ],
+            }),
+            http: None,
+        }))
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(plan.outbound.unwrap().rules.len(), 3);
     }
 
     #[test]

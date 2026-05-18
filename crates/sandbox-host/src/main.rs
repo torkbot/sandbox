@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use bson::Document;
 use sandbox::config::MountSpec;
-use sandbox::config::{HttpSpecInput, MicroVmSpecInput, MountSpecInput};
+use sandbox::config::{
+    HttpSpecInput, MicroVmSpecInput, MountSpecInput, OutboundPolicy, OutboundRuleSpec, OutboundSpec,
+};
 use sandbox::runtime::{HostServices, VirtualFsDevice};
 
 mod host_vfs;
@@ -167,6 +169,7 @@ fn parse_spawn(document: Document) -> Result<MicroVmSpecInput, Box<dyn std::erro
         rootfs_format: document.get_str("rootfsFormat")?.to_string(),
         rootfs_overlay_mode: optional_string(&document, "rootfsOverlayMode"),
         mounts: parse_mounts(document.get_array("mounts")?)?,
+        network_outbound: parse_network_outbound(document.get_document("networkOutbound").ok())?,
         network_http: parse_network_http(document.get_document("networkHttp").ok())?,
     })
 }
@@ -181,6 +184,61 @@ fn parse_mounts(values: &[bson::Bson]) -> Result<Vec<MountSpecInput>, Box<dyn st
                 path: document.get_str("path")?.to_string(),
                 writable: optional_bool(document, "writable"),
             })
+        })
+        .collect()
+}
+
+fn parse_network_outbound(
+    document: Option<&Document>,
+) -> Result<Option<OutboundSpec>, Box<dyn std::error::Error>> {
+    let Some(document) = document else {
+        return Ok(None);
+    };
+    let policy = match document.get_str("policy")? {
+        "deny" => OutboundPolicy::Deny,
+        other => return Err(format!("unsupported networkOutbound.policy: {other}").into()),
+    };
+    let rules = document
+        .get_array("rules")?
+        .iter()
+        .map(|value| {
+            let document = value
+                .as_document()
+                .ok_or("network outbound rule must be a document")?;
+            if document.get_str("action")? != "accept" {
+                return Err("network outbound rule action must be accept".into());
+            }
+            let ports = parse_ports(document)?;
+            if document.get_str("scope").ok() == Some("public-internet") {
+                return Ok(OutboundRuleSpec::AcceptPublicInternet { ports });
+            }
+            let cidr = document.get_str("cidr")?.to_string();
+            match document.get_str("protocol")? {
+                "tcp" => Ok(OutboundRuleSpec::AcceptTcp { cidr, ports }),
+                "udp" => Ok(OutboundRuleSpec::AcceptUdp { cidr, ports }),
+                other => Err(format!("unsupported network outbound protocol: {other}").into()),
+            }
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+
+    Ok(Some(OutboundSpec { policy, rules }))
+}
+
+fn parse_ports(document: &Document) -> Result<Vec<u16>, Box<dyn std::error::Error>> {
+    let Some(values) = document.get_array("ports").ok() else {
+        return Ok(Vec::new());
+    };
+    values
+        .iter()
+        .map(|value| {
+            let port = value
+                .as_i32()
+                .ok_or("network outbound port must be an integer")?;
+            let port = u16::try_from(port)?;
+            if port == 0 {
+                return Err("network outbound port must be greater than zero".into());
+            }
+            Ok(port)
         })
         .collect()
 }

@@ -527,6 +527,7 @@ mod tests {
             rootfs_format: "erofs".to_string(),
             rootfs_overlay_mode: None,
             mounts: Vec::new(),
+            network_outbound: None,
             network_http: None,
         })
         .unwrap();
@@ -548,6 +549,7 @@ mod tests {
             rootfs_format: "directory".to_string(),
             rootfs_overlay_mode: None,
             mounts: Vec::new(),
+            network_outbound: None,
             network_http: None,
         })
         .unwrap_err();
@@ -571,6 +573,7 @@ mod tests {
             rootfs_format: "erofs".to_string(),
             rootfs_overlay_mode: None,
             mounts: Vec::new(),
+            network_outbound: None,
             network_http: None,
         })
         .unwrap();
@@ -602,6 +605,7 @@ mod tests {
             rootfs_format: "erofs".to_string(),
             rootfs_overlay_mode: None,
             mounts: Vec::new(),
+            network_outbound: None,
             network_http: None,
         })
         .unwrap();
@@ -667,6 +671,7 @@ mod tests {
             rootfs_format: "erofs".to_string(),
             rootfs_overlay_mode: None,
             mounts: Vec::new(),
+            network_outbound: None,
             network_http: None,
         })
         .unwrap();
