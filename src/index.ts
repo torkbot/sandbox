@@ -530,14 +530,7 @@ function validateSandboxOptions(options: SandboxOptions): void {
   if (options.init.crate !== "sandbox-init") {
     throw new Error(`invalid spawnSandbox options: unsupported init crate: ${options.init.crate}`);
   }
-  if (options.rootfs.kind === "prebuilt-rootfs") {
-    if (options.rootfs.path.length === 0) {
-      throw new Error("invalid spawnSandbox options: rootfs.path must not be empty");
-    }
-    if (options.rootfs.format === "directory") {
-      throw new Error("invalid spawnSandbox options: directory rootfs is not supported for sandboxed VM launch; use an EROFS rootfs");
-    }
-  }
+  validateRootfsConfig(options.rootfs, "rootfs");
 
   const mountPaths = new Set<string>();
   for (const mount of options.mounts ?? []) {
@@ -570,6 +563,31 @@ function validateSandboxOptions(options: SandboxOptions): void {
     }
     validateOutboundPorts(rule.ports);
   }
+}
+
+function validateRootfsConfig(rootfs: SandboxFsConfig, field: string): void {
+  if (rootfs.kind === "prebuilt-rootfs") {
+    if (rootfs.path.length === 0) {
+      throw new Error(`invalid spawnSandbox options: ${field}.path must not be empty`);
+    }
+    if (rootfs.format === "directory") {
+      const prefix = field === "rootfs" ? "" : `${field} `;
+      throw new Error(`invalid spawnSandbox options: ${prefix}directory rootfs is not supported for sandboxed VM launch; use an EROFS rootfs`);
+    }
+    return;
+  }
+
+  if (rootfs.kind === "linux-overlay-fs") {
+    validateRootfsConfig(rootfs.lower, `${field}.lower`);
+    validateRootfsConfig(rootfs.upper, `${field}.upper`);
+    return;
+  }
+
+  if (rootfs.kind === "scratch-fs") {
+    return;
+  }
+
+  throw new Error(`invalid spawnSandbox options: unsupported ${field} kind`);
 }
 
 function validateGuestPath(path: string, field: "mount.path" | "binding.path"): void {

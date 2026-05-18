@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io::{self, Cursor, Read, Write};
 use std::net::TcpStream;
@@ -165,9 +165,18 @@ fn run_network_service(
         let timestamp = Instant::now();
         let _ = iface.poll(timestamp, &mut device, &mut sockets);
         poll_dns_socket(&mut sockets, dns_handle, outbound_rules.as_deref());
-        for port in device.nat.host_ports() {
-            add_http_listener(&mut sockets, &mut http_sockets, port);
+        device.nat.prune_expired_flows();
+        let active_nat_ports = device.nat.host_ports().collect::<HashSet<_>>();
+        for port in &active_nat_ports {
+            add_http_listener(&mut sockets, &mut http_sockets, *port);
         }
+        prune_dynamic_http_listeners(
+            &mut sockets,
+            &mut http_sockets,
+            &active_nat_ports,
+            &http_connections,
+            &tls_connections,
+        );
         for (port, handle) in http_sockets
             .iter()
             .flat_map(|(port, handles)| handles.iter().map(|handle| (*port, *handle)))
@@ -243,6 +252,43 @@ fn add_http_listener(
             })
             .collect()
     });
+}
+
+fn prune_dynamic_http_listeners(
+    sockets: &mut SocketSet<'_>,
+    http_sockets: &mut HashMap<u16, Vec<SocketHandle>>,
+    active_nat_ports: &HashSet<u16>,
+    http_connections: &HashMap<SocketHandle, HttpConnection>,
+    tls_connections: &HashMap<SocketHandle, TlsConnection>,
+) {
+    let stale_ports = http_sockets
+        .iter()
+        .filter_map(|(port, handles)| {
+            (!is_static_listener_port(*port)
+                && !active_nat_ports.contains(port)
+                && handles.iter().all(|handle| {
+                    !http_connections.contains_key(handle)
+                        && !tls_connections.contains_key(handle)
+                        && !sockets.get::<tcp::Socket>(*handle).is_active()
+                }))
+            .then_some(*port)
+        })
+        .collect::<Vec<_>>();
+
+    for port in stale_ports {
+        if let Some(handles) = http_sockets.remove(&port) {
+            for handle in handles {
+                sockets.remove(handle);
+            }
+        }
+    }
+}
+
+fn is_static_listener_port(port: u16) -> bool {
+    matches!(
+        port,
+        HOST_HTTP_PORT | HOST_HTTP_PROBE_PORT | HOST_HTTPS_PORT | HOST_ALT_HTTPS_PORT
+    )
 }
 
 fn poll_http_socket(
@@ -415,9 +461,11 @@ fn poll_plain_http_socket(
             .extend_from_slice(UPSTREAM_FAILURE_RESPONSE);
         connection.close_after_response = true;
     } else {
+        connection.flush_to_proxy();
         if !received.is_empty() {
             connection.write_to_proxy(received);
         }
+        connection.flush_to_proxy();
         while socket.can_recv() {
             let mut chunk = [0; TLS_READ_BUFFER_BYTES];
             let received = socket.recv_slice(&mut chunk).unwrap_or(0);
@@ -425,6 +473,7 @@ fn poll_plain_http_socket(
                 break;
             }
             connection.write_to_proxy(&chunk[..received]);
+            connection.flush_to_proxy();
         }
         connection.read_from_proxy();
     }
@@ -490,9 +539,11 @@ fn poll_tls_http_socket(
         );
     }
     if let Some(proxy) = connection.proxy.as_mut() {
+        proxy.flush_to_proxy();
         if !plaintext.is_empty() {
             proxy.write_to_proxy(&plaintext);
         }
+        proxy.flush_to_proxy();
         proxy.read_from_proxy();
         if !proxy.to_guest.is_empty() {
             let _ = connection.tls.writer().write_all(&proxy.to_guest);
@@ -506,12 +557,22 @@ fn poll_tls_http_socket(
     let mut encrypted = Vec::new();
     let _ = connection.tls.write_tls(&mut encrypted);
     if !encrypted.is_empty() {
-        let _ = socket.send_slice(&encrypted);
+        connection.encrypted_to_guest.extend_from_slice(&encrypted);
+    }
+    while socket.can_send() && !connection.encrypted_to_guest.is_empty() {
+        let sent = socket
+            .send_slice(&connection.encrypted_to_guest)
+            .unwrap_or(0);
+        if sent == 0 {
+            break;
+        }
+        connection.encrypted_to_guest.drain(..sent);
     }
     if connection
         .proxy
         .as_ref()
         .is_some_and(|proxy| proxy.close_after_response)
+        && connection.encrypted_to_guest.is_empty()
     {
         socket.close();
     }
@@ -811,6 +872,7 @@ struct TlsAcceptor {
 
 struct HttpConnection {
     proxy: Option<TcpStream>,
+    to_proxy: PendingWriteBuffer,
     to_guest: Vec<u8>,
     close_after_response: bool,
     failed: bool,
@@ -820,6 +882,7 @@ impl Default for HttpConnection {
     fn default() -> Self {
         Self {
             proxy: None,
+            to_proxy: PendingWriteBuffer::default(),
             to_guest: Vec::new(),
             close_after_response: false,
             failed: false,
@@ -830,6 +893,7 @@ impl Default for HttpConnection {
 struct TlsConnection {
     tls: rustls::ServerConnection,
     proxy: Option<HttpConnection>,
+    encrypted_to_guest: Vec<u8>,
 }
 
 impl HttpConnection {
@@ -839,11 +903,12 @@ impl HttpConnection {
         tls: Option<HostTlsMetadata>,
     ) -> io::Result<Self> {
         let mut proxy = TcpStream::connect(("127.0.0.1", proxy_port))?;
-        proxy.set_nonblocking(true)?;
         let preface = proxy_preface(destination, tls);
-        write_all_nonblocking(&mut proxy, preface.as_bytes())?;
+        proxy.write_all(preface.as_bytes())?;
+        proxy.set_nonblocking(true)?;
         Ok(Self {
             proxy: Some(proxy),
+            to_proxy: PendingWriteBuffer::default(),
             to_guest: Vec::new(),
             close_after_response: false,
             failed: false,
@@ -853,6 +918,7 @@ impl HttpConnection {
     fn failed() -> Self {
         Self {
             proxy: None,
+            to_proxy: PendingWriteBuffer::default(),
             to_guest: Vec::new(),
             close_after_response: true,
             failed: true,
@@ -860,11 +926,20 @@ impl HttpConnection {
     }
 
     fn write_to_proxy(&mut self, bytes: &[u8]) {
+        self.to_proxy.push(bytes);
+        self.flush_to_proxy();
+    }
+
+    fn flush_to_proxy(&mut self) {
         let Some(proxy) = self.proxy.as_mut() else {
             return;
         };
-        if write_all_nonblocking(proxy, bytes).is_err() {
-            self.close_after_response = true;
+        match self.to_proxy.flush(proxy) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(_) => {
+                self.close_after_response = true;
+            }
         }
     }
 
@@ -890,21 +965,39 @@ impl HttpConnection {
     }
 }
 
-fn write_all_nonblocking(stream: &mut TcpStream, mut bytes: &[u8]) -> io::Result<()> {
-    while !bytes.is_empty() {
-        match stream.write(bytes) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "proxy write closed",
-                ));
-            }
-            Ok(written) => bytes = &bytes[written..],
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Err(error),
-            Err(error) => return Err(error),
-        }
+#[derive(Default)]
+struct PendingWriteBuffer {
+    bytes: Vec<u8>,
+}
+
+impl PendingWriteBuffer {
+    fn push(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
     }
-    Ok(())
+
+    fn flush(&mut self, writer: &mut impl Write) -> io::Result<()> {
+        while !self.bytes.is_empty() {
+            match writer.write(&self.bytes) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "buffered write closed",
+                    ));
+                }
+                Ok(written) => {
+                    self.bytes.drain(..written);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Err(error),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
 }
 
 fn proxy_preface(destination: HttpDestination, tls: Option<HostTlsMetadata>) -> String {
@@ -944,6 +1037,7 @@ impl TlsAcceptor {
             tls: rustls::ServerConnection::new(self.config.clone())
                 .expect("TLS server config should create connections"),
             proxy: None,
+            encrypted_to_guest: Vec::new(),
         }
     }
 }
@@ -1427,6 +1521,52 @@ mod tests {
             None
         );
         assert_eq!(nat.host_ports().count(), 0);
+    }
+
+    #[test]
+    fn pending_write_buffer_preserves_unwritten_suffix_after_would_block() {
+        let mut buffer = PendingWriteBuffer::default();
+        buffer.push(b"abcdef");
+        let mut writer = PartialWouldBlockWriter {
+            first_write_len: 2,
+            writes: Vec::new(),
+            blocked: false,
+        };
+
+        assert_eq!(
+            buffer.flush(&mut writer).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(writer.writes, vec![b"ab".to_vec()]);
+        assert!(!buffer.is_empty());
+
+        let mut writer = Vec::new();
+        buffer.flush(&mut writer).unwrap();
+
+        assert_eq!(writer, b"cdef");
+        assert!(buffer.is_empty());
+    }
+
+    struct PartialWouldBlockWriter {
+        first_write_len: usize,
+        writes: Vec<Vec<u8>>,
+        blocked: bool,
+    }
+
+    impl Write for PartialWouldBlockWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.blocked {
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "blocked"));
+            }
+            let written = self.first_write_len.min(bytes.len());
+            self.writes.push(bytes[..written].to_vec());
+            self.blocked = true;
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     fn tcp_frame(

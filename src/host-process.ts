@@ -335,6 +335,10 @@ export class HostProcessSandboxVm implements HostControlChannel {
 
   #writeToHost(packet: Uint8Array): void {
     this.#assertOpen();
+    this.#writeOpenPacket(packet);
+  }
+
+  #writeOpenPacket(packet: Uint8Array): void {
     if (!this.#child.stdin.writable) {
       throw new Error("sandbox-host stdin is closed");
     }
@@ -346,6 +350,19 @@ export class HostProcessSandboxVm implements HostControlChannel {
         }
       }
     });
+  }
+
+  #tryWriteToHost(packet: Uint8Array): void {
+    if (this.#closed || this.#stdinError !== null || this.#exitError !== null) {
+      return;
+    }
+    try {
+      this.#writeOpenPacket(packet);
+    } catch (error) {
+      if (!this.#closed && this.#stdinError === null && this.#exitError === null) {
+        throw error;
+      }
+    }
   }
 
   #receive(chunk: Uint8Array): void {
@@ -411,7 +428,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
       switch (document.type) {
         case "host.vfs.stat": {
           const path = assertString(document.path, "path");
-          this.#child.stdin.write(encodePacket({
+          this.#tryWriteToHost(encodePacket({
             type: "host.vfs.response",
             id,
             ok: true,
@@ -421,7 +438,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
         }
         case "host.vfs.list": {
           const path = assertString(document.path, "path");
-          this.#child.stdin.write(encodePacket({
+          this.#tryWriteToHost(encodePacket({
             type: "host.vfs.response",
             id,
             ok: true,
@@ -438,7 +455,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
             range: { offset, length: size },
             signal: AbortSignal.timeout(30_000),
           });
-          this.#child.stdin.write(encodePacket({
+          this.#tryWriteToHost(encodePacket({
             type: "host.vfs.response",
             id,
             ok: true,
@@ -451,7 +468,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
           if (!isSandboxWritableFileSystem(fileSystem)) {
             throw new Error(`host filesystem mount is read-only: ${mountPath}`);
           }
-          this.#child.stdin.write(encodePacket({
+          this.#tryWriteToHost(encodePacket({
             type: "host.vfs.response",
             id,
             ok: true,
@@ -465,7 +482,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
             throw new Error(`host filesystem mount is read-only: ${mountPath}`);
           }
           const offset = assertNumber(document.offset, "offset");
-          this.#child.stdin.write(encodePacket({
+          this.#tryWriteToHost(encodePacket({
             type: "host.vfs.response",
             id,
             ok: true,
@@ -483,7 +500,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
             throw new Error(`host filesystem mount is read-only: ${mountPath}`);
           }
           const size = assertNumber(document.size, "size");
-          this.#child.stdin.write(encodePacket({
+          this.#tryWriteToHost(encodePacket({
             type: "host.vfs.response",
             id,
             ok: true,
@@ -494,7 +511,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
         case "host.vfs.mkdir": {
           const path = assertString(document.path, "path");
           const posix = assertPosixFileSystem(fileSystem, mountPath);
-          this.#child.stdin.write(encodePacket({
+          this.#tryWriteToHost(encodePacket({
             type: "host.vfs.response",
             id,
             ok: true,
@@ -506,7 +523,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
           const path = assertString(document.path, "path");
           const posix = assertPosixFileSystem(fileSystem, mountPath);
           await posix.unlink(path);
-          this.#child.stdin.write(encodePacket({
+          this.#tryWriteToHost(encodePacket({
             type: "host.vfs.response",
             id,
             ok: true,
@@ -517,7 +534,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
           const path = assertString(document.path, "path");
           const posix = assertPosixFileSystem(fileSystem, mountPath);
           await posix.rmdir(path);
-          this.#child.stdin.write(encodePacket({
+          this.#tryWriteToHost(encodePacket({
             type: "host.vfs.response",
             id,
             ok: true,
@@ -530,7 +547,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
           const to = assertString(document.to, "to");
           const flags = assertNumber(document.flags, "flags");
           await posix.rename(from, to, flags);
-          this.#child.stdin.write(encodePacket({
+          this.#tryWriteToHost(encodePacket({
             type: "host.vfs.response",
             id,
             ok: true,
@@ -542,7 +559,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
           const posix = assertPosixFileSystem(fileSystem, mountPath);
           const target = assertString(document.target, "target");
           const stat = await posix.symlink(target, path);
-          this.#child.stdin.write(encodePacket({
+          this.#tryWriteToHost(encodePacket({
             type: "host.vfs.response",
             id,
             ok: true,
@@ -553,7 +570,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
         case "host.vfs.readlink": {
           const path = assertString(document.path, "path");
           const posix = assertPosixFileSystem(fileSystem, mountPath);
-          this.#child.stdin.write(encodePacket({
+          this.#tryWriteToHost(encodePacket({
             type: "host.vfs.response",
             id,
             ok: true,
@@ -563,7 +580,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
         }
       }
     } catch (error) {
-      this.#child.stdin.write(encodePacket({
+      this.#tryWriteToHost(encodePacket({
         type: "host.vfs.response",
         id,
         ok: false,

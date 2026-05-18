@@ -320,6 +320,12 @@ impl sandbox::vfs::HostVirtualFileSystem for NodeVirtualFs {
         })?;
         let from = join_guest_path(&olddir, oldname);
         let to = join_guest_path(&newdir, newname);
+        if flags != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "virtual filesystem rename flags are not supported",
+            ));
+        }
         self.bridge.request(doc! {
             "type": "host.vfs.rename",
             "mountPath": &self.mount_path,

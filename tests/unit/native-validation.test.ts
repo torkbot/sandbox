@@ -3,9 +3,11 @@ import assert from "node:assert/strict";
 import {
   acceptTcp,
   binding,
+  linuxOverlayFs,
   prebuiltRootfs,
   projectInit,
   projectKernel,
+  scratchFs,
   spawnSandbox,
   virtualFsMount,
 } from "../../src/index.ts";
@@ -49,6 +51,34 @@ test("spawnSandbox rejects directory rootfs before runtime launch", async () => 
       }),
     }),
     /invalid spawnSandbox options: directory rootfs is not supported for sandboxed VM launch; use an EROFS rootfs/,
+  );
+});
+
+test("spawnSandbox rejects invalid overlay lower rootfs before runtime launch", async () => {
+  await assert.rejects(
+    spawnSandbox({
+      kernel: projectKernel(),
+      init: projectInit(),
+      rootfs: linuxOverlayFs({
+        lower: prebuiltRootfs("", { format: "erofs" }),
+        upper: scratchFs(),
+      }),
+    }),
+    /invalid spawnSandbox options: rootfs\.lower\.path must not be empty/,
+  );
+
+  await assert.rejects(
+    spawnSandbox({
+      kernel: projectKernel(),
+      init: projectInit(),
+      rootfs: linuxOverlayFs({
+        lower: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20", {
+          format: "directory",
+        }),
+        upper: scratchFs(),
+      }),
+    }),
+    /invalid spawnSandbox options: rootfs\.lower directory rootfs is not supported for sandboxed VM launch; use an EROFS rootfs/,
   );
 });
 
