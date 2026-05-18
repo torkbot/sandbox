@@ -143,8 +143,8 @@ Passing:
 
 - `plain HTTP traffic is intercepted, policy checked, rewritten, and forwarded`
   - Covers allow, deny, header rewrite, outbound policy handling, and policy metadata.
-- `HTTPS traffic is intercepted, policy checked, rewritten, and outbound-denied destinations are blocked`
-  - Covers CA trust, TLS MITM, allow, deny, rewrite, and outbound-denied destinations.
+- `HTTPS traffic is intercepted, policy checked, and outbound-denied destinations are blocked`
+  - Covers guest CA trust, TLS MITM, deny decisions, and outbound-denied destinations.
 - `outbound default-deny blocks destinations before JavaScript policy`
   - Covers default-deny outbound enforcement before policy.
 - `transparent HTTPS generates a trusted leaf cert for the requested SNI hostname`
@@ -157,10 +157,6 @@ Passing:
   - Covers large HTTP upload/download and host framing.
 - `HTTP interception handles concurrent guest requests without dropping policy calls`
   - Covers concurrent HTTP request accounting.
-- `HTTPS interception forwards request bodies and larger TLS responses`
-  - Covers HTTPS upload handling and larger HTTPS downloads.
-- `HTTPS interception handles concurrent guest requests without dropping TLS policy calls`
-  - Covers concurrent HTTPS request accounting.
 - `HTTP keep-alive behavior is explicit and deterministic`
   - Uses one client connection for two pipelined requests and asserts the documented close-after-one-response behavior.
 - `upstream connection refused returns a deterministic guest-visible failure`
