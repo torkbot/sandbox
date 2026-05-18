@@ -12,8 +12,8 @@ use sandbox::network_service::{
 };
 use sandbox::vfs::{
     VirtioFsDirEntry, VirtioFsEntry, VirtioVirtualFsBackend, VirtualFsAdapter, VirtualInode,
-    bindings, virtual_directory_entry, virtual_file_entry, virtual_writable_directory_entry,
-    virtual_writable_file_entry, virtual_symlink_entry,
+    bindings, virtual_directory_entry, virtual_file_entry, virtual_symlink_entry,
+    virtual_writable_directory_entry, virtual_writable_file_entry,
 };
 
 pub struct HostIoBridge {
@@ -102,6 +102,7 @@ impl HostHttpHandler for HostIoBridge {
             "method": request.method,
             "url": request.url,
             "destinationIp": request.destination_ip,
+            "destinationPort": i32::from(request.destination_port),
             "headers": request.headers.into_iter().map(|(name, value)| doc! {
                 "name": name,
                 "value": value,
@@ -431,23 +432,30 @@ impl sandbox::vfs::HostVirtualFileSystem for NodeVirtualFs {
             "mountPath": &self.mount_path,
             "path": &path,
         })?;
-        Ok(response.get_str("target").map_err(to_io_error)?.as_bytes().to_vec())
+        Ok(response
+            .get_str("target")
+            .map_err(to_io_error)?
+            .as_bytes()
+            .to_vec())
     }
 }
 
 impl NodeVirtualFs {
     fn stat_path(&self, path: &str) -> io::Result<Document> {
-        let response = self.bridge.request(doc! {
-            "type": "host.vfs.stat",
-            "mountPath": &self.mount_path,
-            "path": path,
-        }).map_err(|error| {
-            if error.to_string().contains("missing path") {
-                io::Error::from_raw_os_error(libc::ENOENT)
-            } else {
-                error
-            }
-        })?;
+        let response = self
+            .bridge
+            .request(doc! {
+                "type": "host.vfs.stat",
+                "mountPath": &self.mount_path,
+                "path": path,
+            })
+            .map_err(|error| {
+                if error.to_string().contains("missing path") {
+                    io::Error::from_raw_os_error(libc::ENOENT)
+                } else {
+                    error
+                }
+            })?;
         response.get_document("stat").cloned().map_err(to_io_error)
     }
 

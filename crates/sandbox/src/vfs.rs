@@ -223,7 +223,8 @@ impl VirtioVirtualFsBackend for VirtualFsAdapter {
     }
 
     fn symlink(&self, linkname: &CStr, parent: u64, name: &CStr) -> io::Result<VirtioFsEntry> {
-        self.inner.symlink(linkname, VirtualInode::from(parent), name)
+        self.inner
+            .symlink(linkname, VirtualInode::from(parent), name)
     }
 
     fn readlink(&self, inode: u64) -> io::Result<Vec<u8>> {

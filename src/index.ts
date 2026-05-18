@@ -160,6 +160,7 @@ export interface HttpPolicyRequest {
   readonly method: string;
   readonly url: string;
   readonly destinationIp: string;
+  readonly destinationPort: number;
   readonly headers: Record<string, string>;
   readonly tls?: {
     readonly serverName?: string;

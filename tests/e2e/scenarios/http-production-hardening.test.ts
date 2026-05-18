@@ -248,7 +248,7 @@ test("plain HTTP egress header rewrite does not expose or modify request bodies"
   }]);
   assert.deepEqual(policyEvidence, [{
     url: `${origin.url}/header-only`,
-    keys: ["destinationIp", "headers", "method", "url"],
+    keys: ["destinationIp", "destinationPort", "headers", "method", "url"],
   }]);
 
   const headers = await execGuest(vm, {
@@ -361,7 +361,7 @@ test("HTTPS egress header rewrite does not expose or modify request bodies", asy
   }]);
   assert.deepEqual(policyEvidence, [{
     url: `${origin.url}/header-only`,
-    keys: ["destinationIp", "headers", "method", "tls", "url"],
+    keys: ["destinationIp", "destinationPort", "headers", "method", "tls", "url"],
     tlsServerName: undefined,
   }]);
 

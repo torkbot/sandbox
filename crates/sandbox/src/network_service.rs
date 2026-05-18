@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Cursor, Read, Write};
-use std::net::ToSocketAddrs;
 use std::net::TcpStream;
+use std::net::ToSocketAddrs;
 use std::os::fd::{IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -40,6 +40,7 @@ pub struct HostHttpRequest {
     pub method: String,
     pub url: String,
     pub destination_ip: String,
+    pub destination_port: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub tls: Option<HostTlsMetadata>,
@@ -447,9 +448,12 @@ fn poll_tls_http_socket(
         connection.continue_sent = true;
     }
     if !connection.request.is_empty() && http_request_ready(&connection.request) {
-        if let Some(request) =
-            parse_http_request(socket, nat, &connection.request, tls_metadata(&connection.tls))
-        {
+        if let Some(request) = parse_http_request(
+            socket,
+            nat,
+            &connection.request,
+            tls_metadata(&connection.tls),
+        ) {
             connection.request.clear();
             if let Ok(response) = handler.handle_http_request(request) {
                 let _ = connection
@@ -557,6 +561,7 @@ fn parse_http_request(
         method,
         url,
         destination_ip,
+        destination_port: local.port,
         headers,
         body,
         tls,
@@ -718,8 +723,12 @@ fn stream_plain_upstream(
     let mut sent_any = false;
     let dial_host = upstream_ip.as_deref().unwrap_or(parsed.host.as_str());
     let mut stream = TcpStream::connect((dial_host, parsed.port)).map_err(|_| sent_any)?;
-    stream.set_read_timeout(Some(Duration::from_secs(2))).map_err(|_| sent_any)?;
-    stream.set_write_timeout(Some(Duration::from_secs(2))).map_err(|_| sent_any)?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|_| sent_any)?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|_| sent_any)?;
     let outbound = encode_upstream_http_request(&request, &headers, &parsed);
     stream.write_all(&outbound).map_err(|_| sent_any)?;
 
@@ -743,9 +752,7 @@ fn encode_upstream_http_request(
     parsed: &ParsedHttpUrl,
 ) -> Vec<u8> {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(
-        format!("{} {} HTTP/1.1\r\n", request.method, parsed.path).as_bytes(),
-    );
+    bytes.extend_from_slice(format!("{} {} HTTP/1.1\r\n", request.method, parsed.path).as_bytes());
     let mut has_host = false;
     for (name, value) in headers {
         let lower = name.to_ascii_lowercase();
@@ -792,7 +799,10 @@ struct ParsedHttpUrl {
 impl ParsedHttpUrl {
     fn parse(url: &str) -> io::Result<Self> {
         let rest = url.strip_prefix("http://").ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "only plain HTTP URLs can be streamed")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "only plain HTTP URLs can be streamed",
+            )
         })?;
         let (authority, path) = match rest.split_once('/') {
             Some((authority, path)) => (authority, format!("/{path}")),
@@ -841,7 +851,11 @@ fn dns_response(request: &[u8]) -> Option<Vec<u8>> {
 
     let mut response = Vec::new();
     response.extend_from_slice(&request[0..2]);
-    response.extend_from_slice(if answer.is_some() { &[0x81, 0x80] } else { &[0x81, 0x83] });
+    response.extend_from_slice(if answer.is_some() {
+        &[0x81, 0x80]
+    } else {
+        &[0x81, 0x83]
+    });
     response.extend_from_slice(&request[4..6]);
     response.extend_from_slice(&(answer.is_some() as u16).to_be_bytes());
     response.extend_from_slice(&[0, 0, 0, 0]);
@@ -1122,8 +1136,19 @@ impl MitmCertIssuer {
     fn generate_certificate(&self, server_name: &str) -> io::Result<CertifiedKey> {
         let leaf_key = rcgen::KeyPair::generate()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        let leaf = rcgen::CertificateParams::new(vec![server_name.to_string()])
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?
+        let mut leaf_params = rcgen::CertificateParams::new(vec![server_name.to_string()])
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        leaf_params.distinguished_name = rcgen::DistinguishedName::new();
+        leaf_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, server_name.to_string());
+        leaf_params.is_ca = rcgen::IsCa::ExplicitNoCa;
+        leaf_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::DigitalSignature,
+            rcgen::KeyUsagePurpose::KeyEncipherment,
+        ];
+        leaf_params.insert_extended_key_usage(rcgen::ExtendedKeyUsagePurpose::ServerAuth);
+        let leaf = leaf_params
             .signed_by(&leaf_key, &self.ca)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
         let cert_chain = vec![CertificateDer::from(leaf.der().to_vec())];

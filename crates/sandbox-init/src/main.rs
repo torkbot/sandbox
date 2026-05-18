@@ -36,8 +36,11 @@ fn prepare_rootfs_overlay(
 ) -> Result<bool, InitError> {
     mount_fs("proc", "/proc", "proc", 0)?;
     let enabled = mode.as_deref() == Some("writable")
-        || args.into_iter().any(|arg| arg == "--rootfs-overlay=writable")
-        || read_key_value_from_proc_cmdline("SANDBOX_ROOTFS_OVERLAY").as_deref() == Some("writable");
+        || args
+            .into_iter()
+            .any(|arg| arg == "--rootfs-overlay=writable")
+        || read_key_value_from_proc_cmdline("SANDBOX_ROOTFS_OVERLAY").as_deref()
+            == Some("writable");
     if !enabled {
         return Ok(false);
     }
@@ -76,11 +79,11 @@ fn mount_overlay_root(target: &str, options: &str) -> Result<(), InitError> {
     use std::ffi::CString;
 
     let source = CString::new("overlay").unwrap();
-    let target = CString::new(target)
-        .map_err(|_| InitError("overlay target contains nul".to_string()))?;
+    let target =
+        CString::new(target).map_err(|_| InitError("overlay target contains nul".to_string()))?;
     let fstype = CString::new("overlay").unwrap();
-    let options = CString::new(options)
-        .map_err(|_| InitError("overlay options contain nul".to_string()))?;
+    let options =
+        CString::new(options).map_err(|_| InitError("overlay options contain nul".to_string()))?;
     let result = unsafe {
         libc::mount(
             source.as_ptr(),

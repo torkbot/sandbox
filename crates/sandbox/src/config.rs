@@ -109,10 +109,18 @@ impl HttpSpec {
 
 fn generate_http_ca() -> Result<(String, String), rcgen::Error> {
     let key = rcgen::KeyPair::generate()?;
-    let mut params = rcgen::CertificateParams::new(vec![
-        "Sandbox HTTP Interception CA".to_string(),
-    ])?;
+    let mut params =
+        rcgen::CertificateParams::new(vec!["Sandbox HTTP Interception CA".to_string()])?;
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Sandbox HTTP Interception CA");
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::DigitalSignature,
+        rcgen::KeyUsagePurpose::CrlSign,
+    ];
     let certificate = params.self_signed(&key)?;
     Ok((certificate.pem(), key.serialize_pem()))
 }

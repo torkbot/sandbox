@@ -401,6 +401,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
         method: assertString(document.method, "method"),
         url: assertString(document.url, "url"),
         destinationIp: assertString(document.destinationIp, "destinationIp"),
+        destinationPort: assertPort(document.destinationPort, "destinationPort"),
         headers,
         ...(tls === undefined ? {} : { tls }),
       };
@@ -493,6 +494,13 @@ function assertString(value: unknown, field: string): string {
 function assertNumber(value: unknown, field: string): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
     throw new Error(`host vfs request ${field} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
+function assertPort(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 65535) {
+    throw new Error(`host HTTP request ${field} must be a TCP port`);
   }
   return value;
 }
@@ -713,17 +721,17 @@ async function inspectHttpProtection(
   rules: readonly OutboundNetworkRule[],
 ): Promise<{ readonly blocked: boolean; readonly upstreamIp?: string }> {
   const parsed = new URL(request.url);
-  const port = parsed.port.length === 0
+  const upstreamPort = parsed.port.length === 0
     ? (parsed.protocol === "https:" ? 443 : 80)
     : Number(parsed.port);
 
-  if (!isAllowedTcpDestination(request.destinationIp, port, rules)) {
+  if (!isAllowedTcpDestination(request.destinationIp, request.destinationPort, rules)) {
     return { blocked: true };
   }
 
   const addresses = await resolveUrlAddresses(request.url);
   for (const address of addresses) {
-    if (!isAllowedTcpDestination(address, port, rules)) {
+    if (!isAllowedTcpDestination(address, upstreamPort, rules)) {
       return { blocked: true };
     }
   }
