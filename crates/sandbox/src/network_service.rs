@@ -6,6 +6,7 @@ use std::net::ToSocketAddrs;
 use std::os::fd::{IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -37,6 +38,29 @@ const DNS_PUBLIC_TEST_IP: [u8; 4] = [93, 184, 216, 34];
 const MITM_CERT_CACHE_LIMIT: usize = 256;
 const HOST_HTTP_PROBE_RESPONSE: &[u8] =
     b"HTTP/1.1 200 OK\r\ncontent-length: 25\r\nconnection: close\r\n\r\nsandbox explicit network\n";
+static SPECIAL_USE_IPV4_RANGES: LazyLock<Vec<CidrRange>> = LazyLock::new(|| {
+    [
+        "0.0.0.0/8",
+        "127.0.0.0/8",
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.0.0.0/24",
+        "192.0.2.0/24",
+        "192.88.99.0/24",
+        "192.168.0.0/16",
+        "198.18.0.0/15",
+        "198.51.100.0/24",
+        "203.0.113.0/24",
+        "224.0.0.0/4",
+        "240.0.0.0/4",
+        "255.255.255.255/32",
+    ]
+    .into_iter()
+    .map(|range| CidrRange::parse(range).expect("valid special-use range"))
+    .collect()
+});
 
 #[derive(Debug, Clone)]
 pub struct HostHttpRequest {
@@ -773,94 +797,18 @@ fn port_matches(ports: &[u16], destination_port: u16) -> bool {
 }
 
 fn cidr_contains(cidr: &CidrRange, destination_ip: &str) -> bool {
-    let std::net::IpAddr::V4(network) = cidr.address else {
-        return false;
-    };
-    let Ok(destination) = destination_ip.parse::<std::net::Ipv4Addr>() else {
-        return false;
-    };
-    let network = u32::from(network);
-    let destination = u32::from(destination);
-    let mask = if cidr.prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - cidr.prefix)
-    };
-    (network & mask) == (destination & mask)
+    destination_ip
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|destination| cidr.contains(destination))
 }
 
 fn is_public_ipv4_destination(destination_ip: &str) -> bool {
     destination_ip
         .parse::<std::net::Ipv4Addr>()
         .is_ok_and(|destination| {
-            ![
-                CidrRange {
-                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
-                    prefix: 8,
-                },
-                CidrRange {
-                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 0)),
-                    prefix: 8,
-                },
-                CidrRange {
-                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 0)),
-                    prefix: 8,
-                },
-                CidrRange {
-                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(100, 64, 0, 0)),
-                    prefix: 10,
-                },
-                CidrRange {
-                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(169, 254, 0, 0)),
-                    prefix: 16,
-                },
-                CidrRange {
-                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 16, 0, 0)),
-                    prefix: 12,
-                },
-                CidrRange {
-                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 0, 0)),
-                    prefix: 24,
-                },
-                CidrRange {
-                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 0)),
-                    prefix: 24,
-                },
-                CidrRange {
-                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 88, 99, 0)),
-                    prefix: 24,
-                },
-                CidrRange {
-                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 0, 0)),
-                    prefix: 16,
-                },
-                CidrRange {
-                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 18, 0, 0)),
-                    prefix: 15,
-                },
-                CidrRange {
-                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 0)),
-                    prefix: 24,
-                },
-                CidrRange {
-                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 0)),
-                    prefix: 24,
-                },
-                CidrRange {
-                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(224, 0, 0, 0)),
-                    prefix: 4,
-                },
-                CidrRange {
-                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(240, 0, 0, 0)),
-                    prefix: 4,
-                },
-                CidrRange {
-                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(255, 255, 255, 255)),
-                    prefix: 32,
-                },
-            ]
-            .iter()
-            .any(|range| cidr_contains(range, &destination.to_string()))
+            !SPECIAL_USE_IPV4_RANGES
+                .iter()
+                .any(|range| range.contains(std::net::IpAddr::V4(destination)))
         })
 }
 
@@ -1616,10 +1564,7 @@ mod tests {
     #[test]
     fn outbound_rules_deny_unmatched_tcp_destinations() {
         let rules = vec![OutboundRulePlan::AcceptTcp {
-            cidr: CidrRange {
-                address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
-                prefix: 32,
-            },
+            cidr: CidrRange::parse("93.184.216.34/32").unwrap(),
             ports: vec![80],
         }];
 
@@ -1631,10 +1576,7 @@ mod tests {
     #[test]
     fn outbound_rules_honor_udp_protocol_and_port() {
         let rules = vec![OutboundRulePlan::AcceptUdp {
-            cidr: CidrRange {
-                address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 2, 1)),
-                prefix: 32,
-            },
+            cidr: CidrRange::parse("10.0.2.1/32").unwrap(),
             ports: vec![53],
         }];
 

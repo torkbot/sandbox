@@ -1,5 +1,4 @@
 use std::fmt;
-use std::net::IpAddr;
 
 use crate::config::{HttpSpec, NetworkSpec, OutboundRuleSpec};
 
@@ -28,8 +27,7 @@ pub struct HttpPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CidrRange {
-    pub address: IpAddr,
-    pub prefix: u8,
+    net: ipnet::IpNet,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,27 +103,30 @@ impl OutboundRulePlan {
 }
 
 impl CidrRange {
-    fn parse(value: &str) -> Result<Self, NetworkError> {
+    pub(crate) fn parse(value: &str) -> Result<Self, NetworkError> {
         let (address, prefix) = value
             .split_once('/')
             .ok_or_else(|| NetworkError::new(format!("invalid CIDR range: {value}")))?;
-        let address = address
-            .parse::<IpAddr>()
+        let _address = address
+            .parse::<std::net::IpAddr>()
             .map_err(|_| NetworkError::new(format!("invalid CIDR address: {value}")))?;
         let prefix = prefix
             .parse::<u8>()
             .map_err(|_| NetworkError::new(format!("invalid CIDR prefix: {value}")))?;
 
-        let max_prefix = match address {
-            IpAddr::V4(_) => 32,
-            IpAddr::V6(_) => 128,
-        };
+        let net = value.parse::<ipnet::IpNet>().map_err(|_| {
+            let max_prefix = if address.contains(':') { 128 } else { 32 };
+            if prefix > max_prefix {
+                NetworkError::new(format!("invalid CIDR prefix: {value}"))
+            } else {
+                NetworkError::new(format!("invalid CIDR range: {value}"))
+            }
+        })?;
+        Ok(Self { net })
+    }
 
-        if prefix > max_prefix {
-            return Err(NetworkError::new(format!("invalid CIDR prefix: {value}")));
-        }
-
-        Ok(Self { address, prefix })
+    pub(crate) fn contains(&self, address: std::net::IpAddr) -> bool {
+        self.net.contains(&address)
     }
 }
 
@@ -198,5 +199,13 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.to_string(), "invalid CIDR prefix: 127.0.0.0/33");
+    }
+
+    #[test]
+    fn cidr_contains_uses_network_boundaries() {
+        let range = CidrRange::parse("192.168.0.0/24").unwrap();
+
+        assert!(range.contains("192.168.0.1".parse().unwrap()));
+        assert!(!range.contains("192.168.1.1".parse().unwrap()));
     }
 }

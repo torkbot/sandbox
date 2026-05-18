@@ -11,6 +11,7 @@ rcgen = { version = "0.14.8", features = ["x509-parser"] }
 krun-devices = { path = "../../deps/libkrun/src/devices", default-features = false, features = ["blk", "net"] }
 krun = { package = "libkrun", path = "../../deps/libkrun/src/libkrun", default-features = false, features = ["blk", "net"] }
 libc = "0.2"
+ipnet = "2.11"
 sandbox-protocol = { path = "../sandbox-protocol" }
 smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-raw", "socket-tcp", "socket-udp"] }
 rustls = "0.23.40"
