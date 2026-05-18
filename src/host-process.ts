@@ -49,6 +49,7 @@ type ProxyMetadata = {
 class HostHttpProxy {
   readonly #options: SandboxOptions;
   readonly #metadata = new WeakMap<Socket, ProxyMetadata>();
+  readonly #sockets = new Set<Socket>();
   readonly #httpServer: http.Server;
   readonly #netServer: net.Server;
 
@@ -73,12 +74,20 @@ class HostHttpProxy {
     return {
       port: address.port,
       async close() {
+        for (const socket of proxy.#sockets) {
+          socket.destroy();
+        }
         await closeServer(proxy.#netServer);
       },
     };
   }
 
   #handleConnection(socket: Socket): void {
+    this.#sockets.add(socket);
+    socket.once("close", () => {
+      this.#sockets.delete(socket);
+    });
+
     let buffer = Buffer.alloc(0);
     const onData = (chunk: Buffer) => {
       buffer = Buffer.concat([buffer, chunk]);
