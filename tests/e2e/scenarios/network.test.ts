@@ -236,6 +236,49 @@ test("DNS resolution to a denied IP is blocked before policy", async (t) => {
   assert.equal(policyCalls, 0);
 });
 
+test("public internet allow rules do not allow IPv6 loopback resolution", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  let policyCalls = 0;
+  const vm = await spawnSandbox({
+    name: "public-internet-ipv6-loopback",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      outbound: {
+        policy: "deny",
+        rules: [acceptPublicInternet({ ports: [80] })],
+      },
+      http: {
+        async policy() {
+          policyCalls += 1;
+          return { action: "allow" };
+        },
+      },
+    },
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuestShell(vm, {
+    id: "public-internet-ipv6-loopback",
+    script: "curl --max-time 4 --connect-timeout 2 --silent --output /dev/null --write-out '%{http_code}' --connect-to localhost:80:203.0.113.10:80 http://localhost/",
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, "403");
+  assert.equal(policyCalls, 0);
+});
+
 test("IPv6 behavior is explicit", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;

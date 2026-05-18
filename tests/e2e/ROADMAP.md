@@ -221,6 +221,8 @@ Passing:
   - Guest requests a hostname without `--connect-to`; assert DNS behavior and policy evidence.
 - `DNS resolution to a denied IP is blocked before policy`
   - Host-controlled hostname resolves to a destination without an accept rule and is blocked.
+- `public internet allow rules do not allow IPv6 loopback resolution`
+  - `acceptPublicInternet(...)` never treats IPv6 loopback/link-local resolution as public reachability.
 - `IPv6 behavior is explicit`
   - Attempt IPv6 HTTP destination and assert deterministic unsupported or implemented behavior.
 - `UDP and non-HTTP traffic cannot silently bypass policy`

@@ -744,11 +744,15 @@ function isAllowedTcpDestination(
     }
 
     if ("scope" in rule) {
-      return !isProtectedDestination(address, DEFAULT_PROTECTED_RANGES);
+      return isPublicIpv4Destination(address);
     }
 
     return rule.protocol === "tcp" && isProtectedDestination(address, [rule.cidr]);
   });
+}
+
+function isPublicIpv4Destination(address: string): boolean {
+  return ipv4ToInt(address) !== null && !isProtectedDestination(address, DEFAULT_PROTECTED_RANGES);
 }
 
 function portMatches(ports: readonly number[] | undefined, port: number): boolean {
