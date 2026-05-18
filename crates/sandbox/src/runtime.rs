@@ -298,10 +298,10 @@ fn encode_virtual_fs_mounts(virtual_fs: &[VirtualFsDevice]) -> String {
         if index > 0 {
             value.push(';');
         }
-        value.push_str(&device.tag);
-        value.push('=');
-        value.push_str(&device.path);
-        value.push('=');
+        value.push_str(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&device.tag));
+        value.push(':');
+        value.push_str(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&device.path));
+        value.push(':');
         value.push_str(if device.readonly { "ro" } else { "rw" });
     }
     value
@@ -447,10 +447,14 @@ impl ControlSocket {
 
     pub fn try_read_packet(&mut self) -> io::Result<Option<Vec<u8>>> {
         self.stream.set_nonblocking(true)?;
+        let mut saw_eof = false;
         loop {
             let mut chunk = [0; 4096];
             match self.stream.read(&mut chunk) {
-                Ok(0) => break,
+                Ok(0) => {
+                    saw_eof = true;
+                    break;
+                }
                 Ok(read) => self.read_buffer.extend_from_slice(&chunk[..read]),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) => return Err(error),
@@ -458,6 +462,12 @@ impl ControlSocket {
         }
 
         if self.read_buffer.len() < 4 {
+            if saw_eof {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "guest control socket closed",
+                ));
+            }
             return Ok(None);
         }
         let len = [
@@ -469,6 +479,12 @@ impl ControlSocket {
         let frame_len = u32::from_le_bytes(len) as usize;
         let packet_len = 4 + frame_len;
         if self.read_buffer.len() < packet_len {
+            if saw_eof {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "guest control socket closed mid-packet",
+                ));
+            }
             return Ok(None);
         }
         let packet = self.read_buffer.drain(..packet_len).collect();
@@ -665,6 +681,42 @@ mod tests {
     }
 
     #[test]
+    fn control_socket_reports_closed_peer() {
+        let (host_socket, guest_socket) = UnixStream::pair().unwrap();
+        let mut control_socket = ControlSocket {
+            stream: host_socket,
+            read_buffer: Vec::new(),
+        };
+        drop(guest_socket);
+
+        let error = control_socket.try_read_packet().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(error.to_string().contains("control socket closed"));
+    }
+
+    #[test]
+    fn control_socket_reports_mid_packet_close() {
+        let (host_socket, mut guest_socket) = UnixStream::pair().unwrap();
+        let mut control_socket = ControlSocket {
+            stream: host_socket,
+            read_buffer: Vec::new(),
+        };
+        let packet = crate::control::ControlFrame::InitReady {
+            root_readonly: true,
+            init_name: "sandbox-init".to_string(),
+        }
+        .encode_packet()
+        .unwrap();
+
+        guest_socket.write_all(&packet[..2]).unwrap();
+        drop(guest_socket);
+
+        let error = control_socket.try_read_packet().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(error.to_string().contains("control socket closed"));
+    }
+
+    #[test]
     fn control_socket_writes_after_nonblocking_poll() {
         let (host_socket, mut guest_socket) = UnixStream::pair().unwrap();
         let mut control_socket = ControlSocket {
@@ -685,6 +737,55 @@ mod tests {
         let mut received = vec![0; packet.len()];
         guest_socket.read_exact(&mut received).unwrap();
         assert_eq!(received, packet);
+    }
+
+    #[test]
+    fn virtual_fs_mount_encoding_preserves_delimiters() {
+        struct EmptyFs;
+        impl crate::vfs::HostVirtualFileSystem for EmptyFs {
+            fn lookup(
+                &self,
+                _parent: crate::vfs::VirtualInode,
+                _name: &std::ffi::CStr,
+            ) -> io::Result<crate::vfs::VirtioFsEntry> {
+                Err(io::Error::from_raw_os_error(libc::ENOENT))
+            }
+
+            fn getattr(
+                &self,
+                _inode: crate::vfs::VirtualInode,
+            ) -> io::Result<(crate::vfs::bindings::stat64, std::time::Duration)> {
+                Err(io::Error::from_raw_os_error(libc::ENOENT))
+            }
+
+            fn readdir(
+                &self,
+                _inode: crate::vfs::VirtualInode,
+            ) -> io::Result<Vec<crate::vfs::VirtioFsDirEntry>> {
+                Ok(Vec::new())
+            }
+
+            fn read(
+                &self,
+                _inode: crate::vfs::VirtualInode,
+                _offset: u64,
+                _size: u32,
+            ) -> io::Result<Vec<u8>> {
+                Err(io::Error::from_raw_os_error(libc::ENOENT))
+            }
+        }
+        let backend = Arc::new(crate::vfs::VirtualFsAdapter::new(Arc::new(EmptyFs)));
+        let encoded = encode_virtual_fs_mounts(&[VirtualFsDevice {
+            tag: "virtio=fs;tag".to_string(),
+            path: "/mnt/with=equals;semicolon".to_string(),
+            readonly: false,
+            backend,
+        }]);
+
+        assert_eq!(
+            encoded,
+            "dmlydGlvPWZzO3RhZw:L21udC93aXRoPWVxdWFscztzZW1pY29sb24:rw"
+        );
     }
 
     #[test]

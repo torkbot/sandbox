@@ -4,7 +4,7 @@ import { once } from "node:events";
 import { existsSync } from "node:fs";
 import http from "node:http";
 import https from "node:https";
-import net, { isIP, type Socket } from "node:net";
+import net, { BlockList, isIP, type Socket } from "node:net";
 import { resolve } from "node:path";
 import { Binary, BSON } from "bson";
 import type { HostControlChannel } from "./control.ts";
@@ -35,6 +35,9 @@ const DEFAULT_PROTECTED_RANGES = [
   "224.0.0.0/4",
   "240.0.0.0/4",
   "255.255.255.255/32",
+  "::1/128",
+  "fc00::/7",
+  "fe80::/10",
 ] as const;
 
 type ProxyMetadata = {
@@ -776,24 +779,26 @@ function outboundRequestHeaders(headers: Record<string, string>): Record<string,
 }
 
 function isProtectedDestination(destinationIp: string, ranges: readonly string[]): boolean {
-  const destination = ipv4ToInt(destinationIp);
-  if (destination === null) {
+  const destinationFamily = ipFamily(destinationIp);
+  if (destinationFamily === null) {
     return false;
   }
 
-  return ranges.some((range) => {
+  const blockList = new BlockList();
+  for (const range of ranges) {
     const [address, prefixText] = range.split("/");
     if (address === undefined || prefixText === undefined) {
-      return false;
+      continue;
     }
-    const network = ipv4ToInt(address);
     const prefix = Number(prefixText);
-    if (network === null || !Number.isInteger(prefix) || prefix < 0 || prefix > 32) {
-      return false;
+    const rangeFamily = ipFamily(address);
+    const maxPrefix = rangeFamily === "ipv6" ? 128 : 32;
+    if (rangeFamily === null || !Number.isInteger(prefix) || prefix < 0 || prefix > maxPrefix) {
+      continue;
     }
-    const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
-    return (destination & mask) === (network & mask);
-  });
+    blockList.addSubnet(address, prefix, rangeFamily);
+  }
+  return blockList.check(destinationIp, destinationFamily);
 }
 
 async function inspectHttpProtection(
@@ -843,7 +848,7 @@ function isAllowedTcpDestination(
 }
 
 function isPublicIpv4Destination(address: string): boolean {
-  return ipv4ToInt(address) !== null && !isProtectedDestination(address, DEFAULT_PROTECTED_RANGES);
+  return ipFamily(address) === "ipv4" && !isProtectedDestination(address, DEFAULT_PROTECTED_RANGES);
 }
 
 function portMatches(ports: readonly number[] | undefined, port: number): boolean {
@@ -852,9 +857,9 @@ function portMatches(ports: readonly number[] | undefined, port: number): boolea
 
 async function resolveUrlAddresses(url: string): Promise<string[]> {
   const parsed = new URL(url);
-  const literal = ipv4ToInt(parsed.hostname);
+  const literal = ipLiteral(parsed.hostname);
   if (literal !== null) {
-    return [parsed.hostname];
+    return [literal];
   }
 
   try {
@@ -865,21 +870,22 @@ async function resolveUrlAddresses(url: string): Promise<string[]> {
   }
 }
 
-function ipv4ToInt(address: string): number | null {
-  const parts = address.split(".");
-  if (parts.length !== 4) {
-    return null;
-  }
+function ipLiteral(hostname: string): string | null {
+  const unbracketed = hostname.startsWith("[") && hostname.endsWith("]")
+    ? hostname.slice(1, -1)
+    : hostname;
+  return ipFamily(unbracketed) === null ? null : unbracketed;
+}
 
-  let value = 0;
-  for (const part of parts) {
-    const octet = Number(part);
-    if (!Number.isInteger(octet) || octet < 0 || octet > 255) {
-      return null;
-    }
-    value = ((value << 8) | octet) >>> 0;
+function ipFamily(address: string): "ipv4" | "ipv6" | null {
+  const family = isIP(address);
+  if (family === 4) {
+    return "ipv4";
   }
-  return value;
+  if (family === 6) {
+    return "ipv6";
+  }
+  return null;
 }
 
 function delay(milliseconds: number): Promise<void> {

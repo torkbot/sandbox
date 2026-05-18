@@ -249,19 +249,23 @@ fn mount_virtual_filesystems(
     let Some(mounts) = mounts else { return Ok(()) };
 
     for mount in mounts.split(';').filter(|mount| !mount.is_empty()) {
-        let (tag, rest) = mount
-            .split_once('=')
-            .ok_or_else(|| InitError(format!("invalid virtual filesystem mount: {mount}")))?;
-        let (path, mode) = rest.split_once('=').unwrap_or((rest, "ro"));
-        std::fs::create_dir_all(Path::new(path))
+        let parts = mount.split(':').collect::<Vec<_>>();
+        let [tag, path, mode] = parts.as_slice() else {
+            return Err(InitError(format!(
+                "invalid virtual filesystem mount: {mount}"
+            )));
+        };
+        let tag = decode_mount_field(tag)?;
+        let path = decode_mount_field(path)?;
+        std::fs::create_dir_all(Path::new(&path))
             .map_err(|error| InitError(format!("create mount point {path}: {error}")))?;
 
-        let source = CString::new(tag)
+        let source = CString::new(tag.as_str())
             .map_err(|_| InitError(format!("virtual filesystem tag contains nul: {tag}")))?;
-        let target = CString::new(path)
+        let target = CString::new(path.as_str())
             .map_err(|_| InitError(format!("virtual filesystem path contains nul: {path}")))?;
         let fstype = CString::new("virtiofs").unwrap();
-        let readonly = mode != "rw";
+        let readonly = *mode != "rw";
         let options = CString::new(if readonly { "ro" } else { "rw" }).unwrap();
 
         let result = unsafe {
@@ -281,6 +285,21 @@ fn mount_virtual_filesystems(
     }
 
     Ok(())
+}
+
+fn decode_mount_field(value: &str) -> Result<String, InitError> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|error| {
+            InitError(format!(
+                "invalid virtual filesystem mount encoding: {error}"
+            ))
+        })?;
+    String::from_utf8(bytes).map_err(|error| {
+        InitError(format!(
+            "virtual filesystem mount field is not utf-8: {error}"
+        ))
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -550,6 +569,16 @@ mod tests {
                 root_readonly: true,
                 init_name: "sandbox-init".to_string(),
             },
+        );
+    }
+
+    #[test]
+    fn mount_field_decoding_preserves_delimiters() {
+        let encoded =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("/mnt/with=equals;semicolon");
+        assert_eq!(
+            decode_mount_field(&encoded).unwrap(),
+            "/mnt/with=equals;semicolon",
         );
     }
 }
