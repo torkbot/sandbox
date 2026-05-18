@@ -54,6 +54,24 @@ test("Node can boot a sandbox VM and exchange control messages", async (t) => {
   });
 });
 
+test("spawnSandbox rejects host launch failures before returning a VM", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  await assert.rejects(
+    spawnSandbox({
+      name: "missing-rootfs-launch-failure",
+      kernel: projectKernel(),
+      init: projectInit(),
+      rootfs: prebuiltRootfs("dist/rootfs/missing.erofs", {
+        format: "erofs",
+      }),
+    }),
+    /sandbox-host exited|krun_add_disk|failed/i,
+  );
+});
+
 test("guest init resists fatal signals from guest workloads", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;

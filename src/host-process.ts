@@ -201,6 +201,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
   readonly #options: SandboxOptions;
   readonly #httpProxy?: { close(): Promise<void> };
   readonly #packets: Uint8Array[] = [];
+  readonly #hostPacketWaiters: (() => void)[] = [];
   readonly #hostFs = new Map<string, SandboxFileSystem>();
   #buffer = new Uint8Array();
   #stderr = "";
@@ -258,11 +259,12 @@ export class HostProcessSandboxVm implements HostControlChannel {
     const httpProxy = options.network?.http === undefined
       ? undefined
       : await HostHttpProxy.start(options);
+    let vm: HostProcessSandboxVm | undefined;
     try {
       const child = spawn(hostBinaryPath(), ["--stdio"], {
         stdio: ["pipe", "pipe", "pipe"],
       });
-      const vm = new HostProcessSandboxVm(child, options, httpProxy);
+      vm = new HostProcessSandboxVm(child, options, httpProxy);
       await Promise.race([
         once(child, "spawn"),
         once(child, "error").then(([error]) => {
@@ -270,9 +272,13 @@ export class HostProcessSandboxVm implements HostControlChannel {
         }),
       ]);
       vm.#writeToHost(encodeHostSpawn(withHostProxyPort(nativeOptions, httpProxy?.port)));
+      await vm.#waitForLaunch();
       return vm;
     } catch (error) {
-      await httpProxy?.close();
+      await vm?.close();
+      if (vm === undefined) {
+        await httpProxy?.close();
+      }
       throw error;
     }
   }
@@ -395,6 +401,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
 
       const packet = this.#buffer.slice(0, packetLength);
       this.#buffer = this.#buffer.slice(packetLength);
+      this.#notifyHostPacket();
       if (!this.#routeHostPacket(packet)) {
         this.#packets.push(packet);
       }
@@ -604,6 +611,30 @@ export class HostProcessSandboxVm implements HostControlChannel {
     }
   }
 
+  async #waitForLaunch(): Promise<void> {
+    if (this.#packets.length > 0) {
+      return;
+    }
+
+    await Promise.race([
+      new Promise<void>((resolvePromise) => {
+        this.#hostPacketWaiters.push(resolvePromise);
+      }),
+      once(this.#child, "exit").then(() => {
+        throw this.#exitError ?? new Error("sandbox-host exited before VM launch completed");
+      }),
+      delay(10_000).then(() => {
+        throw new Error("sandbox-host did not produce a launch acknowledgement");
+      }),
+    ]);
+  }
+
+  #notifyHostPacket(): void {
+    const waiters = this.#hostPacketWaiters.splice(0);
+    for (const waiter of waiters) {
+      waiter();
+    }
+  }
 }
 
 function parseProxyPreface(line: string): ProxyMetadata | null {

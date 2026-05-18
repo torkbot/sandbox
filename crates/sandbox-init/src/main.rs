@@ -267,8 +267,11 @@ fn mount_virtual_filesystems(
         };
         let tag = decode_mount_field(tag)?;
         let path = decode_mount_field(path)?;
-        std::fs::create_dir_all(Path::new(&path))
-            .map_err(|error| InitError(format!("create mount point {path}: {error}")))?;
+        if !Path::new(&path).is_dir() {
+            return Err(InitError(format!(
+                "virtual filesystem mount point does not exist: {path}"
+            )));
+        }
 
         let source = CString::new(tag.as_str())
             .map_err(|_| InitError(format!("virtual filesystem tag contains nul: {tag}")))?;

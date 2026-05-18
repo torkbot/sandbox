@@ -393,6 +393,27 @@ test("guest-visible mounts are applied in declaration order so specific mounts c
   assert.equal(result.stdout, "child mount wins");
 });
 
+test("guest-visible mount points must exist in the rootfs or an earlier mounted filesystem", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  await assert.rejects(
+    spawnSandbox({
+      name: "missing-virtual-fs-mount-point",
+      kernel: projectKernel(),
+      init: projectInit(),
+      rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+        format: "erofs",
+      }),
+      mounts: [
+        virtualFsMount("/sandbox/proc", createMemoryWritableFileSystem()),
+      ],
+    }),
+    /virtual filesystem mount point does not exist|sandbox-host exited|sandbox-init failed/i,
+  );
+});
+
 test("closing a VM while a host filesystem callback is locked up cleans up the sandbox", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;

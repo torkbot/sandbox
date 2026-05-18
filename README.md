@@ -36,7 +36,7 @@ await using vm = await spawnSandbox({
   }),
 
   mounts: [
-    mount("/sandbox/proc", {
+    mount("/sandbox", {
       async stat(path) {
         if (path === "/") {
           return {
@@ -122,7 +122,7 @@ if (result.exitCode !== 0) {
 Mounted filesystems expose both the raw callback shape and a host-side tool surface for agent workflows:
 
 ```ts
-const sandboxProc = vm.mounts.virtualFs("/sandbox/proc");
+const sandboxProc = vm.mounts.virtualFs("/sandbox");
 const statusBytes = await sandboxProc.read({
   path: "/status.json",
   signal: AbortSignal.timeout(1_000),
@@ -177,7 +177,7 @@ await vm.control.exec({
 The guest contract is intentionally narrow:
 
 - `/` is read-only unless the rootfs is a `linuxOverlayFs(...)` composition.
-- `/sandbox/proc` is implemented by the host.
+- `/sandbox` is implemented by the host.
 - HTTP policy and header rewriting happen in TypeScript on the host.
 - Network egress starts from deny; outbound rules opt in the exact protocols, ranges, and ports the guest can reach.
 - The HTTP interception CA is generated and injected by Sandbox. Callers provide policy, not certificate plumbing.

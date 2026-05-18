@@ -397,12 +397,9 @@ impl KrunVm {
             .context
             .take()
             .ok_or_else(|| KrunError::new("krun_start_enter", -libc::EINVAL))?;
-        let context_id = context.id();
-        std::mem::forget(context);
-
         let start_status = Arc::clone(&self.start_status);
         self.worker = Some(thread::spawn(move || {
-            let result = check_krun("krun_start_enter", krun::krun_start_enter(context_id));
+            let result = check_krun("krun_start_enter", krun::krun_start_enter(context.id()));
             *start_status.lock().expect("start status lock poisoned") = Some(result.clone());
             result
         }));
