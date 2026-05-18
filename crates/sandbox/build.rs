@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(sandbox_static_kernel)");
+    println!("cargo:rerun-if-env-changed=SANDBOX_KERNEL_BUNDLE_C");
 
     let Ok(kernel_c) = env::var("SANDBOX_KERNEL_BUNDLE_C") else {
         return;
@@ -21,7 +22,6 @@ fn main() {
         .define("ABI_VERSION", "5")
         .compile("sandbox_kernel_bundle");
 
-    println!("cargo:rerun-if-env-changed=SANDBOX_KERNEL_BUNDLE_C");
     println!("cargo:rerun-if-changed={}", kernel_c.display());
     println!("cargo:rustc-cfg=sandbox_static_kernel");
 }

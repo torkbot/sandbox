@@ -311,7 +311,7 @@ class JustBashMountedFileSystem implements IFileSystem {
       name: entry.name,
       isFile: entry.type === "file",
       isDirectory: entry.type === "directory",
-      isSymbolicLink: false,
+      isSymbolicLink: entry.type === "symlink",
     }));
   }
 

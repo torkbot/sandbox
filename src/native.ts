@@ -1,6 +1,7 @@
 import type { OutboundNetworkRule } from "./index.ts";
 
 import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 
 type NativeSandboxVm = {
   readonly hasControlSocket: boolean;
@@ -68,7 +69,7 @@ function nativeModuleName(): string {
 }
 
 export function nativeBindingPath(): string {
-  return new URL(`../crates/sandbox-node/${nativeModuleName()}`, import.meta.url).pathname;
+  return fileURLToPath(new URL(`../crates/sandbox-node/${nativeModuleName()}`, import.meta.url));
 }
 
 export function loadNativeBinding(): NativeBinding {

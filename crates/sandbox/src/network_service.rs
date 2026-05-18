@@ -21,6 +21,8 @@ use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
 
+use crate::network::{CidrRange, OutboundRulePlan};
+
 const HOST_HTTP_PROBE_PORT: u16 = 8080;
 const HOST_HTTP_PORT: u16 = 80;
 const HOST_HTTPS_PORT: u16 = 443;
@@ -83,13 +85,20 @@ impl HostNetwork {
     pub fn new(
         http_handler: Option<Arc<dyn HostHttpHandler>>,
         tls_config: Option<MitmTlsConfig>,
+        outbound_rules: Option<Vec<OutboundRulePlan>>,
     ) -> io::Result<Self> {
         let (host, guest) = UnixStream::pair()?;
         let tls_acceptor = tls_config.map(TlsAcceptor::new).transpose()?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = shutdown.clone();
         let worker = thread::spawn(move || {
-            run_network_service(host, worker_shutdown, http_handler, tls_acceptor)
+            run_network_service(
+                host,
+                worker_shutdown,
+                http_handler,
+                tls_acceptor,
+                outbound_rules,
+            )
         });
         Ok(Self {
             guest_fd: guest.into_raw_fd(),
@@ -117,6 +126,7 @@ fn run_network_service(
     shutdown: Arc<AtomicBool>,
     http_handler: Option<Arc<dyn HostHttpHandler>>,
     tls_acceptor: Option<TlsAcceptor>,
+    outbound_rules: Option<Vec<OutboundRulePlan>>,
 ) {
     let _ = stream.set_nonblocking(true);
     let tx = match stream.try_clone() {
@@ -163,6 +173,7 @@ fn run_network_service(
                 http_handler.as_deref(),
                 &device.nat,
                 tls_acceptor.as_ref(),
+                outbound_rules.as_deref(),
                 &mut http_connections,
                 &mut tls_connections,
             );
@@ -225,6 +236,7 @@ fn poll_http_socket(
     handler: Option<&dyn HostHttpHandler>,
     nat: &TransparentTcpNat,
     tls_acceptor: Option<&TlsAcceptor>,
+    outbound_rules: Option<&[OutboundRulePlan]>,
     http_connections: &mut HashMap<SocketHandle, HttpConnection>,
     tls_connections: &mut HashMap<SocketHandle, TlsConnection>,
 ) {
@@ -249,7 +261,15 @@ fn poll_http_socket(
         return;
     }
     if http_connections.contains_key(&handle) {
-        poll_plain_http_socket(socket, handle, nat, handler, http_connections, &[]);
+        poll_plain_http_socket(
+            socket,
+            handle,
+            nat,
+            handler,
+            outbound_rules,
+            http_connections,
+            &[],
+        );
         return;
     }
 
@@ -295,6 +315,7 @@ fn poll_http_socket(
         handle,
         nat,
         handler,
+        outbound_rules,
         http_connections,
         &initial[..received],
     );
@@ -313,6 +334,7 @@ fn poll_plain_http_socket(
     handle: SocketHandle,
     nat: &TransparentTcpNat,
     handler: Option<&dyn HostHttpHandler>,
+    outbound_rules: Option<&[OutboundRulePlan]>,
     http_connections: &mut HashMap<SocketHandle, HttpConnection>,
     received: &[u8],
 ) {
@@ -364,6 +386,14 @@ fn poll_plain_http_socket(
             handler.handle_http_request(policy_request).ok()
         }
         None => {
+            if outbound_rules.is_some_and(|rules| {
+                !is_allowed_outbound_tcp(&request.destination_ip, request.destination_port, rules)
+            }) {
+                connection.response = outbound_denied_response();
+                connection.close_after_response = true;
+                flush_plain_http_response(socket, connection);
+                return;
+            }
             connection.response = HOST_HTTP_PROBE_RESPONSE.to_vec();
             connection.close_after_response = true;
             flush_plain_http_response(socket, connection);
@@ -692,6 +722,83 @@ fn encode_http_response(response: HostHttpResponse) -> Vec<u8> {
 
 fn upstream_failure_response() -> Vec<u8> {
     b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 20\r\nconnection: close\r\n\r\nupstream unavailable".to_vec()
+}
+
+fn outbound_denied_response() -> Vec<u8> {
+    b"HTTP/1.1 403 Forbidden\r\ncontent-length: 15\r\nconnection: close\r\n\r\noutbound denied"
+        .to_vec()
+}
+
+fn is_allowed_outbound_tcp(
+    destination_ip: &str,
+    destination_port: u16,
+    rules: &[OutboundRulePlan],
+) -> bool {
+    rules.iter().any(|rule| match rule {
+        OutboundRulePlan::AcceptTcp { cidr, ports } => {
+            port_matches(ports, destination_port) && cidr_contains(cidr, destination_ip)
+        }
+        OutboundRulePlan::AcceptUdp { .. } => false,
+        OutboundRulePlan::AcceptPublicInternet { ports } => {
+            port_matches(ports, destination_port) && is_public_ipv4_destination(destination_ip)
+        }
+    })
+}
+
+fn port_matches(ports: &[u16], destination_port: u16) -> bool {
+    ports.is_empty() || ports.contains(&destination_port)
+}
+
+fn cidr_contains(cidr: &CidrRange, destination_ip: &str) -> bool {
+    let std::net::IpAddr::V4(network) = cidr.address else {
+        return false;
+    };
+    let Ok(destination) = destination_ip.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    let network = u32::from(network);
+    let destination = u32::from(destination);
+    let mask = if cidr.prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - cidr.prefix)
+    };
+    (network & mask) == (destination & mask)
+}
+
+fn is_public_ipv4_destination(destination_ip: &str) -> bool {
+    destination_ip
+        .parse::<std::net::Ipv4Addr>()
+        .is_ok_and(|destination| {
+            ![
+                CidrRange {
+                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 0)),
+                    prefix: 8,
+                },
+                CidrRange {
+                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 0)),
+                    prefix: 8,
+                },
+                CidrRange {
+                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(100, 64, 0, 0)),
+                    prefix: 10,
+                },
+                CidrRange {
+                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(169, 254, 0, 0)),
+                    prefix: 16,
+                },
+                CidrRange {
+                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 16, 0, 0)),
+                    prefix: 12,
+                },
+                CidrRange {
+                    address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 0, 0)),
+                    prefix: 16,
+                },
+            ]
+            .iter()
+            .any(|range| cidr_contains(range, &destination.to_string()))
+        })
 }
 
 fn start_plain_upstream_stream(
@@ -1425,5 +1532,28 @@ mod tests {
         rx_writer.write_all(&packet[2..]).unwrap();
 
         assert_eq!(device.read_frame().unwrap(), Some(ethernet.to_vec()));
+    }
+
+    #[test]
+    fn outbound_rules_deny_unmatched_tcp_destinations() {
+        let rules = vec![OutboundRulePlan::AcceptTcp {
+            cidr: CidrRange {
+                address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 10)),
+                prefix: 32,
+            },
+            ports: vec![80],
+        }];
+
+        assert!(is_allowed_outbound_tcp("203.0.113.10", 80, &rules));
+        assert!(!is_allowed_outbound_tcp("203.0.113.11", 80, &rules));
+        assert!(!is_allowed_outbound_tcp("203.0.113.10", 443, &rules));
+    }
+
+    #[test]
+    fn public_internet_rules_exclude_loopback() {
+        let rules = vec![OutboundRulePlan::AcceptPublicInternet { ports: vec![80] }];
+
+        assert!(is_allowed_outbound_tcp("203.0.113.10", 80, &rules));
+        assert!(!is_allowed_outbound_tcp("127.0.0.1", 80, &rules));
     }
 }

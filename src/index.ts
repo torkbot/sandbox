@@ -521,10 +521,10 @@ function lowerNativeRootfs(rootfs: RootfsConfig): PrebuiltRootfsConfig {
 }
 
 function validateSandboxOptions(options: SandboxOptions): void {
-  if (options.cpu?.vcpus !== undefined && options.cpu.vcpus <= 0) {
+  if (options.cpu?.vcpus !== undefined && (!Number.isInteger(options.cpu.vcpus) || options.cpu.vcpus <= 0)) {
     throw new Error("invalid spawnSandbox options: cpu.vcpus must be greater than zero");
   }
-  if (options.memory?.mib !== undefined && options.memory.mib <= 0) {
+  if (options.memory?.mib !== undefined && (!Number.isInteger(options.memory.mib) || options.memory.mib <= 0)) {
     throw new Error("invalid spawnSandbox options: memory.mib must be greater than zero");
   }
   if (options.init.crate !== "sandbox-init") {

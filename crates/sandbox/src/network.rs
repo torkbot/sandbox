@@ -87,7 +87,7 @@ impl NetworkPlan {
 }
 
 impl OutboundRulePlan {
-    fn parse(rule: &OutboundRuleSpec) -> Result<Self, NetworkError> {
+    pub(crate) fn parse(rule: &OutboundRuleSpec) -> Result<Self, NetworkError> {
         match rule {
             OutboundRuleSpec::AcceptTcp { cidr, ports } => Ok(Self::AcceptTcp {
                 cidr: CidrRange::parse(cidr)?,

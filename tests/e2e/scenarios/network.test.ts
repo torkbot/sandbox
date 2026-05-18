@@ -190,6 +190,40 @@ test("outbound-only policy creates the guest network device", async (t) => {
   assert.match(result.stdout, /sandbox explicit network/);
 });
 
+test("outbound-only default deny blocks HTTP without JavaScript policy", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const vm = await spawnSandbox({
+    name: "outbound-only-default-deny",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      outbound: {
+        policy: "deny",
+        rules: [],
+      },
+    },
+  });
+
+  t.after(async () => {
+    await vm.close();
+  });
+
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuestShell(vm, {
+    id: "outbound-only-default-deny",
+    script: "curl --max-time 3 --connect-timeout 2 --silent --output /dev/null --write-out '%{http_code}' http://203.0.113.10/",
+  });
+
+  assert.equal(result.stdout, "403");
+});
+
 test("DNS-dependent traffic is observable and cannot bypass policy", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;

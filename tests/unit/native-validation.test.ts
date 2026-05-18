@@ -24,6 +24,21 @@ test("spawnSandbox rejects invalid CPU config before runtime launch", async () =
   );
 });
 
+test("spawnSandbox rejects fractional resource config before runtime launch", async () => {
+  await assert.rejects(
+    spawnSandbox({
+      kernel: projectKernel(),
+      init: projectInit(),
+      cpu: { vcpus: 1.5 },
+      memory: { mib: 128.5 },
+      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
+        format: "erofs",
+      }),
+    }),
+    /invalid spawnSandbox options: cpu\.vcpus must be greater than zero/,
+  );
+});
+
 test("spawnSandbox rejects directory rootfs before runtime launch", async () => {
   await assert.rejects(
     spawnSandbox({

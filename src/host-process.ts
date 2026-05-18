@@ -20,6 +20,7 @@ import type {
 } from "./index.ts";
 
 const DEFAULT_PROTECTED_RANGES = [
+  "127.0.0.0/8",
   "10.0.0.0/8",
   "100.64.0.0/10",
   "169.254.0.0/16",
@@ -725,7 +726,8 @@ async function inspectHttpProtection(
     ? (parsed.protocol === "https:" ? 443 : 80)
     : Number(parsed.port);
 
-  if (!isAllowedTcpDestination(request.destinationIp, request.destinationPort, rules)) {
+  const destinationPort = request.tls === undefined ? request.destinationPort : upstreamPort;
+  if (!isAllowedTcpDestination(request.destinationIp, destinationPort, rules)) {
     return { blocked: true };
   }
 
