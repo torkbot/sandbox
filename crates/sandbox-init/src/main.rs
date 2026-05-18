@@ -187,6 +187,8 @@ fn mount_kernel_filesystems() -> Result<(), InitError> {
     mount_fs("sysfs", "/sys", "sysfs", 0)?;
     mount_fs("devtmpfs", "/dev", "devtmpfs", 0)?;
     mount_fs("tmpfs", "/run", "tmpfs", 0)?;
+    mount_fs("tmpfs", "/tmp", "tmpfs", 0)?;
+    set_directory_mode("/tmp", 0o1777)?;
     Ok(())
 }
 
@@ -231,6 +233,14 @@ fn mount_fs(
         return Err(InitError::last_os(&format!("mount {target}")));
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn set_directory_mode(path: &str, mode: u32) -> Result<(), InitError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .map_err(|error| InitError(format!("set mode on {path}: {error}")))
 }
 
 #[cfg(target_os = "linux")]

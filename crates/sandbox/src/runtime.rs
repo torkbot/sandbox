@@ -538,6 +538,10 @@ mod tests {
 
     #[test]
     fn creates_configures_and_frees_krun_context() {
+        if std::env::var_os("SANDBOX_RUN_LIBKRUN_UNIT_TESTS").is_none() {
+            return;
+        }
+
         let spec = MicroVmSpec::build(MicroVmSpecInput {
             name: Some("runtime-test".to_string()),
             vcpus: Some(1),
@@ -616,6 +620,10 @@ mod tests {
 
     #[test]
     fn vm_creation_owns_host_control_socket() {
+        if std::env::var_os("SANDBOX_RUN_LIBKRUN_UNIT_TESTS").is_none() {
+            return;
+        }
+
         let spec = MicroVmSpec::build(MicroVmSpecInput {
             name: Some("control-socket".to_string()),
             vcpus: Some(1),

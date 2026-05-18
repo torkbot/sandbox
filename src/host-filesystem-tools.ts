@@ -16,6 +16,7 @@ import type {
   SandboxHostFileSystemTools,
   SandboxHostPatchEdit,
   SandboxHostReadResult,
+  SandboxPosixFileSystem,
   SandboxWritableFileSystem,
 } from "./index.ts";
 
@@ -289,10 +290,29 @@ class JustBashMountedFileSystem implements IFileSystem {
   }
 
   async mkdir(path: string, options?: MkdirOptions): Promise<void> {
-    if (path === "/" || (options?.recursive === true && path === ".")) {
+    const normalized = normalizeMountedPath(path);
+    if (normalized === "/" || (options?.recursive === true && path === ".")) {
       return;
     }
-    throw new Error(`mkdir is not supported by this sandbox filesystem: ${path}`);
+    const fileSystem = this.#assertPosix();
+    if (options?.recursive === true) {
+      let current = "";
+      for (const component of normalized.split("/").filter((part) => part.length > 0)) {
+        current = `${current}/${component}`;
+        let stat: SandboxFileStat | null = null;
+        try {
+          stat = await this.#fileSystem.stat(current);
+        } catch {
+          await fileSystem.mkdir(current);
+          continue;
+        }
+        if (stat.type !== "directory") {
+          throw new Error(`not a directory: ${current}`);
+        }
+      }
+      return;
+    }
+    await fileSystem.mkdir(normalized);
   }
 
   async readdir(path: string): Promise<string[]> {
@@ -370,6 +390,14 @@ class JustBashMountedFileSystem implements IFileSystem {
       throw new Error("host filesystem mount is read-only");
     }
     return this.#fileSystem;
+  }
+
+  #assertPosix(): SandboxPosixFileSystem {
+    const candidate = this.#assertWritable() as Partial<SandboxPosixFileSystem>;
+    if (typeof candidate.mkdir !== "function") {
+      throw new Error("mkdir is not supported by this sandbox filesystem");
+    }
+    return candidate as SandboxPosixFileSystem;
   }
 }
 

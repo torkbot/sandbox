@@ -142,6 +142,25 @@ test("guest disk exhaustion is bounded to the sandbox upper filesystem", async (
   assert.equal(freshResult.exitCode, 0);
 });
 
+test("guest rootfs provides a sticky world-writable tmp directory", async (t) => {
+  const vm = await spawnHardeningVm(t, "guest-rootfs-tmp-mode");
+  if (vm === null) {
+    return;
+  }
+
+  const result = await execGuestShell(vm, {
+    id: "guest-rootfs-tmp-mode",
+    script: "stat -c '%a %F' /tmp && touch /tmp/sandbox-tmp-check",
+  });
+
+  assert.equal(
+    result.exitCode,
+    0,
+    `guest /tmp check failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+  );
+  assert.equal(result.stdout, "1777 directory\n");
+});
+
 test("guest kernel object pressure can be stopped without wedging the host API", async (t) => {
   const vm = await spawnHardeningVm(t, "guest-kernel-object-pressure", {
     memoryMib: 256,

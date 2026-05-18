@@ -1,4 +1,4 @@
-import { copyFile, mkdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { getgid, getuid } from "node:process";
@@ -37,6 +37,8 @@ await mkdir(resolve(outDir, "dev"), { recursive: true });
 await mkdir(resolve(outDir, "proc"), { recursive: true });
 await mkdir(resolve(outDir, "sandbox"), { recursive: true });
 await mkdir(resolve(outDir, "sys"), { recursive: true });
+await mkdir(resolve(outDir, "tmp"), { recursive: true, mode: 0o1777 });
+await chmod(resolve(outDir, "tmp"), 0o1777);
 await mkdir(resolve(outDir, "workspace"), { recursive: true });
 
 console.log(`rootfs directory written to ${outDir}`);

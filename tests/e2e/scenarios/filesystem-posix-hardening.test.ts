@@ -58,6 +58,21 @@ test("writable virtual filesystem supports nested directories and atomic rename"
   assert.deepEqual(await fileSystem.list("/src/lib"), [
     { name: "value.ts", type: "file" },
   ]);
+
+  const hostResult = await vm.mounts.host("/workspace").bash({
+    command: "mkdir -p host/tools && printf 'host api\\n' > host/tools/output.txt && cat host/tools/output.txt",
+    timeoutMs: 1_000,
+    signal: AbortSignal.timeout(2_000),
+  });
+  assert.equal(
+    hostResult.exitCode,
+    0,
+    `host bash POSIX mkdir failed\nstdout:\n${hostResult.stdout}\nstderr:\n${hostResult.stderr}`,
+  );
+  assert.equal(hostResult.stdout, "host api\n");
+  assert.deepEqual(await fileSystem.list("/host/tools"), [
+    { name: "output.txt", type: "file" },
+  ]);
 });
 
 test("writable virtual filesystem supports unlink and empty directory removal", async (t) => {

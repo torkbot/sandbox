@@ -817,10 +817,10 @@ async function inspectHttpProtection(
     return { blocked: true };
   }
 
-  const addresses = await resolveUrlAddresses(request.url);
-  if (addresses.length === 0) {
-    return { blocked: false, unresolved: true };
-  }
+  const resolvedAddresses = await resolveUrlAddresses(request.url);
+  const addresses = resolvedAddresses.length === 0
+    ? [request.destinationIp]
+    : resolvedAddresses;
   for (const address of addresses) {
     if (!isAllowedTcpDestination(address, upstreamPort, rules)) {
       return { blocked: true };
