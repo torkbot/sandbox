@@ -541,12 +541,7 @@ function validateSandboxOptions(options: SandboxOptions): void {
 
   const mountPaths = new Set<string>();
   for (const mount of options.mounts ?? []) {
-    if (!mount.path.startsWith("/")) {
-      throw new Error("invalid spawnSandbox options: mount.path must be absolute");
-    }
-    if (mount.path.includes("=") || mount.path.includes(";")) {
-      throw new Error("invalid spawnSandbox options: mount.path must not contain '=' or ';'");
-    }
+    validateGuestPath(mount.path, "mount.path");
     if (mountPaths.has(mount.path)) {
       throw new Error(`invalid spawnSandbox options: duplicate mount path: ${mount.path}`);
     }
@@ -555,9 +550,7 @@ function validateSandboxOptions(options: SandboxOptions): void {
 
   const bindingPaths = new Set<string>();
   for (const binding of options.bindings ?? []) {
-    if (!binding.path.startsWith("/")) {
-      throw new Error("invalid spawnSandbox options: binding.path must be absolute");
-    }
+    validateGuestPath(binding.path, "binding.path");
     if (mountPaths.has(binding.path)) {
       throw new Error(`invalid spawnSandbox options: binding path conflicts with mount path: ${binding.path}`);
     }
@@ -576,6 +569,18 @@ function validateSandboxOptions(options: SandboxOptions): void {
       validateCidr(rule.cidr);
     }
     validateOutboundPorts(rule.ports);
+  }
+}
+
+function validateGuestPath(path: string, field: "mount.path" | "binding.path"): void {
+  if (!path.startsWith("/")) {
+    throw new Error(`invalid spawnSandbox options: ${field} must be absolute`);
+  }
+  if (path.includes("\0")) {
+    throw new Error(`invalid spawnSandbox options: ${field} must not contain NUL bytes`);
+  }
+  if (path.includes("=") || path.includes(";")) {
+    throw new Error(`invalid spawnSandbox options: ${field} must not contain '=' or ';'`);
   }
 }
 
@@ -602,10 +607,70 @@ function validateCidr(range: string): void {
     if (prefix < 0 || prefix > 128) {
       throw new Error(`invalid spawnSandbox options: invalid CIDR prefix: ${range}`);
     }
+    if (parseIpv6Address(address) === null) {
+      throw new Error(`invalid spawnSandbox options: invalid CIDR address: ${range}`);
+    }
     return;
   }
 
   if (prefix < 0 || prefix > 32) {
     throw new Error(`invalid spawnSandbox options: invalid CIDR prefix: ${range}`);
   }
+  if (parseIpv4Address(address) === null) {
+    throw new Error(`invalid spawnSandbox options: invalid CIDR address: ${range}`);
+  }
+}
+
+function parseIpv4Address(address: string): number | null {
+  const parts = address.split(".");
+  if (parts.length !== 4) {
+    return null;
+  }
+  let value = 0;
+  for (const part of parts) {
+    if (!/^\d+$/.test(part)) {
+      return null;
+    }
+    const octet = Number(part);
+    if (octet < 0 || octet > 255) {
+      return null;
+    }
+    value = ((value << 8) | octet) >>> 0;
+  }
+  return value;
+}
+
+function parseIpv6Address(address: string): bigint | null {
+  const zoneIndex = address.indexOf("%");
+  if (zoneIndex !== -1) {
+    return null;
+  }
+  const doubleColonParts = address.split("::");
+  if (doubleColonParts.length > 2) {
+    return null;
+  }
+
+  const head = doubleColonParts[0] === "" ? [] : doubleColonParts[0]?.split(":") ?? [];
+  const tail = doubleColonParts.length === 1 || doubleColonParts[1] === ""
+    ? []
+    : doubleColonParts[1]?.split(":") ?? [];
+  const hasCompression = doubleColonParts.length === 2;
+  const missing = 8 - head.length - tail.length;
+  if ((!hasCompression && missing !== 0) || (hasCompression && missing < 1)) {
+    return null;
+  }
+
+  const groups = [...head, ...Array<string>(hasCompression ? missing : 0).fill("0"), ...tail];
+  if (groups.length !== 8) {
+    return null;
+  }
+
+  let value = 0n;
+  for (const group of groups) {
+    if (!/^[0-9a-fA-F]{1,4}$/.test(group)) {
+      return null;
+    }
+    value = (value << 16n) | BigInt(Number.parseInt(group, 16));
+  }
+  return value;
 }

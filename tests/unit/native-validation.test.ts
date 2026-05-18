@@ -127,6 +127,22 @@ test("spawnSandbox rejects mount paths that cannot be encoded for guest init", a
   );
 });
 
+test("spawnSandbox rejects mount paths with NUL bytes before runtime launch", async () => {
+  await assert.rejects(
+    spawnSandbox({
+      kernel: projectKernel(),
+      init: projectInit(),
+      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
+        format: "erofs",
+      }),
+      mounts: [
+        virtualFsMount("/bad\0path", unreachableFileSystem()),
+      ],
+    }),
+    /invalid spawnSandbox options: mount\.path must not contain NUL bytes/,
+  );
+});
+
 test("spawnSandbox rejects relative binding paths before runtime launch", async () => {
   await assert.rejects(
     spawnSandbox({
@@ -215,6 +231,25 @@ test("spawnSandbox rejects invalid outbound CIDR ranges before runtime launch", 
       },
     }),
     /invalid spawnSandbox options: invalid CIDR prefix: 127\.0\.0\.0\/33/,
+  );
+});
+
+test("spawnSandbox rejects invalid outbound CIDR addresses before runtime launch", async () => {
+  await assert.rejects(
+    spawnSandbox({
+      kernel: projectKernel(),
+      init: projectInit(),
+      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
+        format: "erofs",
+      }),
+      network: {
+        outbound: {
+          policy: "deny",
+          rules: [acceptTcp({ cidr: "999.0.0.0/8" })],
+        },
+      },
+    }),
+    /invalid spawnSandbox options: invalid CIDR address: 999\.0\.0\.0\/8/,
   );
 });
 
