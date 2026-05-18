@@ -610,7 +610,7 @@ function validateCidr(range: string): void {
     if (parseIpv6Address(address) === null) {
       throw new Error(`invalid spawnSandbox options: invalid CIDR address: ${range}`);
     }
-    return;
+    throw new Error(`invalid spawnSandbox options: IPv6 outbound CIDR ranges are not supported yet: ${range}`);
   }
 
   if (prefix < 0 || prefix > 32) {

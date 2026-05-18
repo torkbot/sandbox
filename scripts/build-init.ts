@@ -1,6 +1,7 @@
 import { copyFile, mkdir, stat } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { spawn } from "node:child_process";
+import { getgid, getuid } from "node:process";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 const target = process.env.SANDBOX_INIT_TARGET ?? guestTarget();
@@ -23,6 +24,7 @@ await run("docker", [
     "apt-get update",
     "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends musl-tools",
     `cargo build -p sandbox-init --release --target ${shellArg(target)}`,
+    `chown -R ${getuid?.() ?? 0}:${getgid?.() ?? 0} /work/target/${shellArg(target)}`,
   ].join(" && "),
 ]);
 

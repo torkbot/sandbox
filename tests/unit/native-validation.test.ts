@@ -253,6 +253,25 @@ test("spawnSandbox rejects invalid outbound CIDR addresses before runtime launch
   );
 });
 
+test("spawnSandbox rejects IPv6 outbound CIDR ranges until IPv6 egress is supported", async () => {
+  await assert.rejects(
+    spawnSandbox({
+      kernel: projectKernel(),
+      init: projectInit(),
+      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
+        format: "erofs",
+      }),
+      network: {
+        outbound: {
+          policy: "deny",
+          rules: [acceptTcp({ cidr: "2001:db8::/32" })],
+        },
+      },
+    }),
+    /invalid spawnSandbox options: IPv6 outbound CIDR ranges are not supported yet: 2001:db8::\/32/,
+  );
+});
+
 test("virtualFsMount preserves the host filesystem object", () => {
   const virtualFs = {
     async stat() {
