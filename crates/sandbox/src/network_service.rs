@@ -31,6 +31,7 @@ const HTTP_SOCKET_BUFFER_BYTES: usize = 256 * 1024;
 const TLS_READ_BUFFER_BYTES: usize = 16 * 1024;
 const DNS_PACKET_BUFFER_BYTES: usize = 4096;
 const DNS_PROTECTED_TEST_IP: [u8; 4] = [10, 1, 2, 3];
+const DNS_PUBLIC_TEST_IP: [u8; 4] = [203, 0, 113, 10];
 const HOST_HTTP_PROBE_RESPONSE: &[u8] =
     b"HTTP/1.1 200 OK\r\ncontent-length: 25\r\nconnection: close\r\n\r\nsandbox explicit network\n";
 
@@ -878,6 +879,9 @@ fn parse_dns_name(packet: &[u8], mut offset: usize) -> Option<(String, usize)> {
 fn dns_address(name: &str) -> Option<[u8; 4]> {
     if name == "protected.sandbox.test" {
         return Some(DNS_PROTECTED_TEST_IP);
+    }
+    if name == "public.sandbox.test" {
+        return Some(DNS_PUBLIC_TEST_IP);
     }
     (name, 0)
         .to_socket_addrs()

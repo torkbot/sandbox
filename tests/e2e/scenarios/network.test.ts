@@ -225,13 +225,13 @@ test("DNS-dependent traffic is observable and cannot bypass policy", async (t) =
 
   const result = await execGuestShell(vm, {
     id: "dns-policy",
-    script: "curl --max-time 4 --connect-timeout 2 --silent http://example.com/hostname",
+    script: "curl --max-time 4 --connect-timeout 2 --silent http://public.sandbox.test/hostname",
   });
 
   assert.equal(result.exitCode, 0);
   assert.match(result.stdout, /dns policy observed/);
   assert.equal(policyUrls.length, 1);
-  assert.match(policyUrls[0] ?? "", /^\d+\.\d+\.\d+\.\d+ http:\/\/example\.com\/hostname$/);
+  assert.equal(policyUrls[0], "203.0.113.10 http://public.sandbox.test/hostname");
 });
 
 test("DNS resolution to a denied IP is blocked before policy", async (t) => {
