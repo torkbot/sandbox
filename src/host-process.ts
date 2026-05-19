@@ -13,6 +13,7 @@ import { isSandboxWritableFileSystem } from "./vfs.ts";
 import type {
   HttpPolicyRequest,
   OutboundNetworkRule,
+  SandboxHttpRequestHeadersHook,
   SandboxOptions,
   SandboxFileSystem,
   SandboxPosixFileSystem,
@@ -46,15 +47,25 @@ type ProxyMetadata = {
   readonly tls?: HttpPolicyRequest["tls"];
 };
 
+export type HostHttpRequestHeadersRegistration = {
+  readonly pattern: string;
+  readonly hook: SandboxHttpRequestHeadersHook;
+};
+
 class HostHttpProxy {
   readonly #options: SandboxOptions;
+  readonly #requestHeaderHooks: readonly HostHttpRequestHeadersRegistration[];
   readonly #metadata = new WeakMap<Socket, ProxyMetadata>();
   readonly #sockets = new Set<Socket>();
   readonly #httpServer: http.Server;
   readonly #netServer: net.Server;
 
-  private constructor(options: SandboxOptions) {
+  private constructor(
+    options: SandboxOptions,
+    requestHeaderHooks: readonly HostHttpRequestHeadersRegistration[],
+  ) {
     this.#options = options;
+    this.#requestHeaderHooks = requestHeaderHooks;
     this.#httpServer = http.createServer((request, response) => {
       void this.#handleRequest(request, response);
     });
@@ -63,8 +74,11 @@ class HostHttpProxy {
     });
   }
 
-  static async start(options: SandboxOptions): Promise<{ readonly port: number; close(): Promise<void> }> {
-    const proxy = new HostHttpProxy(options);
+  static async start(
+    options: SandboxOptions,
+    requestHeaderHooks: readonly HostHttpRequestHeadersRegistration[],
+  ): Promise<{ readonly port: number; close(): Promise<void> }> {
+    const proxy = new HostHttpProxy(options, requestHeaderHooks);
     proxy.#netServer.listen(0, "127.0.0.1");
     await once(proxy.#netServer, "listening");
     const address = proxy.#netServer.address();
@@ -160,9 +174,45 @@ class HostHttpProxy {
         return;
       }
 
+      const matchingRequestHeaderHooks = this.#requestHeaderHooks.filter((registration) => {
+        return requestPatternMatches(registration.pattern, policyRequest.url);
+      });
+      if (
+        matchingRequestHeaderHooks.length > 0
+        && authorityIsHostname(policyRequest.url)
+        && !isPublicIpv4Destination(policyRequest.destinationIp)
+      ) {
+        response.writeHead(403, { "content-type": "text/plain" });
+        response.end("outbound denied");
+        return;
+      }
+
+      const upstreamHeaders = new Headers(decision.headers ?? headers);
+      for (const registration of matchingRequestHeaderHooks) {
+        await registration.hook({
+          url: new URL(policyRequest.url),
+          method: policyRequest.method,
+          headers: upstreamHeaders,
+          destination: {
+            originalIp: policyRequest.destinationIp,
+            originalPort: policyRequest.destinationPort,
+            upstreamIp: protection.upstreamIp ?? policyRequest.destinationIp,
+            upstreamPort: upstreamPort(policyRequest.url),
+          },
+          ...(policyRequest.tls === undefined
+            ? {}
+            : {
+                tls: {
+                  sni: policyRequest.tls.serverName,
+                  alpn: policyRequest.tls.alpnProtocol,
+                },
+              }),
+        });
+      }
+
       const upstream = createUpstreamRequest(policyRequest.url, {
         method: policyRequest.method,
-        headers: decision.headers ?? headers,
+        headers: Object.fromEntries(upstreamHeaders.entries()),
         upstreamIp: protection.upstreamIp,
       }, (upstreamResponse) => {
         response.writeHead(
@@ -255,10 +305,11 @@ export class HostProcessSandboxVm implements HostControlChannel {
   static async spawn(
     options: SandboxOptions,
     nativeOptions: NativeSpawnSandboxOptions,
+    requestHeaderHooks: readonly HostHttpRequestHeadersRegistration[] = [],
   ): Promise<HostProcessSandboxVm> {
-    const httpProxy = options.network?.http === undefined
+    const httpProxy = options.network?.http === undefined && requestHeaderHooks.length === 0
       ? undefined
-      : await HostHttpProxy.start(options);
+      : await HostHttpProxy.start(options, requestHeaderHooks);
     let vm: HostProcessSandboxVm | undefined;
     try {
       const child = spawn(hostBinaryPath(), ["--stdio"], {
@@ -663,6 +714,25 @@ function requestUrl(request: http.IncomingMessage, metadata: ProxyMetadata): str
   }
   const host = request.headers.host ?? metadata.destinationIp;
   return `${metadata.tls === undefined ? "http" : "https"}://${host}${target}`;
+}
+
+function requestPatternMatches(pattern: string, url: string): boolean {
+  if (pattern.endsWith("/*")) {
+    return url.startsWith(pattern.slice(0, -1));
+  }
+  return pattern === url;
+}
+
+function upstreamPort(url: string): number {
+  const parsed = new URL(url);
+  if (parsed.port.length > 0) {
+    return Number(parsed.port);
+  }
+  return parsed.protocol === "https:" ? 443 : 80;
+}
+
+function authorityIsHostname(url: string): boolean {
+  return ipLiteral(new URL(url).hostname) === null;
 }
 
 function normalizeIncomingHeaders(headers: http.IncomingHttpHeaders): Record<string, string> {

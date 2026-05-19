@@ -48,6 +48,7 @@ test("HTTP request-header hook injects host credentials only on the upstream leg
         policy: "deny",
         rules: [
           acceptTcp({ cidr: "127.0.0.1/32", ports: [urlPort(origin.url)] }),
+          acceptTcp({ cidr: "203.0.113.10/32", ports: [80] }),
         ],
       },
     },
@@ -73,7 +74,7 @@ test("HTTP request-header hook injects host credentials only on the upstream leg
       "-fsS",
       "-H",
       "x-guest-authorization: none",
-      `${origin.url}/user`,
+      ...interceptedHttpArgs(`${origin.url}/user`),
     ],
   });
 
@@ -107,7 +108,7 @@ test("HTTP credential hooks do not authorize DNS-rebound private destinations", 
       outbound: {
         policy: "deny",
         rules: [
-          acceptTcp({ cidr: "127.0.0.1/32", ports: [80, 443] }),
+          acceptTcp({ cidr: "169.254.169.254/32", ports: [443] }),
         ],
       },
     },
@@ -136,7 +137,7 @@ test("HTTP credential hooks do not authorize DNS-rebound private destinations", 
       "-w",
       "%{http_code}",
       "--connect-to",
-      "api.github.com:443:127.0.0.1:443",
+      "api.github.com:443:169.254.169.254:443",
       "https://api.github.com/user",
     ],
   });
@@ -148,4 +149,13 @@ function urlPort(url: string): number {
   const port = Number(new URL(url).port);
   assert.ok(Number.isInteger(port) && port > 0);
   return port;
+}
+
+function interceptedHttpArgs(url: string): string[] {
+  const parsed = new URL(url);
+  return [
+    "--connect-to",
+    `${parsed.hostname}:${parsed.port}:203.0.113.10:80`,
+    url,
+  ];
 }
