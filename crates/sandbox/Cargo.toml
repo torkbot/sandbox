@@ -15,6 +15,8 @@ ipnet = "2.11"
 sandbox-protocol = { path = "../sandbox-protocol" }
 smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-raw", "socket-tcp", "socket-udp"] }
 rustls = "0.23.40"
+rama-core = { git = "https://github.com/plabayo/rama", rev = "09ea1a0ff0cd5941ba65421ff5b0f263f6cf5211", version = "0.3.0-rc1" }
+rama-http = { git = "https://github.com/plabayo/rama", rev = "09ea1a0ff0cd5941ba65421ff5b0f263f6cf5211", version = "0.3.0-rc1" }
 
 [build-dependencies]
 cc = "1.2"
