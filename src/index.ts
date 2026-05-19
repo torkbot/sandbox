@@ -1,5 +1,5 @@
 import { HostControlTransport } from "./control.ts";
-import { HostProcessSandboxVm, type HostHttpRequestHeadersRegistration } from "./host-process.ts";
+import { HostProcessSandboxVm } from "./host-process.ts";
 import { createSandboxHostFileSystemTools } from "./host-filesystem-tools.ts";
 import { isSandboxWritableFileSystem } from "./vfs.ts";
 import type { NativeSpawnSandboxOptions } from "./native.ts";
@@ -376,13 +376,10 @@ export function acceptPublicInternet(input: {
   };
 }
 
-export async function spawnSandbox(
-  options: SandboxOptions,
-  requestHeaderHooks: readonly HostHttpRequestHeadersRegistration[] = [],
-): Promise<SandboxVm> {
+export async function spawnSandbox(options: SandboxOptions): Promise<SandboxVm> {
   validateSandboxOptions(options);
   const nativeOptions = toNativeSpawnOptions(options);
-  const nativeVm = await HostProcessSandboxVm.spawn(options, nativeOptions, requestHeaderHooks);
+  const nativeVm = await HostProcessSandboxVm.spawn(options, nativeOptions);
   return new NativeBackedSandboxVm(nativeVm, options);
 }
 
@@ -426,10 +423,7 @@ class ConfiguredSandboxBuilder implements SandboxBuilder {
     if (this.#vm !== null) {
       throw new Error("sandbox has already been run");
     }
-    this.#vm = await spawnSandbox(
-      this.#options,
-      [...this.#requestHeaderHooks].filter((registration) => registration.active),
-    );
+    this.#vm = await spawnSandbox(this.#options);
     return this.#vm;
   }
 

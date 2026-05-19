@@ -141,14 +141,14 @@ This file owns the new L7 contract: HTTP request-header hooks are default-allow,
 
 Passing:
 
+- None yet. These tests define the Rust/Rama data-plane contract and must fail until that implementation exists.
+
+Failing:
+
 - `HTTP request-header hook injects host credentials only on the upstream leg`
   - A guest request reaches a local origin, a host hook sets `authorization`, and the origin sees the header while the guest only supplied its own non-secret marker.
 - `HTTP credential hooks do not authorize DNS-rebound private destinations`
   - A request whose URL authority matches `https://api.github.com/*` but whose connection is rebound to link-local/private address space must be denied before credential injection.
-
-Failing:
-
-- No remaining known failures in this scenario file.
 
 ## `network.test.ts`
 
