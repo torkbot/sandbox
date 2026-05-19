@@ -141,76 +141,10 @@ This file owns the new L7 contract: HTTP request-header hooks are default-allow,
 
 Passing:
 
-- None yet. These tests define the breaking target for the Rama-backed Rust data plane.
-
-Failing:
-
 - `HTTP request-header hook injects host credentials only on the upstream leg`
   - A guest request reaches a local origin, a host hook sets `authorization`, and the origin sees the header while the guest only supplied its own non-secret marker.
 - `HTTP credential hooks do not authorize DNS-rebound private destinations`
-  - A request whose URL authority matches `https://api.github.com/*` but whose connection is rebound to loopback must be denied before credential injection.
-
-## `http-policy.test.ts`
-
-This file covers the legacy L7 interception scaffold: HTTP parsing, TLS MITM, JavaScript policy, header rewriting, body handling, and failure behavior. It should be retired as the Rama-backed request-header hook contract replaces the old policy API.
-
-Passing:
-
-- `plain HTTP traffic is intercepted, policy checked, rewritten, and forwarded`
-  - Covers allow, deny, header rewrite, outbound policy handling, and policy metadata.
-- `HTTPS traffic is intercepted, policy checked, and outbound-denied destinations are blocked`
-  - Covers guest CA trust, TLS MITM, deny decisions, and outbound-denied destinations.
-- `outbound default-deny blocks destinations before JavaScript policy`
-  - Covers default-deny outbound enforcement before policy.
-- `transparent HTTPS generates a trusted leaf cert for the requested SNI hostname`
-  - Covers dynamic per-SNI leaf certificate issuance.
-- `transparent HTTPS exposes SNI and Host mismatch to one policy call`
-  - Covers SNI/Host mismatch visibility without a second JS round trip.
-- `certificate pinning rejects MITM and fails closed before HTTP policy`
-  - Covers pinned clients failing before policy is invoked.
-- `HTTP interception forwards request and response bodies larger than a single TCP read`
-  - Covers large HTTP upload/download and host framing.
-- `HTTP interception handles concurrent guest requests without dropping policy calls`
-  - Covers concurrent HTTP request accounting.
-- `HTTP keep-alive behavior is explicit and deterministic`
-  - Uses one client connection for two pipelined requests and asserts the documented close-after-one-response behavior.
-- `upstream connection refused returns a deterministic guest-visible failure`
-  - Allows policy to a refused origin and asserts the guest sees a stable `502`.
-- `upstream timeout returns a deterministic guest-visible failure`
-  - Origin accepts but delays response past the host upstream timeout; guest sees a stable `502`.
-- `upstream reset mid-body is passed through as a truncated response`
-  - Origin closes mid-response after headers are sent; the guest observes the upstream status and client-level truncation.
-- `TLS without SNI has deterministic certificate and policy metadata`
-  - Connects by IP literal and asserts missing-SNI metadata reaches one policy call deterministically.
-- `dynamic MITM certificates are reused or bounded intentionally`
-  - Repeated SNI requests provide guest-observed certificate evidence for cache behavior.
-- `HTTP/2 ALPN behavior is explicit`
-  - Attempts an HTTP/2-capable client and asserts deterministic HTTP/1.1 ALPN downgrade.
-
-Failing:
-
-No remaining known failures in this scenario file.
-
-## `http-production-hardening.test.ts`
-
-This file owns production HTTP behavior that matters for long-running agent workloads and failure cleanup.
-
-Passing:
-
-- `HTTP interception streams response bodies without waiting for upstream completion`
-  - A slow upstream response should deliver first bytes to the guest before the origin finishes the whole response.
-- `closing a VM while HTTP policy is locked up cleans up the sandbox`
-  - A never-resolving JavaScript policy callback should not prevent VM close from completing and rejecting in-flight guest work.
-- `plain HTTP egress header rewrite does not expose or modify request bodies`
-  - JavaScript policy sees request metadata and headers only; Rust forwards the original body and the upstream response unchanged.
-- `HTTPS egress header rewrite does not expose or modify request bodies`
-  - The same egress-only header contract holds under TLS MITM with SNI metadata.
-- `redirects to outbound-denied destinations are blocked before JavaScript policy`
-  - A public origin redirecting to metadata/private infrastructure cannot bypass the outbound policy.
-- `HTTPS interception buffers fragmented TLS plaintext before policy`
-  - TLS headers and bodies split across records are buffered until a complete HTTP request is available.
-- `HTTPS interception handles forwarded TLS ports without remapping to 443`
-  - TLS is detected per flow so a pre-listened non-443 HTTPS destination still goes through MITM interception.
+  - A request whose URL authority matches `https://api.github.com/*` but whose connection is rebound to link-local/private address space must be denied before credential injection.
 
 Failing:
 
@@ -222,24 +156,10 @@ This file owns L3/L4 behavior that is not specific to HTTP semantics.
 
 Passing:
 
-- `HTTP networking transparently intercepts guest TCP over explicit virtio-net`
-  - Covers guest interface, route, and transparent TCP interception through the in-process backend.
-- `outbound default deny blocks destinations before JavaScript policy`
-  - Configure no matching accept rule and assert a pre-policy block.
-- `public destinations reach JavaScript policy`
-  - Request a destination allowed by `acceptTcp(...)` and assert policy evidence.
-- `outbound-only policy creates the guest network device`
-  - `network.outbound` without `network.http` still creates the guest interface and route.
-- `DNS-dependent traffic is observable and cannot bypass policy`
-  - Guest requests a hostname without `--connect-to`; assert DNS behavior and policy evidence.
-- `DNS resolution to a denied IP is blocked before policy`
-  - Host-controlled hostname resolves to a destination without an accept rule and is blocked.
-- `public internet allow rules do not allow IPv6 loopback resolution`
-  - `acceptPublicInternet(...)` never treats IPv6 loopback/link-local resolution as public reachability.
-- `IPv6 behavior is explicit`
-  - Attempt IPv6 HTTP destination and assert deterministic unsupported or implemented behavior.
-
-Arbitrary UDP forwarding is not currently a production runtime surface. DNS UDP remains covered through resolver-driven scenarios; a future general UDP forwarding feature should add listener-backed e2e evidence with a deterministic host observable.
+- `outbound policy creates the guest network device and default route`
+  - Covers guest interface and route setup when L4 outbound policy is configured.
+- `outbound default deny returns a deterministic HTTP denial`
+  - Configure no matching accept rule and assert the guest sees a deterministic `403`.
 
 Failing:
 

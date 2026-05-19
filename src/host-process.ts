@@ -11,7 +11,6 @@ import type { HostControlChannel } from "./control.ts";
 import type { NativeSpawnSandboxOptions } from "./native.ts";
 import { isSandboxWritableFileSystem } from "./vfs.ts";
 import type {
-  HttpPolicyRequest,
   OutboundNetworkRule,
   SandboxHttpRequestHeadersHook,
   SandboxOptions,
@@ -44,7 +43,11 @@ const DEFAULT_PROTECTED_RANGES = [
 type ProxyMetadata = {
   readonly destinationIp: string;
   readonly destinationPort: number;
-  readonly tls?: HttpPolicyRequest["tls"];
+  readonly tls?: {
+    readonly serverName?: string;
+    readonly alpnProtocol?: string;
+    readonly protocol?: string;
+  };
 };
 
 export type HostHttpRequestHeadersRegistration = {
@@ -128,8 +131,7 @@ class HostHttpProxy {
 
   async #handleRequest(request: http.IncomingMessage, response: http.ServerResponse): Promise<void> {
     const metadata = this.#metadata.get(request.socket);
-    const interception = this.#options.network?.http;
-    if (metadata === undefined || interception === undefined) {
+    if (metadata === undefined) {
       response.writeHead(502, { "content-type": "text/plain" });
       response.end("upstream unavailable");
       return;
@@ -138,7 +140,7 @@ class HostHttpProxy {
     try {
       const headers = normalizeIncomingHeaders(request.headers);
       const url = requestUrl(request, metadata);
-      const policyRequest: HttpPolicyRequest = {
+      const interceptedRequest = {
         method: request.method ?? "GET",
         url,
         destinationIp: metadata.destinationIp,
@@ -149,25 +151,13 @@ class HostHttpProxy {
       const outboundRules = this.#options.network?.outbound?.rules;
       const protection = outboundRules === undefined
         ? { blocked: false as const }
-        : await inspectHttpProtection(policyRequest, outboundRules);
+        : await inspectHttpProtection(interceptedRequest, outboundRules);
       if (protection.blocked) {
         response.writeHead(403, { "content-type": "text/plain" });
         response.end("outbound denied");
         return;
       }
 
-      const decision = await interception.policy(policyRequest);
-      if (decision.action === "deny") {
-        if (typeof decision.reason !== "string") {
-          throw new Error("HTTP policy deny action must include a string reason");
-        }
-        response.writeHead(451, { "content-type": "text/plain" });
-        response.end(decision.reason);
-        return;
-      }
-      if (decision.action !== "allow") {
-        throw new Error(`HTTP policy returned unsupported action: ${String((decision as { action?: unknown }).action)}`);
-      }
       if (protection.unresolved) {
         response.writeHead(502, { "content-type": "text/plain" });
         response.end("upstream unavailable");
@@ -175,43 +165,43 @@ class HostHttpProxy {
       }
 
       const matchingRequestHeaderHooks = this.#requestHeaderHooks.filter((registration) => {
-        return requestPatternMatches(registration.pattern, policyRequest.url);
+        return requestPatternMatches(registration.pattern, interceptedRequest.url);
       });
       if (
         matchingRequestHeaderHooks.length > 0
-        && authorityIsHostname(policyRequest.url)
-        && !isPublicIpv4Destination(policyRequest.destinationIp)
+        && authorityIsHostname(interceptedRequest.url)
+        && !isPublicIpv4Destination(interceptedRequest.destinationIp)
       ) {
         response.writeHead(403, { "content-type": "text/plain" });
         response.end("outbound denied");
         return;
       }
 
-      const upstreamHeaders = new Headers(decision.headers ?? headers);
+      const upstreamHeaders = new Headers(headers);
       for (const registration of matchingRequestHeaderHooks) {
         await registration.hook({
-          url: new URL(policyRequest.url),
-          method: policyRequest.method,
+          url: new URL(interceptedRequest.url),
+          method: interceptedRequest.method,
           headers: upstreamHeaders,
           destination: {
-            originalIp: policyRequest.destinationIp,
-            originalPort: policyRequest.destinationPort,
-            upstreamIp: protection.upstreamIp ?? policyRequest.destinationIp,
-            upstreamPort: upstreamPort(policyRequest.url),
+            originalIp: interceptedRequest.destinationIp,
+            originalPort: interceptedRequest.destinationPort,
+            upstreamIp: protection.upstreamIp ?? interceptedRequest.destinationIp,
+            upstreamPort: upstreamPort(interceptedRequest.url),
           },
-          ...(policyRequest.tls === undefined
+          ...(interceptedRequest.tls === undefined
             ? {}
             : {
                 tls: {
-                  sni: policyRequest.tls.serverName,
-                  alpn: policyRequest.tls.alpnProtocol,
+                  sni: interceptedRequest.tls.serverName,
+                  alpn: interceptedRequest.tls.alpnProtocol,
                 },
               }),
         });
       }
 
-      const upstream = createUpstreamRequest(policyRequest.url, {
-        method: policyRequest.method,
+      const upstream = createUpstreamRequest(interceptedRequest.url, {
+        method: interceptedRequest.method,
         headers: Object.fromEntries(upstreamHeaders.entries()),
         upstreamIp: protection.upstreamIp,
       }, (upstreamResponse) => {
@@ -307,7 +297,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
     nativeOptions: NativeSpawnSandboxOptions,
     requestHeaderHooks: readonly HostHttpRequestHeadersRegistration[] = [],
   ): Promise<HostProcessSandboxVm> {
-    const httpProxy = options.network?.http === undefined && requestHeaderHooks.length === 0
+    const httpProxy = requestHeaderHooks.length === 0
       ? undefined
       : await HostHttpProxy.start(options, requestHeaderHooks);
     let vm: HostProcessSandboxVm | undefined;
@@ -811,7 +801,6 @@ function withHostProxyPort(
     network: {
       ...options.network,
       http: {
-        ...options.network.http,
         hostProxyPort: port,
       },
     },
@@ -915,7 +904,11 @@ function isProtectedDestination(destinationIp: string, ranges: readonly string[]
 }
 
 async function inspectHttpProtection(
-  request: HttpPolicyRequest,
+  request: {
+    readonly url: string;
+    readonly destinationIp: string;
+    readonly destinationPort: number;
+  },
   rules: readonly OutboundNetworkRule[],
 ): Promise<{ readonly blocked: boolean; readonly unresolved?: boolean; readonly upstreamIp?: string }> {
   const parsed = new URL(request.url);
@@ -1021,11 +1014,7 @@ function encodeHostSpawn(options: NativeSpawnSandboxOptions): Uint8Array {
     rootfsOverlayMode: options.rootfsOverlay?.mode,
     mounts: options.mounts ?? [],
     networkOutbound: options.network?.outbound,
-    networkHttp: options.network?.http === undefined
-      ? undefined
-      : {
-          hostProxyPort: options.network.http.hostProxyPort,
-        },
+    networkHttp: options.network?.http === undefined ? undefined : options.network.http,
   });
 }
 

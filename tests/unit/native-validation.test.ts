@@ -275,26 +275,6 @@ test("spawnSandbox rejects unsupported init crates before runtime launch", async
   );
 });
 
-test("spawnSandbox rejects HTTP interception without an explicit outbound policy", async () => {
-  await assert.rejects(
-    spawnSandbox({
-      kernel: projectKernel(),
-      init: projectInit(),
-      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
-        format: "erofs",
-      }),
-      network: {
-        http: {
-          async policy(request) {
-            return { action: "allow", headers: request.headers };
-          },
-        },
-      },
-    }),
-    /invalid spawnSandbox options: network\.http requires network\.outbound/,
-  );
-});
-
 test("spawnSandbox rejects invalid outbound CIDR ranges before runtime launch", async () => {
   await assert.rejects(
     spawnSandbox({

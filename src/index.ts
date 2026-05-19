@@ -156,27 +156,6 @@ export type FileSystemBindingConfig = {
 
 export type MountConfig = VirtualFsMountConfig;
 
-export interface HttpPolicyRequest {
-  readonly method: string;
-  readonly url: string;
-  readonly destinationIp: string;
-  readonly destinationPort: number;
-  readonly headers: Record<string, string>;
-  readonly tls?: {
-    readonly serverName?: string;
-    readonly alpnProtocol?: string;
-    readonly protocol?: string;
-  };
-}
-
-export type HttpPolicyDecision =
-  | { readonly action: "allow"; readonly headers?: Record<string, string> }
-  | { readonly action: "deny"; readonly reason: string };
-
-export interface HttpInterceptionConfig {
-  policy(request: HttpPolicyRequest): Promise<HttpPolicyDecision>;
-}
-
 export interface SandboxHttpRequestHeaders {
   readonly url: URL;
   readonly method: string;
@@ -240,7 +219,6 @@ export interface OutboundNetworkPolicy {
 
 export interface NetworkConfig {
   readonly outbound?: OutboundNetworkPolicy;
-  readonly http?: HttpInterceptionConfig;
 }
 
 export interface SandboxOptions {
@@ -448,21 +426,7 @@ class ConfiguredSandboxBuilder implements SandboxBuilder {
     if (this.#vm !== null) {
       throw new Error("sandbox has already been run");
     }
-    this.#vm = await spawnSandbox({
-      ...this.#options,
-      network: this.#options.network === undefined
-        ? undefined
-        : {
-            ...this.#options.network,
-            http: this.#requestHeaderHooks.size === 0
-              ? undefined
-              : {
-                  async policy(request) {
-                    return { action: "allow", headers: request.headers };
-                  },
-                },
-          },
-    }, [...this.#requestHeaderHooks]
+    this.#vm = await spawnSandbox(this.#options, [...this.#requestHeaderHooks]
       .filter((registration) => registration.active)
       .map((registration): HostHttpRequestHeadersRegistration => ({
         pattern: registration.pattern,
@@ -638,14 +602,7 @@ function toNativeSpawnOptions(options: SandboxOptions): NativeSpawnSandboxOption
         writable: isSandboxWritableFileSystem(mount.fileSystem),
       };
     }),
-    network: options.network === undefined
-      ? undefined
-      : {
-          outbound: options.network.outbound,
-          http: options.network.http === undefined
-            ? undefined
-            : {},
-        },
+    network: options.network === undefined ? undefined : { outbound: options.network.outbound },
   };
 }
 
@@ -705,10 +662,6 @@ function validateSandboxOptions(options: SandboxOptions): void {
   if (options.network?.outbound?.policy !== undefined && options.network.outbound.policy !== "deny") {
     throw new Error("invalid spawnSandbox options: network.outbound.policy must be deny");
   }
-  if (options.network?.http !== undefined && options.network.outbound === undefined) {
-    throw new Error("invalid spawnSandbox options: network.http requires network.outbound");
-  }
-
   for (const rule of options.network?.outbound?.rules ?? []) {
     if ("cidr" in rule) {
       validateCidr(rule.cidr);
