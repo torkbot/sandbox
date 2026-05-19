@@ -53,6 +53,7 @@ type ProxyMetadata = {
 export type HostHttpRequestHeadersRegistration = {
   readonly pattern: string;
   readonly hook: SandboxHttpRequestHeadersHook;
+  readonly active: boolean;
 };
 
 class HostHttpProxy {
@@ -165,7 +166,7 @@ class HostHttpProxy {
       }
 
       const matchingRequestHeaderHooks = this.#requestHeaderHooks.filter((registration) => {
-        return requestPatternMatches(registration.pattern, interceptedRequest.url);
+        return registration.active && requestPatternMatches(registration.pattern, interceptedRequest.url);
       });
       if (
         matchingRequestHeaderHooks.length > 0

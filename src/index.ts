@@ -426,12 +426,10 @@ class ConfiguredSandboxBuilder implements SandboxBuilder {
     if (this.#vm !== null) {
       throw new Error("sandbox has already been run");
     }
-    this.#vm = await spawnSandbox(this.#options, [...this.#requestHeaderHooks]
-      .filter((registration) => registration.active)
-      .map((registration): HostHttpRequestHeadersRegistration => ({
-        pattern: registration.pattern,
-        hook: registration.hook,
-      })));
+    this.#vm = await spawnSandbox(
+      this.#options,
+      [...this.#requestHeaderHooks].filter((registration) => registration.active),
+    );
     return this.#vm;
   }
 

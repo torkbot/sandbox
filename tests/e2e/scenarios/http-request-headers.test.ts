@@ -58,7 +58,7 @@ test("HTTP request-header hook injects host credentials only on the upstream leg
     await sandbox[Symbol.asyncDispose]();
   });
 
-  sandbox.http.onRequestHeaders(`${origin.url}/*`, (request) => {
+  const hook = sandbox.http.onRequestHeaders(`${origin.url}/*`, (request) => {
     request.headers.set("authorization", "Bearer host-only-token");
   });
 
@@ -85,6 +85,27 @@ test("HTTP request-header hook injects host credentials only on the upstream leg
   });
   assert.equal(observed.length, 1);
   assert.equal(observed[0]?.authorization, "Bearer host-only-token");
+
+  await hook[Symbol.asyncDispose]();
+
+  const afterDispose = await execGuest(vm, {
+    id: "curl-after-hook-dispose",
+    argv: [
+      "curl",
+      "--max-time",
+      "5",
+      "-fsS",
+      ...interceptedHttpArgs(`${origin.url}/after-dispose`),
+    ],
+  });
+
+  assert.equal(afterDispose.exitCode, 0, afterDispose.stderr);
+  assert.deepEqual(JSON.parse(afterDispose.stdout), {
+    authorization: null,
+    guestSuppliedAuthorization: null,
+  });
+  assert.equal(observed.length, 2);
+  assert.equal(observed[1]?.authorization, undefined);
 
   await writeEvidence("http-request-headers.json", {
     observed,
