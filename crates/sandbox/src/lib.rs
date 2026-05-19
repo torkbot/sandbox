@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod control;
+pub mod http_interception;
 pub mod mounts;
 pub mod network;
 pub mod network_service;
