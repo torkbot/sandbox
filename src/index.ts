@@ -177,6 +177,43 @@ export interface HttpInterceptionConfig {
   policy(request: HttpPolicyRequest): Promise<HttpPolicyDecision>;
 }
 
+export interface SandboxHttpRequestHeaders {
+  readonly url: URL;
+  readonly method: string;
+  readonly headers: Headers;
+  readonly destination: {
+    readonly originalIp: string;
+    readonly originalPort: number;
+    readonly upstreamIp: string;
+    readonly upstreamPort: number;
+  };
+  readonly tls?: {
+    readonly sni?: string;
+    readonly alpn?: string;
+  };
+}
+
+export type SandboxHttpRequestHeadersHook = (
+  request: SandboxHttpRequestHeaders,
+) => void | Promise<void>;
+
+export interface SandboxHttpHook extends AsyncDisposable {
+  [Symbol.asyncDispose](): Promise<void>;
+}
+
+export interface SandboxHttpHooks {
+  onRequestHeaders(
+    pattern: string,
+    hook: SandboxHttpRequestHeadersHook,
+  ): SandboxHttpHook;
+}
+
+export interface SandboxBuilder extends AsyncDisposable {
+  readonly http: SandboxHttpHooks;
+  run(): Promise<SandboxVm>;
+  [Symbol.asyncDispose](): Promise<void>;
+}
+
 export type OutboundNetworkRule =
   | {
       readonly action: "accept";
@@ -366,6 +403,107 @@ export async function spawnSandbox(options: SandboxOptions): Promise<SandboxVm> 
   const nativeOptions = toNativeSpawnOptions(options);
   const nativeVm = await HostProcessSandboxVm.spawn(options, nativeOptions);
   return new NativeBackedSandboxVm(nativeVm, options);
+}
+
+export function createSandbox(options: SandboxOptions): SandboxBuilder {
+  validateSandboxOptions(options);
+  return new ConfiguredSandboxBuilder(options);
+}
+
+type RegisteredHttpRequestHeadersHook = {
+  readonly pattern: string;
+  readonly hook: SandboxHttpRequestHeadersHook;
+  active: boolean;
+};
+
+class ConfiguredSandboxBuilder implements SandboxBuilder {
+  readonly http: SandboxHttpHooks;
+
+  readonly #options: SandboxOptions;
+  readonly #requestHeaderHooks = new Set<RegisteredHttpRequestHeadersHook>();
+  #vm: SandboxVm | null = null;
+  #closed = false;
+
+  constructor(options: SandboxOptions) {
+    this.#options = options;
+    this.http = {
+      onRequestHeaders: (pattern, hook) => {
+        this.#assertOpen();
+        const registration: RegisteredHttpRequestHeadersHook = {
+          pattern,
+          hook,
+          active: true,
+        };
+        this.#requestHeaderHooks.add(registration);
+        return new ConfiguredSandboxHttpHook(this, registration);
+      },
+    };
+  }
+
+  async run(): Promise<SandboxVm> {
+    this.#assertOpen();
+    if (this.#vm !== null) {
+      throw new Error("sandbox has already been run");
+    }
+    this.#vm = await spawnSandbox({
+      ...this.#options,
+      network: this.#options.network === undefined
+        ? undefined
+        : {
+            ...this.#options.network,
+            http: this.#requestHeaderHooks.size === 0
+              ? undefined
+              : {
+                  async policy(request) {
+                    return { action: "allow", headers: request.headers };
+                  },
+                },
+          },
+    });
+    return this.#vm;
+  }
+
+  async [Symbol.asyncDispose](): Promise<void> {
+    if (this.#closed) {
+      return;
+    }
+    this.#closed = true;
+    await this.#vm?.close();
+    this.#requestHeaderHooks.clear();
+  }
+
+  async removeHook(registration: RegisteredHttpRequestHeadersHook): Promise<void> {
+    registration.active = false;
+    this.#requestHeaderHooks.delete(registration);
+  }
+
+  #assertOpen(): void {
+    if (this.#closed) {
+      throw new Error("sandbox is closed");
+    }
+  }
+}
+
+class ConfiguredSandboxHttpHook implements SandboxHttpHook {
+  readonly #sandbox: ConfiguredSandboxBuilder;
+  readonly #registration: RegisteredHttpRequestHeadersHook;
+  #disposed = false;
+
+  constructor(
+    sandbox: ConfiguredSandboxBuilder,
+    registration: RegisteredHttpRequestHeadersHook,
+  ) {
+    this.#sandbox = sandbox;
+    this.#registration = registration;
+  }
+
+  async [Symbol.asyncDispose](): Promise<void> {
+    if (this.#disposed) {
+      return;
+    }
+    this.#disposed = true;
+    await this.#sandbox.removeHook(this.#registration);
+  }
 }
 
 class NativeBackedSandboxVm implements SandboxVm {

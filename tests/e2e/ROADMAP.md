@@ -135,9 +135,24 @@ Failing:
 
 - No remaining known failures in this scenario file.
 
+## `http-request-headers.test.ts`
+
+This file owns the new L7 contract: HTTP request-header hooks are default-allow, mutate only the host-to-upstream request, and cannot use URL authority alone to release credentials.
+
+Passing:
+
+- None yet. These tests define the breaking target for the Rama-backed Rust data plane.
+
+Failing:
+
+- `HTTP request-header hook injects host credentials only on the upstream leg`
+  - A guest request reaches a local origin, a host hook sets `authorization`, and the origin sees the header while the guest only supplied its own non-secret marker.
+- `HTTP credential hooks do not authorize DNS-rebound private destinations`
+  - A request whose URL authority matches `https://api.github.com/*` but whose connection is rebound to loopback must be denied before credential injection.
+
 ## `http-policy.test.ts`
 
-This file owns L7 interception: HTTP parsing, TLS MITM, JavaScript policy, header rewriting, body handling, and failure behavior.
+This file covers the legacy L7 interception scaffold: HTTP parsing, TLS MITM, JavaScript policy, header rewriting, body handling, and failure behavior. It should be retired as the Rama-backed request-header hook contract replaces the old policy API.
 
 Passing:
 

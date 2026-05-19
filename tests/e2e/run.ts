@@ -21,6 +21,7 @@ const manifest = {
     "guest-hardening",
     "http-policy",
     "http-production-hardening",
+    "http-request-headers",
     "libkrun-contract",
     "network",
     "rootfs-shaping",
