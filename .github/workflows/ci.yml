@@ -2,9 +2,14 @@ name: CI
 
 on:
   pull_request:
+  workflow_dispatch:
   push:
     branches:
       - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -32,6 +37,11 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-${{ runner.os }}-${{ runner.arch }}
+
       - name: Install Linux host dependencies
         if: runner.os == 'Linux'
         run: |
@@ -57,37 +67,14 @@ jobs:
         run: npm run test:unit
 
   e2e-fixtures:
-    name: Build e2e fixtures (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-24.04
-          - ubuntu-24.04-arm
+    name: Build e2e fixtures (ubuntu-24.04)
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Linux host dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang llvm pkg-config build-essential
-
-      - name: Install dependencies
-        run: npm ci
 
       - name: Compute fixture cache key
         id: fixture-cache-key
@@ -121,6 +108,80 @@ jobs:
             dist/rootfs
           key: ${{ steps.fixture-cache-key.outputs.key }}
           enableCrossOsArchive: true
+
+      - name: Set up Node.js
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Build kernel fixture
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: npm run build:kernel
+
+      - name: Build sandbox init fixture
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: npm run build:init
+
+      - name: Build libkrun stage-0 init fixture
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: npm run build:libkrun-init
+
+      - name: Build rootfs fixture
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: |
+          npm run build:rootfs
+          npm run build:rootfs:erofs
+
+  e2e-fixtures-arm64:
+    name: Build e2e fixtures (ubuntu-24.04-arm)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Compute fixture cache key
+        id: fixture-cache-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            printf 'runner-arch=%s\n' '${{ runner.arch }}'
+            git submodule status --recursive deps/libkrun deps/libkrunfw
+            shasum -a 256 \
+              package-lock.json \
+              Cargo.lock \
+              crates/sandbox-init/Cargo.toml \
+              crates/sandbox-init/src/main.rs \
+              scripts/build-kernel.ts \
+              scripts/build-init.ts \
+              scripts/build-libkrun-init.ts \
+              scripts/build-rootfs.ts \
+              scripts/build-rootfs-erofs.ts
+          } > fixture-cache-inputs.txt
+          key_hash="$(shasum -a 256 fixture-cache-inputs.txt | cut -d ' ' -f1)"
+          echo "key=sandbox-fixtures-${{ runner.arch }}-${key_hash}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore fixture cache
+        id: fixture-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            dist/kernel
+            dist/init
+            dist/rootfs
+          key: ${{ steps.fixture-cache-key.outputs.key }}
+          enableCrossOsArchive: true
+
+      - name: Set up Node.js
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
 
       - name: Build kernel fixture
         if: steps.fixture-cache.outputs.cache-hit != 'true'
@@ -160,6 +221,11 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install Linux host dependencies
         run: |
