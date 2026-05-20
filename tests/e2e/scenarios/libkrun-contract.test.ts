@@ -10,7 +10,7 @@ import { collectAsync } from "../support/evidence.ts";
 import { execGuestShell } from "../support/guest-control.ts";
 import { requireVmLaunchSupport } from "../support/capabilities.ts";
 
-test("direct Rust init injection boots without libkrun stage-1 init", async (t) => {
+test("boots sandbox-init as PID 1", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
   }

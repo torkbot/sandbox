@@ -70,7 +70,7 @@ The guest init is a first-class binary in this repo. It should:
 
 This is where project-specific behavior belongs. The Node-facing API should not rely on shelling into the guest after boot to repair missing setup.
 
-The target is direct Rust init injection: libkrun should load the `sandbox-init` binary we build in this repository without relying on the legacy C `init.krun` stage. The current two-stage boot path, where libkrun's init mounts the root and then execs `/sandbox-init`, is only a compatibility bridge while our fork catches up. `containers/libkrun#670` is the closest upstream direction: it ports libkrun's init to Rust and moves mount, network, config, and workload supervision into crate code. We should pull the useful shape into `torkbot/libkrun` where it helps, but keep Sandbox's project-specific control protocol and setup logic in `crates/sandbox-init`.
+Sandbox boots the `sandbox-init` binary we build in this repository directly as PID 1. The `torkbot/libkrun` fork exposes the command-line override Sandbox needs for both block-backed and directory-backed roots; project-specific control protocol and setup logic stays in `crates/sandbox-init`.
 
 ## Root Filesystem
 
@@ -230,7 +230,7 @@ The first helper protocol is deliberately small. Node starts `sandbox-host --std
 ## Phased Implementation
 
 1. Create a minimal Node API and Rust host crate with a libkrun context wrapper.
-2. Build `sandbox-init` as a static guest binary and boot it with an explicit kernel/initramfs. If needed, use libkrun's legacy init only as a temporary bridge.
+2. Build `sandbox-init` as a static guest binary and boot it directly with an explicit kernel/initramfs.
 3. Add a vsock control channel and adapt it to the TypeScript `Transport` interface.
 4. Add build-time Docker image export/extract rootfs tooling, then consume a prebuilt immutable read-only root volume at VM instantiation.
 5. Add `linuxOverlayFs({ lower: prebuiltRootfs(...), upper: scratchFs() })` so `/` can be writable while the prebuilt lower remains immutable.
