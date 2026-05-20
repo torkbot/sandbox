@@ -45,6 +45,8 @@ export type NativeSpawnSandboxOptions = {
       readonly rules: readonly OutboundNetworkRule[];
     };
     readonly http?: {
+      readonly caCertificatePem?: string;
+      readonly caPrivateKeyPem?: string;
       readonly requestHeaderHooks?: readonly {
         readonly id: string;
         readonly pattern: string;

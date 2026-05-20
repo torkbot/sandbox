@@ -220,6 +220,12 @@ export interface OutboundNetworkPolicy {
 
 export interface NetworkConfig {
   readonly outbound?: OutboundNetworkPolicy;
+  readonly http?: {
+    readonly certificateAuthority?: {
+      readonly certificatePem: string;
+      readonly privateKeyPem: string;
+    };
+  };
 }
 
 export interface SandboxOptions {
@@ -591,8 +597,11 @@ function toNativeSpawnOptions(
     : {
       outbound: options.network?.outbound,
       http: requestHeaderHooks.length === 0
+        && options.network?.http?.certificateAuthority === undefined
         ? undefined
         : {
+          caCertificatePem: options.network?.http?.certificateAuthority?.certificatePem,
+          caPrivateKeyPem: options.network?.http?.certificateAuthority?.privateKeyPem,
           requestHeaderHooks: requestHeaderHooks.map((hook) => ({
             id: hook.id,
             pattern: hook.pattern,

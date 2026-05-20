@@ -208,6 +208,12 @@ test("HTTPS request-header hook injects host credentials after guest-trusted MIT
       format: "erofs",
     }),
     network: {
+      http: {
+        certificateAuthority: {
+          certificatePem: ca.certificatePem,
+          privateKeyPem: ca.privateKeyPem,
+        },
+      },
       outbound: {
         policy: "deny",
         rules: [
@@ -330,6 +336,12 @@ test("HTTPS/2 request-header hook injects host credentials after ALPN negotiatio
       format: "erofs",
     }),
     network: {
+      http: {
+        certificateAuthority: {
+          certificatePem: ca.certificatePem,
+          privateKeyPem: ca.privateKeyPem,
+        },
+      },
       outbound: {
         policy: "deny",
         rules: [
