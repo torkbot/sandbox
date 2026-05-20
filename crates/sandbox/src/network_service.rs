@@ -68,7 +68,7 @@ static SPECIAL_USE_IPV4_RANGES: LazyLock<Vec<CidrRange>> = LazyLock::new(|| {
     .collect()
 });
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostTlsMetadata {
     pub server_name: Option<String>,
     pub alpn_protocol: Option<String>,

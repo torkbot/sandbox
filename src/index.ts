@@ -379,8 +379,8 @@ export function acceptPublicInternet(input: {
 
 export async function spawnSandbox(options: SandboxOptions): Promise<SandboxVm> {
   validateSandboxOptions(options);
-  const nativeOptions = toNativeSpawnOptions(options);
-  const nativeVm = await HostProcessSandboxVm.spawn(options, nativeOptions);
+  const nativeOptions = toNativeSpawnOptions(options, []);
+  const nativeVm = await HostProcessSandboxVm.spawn(options, nativeOptions, new Map());
   return new NativeBackedSandboxVm(nativeVm, options);
 }
 
@@ -390,9 +390,15 @@ export function createSandbox(options: SandboxOptions): SandboxBuilder {
 }
 
 type RegisteredHttpRequestHeadersHook = {
+  readonly id: string;
   readonly pattern: string;
   readonly hook: SandboxHttpRequestHeadersHook;
   active: boolean;
+};
+
+type SpawnHttpRequestHeadersHook = {
+  readonly id: string;
+  readonly pattern: string;
 };
 
 class ConfiguredSandboxBuilder implements SandboxBuilder {
@@ -409,6 +415,7 @@ class ConfiguredSandboxBuilder implements SandboxBuilder {
       onRequestHeaders: (pattern, hook) => {
         this.#assertOpen();
         const registration: RegisteredHttpRequestHeadersHook = {
+          id: `http-request-headers-${this.#requestHeaderHooks.size + 1}`,
           pattern,
           hook,
           active: true,
@@ -424,7 +431,14 @@ class ConfiguredSandboxBuilder implements SandboxBuilder {
     if (this.#vm !== null) {
       throw new Error("sandbox has already been run");
     }
-    this.#vm = await spawnSandbox(this.#options);
+    const registrations = Array.from(this.#requestHeaderHooks);
+    const nativeOptions = toNativeSpawnOptions(this.#options, registrations);
+    const nativeVm = await HostProcessSandboxVm.spawn(
+      this.#options,
+      nativeOptions,
+      new Map(registrations.map((registration) => [registration.id, registration])),
+    );
+    this.#vm = new NativeBackedSandboxVm(nativeVm, this.#options);
     return this.#vm;
   }
 
@@ -567,8 +581,24 @@ class ConfiguredSandboxMounts implements SandboxMounts {
   }
 }
 
-function toNativeSpawnOptions(options: SandboxOptions): NativeSpawnSandboxOptions {
+function toNativeSpawnOptions(
+  options: SandboxOptions,
+  requestHeaderHooks: readonly SpawnHttpRequestHeadersHook[],
+): NativeSpawnSandboxOptions {
   const rootfs = lowerNativeRootfs(options.rootfs);
+  const network = options.network === undefined && requestHeaderHooks.length === 0
+    ? undefined
+    : {
+      outbound: options.network?.outbound,
+      http: requestHeaderHooks.length === 0
+        ? undefined
+        : {
+          requestHeaderHooks: requestHeaderHooks.map((hook) => ({
+            id: hook.id,
+            pattern: hook.pattern,
+          })),
+        },
+    };
 
   return {
     name: options.name,
@@ -595,7 +625,7 @@ function toNativeSpawnOptions(options: SandboxOptions): NativeSpawnSandboxOption
         writable: isSandboxWritableFileSystem(mount.fileSystem),
       };
     }),
-    network: options.network === undefined ? undefined : { outbound: options.network.outbound },
+    network,
   };
 }
 

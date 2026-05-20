@@ -10,7 +10,14 @@ import type {
   SandboxOptions,
   SandboxFileSystem,
   SandboxPosixFileSystem,
+  SandboxHttpRequestHeadersHook,
 } from "./index.ts";
+
+type RegisteredHttpRequestHeadersHook = {
+  readonly pattern: string;
+  readonly hook: SandboxHttpRequestHeadersHook;
+  active: boolean;
+};
 
 export class HostProcessSandboxVm implements HostControlChannel {
   readonly hasControlSocket = true;
@@ -20,6 +27,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
   readonly #packets: Uint8Array[] = [];
   readonly #hostPacketWaiters: (() => void)[] = [];
   readonly #hostFs = new Map<string, SandboxFileSystem>();
+  readonly #requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook>;
   #buffer = new Uint8Array();
   #stderr = "";
   #closed = false;
@@ -29,9 +37,11 @@ export class HostProcessSandboxVm implements HostControlChannel {
   private constructor(
     child: ChildProcessWithoutNullStreams,
     options: SandboxOptions,
+    requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook>,
   ) {
     this.#child = child;
     this.#options = options;
+    this.#requestHeaderHooks = requestHeaderHooks;
     for (const mount of options.mounts ?? []) {
       if (mount.kind === "virtual-fs") {
         this.#hostFs.set(mount.path, mount.fileSystem);
@@ -70,13 +80,14 @@ export class HostProcessSandboxVm implements HostControlChannel {
   static async spawn(
     options: SandboxOptions,
     nativeOptions: NativeSpawnSandboxOptions,
+    requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook> = new Map(),
   ): Promise<HostProcessSandboxVm> {
     let vm: HostProcessSandboxVm | undefined;
     try {
       const child = spawn(hostBinaryPath(), ["--stdio"], {
         stdio: ["pipe", "pipe", "pipe"],
       });
-      vm = new HostProcessSandboxVm(child, options);
+      vm = new HostProcessSandboxVm(child, options, requestHeaderHooks);
       await Promise.race([
         once(child, "spawn"),
         once(child, "error").then(([error]) => {
@@ -237,12 +248,59 @@ export class HostProcessSandboxVm implements HostControlChannel {
       && type !== "host.vfs.rename"
       && type !== "host.vfs.symlink"
       && type !== "host.vfs.readlink"
+      && type !== "host.http.requestHeaders"
     ) {
       return false;
     }
 
-    void this.#handleVirtualFsRequest(document);
+    if (type === "host.http.requestHeaders") {
+      void this.#handleHttpRequestHeaders(document);
+    } else {
+      void this.#handleVirtualFsRequest(document);
+    }
     return true;
+  }
+
+  async #handleHttpRequestHeaders(document: Record<string, unknown>): Promise<void> {
+    const id = typeof document.id === "string" ? document.id : "";
+    try {
+      const hookIds = assertStringArray(document.hookIds, "hookIds");
+      const headers = new Headers(assertHeaderPairs(document.headers, "headers"));
+      const request = {
+        protocol: assertProtocol(document.protocol),
+        url: new URL(assertString(document.url, "url")),
+        method: assertString(document.method, "method"),
+        headers,
+        destination: {
+          originalIp: assertString(document.originalDestinationIp, "originalDestinationIp"),
+          originalPort: assertNumber(document.originalDestinationPort, "originalDestinationPort"),
+          upstreamIp: assertString(document.upstreamDialIp, "upstreamDialIp"),
+          upstreamPort: assertNumber(document.upstreamDialPort, "upstreamDialPort"),
+        },
+        tls: optionalTlsMetadata(document.tls),
+      };
+
+      for (const hookId of hookIds) {
+        const registration = this.#requestHeaderHooks.get(hookId);
+        if (registration?.active === true) {
+          await registration.hook(request);
+        }
+      }
+
+      this.#tryWriteToHost(encodePacket({
+        type: "host.http.response",
+        id,
+        ok: true,
+        headers: Array.from(headers.entries()),
+      }));
+    } catch (error) {
+      this.#tryWriteToHost(encodePacket({
+        type: "host.http.response",
+        id,
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    }
   }
 
   async #handleVirtualFsRequest(document: Record<string, unknown>): Promise<void> {
@@ -461,9 +519,52 @@ function assertString(value: unknown, field: string): string {
 
 function assertNumber(value: unknown, field: string): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
-    throw new Error(`host vfs request ${field} must be a non-negative safe integer`);
+    throw new Error(`host request ${field} must be a non-negative safe integer`);
   }
   return value;
+}
+
+function assertStringArray(value: unknown, field: string): string[] {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
+    throw new Error(`host request ${field} must be a string array`);
+  }
+  return value;
+}
+
+function assertHeaderPairs(value: unknown, field: string): [string, string][] {
+  if (
+    !Array.isArray(value)
+    || value.some((entry) => {
+      return !Array.isArray(entry)
+        || entry.length !== 2
+        || typeof entry[0] !== "string"
+        || typeof entry[1] !== "string";
+    })
+  ) {
+    throw new Error(`host request ${field} must be header pairs`);
+  }
+  return value as [string, string][];
+}
+
+function assertProtocol(value: unknown): "http/1.1" | "h2" {
+  if (value === "http/1.1" || value === "h2") {
+    return value;
+  }
+  throw new Error("host request protocol must be http/1.1 or h2");
+}
+
+function optionalTlsMetadata(value: unknown): { readonly sni?: string; readonly alpn?: string } | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value !== "object") {
+    throw new Error("host request tls must be a document");
+  }
+  const document = value as Record<string, unknown>;
+  return {
+    sni: document.sni === undefined ? undefined : assertString(document.sni, "tls.sni"),
+    alpn: document.alpn === undefined ? undefined : assertString(document.alpn, "tls.alpn"),
+  };
 }
 
 function binaryField(value: unknown, field: string): Uint8Array {

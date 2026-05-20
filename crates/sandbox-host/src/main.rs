@@ -8,7 +8,8 @@ use std::time::Duration;
 use bson::Document;
 use sandbox::config::MountSpec;
 use sandbox::config::{
-    HttpSpecInput, MicroVmSpecInput, MountSpecInput, OutboundPolicy, OutboundRuleSpec, OutboundSpec,
+    HttpRequestHeaderHookSpec, HttpSpecInput, MicroVmSpecInput, MountSpecInput, OutboundPolicy,
+    OutboundRuleSpec, OutboundSpec,
 };
 use sandbox::runtime::{HostServices, VirtualFsDevice};
 
@@ -62,7 +63,7 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
     let spec = sandbox::MicroVmSpec::build(parse_spawn(spawn_document)?)?;
     let bridge = HostIoBridge::new();
     let virtual_fs = virtual_fs_devices(&spec, bridge.clone());
-    let services = HostServices;
+    let services = HostServices::default();
     let mut vm = sandbox::runtime::KrunVm::create_with_services(&spec, virtual_fs, services)?;
     vm.start()?;
 
@@ -260,9 +261,30 @@ fn parse_network_http(
         protected_ranges,
         ca_certificate_pem: optional_string(document, "caCertificatePem"),
         ca_private_key_pem: optional_string(document, "caPrivateKeyPem"),
-        host_proxy_port: optional_i32(document, "hostProxyPort")
-            .and_then(|port| u16::try_from(port).ok()),
+        request_header_hooks: parse_request_header_hooks(
+            document.get_array("requestHeaderHooks").ok(),
+        )?,
     }))
+}
+
+fn parse_request_header_hooks(
+    values: Option<&Vec<bson::Bson>>,
+) -> Result<Vec<HttpRequestHeaderHookSpec>, Box<dyn std::error::Error>> {
+    let Some(values) = values else {
+        return Ok(Vec::new());
+    };
+    values
+        .iter()
+        .map(|value| {
+            let document = value
+                .as_document()
+                .ok_or("requestHeaderHooks entries must be documents")?;
+            Ok(HttpRequestHeaderHookSpec {
+                id: document.get_str("id")?.to_string(),
+                pattern: document.get_str("pattern")?.to_string(),
+            })
+        })
+        .collect()
 }
 
 fn optional_string(document: &Document, key: &str) -> Option<String> {

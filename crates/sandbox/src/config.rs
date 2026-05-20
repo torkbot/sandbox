@@ -86,7 +86,13 @@ pub struct HttpSpec {
     pub protected_ranges: Vec<String>,
     pub ca_certificate_pem: Option<String>,
     pub ca_private_key_pem: Option<String>,
-    pub host_proxy_port: Option<u16>,
+    pub request_header_hooks: Vec<HttpRequestHeaderHookSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpRequestHeaderHookSpec {
+    pub id: String,
+    pub pattern: String,
 }
 
 impl HttpSpec {
@@ -104,7 +110,7 @@ impl HttpSpec {
             protected_ranges: input.protected_ranges,
             ca_certificate_pem,
             ca_private_key_pem,
-            host_proxy_port: input.host_proxy_port,
+            request_header_hooks: input.request_header_hooks,
         })
     }
 }
@@ -331,7 +337,7 @@ pub struct HttpSpecInput {
     pub protected_ranges: Vec<String>,
     pub ca_certificate_pem: Option<String>,
     pub ca_private_key_pem: Option<String>,
-    pub host_proxy_port: Option<u16>,
+    pub request_header_hooks: Vec<HttpRequestHeaderHookSpec>,
 }
 
 #[cfg(test)]
@@ -394,7 +400,10 @@ mod tests {
             ca_private_key_pem: Some(
                 "-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----".to_string(),
             ),
-            host_proxy_port: None,
+            request_header_hooks: vec![HttpRequestHeaderHookSpec {
+                id: "github".to_string(),
+                pattern: "https://api.github.com/*".to_string(),
+            }],
         });
 
         let spec = MicroVmSpec::build(input).unwrap();
@@ -418,7 +427,9 @@ mod tests {
                 OutboundRuleSpec::AcceptPublicInternet { ports: vec![443] },
             ],
         );
-        assert_eq!(network.http.unwrap().protected_ranges, vec!["127.0.0.0/8"]);
+        let http = network.http.unwrap();
+        assert_eq!(http.protected_ranges, vec!["127.0.0.0/8"]);
+        assert_eq!(http.request_header_hooks[0].id, "github");
     }
 
     #[test]
