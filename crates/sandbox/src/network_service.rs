@@ -565,18 +565,26 @@ fn rewrite_h1_head(
     }
     let method = request.method.unwrap_or("GET").to_string();
     let path = request.path.unwrap_or("/").to_string();
-    let authority = request
+    let host_headers = request
         .headers
         .iter()
-        .find(|header| header.name.eq_ignore_ascii_case("host"))
-        .and_then(|header| std::str::from_utf8(header.value).ok())
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "HTTP/1.1 request missing host"))?
+        .filter(|header| header.name.eq_ignore_ascii_case("host"))
+        .collect::<Vec<_>>();
+    if host_headers.len() != 1 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "HTTP/1.1 request must contain exactly one host header",
+        ));
+    }
+    let authority = std::str::from_utf8(host_headers[0].value)
+        .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?
         .to_string();
     let upstream = resolve_upstream_authority(&authority, default_port_for_scheme(scheme))?;
     validate_upstream_allowed(&upstream, outbound_rules)?;
     let mut pairs = request
         .headers
         .iter()
+        .filter(|header| !header.name.eq_ignore_ascii_case("connection"))
         .map(|header| {
             Ok((
                 header.name.to_ascii_lowercase(),
@@ -586,6 +594,7 @@ fn rewrite_h1_head(
             ))
         })
         .collect::<io::Result<Vec<_>>>()?;
+    pairs.push(("connection".to_string(), "close".to_string()));
     let request = InterceptedHttpRequest {
         protocol: HttpRequestProtocol::Http1,
         method,
@@ -645,17 +654,22 @@ fn rewrite_h2_head(
             cursor = frame_end;
             continue;
         }
-        if flags & 0x4 == 0 {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
-                "HTTP/2 continuation frames are not supported at the interception boundary",
-            ));
-        }
 
         let payload = &guest_head[cursor + 9..frame_end];
         let (header_prefix, header_block, header_padding) =
             split_h2_headers_payload(payload, flags)?;
-        let mut block = rama_core::bytes::BytesMut::from(header_block);
+        let stream_id = h2_stream_id(&guest_head[cursor + 5..cursor + 9]);
+        let mut header_block = header_block.to_vec();
+        let mut header_sequence_end = frame_end;
+        if flags & 0x4 == 0 {
+            let continuation = collect_h2_continuations(guest_head, frame_end, stream_id)?;
+            let Some(continuation) = continuation else {
+                return Ok(None);
+            };
+            header_block.extend_from_slice(&continuation.header_block);
+            header_sequence_end = continuation.end;
+        }
+        let mut block = rama_core::bytes::BytesMut::from(header_block.as_slice());
         let mut decoder = rama_http::proto::h2::hpack::Decoder::new(4096);
         let mut decoded = Vec::new();
         decoder
@@ -776,18 +790,19 @@ fn rewrite_h2_head(
         let mut rewritten = Vec::new();
         rewritten.extend_from_slice(&guest_head[..cursor]);
         let rewritten_payload_len = header_prefix.len() + encoded.len() + header_padding.len();
+        let rewritten_flags = flags | 0x4;
         rewritten.extend_from_slice(&[
             ((rewritten_payload_len >> 16) & 0xff) as u8,
             ((rewritten_payload_len >> 8) & 0xff) as u8,
             (rewritten_payload_len & 0xff) as u8,
             frame_type,
-            flags,
+            rewritten_flags,
         ]);
         rewritten.extend_from_slice(&guest_head[cursor + 5..cursor + 9]);
         rewritten.extend_from_slice(header_prefix);
         rewritten.extend_from_slice(&encoded);
         rewritten.extend_from_slice(header_padding);
-        rewritten.extend_from_slice(&guest_head[frame_end..]);
+        rewritten.extend_from_slice(&guest_head[header_sequence_end..]);
         return Ok(Some(RewrittenHead {
             bytes: rewritten,
             upstream_ip: upstream.ip,
@@ -834,6 +849,51 @@ fn split_h2_headers_payload(payload: &[u8], flags: u8) -> io::Result<(&[u8], &[u
         &payload[block_start..block_end],
         &payload[block_end..],
     ))
+}
+
+struct H2ContinuationBlock {
+    header_block: Vec<u8>,
+    end: usize,
+}
+
+fn collect_h2_continuations(
+    bytes: &[u8],
+    mut cursor: usize,
+    stream_id: u32,
+) -> io::Result<Option<H2ContinuationBlock>> {
+    let mut header_block = Vec::new();
+    loop {
+        if bytes.len() < cursor + 9 {
+            return Ok(None);
+        }
+        let length = ((bytes[cursor] as usize) << 16)
+            | ((bytes[cursor + 1] as usize) << 8)
+            | (bytes[cursor + 2] as usize);
+        let frame_type = bytes[cursor + 3];
+        let flags = bytes[cursor + 4];
+        let frame_end = cursor + 9 + length;
+        if bytes.len() < frame_end {
+            return Ok(None);
+        }
+        if frame_type != 0x9 || h2_stream_id(&bytes[cursor + 5..cursor + 9]) != stream_id {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "HTTP/2 HEADERS frame was not followed by matching CONTINUATION frames",
+            ));
+        }
+        header_block.extend_from_slice(&bytes[cursor + 9..frame_end]);
+        if flags & 0x4 != 0 {
+            return Ok(Some(H2ContinuationBlock {
+                header_block,
+                end: frame_end,
+            }));
+        }
+        cursor = frame_end;
+    }
+}
+
+fn h2_stream_id(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes([bytes[0] & 0x7f, bytes[1], bytes[2], bytes[3]])
 }
 
 trait HpackHeaderExt {
@@ -1456,7 +1516,7 @@ impl TlsInterceptConnection {
             if client.is_handshaking() {
                 self.pending_upstream_plaintext
                     .extend_from_slice(&plaintext);
-            } else if client.writer().write_all(&plaintext).is_err() {
+            } else {
                 self.close_after_flush = true;
             }
         } else {
@@ -1676,9 +1736,6 @@ impl InterceptConnection {
         self.flush_upstream();
         self.read_upstream();
         self.flush_guest(socket);
-        if matches!(self.state, InterceptState::Relaying) {
-            self.relay_guest_body(socket);
-        }
         self.flush_upstream();
         self.read_upstream();
         self.flush_guest(socket);
@@ -1773,17 +1830,6 @@ impl InterceptConnection {
                     return;
                 }
             }
-        }
-    }
-
-    fn relay_guest_body(&mut self, socket: &mut tcp::Socket<'_>) {
-        while socket.can_recv() {
-            let mut buffer = [0; TLS_READ_BUFFER_BYTES];
-            let received = socket.recv_slice(&mut buffer).unwrap_or(0);
-            if received == 0 {
-                break;
-            }
-            self.to_upstream.extend_from_slice(&buffer[..received]);
         }
     }
 
@@ -2261,6 +2307,83 @@ mod tests {
     }
 
     #[test]
+    fn h1_rewrite_rejects_duplicate_host_headers() {
+        let destination = HttpDestination {
+            ip: "93.184.216.34".to_string(),
+            port: 80,
+        };
+        let request =
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nHost: attacker.example\r\n\r\n";
+
+        let error = match rewrite_h1_head(request, &destination, "http", None, None, None) {
+            Ok(_) => panic!("duplicate Host headers must be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn h2_rewrite_accepts_headers_split_across_continuations() {
+        let mut encoded = rama_core::bytes::BytesMut::new();
+        let mut encoder = rama_http::proto::h2::hpack::Encoder::new(4096, 4096);
+        encoder.encode(
+            [
+                rama_http::proto::h2::hpack::Header::Method("GET".parse().unwrap()),
+                rama_http::proto::h2::hpack::Header::Scheme(
+                    rama_http::proto::h2::hpack::BytesStr::try_from(
+                        rama_core::bytes::Bytes::from_static(b"https"),
+                    )
+                    .unwrap(),
+                ),
+                rama_http::proto::h2::hpack::Header::Authority(
+                    rama_http::proto::h2::hpack::BytesStr::try_from(
+                        rama_core::bytes::Bytes::from_static(b"93.184.216.34"),
+                    )
+                    .unwrap(),
+                ),
+                rama_http::proto::h2::hpack::Header::Path(
+                    rama_http::proto::h2::hpack::BytesStr::try_from(
+                        rama_core::bytes::Bytes::from_static(b"/"),
+                    )
+                    .unwrap(),
+                ),
+            ]
+            .into_iter()
+            .map(HpackHeaderExt::with_optional_name),
+            &mut encoded,
+        );
+        let split = encoded.len() / 2;
+        let mut request = Vec::new();
+        request.extend_from_slice(H2_PREFACE);
+        request.extend_from_slice(&h2_frame(0x1, 0, 1, &encoded[..split]));
+        request.extend_from_slice(&h2_frame(0x9, 0x4, 1, &encoded[split..]));
+
+        let rewritten = rewrite_h2_head(
+            &request,
+            &HttpDestination {
+                ip: "93.184.216.34".to_string(),
+                port: 443,
+            },
+            "https",
+            None,
+            Some(&[OutboundRulePlan::AcceptPublicInternet { ports: vec![443] }]),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(rewritten.bytes.starts_with(H2_PREFACE));
+        let cursor = H2_PREFACE.len();
+        let length = ((rewritten.bytes[cursor] as usize) << 16)
+            | ((rewritten.bytes[cursor + 1] as usize) << 8)
+            | rewritten.bytes[cursor + 2] as usize;
+        assert_eq!(rewritten.bytes[cursor + 3], 0x1);
+        assert_eq!(rewritten.bytes[cursor + 4] & 0x4, 0x4);
+        assert_eq!(rewritten.bytes.len(), cursor + 9 + length);
+    }
+
+    #[test]
     fn transparent_nat_prunes_flow_after_host_fin() {
         let mut nat = TransparentTcpNat::new(Ipv4Address::new(10, 0, 2, 1));
         let mut guest_frame = tcp_frame([10, 0, 2, 15], [93, 184, 216, 34], 50_000, 443, 0x02);
@@ -2335,6 +2458,20 @@ mod tests {
         frame[tcp_start + 2..tcp_start + 4].copy_from_slice(&destination_port.to_be_bytes());
         frame[tcp_start + 12] = 5 << 4;
         frame[tcp_start + 13] = tcp_flags;
+        frame
+    }
+
+    fn h2_frame(frame_type: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[
+            ((payload.len() >> 16) & 0xff) as u8,
+            ((payload.len() >> 8) & 0xff) as u8,
+            (payload.len() & 0xff) as u8,
+            frame_type,
+            flags,
+        ]);
+        frame.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
+        frame.extend_from_slice(payload);
         frame
     }
 }
