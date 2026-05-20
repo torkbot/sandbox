@@ -4,11 +4,11 @@ import { readFile } from "node:fs/promises";
 
 test("Sandbox integrates libkrun through Rust/static build outputs, not the C header surface", async () => {
   const sandboxCargo = await readFile(new URL("../../crates/sandbox/Cargo.toml", import.meta.url), "utf8");
-  const nodeBinding = await readFile(new URL("../../crates/sandbox-node/src/lib.rs", import.meta.url), "utf8");
+  const hostCargo = await readFile(new URL("../../crates/sandbox-host/Cargo.toml", import.meta.url), "utf8");
 
   assert.match(sandboxCargo, /krun = \{ package = "libkrun", path = "\.\.\/\.\.\/deps\/libkrun\/src\/libkrun"/);
   assert.match(sandboxCargo, /krun-devices = \{ path = "\.\.\/\.\.\/deps\/libkrun\/src\/devices"/);
-  assert.doesNotMatch(nodeBinding, /libkrun\.h|krun[_-]sys/i);
+  assert.doesNotMatch(hostCargo, /napi|libkrun\.h|krun[_-]sys/i);
 });
 
 test("Sandbox-owned sockets can be supplied without filesystem socket paths", async () => {

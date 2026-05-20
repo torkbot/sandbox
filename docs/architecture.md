@@ -55,7 +55,7 @@ export interface Transport<TIncoming = unknown, TOutgoing = unknown> {
 
 The transport is backed by libkrun vsock mapped to a host-owned fd. This is the only supported control mode for now, so it should be implicit in `spawnSandbox` rather than exposed as a choice in the public API.
 
-The Node/Rust boundary should use `napi-rs`. Keep the TypeScript API as the ergonomic public surface and use `napi-rs` for the efficient hand-over into the Rust host runtime, libkrun integration, and long-lived native resources.
+The Node/Rust boundary uses the signed `sandbox-host` helper process. Keep the TypeScript API as the ergonomic public surface and use the host protocol for the hand-over into the Rust host runtime, libkrun integration, and long-lived native resources.
 
 ## Guest Init
 
@@ -106,7 +106,7 @@ Candidate directions:
 
 - `smoltcp`: small Rust TCP/IP stack and the best fit for a natively compiled in-process service if it can cover the subset we need.
 - Rust-native virtio/vhost-user networking crates: worth evaluating if they let us build the guest-facing network service without sidecars.
-- `libslirp`: mature userspace NAT model, but only attractive if it can be statically linked cleanly and wrapped without fighting the Rust/napi-rs boundary.
+- `libslirp`: mature userspace NAT model, but only attractive if it can be statically linked cleanly and wrapped without fighting the Rust host boundary.
 - gVisor netstack and `gvproxy`: useful references for behavior and architecture, but poor direct dependencies for Sandbox because they are Go-oriented and sidecar-shaped.
 - `passt`: useful reference for host networking behavior, but not a good runtime dependency if it requires an external process.
 
@@ -221,9 +221,7 @@ The first build entrypoint is `npm run build:kernel`, which assumes a local Dock
 
 The desired output is a statically linked Sandbox VM-host binary, including the libkrun pieces we depend on. Dynamic dependencies should be treated as build failures unless they are unavoidable platform system libraries.
 
-macOS needs a separate signing track. HVF requires the correct Hypervisor entitlement on the executable process that opens Hypervisor.framework. That process must be a Sandbox-owned helper executable, not `node`. The Node package remains the ergonomic TypeScript API, but macOS VM launch is delegated to the signed `sandbox-host` binary over a local control transport. Signing the napi addon or a dylib is not sufficient for HVF because the entitlement is process-scoped.
-
-The napi-rs addon can still provide efficient local primitives, validation, and non-HVF fast paths, but it must not be the only VM launch path on macOS unless the embedding executable is known to be signed with the HVF entitlement. The addon may be ad-hoc signed as a loadable native module, but it should not carry the HVF entitlement.
+macOS needs a separate signing track. HVF requires the correct Hypervisor entitlement on the executable process that opens Hypervisor.framework. That process must be a Sandbox-owned helper executable, not `node`. The Node package remains the ergonomic TypeScript API, but VM launch is delegated to the signed `sandbox-host` binary over a local control transport because the entitlement is process-scoped.
 
 The first helper protocol is deliberately small. Node starts `sandbox-host --stdio`, sends one length-prefixed BSON `host.spawn` document containing the validated VM spec, then both sides reuse the existing length-prefixed guest control frames for `init.ready` and `guest.exec`. Filesystem callbacks, HTTP hook registration, and other host services need explicit protocol additions before their required e2e scenarios can pass.
 

@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { Binary, BSON } from "bson";
 import type { HostControlChannel } from "./control.ts";
-import type { NativeSpawnSandboxOptions } from "./native.ts";
+import type { HostSpawnSandboxOptions } from "./spawn-options.ts";
 import { isSandboxWritableFileSystem } from "./vfs.ts";
 import type {
   SandboxOptions,
@@ -80,7 +80,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
 
   static async spawn(
     options: SandboxOptions,
-    nativeOptions: NativeSpawnSandboxOptions,
+    hostOptions: HostSpawnSandboxOptions,
     requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook> = new Map(),
   ): Promise<HostProcessSandboxVm> {
     let vm: HostProcessSandboxVm | undefined;
@@ -95,7 +95,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
           throw error;
         }),
       ]);
-      vm.#writeToHost(encodeHostSpawn(nativeOptions));
+      vm.#writeToHost(encodeHostSpawn(hostOptions));
       await vm.#waitForLaunch();
       return vm;
     } catch (error) {
@@ -660,7 +660,7 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
 }
 
-function encodeHostSpawn(options: NativeSpawnSandboxOptions): Uint8Array {
+function encodeHostSpawn(options: HostSpawnSandboxOptions): Uint8Array {
   return encodePacket({
     type: "host.spawn",
     name: options.name,

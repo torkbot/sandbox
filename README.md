@@ -178,7 +178,7 @@ The guest contract is intentionally narrow:
 ## Design Targets
 
 - no dynamic `libkrun` or `libkrunfw` dependency in the final host artifact,
-- `napi-rs` for the Node/Rust native boundary,
+- a signed `sandbox-host` process for the Node/Rust host boundary,
 - custom guest init owned by this repo,
 - implicit fd-backed host control sockets owned by Sandbox,
 - avoid host filesystem coordination unless it is intrinsic to the artifact; prefer file descriptors, database handles, bytes, and async iterables over paths,

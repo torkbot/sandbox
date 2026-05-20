@@ -10,13 +10,12 @@
     }
   },
   "scripts": {
-    "build": "npm run build:native && npm run build:host && tsgo --project tsconfig.build.json --pretty",
+    "build": "npm run build:host && tsgo --project tsconfig.build.json --pretty",
     "build:host": "node ./scripts/build-host.ts",
     "build:init": "node ./scripts/build-init.ts",
     "build:kernel": "node ./scripts/build-kernel.ts",
     "build:rootfs": "node ./scripts/build-rootfs.ts",
     "build:rootfs:erofs": "node ./scripts/build-rootfs-erofs.ts",
-    "build:native": "napi build --platform --release --manifest-path crates/sandbox-node/Cargo.toml --package sandbox_node --output-dir crates/sandbox-node && node ./scripts/sign-native.ts",
     "benchmark:e2e:lifecycle": "node ./scripts/benchmark-e2e-lifecycle.ts",
     "check:rust": "cargo check --workspace",
     "test:artifact": "node --test tests/artifact/*.test.ts",
@@ -27,7 +26,6 @@
     "typecheck": "tsgo --noEmit --pretty"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3.6.2",
     "@types/node": "^24.12.0",
     "@typescript/native-preview": "7.0.0-dev.20260423.1",
     "typescript": "^5.9.0"
@@ -38,8 +36,5 @@
   "dependencies": {
     "bson": "^7.2.0",
     "just-bash": "^2.14.5"
-  },
-  "napi": {
-    "binaryName": "index"
   }
 }

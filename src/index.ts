@@ -2,7 +2,7 @@ import { HostControlTransport } from "./control.ts";
 import { HostProcessSandboxVm } from "./host-process.ts";
 import { createSandboxHostFileSystemTools } from "./host-filesystem-tools.ts";
 import { isSandboxWritableFileSystem } from "./vfs.ts";
-import type { NativeSpawnSandboxOptions } from "./native.ts";
+import type { HostSpawnSandboxOptions } from "./spawn-options.ts";
 export { HostControlTransport } from "./control.ts";
 
 export interface Transport<TIncoming = unknown, TOutgoing = unknown> {
@@ -389,9 +389,9 @@ export function acceptPublicInternet(input: {
 
 export async function spawnSandbox(options: SandboxOptions): Promise<SandboxVm> {
   validateSandboxOptions(options);
-  const nativeOptions = toNativeSpawnOptions(options, []);
-  const nativeVm = await HostProcessSandboxVm.spawn(options, nativeOptions, new Map());
-  return new NativeBackedSandboxVm(nativeVm, options);
+  const hostOptions = toHostSpawnOptions(options, []);
+  const hostVm = await HostProcessSandboxVm.spawn(options, hostOptions, new Map());
+  return new HostBackedSandboxVm(hostVm, options);
 }
 
 export function createSandbox(options: SandboxOptions): SandboxBuilder {
@@ -448,13 +448,13 @@ class ConfiguredSandboxBuilder implements SandboxBuilder {
     }
     this.#runStarted = true;
     const registrations = Array.from(this.#requestHeaderHooks);
-    const nativeOptions = toNativeSpawnOptions(this.#options, registrations);
-    const nativeVm = await HostProcessSandboxVm.spawn(
+    const hostOptions = toHostSpawnOptions(this.#options, registrations);
+    const hostVm = await HostProcessSandboxVm.spawn(
       this.#options,
-      nativeOptions,
+      hostOptions,
       new Map(registrations.map((registration) => [registration.id, registration])),
     );
-    this.#vm = new NativeBackedSandboxVm(nativeVm, this.#options);
+    this.#vm = new HostBackedSandboxVm(hostVm, this.#options);
     return this.#vm;
   }
 
@@ -501,12 +501,12 @@ class ConfiguredSandboxHttpHook implements SandboxHttpHook {
   }
 }
 
-class NativeBackedSandboxVm implements SandboxVm {
+class HostBackedSandboxVm implements SandboxVm {
   readonly mounts: SandboxMounts;
   readonly control: SandboxControl;
   readonly diagnostics?: SandboxDiagnostics;
 
-  readonly #nativeVm: {
+  readonly #hostVm: {
     readonly hasControlSocket: boolean;
     writeControlPacket(packet: Uint8Array): void;
     tryReadControlPacket(): Uint8Array | null;
@@ -516,7 +516,7 @@ class NativeBackedSandboxVm implements SandboxVm {
   #closed = false;
 
   constructor(
-    nativeVm: {
+    hostVm: {
       readonly hasControlSocket: boolean;
       writeControlPacket(packet: Uint8Array): void;
       tryReadControlPacket(): Uint8Array | null;
@@ -525,15 +525,15 @@ class NativeBackedSandboxVm implements SandboxVm {
     },
     options: SandboxOptions,
   ) {
-    this.#nativeVm = nativeVm;
+    this.#hostVm = hostVm;
     this.mounts = new ConfiguredSandboxMounts(options.mounts ?? [], options.bindings ?? []);
     this.control = new HostControlTransport({
-      connected: nativeVm.hasControlSocket,
-      channel: nativeVm,
+      connected: hostVm.hasControlSocket,
+      channel: hostVm,
     });
-    if (nativeVm.terminateHostForTest !== undefined) {
+    if (hostVm.terminateHostForTest !== undefined) {
       this.diagnostics = {
-        terminateHostForTest: () => nativeVm.terminateHostForTest?.() ?? Promise.resolve(),
+        terminateHostForTest: () => hostVm.terminateHostForTest?.() ?? Promise.resolve(),
       };
     }
   }
@@ -545,7 +545,7 @@ class NativeBackedSandboxVm implements SandboxVm {
 
     this.#closed = true;
     await this.control.close();
-    await this.#nativeVm.close();
+    await this.#hostVm.close();
   }
 
   async [Symbol.asyncDispose](): Promise<void> {
@@ -597,10 +597,10 @@ class ConfiguredSandboxMounts implements SandboxMounts {
   }
 }
 
-function toNativeSpawnOptions(
+function toHostSpawnOptions(
   options: SandboxOptions,
   requestHeaderHooks: readonly SpawnHttpRequestHeadersHook[],
-): NativeSpawnSandboxOptions {
+): HostSpawnSandboxOptions {
   const rootfs = lowerNativeRootfs(options.rootfs);
   if (
     (requestHeaderHooks.length > 0 || options.network?.http !== undefined)

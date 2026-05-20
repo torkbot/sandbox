@@ -60,9 +60,6 @@ jobs:
       - name: Test Rust workspace
         run: npm run test:rust
 
-      - name: Build native module
-        run: npm run build:native
-
       - name: Run unit tests
         run: npm run test:unit
 
@@ -311,7 +308,6 @@ jobs:
           path: |
             dist
             target/release/sandbox-host
-            crates/sandbox-node/index.linux-x64-gnu.node
           key: ${{ steps.package-cache-key.outputs.key }}
 
       - name: Build package artifacts
