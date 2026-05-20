@@ -116,7 +116,7 @@ pub struct NativeHttpOptions {
 #[napi(object)]
 pub struct NativeHttpRequestHeaderHookOptions {
     pub id: String,
-    pub pattern: String,
+    pub origin: String,
 }
 
 #[napi(object)]
@@ -242,7 +242,7 @@ impl NativeSpawnSandboxOptions {
                         .into_iter()
                         .map(|hook| HttpRequestHeaderHookSpec {
                             id: hook.id,
-                            pattern: hook.pattern,
+                            origin: hook.origin,
                         })
                         .collect(),
                 })

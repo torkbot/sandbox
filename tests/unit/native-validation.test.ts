@@ -341,7 +341,7 @@ test("createSandbox requires outbound policy when request-header hooks are confi
       format: "erofs",
     }),
   });
-  sandbox.http.onRequestHeaders("https://api.github.com/*", () => {});
+  sandbox.http.onRequest({ origin: "https://api.github.com" }, () => {});
 
   await assert.rejects(
     sandbox.run(),

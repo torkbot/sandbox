@@ -90,7 +90,7 @@ await using sandbox = createSandbox({
   },
 });
 
-sandbox.http.onRequestHeaders("https://api.github.com/*", (request) => {
+sandbox.http.onRequest({ origin: "https://api.github.com" }, (request) => {
   request.headers.set("authorization", `Bearer ${process.env.GITHUB_TOKEN}`);
 });
 

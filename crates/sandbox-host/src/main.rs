@@ -15,9 +15,6 @@ use sandbox::config::{
 use sandbox::http_flow::{
     HookBackedHttpInterceptRuntime, HttpHookExecutor, InterceptedHttpRequest,
 };
-use sandbox::http_interception::{
-    RequestHeaderHookDecision, RequestHeaderHookRule, RequestHeaderMatch,
-};
 use sandbox::runtime::{HostServices, VirtualFsDevice};
 
 mod host_vfs;
@@ -128,13 +125,56 @@ fn http_intercept_runtime(
         .map(|hook| {
             Ok(NodeRequestHeaderHook {
                 id: hook.id.clone(),
-                rule: RequestHeaderHookRule::parse(&hook.pattern)?,
+                selector: RequestHookSelector::parse(&hook.origin)?,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(Some(Arc::new(HookBackedHttpInterceptRuntime::new(
         NodeHttpHookExecutor { bridge, hooks },
     ))))
+}
+
+#[derive(Debug, Clone)]
+struct RequestHookSelector {
+    scheme: String,
+    authority: String,
+}
+
+impl RequestHookSelector {
+    fn parse(origin: &str) -> Result<Self, String> {
+        let (scheme, rest) = origin
+            .split_once("://")
+            .ok_or_else(|| "HTTP request selector origin must include a scheme".to_string())?;
+        if scheme != "http" && scheme != "https" {
+            return Err("HTTP request selector origin scheme must be http or https".to_string());
+        }
+        let authority = rest.trim_end_matches('/');
+        if authority.is_empty() || authority.contains('/') {
+            return Err(
+                "HTTP request selector origin must be an origin, not a URL path".to_string(),
+            );
+        }
+        Ok(Self {
+            scheme: scheme.to_string(),
+            authority: canonical_authority(scheme, authority)?,
+        })
+    }
+
+    fn matches(&self, url: &str) -> bool {
+        let Ok(parts) = request_url_origin(url) else {
+            return false;
+        };
+        self.scheme == parts.scheme
+            && canonical_authority(parts.scheme, parts.authority)
+                .is_ok_and(|authority| authority == self.authority)
+    }
+
+    fn matches_rebound_authority(&self, scheme: &str, authority: &str) -> bool {
+        self.scheme == scheme
+            && canonical_authority(scheme, authority)
+                .is_ok_and(|authority| authority == self.authority)
+            && is_hostname(&self.authority)
+    }
 }
 
 #[derive(Debug)]
@@ -146,7 +186,7 @@ struct NodeHttpHookExecutor {
 #[derive(Debug)]
 struct NodeRequestHeaderHook {
     id: String,
-    rule: RequestHeaderHookRule,
+    selector: RequestHookSelector,
 }
 
 impl HttpHookExecutor for NodeHttpHookExecutor {
@@ -154,27 +194,13 @@ impl HttpHookExecutor for NodeHttpHookExecutor {
         &self,
         request: InterceptedHttpRequest,
     ) -> io::Result<Vec<(String, String)>> {
-        let parts = request_url_parts(&request.url)?;
-        let mut hook_ids = Vec::new();
-        for hook in &self.hooks {
-            match hook.rule.evaluate(&RequestHeaderMatch {
-                protocol: request.protocol,
-                scheme: parts.scheme,
-                authority: parts.authority,
-                path: parts.path,
-                original_destination_ip: &request.original_destination.ip,
-                upstream_dial_ip: &request.upstream_dial.ip,
-            }) {
-                RequestHeaderHookDecision::Apply => hook_ids.push(hook.id.clone()),
-                RequestHeaderHookDecision::RejectReboundDestination => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "request-header hook rejected rebound destination",
-                    ));
-                }
-                RequestHeaderHookDecision::Ignore => {}
-            }
-        }
+        let matching_hook_ids = self
+            .hooks
+            .iter()
+            .filter(|hook| hook.selector.matches(&request.url))
+            .map(|hook| hook.id.clone())
+            .collect();
+        let hook_ids = self.active_hook_ids(matching_hook_ids)?;
         if hook_ids.is_empty() {
             return Ok(request.headers);
         }
@@ -213,17 +239,12 @@ impl HttpHookExecutor for NodeHttpHookExecutor {
         let candidate_hook_ids = self
             .hooks
             .iter()
-            .filter(|hook| {
-                hook.rule.rejects_rebound_authority(
-                    scheme,
-                    authority,
-                    &original_destination.ip,
-                    &upstream_dial.ip,
-                )
-            })
+            .filter(|hook| hook.selector.matches_rebound_authority(scheme, authority))
             .map(|hook| hook.id.clone())
             .collect::<Vec<_>>();
-        if candidate_hook_ids.is_empty() {
+        if candidate_hook_ids.is_empty()
+            || !is_rebound_authority(authority, original_destination, upstream_dial)
+        {
             return false;
         }
         match self.active_hook_ids(candidate_hook_ids) {
@@ -235,6 +256,9 @@ impl HttpHookExecutor for NodeHttpHookExecutor {
 
 impl NodeHttpHookExecutor {
     fn active_hook_ids(&self, hook_ids: Vec<String>) -> io::Result<Vec<String>> {
+        if hook_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let response = self.bridge.request(doc! {
             "type": "host.http.activeRequestHeaderHooks",
             "hookIds": hook_ids,
@@ -252,26 +276,112 @@ impl NodeHttpHookExecutor {
     }
 }
 
-struct RequestUrlParts<'a> {
-    scheme: &'a str,
-    authority: &'a str,
-    path: &'a str,
+fn is_rebound_authority(
+    authority: &str,
+    original_destination: &sandbox::http_flow::InterceptedDestination,
+    upstream_dial: &sandbox::http_flow::InterceptedDestination,
+) -> bool {
+    let Some(host) = authority_host(authority) else {
+        return false;
+    };
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    original_destination.ip != upstream_dial.ip
+        && (is_special_use_ip(&original_destination.ip) || is_special_use_ip(&upstream_dial.ip))
 }
 
-fn request_url_parts(url: &str) -> io::Result<RequestUrlParts<'_>> {
+struct RequestUrlOrigin<'a> {
+    scheme: &'a str,
+    authority: &'a str,
+}
+
+fn request_url_origin(url: &str) -> io::Result<RequestUrlOrigin<'_>> {
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "request URL missing scheme"))?;
-    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-    Ok(RequestUrlParts {
-        scheme,
-        authority,
-        path: if path.is_empty() {
-            "/"
-        } else {
-            &url[url.len() - path.len() - 1..]
-        },
-    })
+    let authority = rest
+        .split_once('/')
+        .map_or(rest, |(authority, _)| authority);
+    Ok(RequestUrlOrigin { scheme, authority })
+}
+
+fn canonical_authority(scheme: &str, authority: &str) -> Result<String, String> {
+    let authority = authority.trim();
+    if authority.is_empty() {
+        return Err("HTTP request selector authority must not be empty".to_string());
+    }
+    let (host, port) = split_authority(authority);
+    let host = host.to_ascii_lowercase();
+    match (scheme, port) {
+        ("http", Some(80)) | ("https", Some(443)) | (_, None) => Ok(host),
+        (_, Some(port)) => Ok(format!("{host}:{port}")),
+    }
+}
+
+fn is_hostname(authority: &str) -> bool {
+    authority_host(authority)
+        .map(|host| host.parse::<std::net::IpAddr>().is_err())
+        .unwrap_or(false)
+}
+
+fn authority_host(authority: &str) -> Option<&str> {
+    let without_userinfo = authority.rsplit('@').next().unwrap_or(authority);
+    if let Some(rest) = without_userinfo.strip_prefix('[') {
+        return rest.split_once(']').map(|(host, _)| host);
+    }
+    Some(
+        without_userinfo
+            .split_once(':')
+            .map_or(without_userinfo, |(host, _)| host),
+    )
+}
+
+fn split_authority(authority: &str) -> (&str, Option<u16>) {
+    if authority.starts_with('[') {
+        let Some(end) = authority.find(']') else {
+            return (authority, None);
+        };
+        let host = &authority[..=end];
+        let port = authority
+            .get(end + 1..)
+            .and_then(|rest| rest.strip_prefix(':'))
+            .and_then(|port| port.parse().ok());
+        return (host, port);
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') => (host, port.parse().ok()),
+        _ => (authority, None),
+    }
+}
+
+fn is_special_use_ip(value: &str) -> bool {
+    match value.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            let octets = ip.octets();
+            ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || octets[0] == 0
+                || octets[0] == 100 && (octets[1] & 0b1100_0000) == 0b0100_0000
+                || octets[0] == 192 && octets[1] == 0 && octets[2] == 0
+                || octets[0] == 192 && octets[1] == 88 && octets[2] == 99
+                || octets[0] == 198 && (octets[1] == 18 || octets[1] == 19)
+                || octets[0] >= 240
+        }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || ip.is_multicast()
+        }
+        Err(_) => true,
+    }
 }
 
 fn response_header_pairs(document: &Document) -> io::Result<Vec<(String, String)>> {
@@ -473,7 +583,7 @@ fn parse_request_header_hooks(
                 .ok_or("requestHeaderHooks entries must be documents")?;
             Ok(HttpRequestHeaderHookSpec {
                 id: document.get_str("id")?.to_string(),
-                pattern: document.get_str("pattern")?.to_string(),
+                origin: document.get_str("origin")?.to_string(),
             })
         })
         .collect()

@@ -156,7 +156,7 @@ export type FileSystemBindingConfig = {
 
 export type MountConfig = VirtualFsMountConfig;
 
-export interface SandboxHttpRequestHeaders {
+export interface SandboxHttpRequest {
   readonly protocol: "http/1.1" | "h2";
   readonly url: URL;
   readonly method: string;
@@ -173,18 +173,22 @@ export interface SandboxHttpRequestHeaders {
   };
 }
 
-export type SandboxHttpRequestHeadersHook = (
-  request: SandboxHttpRequestHeaders,
+export type SandboxHttpRequestHook = (
+  request: SandboxHttpRequest,
 ) => void | Promise<void>;
+
+export interface SandboxHttpRequestSelector {
+  readonly origin: string;
+}
 
 export interface SandboxHttpHook extends AsyncDisposable {
   [Symbol.asyncDispose](): Promise<void>;
 }
 
 export interface SandboxHttpHooks {
-  onRequestHeaders(
-    pattern: string,
-    hook: SandboxHttpRequestHeadersHook,
+  onRequest(
+    selector: SandboxHttpRequestSelector,
+    hook: SandboxHttpRequestHook,
   ): SandboxHttpHook;
 }
 
@@ -397,14 +401,14 @@ export function createSandbox(options: SandboxOptions): SandboxBuilder {
 
 type RegisteredHttpRequestHeadersHook = {
   readonly id: string;
-  readonly pattern: string;
-  readonly hook: SandboxHttpRequestHeadersHook;
+  readonly selector: SandboxHttpRequestSelector;
+  readonly hook: SandboxHttpRequestHook;
   active: boolean;
 };
 
 type SpawnHttpRequestHeadersHook = {
   readonly id: string;
-  readonly pattern: string;
+  readonly selector: SandboxHttpRequestSelector;
 };
 
 class ConfiguredSandboxBuilder implements SandboxBuilder {
@@ -420,14 +424,14 @@ class ConfiguredSandboxBuilder implements SandboxBuilder {
   constructor(options: SandboxOptions) {
     this.#options = options;
     this.http = {
-      onRequestHeaders: (pattern, hook) => {
+      onRequest: (selector, hook) => {
         this.#assertOpen();
         if (this.#runStarted) {
           throw new Error("sandbox has already been run");
         }
         const registration: RegisteredHttpRequestHeadersHook = {
           id: `http-request-headers-${this.#nextRequestHeaderHookId++}`,
-          pattern,
+          selector,
           hook,
           active: true,
         };
@@ -616,7 +620,7 @@ function toNativeSpawnOptions(
           caPrivateKeyPem: options.network?.http?.certificateAuthority?.privateKeyPem,
           requestHeaderHooks: requestHeaderHooks.map((hook) => ({
             id: hook.id,
-            pattern: hook.pattern,
+            origin: hook.selector.origin,
           })),
         },
     };

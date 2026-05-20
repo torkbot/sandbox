@@ -10,12 +10,13 @@ import type {
   SandboxOptions,
   SandboxFileSystem,
   SandboxPosixFileSystem,
-  SandboxHttpRequestHeadersHook,
+  SandboxHttpRequestHook,
+  SandboxHttpRequestSelector,
 } from "./index.ts";
 
 type RegisteredHttpRequestHeadersHook = {
-  readonly pattern: string;
-  readonly hook: SandboxHttpRequestHeadersHook;
+  readonly selector: SandboxHttpRequestSelector;
+  readonly hook: SandboxHttpRequestHook;
   active: boolean;
 };
 

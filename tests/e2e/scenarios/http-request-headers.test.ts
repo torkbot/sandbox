@@ -74,10 +74,10 @@ test("HTTP request-header hook injects host credentials only on the upstream leg
     await sandbox[Symbol.asyncDispose]();
   });
 
-  const disposedBeforeRun = sandbox.http.onRequestHeaders(`${origin.url}/disposed/*`, () => {
+  const disposedBeforeRun = sandbox.http.onRequest({ origin: new URL(origin.url).origin }, () => {
     throw new Error("disposed hook should not run");
   });
-  const hook = sandbox.http.onRequestHeaders(`${origin.url}/*`, (request) => {
+  const hook = sandbox.http.onRequest({ origin: new URL(origin.url).origin }, (request) => {
     assert.equal(request.protocol, "http/1.1");
     assert.equal(request.method, "GET");
     assert.equal(request.url.href, `${origin.url}/user`);
@@ -98,14 +98,11 @@ test("HTTP request-header hook injects host credentials only on the upstream leg
     request.headers.set("x-sandbox-http-protocol", request.protocol);
   });
   await disposedBeforeRun[Symbol.asyncDispose]();
-  sandbox.http.onRequestHeaders(`${origin.url}/other/*`, () => {
-    throw new Error("non-matching hook should not run");
-  });
 
   const vm = await sandbox.run();
   await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
   assert.throws(
-    () => sandbox.http.onRequestHeaders(`${origin.url}/late/*`, () => {}),
+    () => sandbox.http.onRequest({ origin: new URL(origin.url).origin }, () => {}),
     /sandbox has already been run/,
   );
 
@@ -241,7 +238,7 @@ test("HTTPS request-header hook injects host credentials after guest-trusted MIT
     await sandbox[Symbol.asyncDispose]();
   });
 
-  sandbox.http.onRequestHeaders(`${interceptUrl}/*`, (request) => {
+  sandbox.http.onRequest({ origin: new URL(interceptUrl).origin }, (request) => {
     assert.equal(request.protocol, "http/1.1");
     assert.equal(request.method, "GET");
     assert.equal(request.url.href, `${interceptUrl}/user`);
@@ -374,7 +371,7 @@ test("HTTPS/2 request-header hook injects host credentials after ALPN negotiatio
     await sandbox[Symbol.asyncDispose]();
   });
 
-  sandbox.http.onRequestHeaders(`${interceptUrl}/*`, (request) => {
+  sandbox.http.onRequest({ origin: new URL(interceptUrl).origin }, (request) => {
     assert.equal(request.protocol, "h2");
     assert.equal(request.method, "GET");
     assert.equal(request.url.href, `${interceptUrl}/user`);
@@ -492,7 +489,7 @@ test("HTTP/2 request-header hook injects host credentials only on the upstream l
     await sandbox[Symbol.asyncDispose]();
   });
 
-  sandbox.http.onRequestHeaders(`${origin.url}/*`, (request) => {
+  sandbox.http.onRequest({ origin: new URL(origin.url).origin }, (request) => {
     assert.equal(request.protocol, "h2");
     assert.equal(request.method, "GET");
     assert.equal(request.url.href, `${origin.url}/user`);
@@ -547,7 +544,7 @@ test("HTTP/2 request-header hook injects host credentials only on the upstream l
   }]);
 });
 
-test("HTTP request-header hooks default allow when no pattern matches", async (t) => {
+test("HTTP request hooks default allow when user code does not mutate", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
   }
@@ -594,7 +591,10 @@ test("HTTP request-header hooks default allow when no pattern matches", async (t
   });
 
   let hookInvocations = 0;
-  sandbox.http.onRequestHeaders(`${origin.url}/private/*`, (request) => {
+  sandbox.http.onRequest({ origin: new URL(origin.url).origin }, (request) => {
+    if (request.url.pathname !== "/private") {
+      return;
+    }
     hookInvocations += 1;
     request.headers.set("authorization", "Bearer host-only-token");
     request.headers.set("x-sandbox-http-protocol", request.protocol);
@@ -664,7 +664,7 @@ test("HTTP request-header hooks cannot dial an upstream denied by outbound polic
   });
 
   let hookInvocations = 0;
-  sandbox.http.onRequestHeaders("http://169.254.169.254/*", (request) => {
+  sandbox.http.onRequest({ origin: "http://169.254.169.254" }, (request) => {
     hookInvocations += 1;
     request.headers.set("authorization", "Bearer host-only-token");
   });
@@ -721,7 +721,7 @@ test("HTTP credential hooks do not authorize DNS-rebound private destinations", 
   });
 
   let hookInvocations = 0;
-  sandbox.http.onRequestHeaders("https://api.github.com/*", (request) => {
+  sandbox.http.onRequest({ origin: "https://api.github.com" }, (request) => {
     hookInvocations += 1;
     request.headers.set("authorization", "Bearer host-only-token");
   });

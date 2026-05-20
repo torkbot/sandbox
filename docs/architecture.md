@@ -130,7 +130,7 @@ const sandbox = createSandbox({
   },
 });
 
-sandbox.http.onRequestHeaders("https://api.github.com/*", (request) => {
+sandbox.http.onRequest({ origin: "https://api.github.com" }, (request) => {
   request.headers.set("authorization", `Bearer ${process.env.GITHUB_TOKEN}`);
 });
 ```
@@ -150,14 +150,14 @@ const sandbox = createSandbox({
   },
 });
 
-await using _github = sandbox.http.onRequestHeaders("https://api.github.com/*", (request) => {
+await using _github = sandbox.http.onRequest({ origin: "https://api.github.com" }, (request) => {
   request.headers.set("authorization", `Bearer ${process.env.GITHUB_TOKEN}`);
 });
 
 await using vm = await sandbox.run();
 ```
 
-`network.outbound` decides reachability. HTTP hooks are default-allow request-header transforms. If no hook matches, the request flows normally. If a hook matches, its mutations are applied only to the upstream request after the Rust data plane verifies the original destination and final upstream dial target are still allowed for that authority.
+`network.outbound` decides reachability. HTTP hooks are default-allow request-header transforms. The origin selector is a host-side interest declaration: requests outside registered origins never cross into JavaScript. Matching hook mutations are applied only to the upstream request after the Rust data plane verifies the original destination and final upstream dial target are still allowed for that authority.
 
 The HTTP interception CA is Sandbox infrastructure, not public API. Guest init should receive Sandbox-generated CA material and update the guest trust store before starting the workload. Callers should only provide request-header hooks. If a future caller needs bring-your-own CA, that should be designed as a separate explicit capability rather than leaking certificate plumbing into the first API.
 

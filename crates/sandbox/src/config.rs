@@ -92,7 +92,7 @@ pub struct HttpSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpRequestHeaderHookSpec {
     pub id: String,
-    pub pattern: String,
+    pub origin: String,
 }
 
 impl HttpSpec {
@@ -402,7 +402,7 @@ mod tests {
             ),
             request_header_hooks: vec![HttpRequestHeaderHookSpec {
                 id: "github".to_string(),
-                pattern: "https://api.github.com/*".to_string(),
+                origin: "https://api.github.com".to_string(),
             }],
         });
 

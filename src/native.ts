@@ -49,7 +49,7 @@ export type NativeSpawnSandboxOptions = {
       readonly caPrivateKeyPem?: string;
       readonly requestHeaderHooks?: readonly {
         readonly id: string;
-        readonly pattern: string;
+        readonly origin: string;
       }[];
     };
   };
