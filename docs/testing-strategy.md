@@ -129,7 +129,7 @@ Cheap static checks run under `npm run test:artifact` against `deps/libkrun` or 
 Evidence:
 
 - static Rust integration builds without binding to the C API.
-- the Node module uses the `napi-rs` boundary for native hand-off rather than shelling out or passing large data through ad hoc subprocess protocols.
+- the Node module uses the signed `sandbox-host` helper protocol for native hand-off rather than loading an addon into the embedding Node process.
 - networking does not require a sidecar daemon; any required network component is native to the static artifact or explicitly fails the contract test.
 - fd-taking variants work for sockets owned by the Sandbox host runtime.
 - path-taking variants still work where they are intentionally used for external processes.

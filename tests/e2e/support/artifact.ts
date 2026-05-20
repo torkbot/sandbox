@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { platform } from "node:os";
 import { promisify } from "node:util";
-import { nativeBindingPath } from "../../../src/native.ts";
+import { hostBinaryPath } from "../../../src/host-process.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -21,12 +21,8 @@ export async function inspectNativeArtifact(input: {
   readonly forbiddenDynamicLibraries: readonly string[];
   readonly macosEntitlements: readonly string[];
 }): Promise<ArtifactInspection> {
-  const artifactPath = nativeBindingPath();
   const vmHostPath = hostBinaryPath();
-  const dynamicLibraries = [
-    ...await readDynamicLibraries(artifactPath),
-    ...await readDynamicLibraries(vmHostPath),
-  ];
+  const dynamicLibraries = await readDynamicLibraries(vmHostPath);
   const codesignValid = platform() !== "darwin" || await validateCodesign(vmHostPath);
   const entitlements = platform() === "darwin" ? await readCodesignEntitlements(vmHostPath) : {};
   const hostExecutableEntitlements = platform() === "darwin"
@@ -50,10 +46,6 @@ export async function inspectNativeArtifact(input: {
       hostExecutableHasRequiredEntitlements: requiredHostEntitlementsPresent,
     },
   };
-}
-
-function hostBinaryPath(): string {
-  return new URL("../../../target/release/sandbox-host", import.meta.url).pathname;
 }
 
 async function validateCodesign(artifactPath: string): Promise<boolean> {
