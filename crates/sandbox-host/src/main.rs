@@ -122,9 +122,6 @@ fn http_intercept_runtime(
     else {
         return Ok(None);
     };
-    if http.request_header_hooks.is_empty() {
-        return Ok(None);
-    }
     let hooks = http
         .request_header_hooks
         .iter()
