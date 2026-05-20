@@ -2,9 +2,14 @@ name: CI
 
 on:
   pull_request:
+  workflow_dispatch:
   push:
     branches:
       - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -32,6 +37,11 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-${{ runner.os }}-${{ runner.arch }}
+
       - name: Install Linux host dependencies
         if: runner.os == 'Linux'
         run: |
@@ -56,9 +66,156 @@ jobs:
       - name: Run unit tests
         run: npm run test:unit
 
-  e2e-linux:
-    name: Build fixtures and run e2e (ubuntu-24.04)
+  e2e-fixtures:
+    name: Build e2e fixtures (ubuntu-24.04)
     runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Compute fixture cache key
+        id: fixture-cache-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            printf 'runner-arch=%s\n' '${{ runner.arch }}'
+            git submodule status --recursive deps/libkrun deps/libkrunfw
+            # Keep this broad and obvious: hash the tracked guest-init crates rather than
+            # hand-maintaining individual Rust source files. If the dependency graph grows,
+            # use `cargo metadata` here to derive the local path-dependency closure.
+            git ls-files -z \
+              package-lock.json \
+              Cargo.lock \
+              Cargo.toml \
+              crates/sandbox-init \
+              crates/sandbox-protocol \
+              scripts/build-kernel.ts \
+              scripts/build-init.ts \
+              scripts/build-libkrun-init.ts \
+              scripts/build-rootfs.ts \
+              scripts/build-rootfs-erofs.ts \
+              | xargs -0 shasum -a 256
+          } > fixture-cache-inputs.txt
+          key_hash="$(shasum -a 256 fixture-cache-inputs.txt | cut -d ' ' -f1)"
+          echo "key=sandbox-fixtures-${{ runner.arch }}-${key_hash}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore fixture cache
+        id: fixture-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            dist/kernel
+            dist/init
+            dist/rootfs
+          key: ${{ steps.fixture-cache-key.outputs.key }}
+          enableCrossOsArchive: true
+
+      - name: Set up Node.js
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Build kernel fixture
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: npm run build:kernel
+
+      - name: Build sandbox init fixture
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: npm run build:init
+
+      - name: Build libkrun stage-0 init fixture
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: npm run build:libkrun-init
+
+      - name: Build rootfs fixture
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: |
+          npm run build:rootfs
+          npm run build:rootfs:erofs
+
+  e2e-fixtures-arm64:
+    name: Build e2e fixtures (ubuntu-24.04-arm)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Compute fixture cache key
+        id: fixture-cache-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            printf 'runner-arch=%s\n' '${{ runner.arch }}'
+            git submodule status --recursive deps/libkrun deps/libkrunfw
+            # Keep this broad and obvious: hash the tracked guest-init crates rather than
+            # hand-maintaining individual Rust source files. If the dependency graph grows,
+            # use `cargo metadata` here to derive the local path-dependency closure.
+            git ls-files -z \
+              package-lock.json \
+              Cargo.lock \
+              Cargo.toml \
+              crates/sandbox-init \
+              crates/sandbox-protocol \
+              scripts/build-kernel.ts \
+              scripts/build-init.ts \
+              scripts/build-libkrun-init.ts \
+              scripts/build-rootfs.ts \
+              scripts/build-rootfs-erofs.ts \
+              | xargs -0 shasum -a 256
+          } > fixture-cache-inputs.txt
+          key_hash="$(shasum -a 256 fixture-cache-inputs.txt | cut -d ' ' -f1)"
+          echo "key=sandbox-fixtures-${{ runner.arch }}-${key_hash}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore fixture cache
+        id: fixture-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            dist/kernel
+            dist/init
+            dist/rootfs
+          key: ${{ steps.fixture-cache-key.outputs.key }}
+          enableCrossOsArchive: true
+
+      - name: Set up Node.js
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Build kernel fixture
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: npm run build:kernel
+
+      - name: Build sandbox init fixture
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: npm run build:init
+
+      - name: Build libkrun stage-0 init fixture
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: npm run build:libkrun-init
+
+      - name: Build rootfs fixture
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: |
+          npm run build:rootfs
+          npm run build:rootfs:erofs
+
+  e2e:
+    name: Run e2e (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    needs:
+      - e2e-fixtures
 
     steps:
       - name: Checkout
@@ -75,29 +232,101 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e-${{ runner.os }}-${{ runner.arch }}
+
       - name: Install Linux host dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y clang llvm pkg-config build-essential
 
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo usermod -a -G kvm "$USER"
+          ls -l /dev/kvm
+
       - name: Install dependencies
         run: npm ci
 
-      - name: Build kernel fixture
-        run: npm run build:kernel
-
-      - name: Build sandbox init fixture
-        run: npm run build:init
-
-      - name: Build libkrun stage-0 init fixture
-        run: npm run build:libkrun-init
-
-      - name: Build rootfs fixture
+      - name: Compute fixture cache key
+        id: fixture-cache-key
+        shell: bash
         run: |
-          npm run build:rootfs
-          npm run build:rootfs:erofs
+          set -euo pipefail
+          {
+            printf 'runner-arch=%s\n' '${{ runner.arch }}'
+            git submodule status --recursive deps/libkrun deps/libkrunfw
+            # Keep this broad and obvious: hash the tracked guest-init crates rather than
+            # hand-maintaining individual Rust source files. If the dependency graph grows,
+            # use `cargo metadata` here to derive the local path-dependency closure.
+            git ls-files -z \
+              package-lock.json \
+              Cargo.lock \
+              Cargo.toml \
+              crates/sandbox-init \
+              crates/sandbox-protocol \
+              scripts/build-kernel.ts \
+              scripts/build-init.ts \
+              scripts/build-libkrun-init.ts \
+              scripts/build-rootfs.ts \
+              scripts/build-rootfs-erofs.ts \
+              | xargs -0 shasum -a 256
+          } > fixture-cache-inputs.txt
+          key_hash="$(shasum -a 256 fixture-cache-inputs.txt | cut -d ' ' -f1)"
+          echo "key=sandbox-fixtures-${{ runner.arch }}-${key_hash}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore fixture cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            dist/kernel
+            dist/init
+            dist/rootfs
+          key: ${{ steps.fixture-cache-key.outputs.key }}
+          enableCrossOsArchive: true
+          fail-on-cache-miss: true
+
+      - name: Compute package artifact cache key
+        id: package-cache-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            printf 'runner-os=%s\n' '${{ runner.os }}'
+            printf 'runner-arch=%s\n' '${{ runner.arch }}'
+            printf 'fixture-key=%s\n' '${{ steps.fixture-cache-key.outputs.key }}'
+            git submodule status --recursive deps/libkrun deps/libkrunfw
+            git ls-files -z \
+              package.json \
+              package-lock.json \
+              Cargo.lock \
+              Cargo.toml \
+              crates \
+              scripts \
+              src \
+              tsconfig*.json \
+              | xargs -0 shasum -a 256
+          } > package-cache-inputs.txt
+          key_hash="$(shasum -a 256 package-cache-inputs.txt | cut -d ' ' -f1)"
+          echo "key=sandbox-package-${{ runner.os }}-${{ runner.arch }}-${key_hash}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore package artifact cache
+        id: package-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            dist
+            target/release/sandbox-host
+            crates/sandbox-node/index.linux-x64-gnu.node
+          key: ${{ steps.package-cache-key.outputs.key }}
 
       - name: Build package artifacts
+        if: steps.package-cache.outputs.cache-hit != 'true'
         run: npm run build
 
       - name: Run artifact tests

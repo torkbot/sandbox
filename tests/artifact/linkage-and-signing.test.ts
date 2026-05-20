@@ -62,6 +62,7 @@ test("Linux host CI runs the core VM/control/network contract", async () => {
   const workflow = await readFile(new URL("../../.github/workflows/ci.yml", import.meta.url), "utf8");
 
   assert.match(workflow, /ubuntu-24\.04/);
+  assert.match(workflow, /udev.*kvm/i);
   assert.match(workflow, /submodules:\s*recursive/);
   assert.match(workflow, /npm run test:e2e/);
 });
