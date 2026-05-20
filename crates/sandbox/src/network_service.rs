@@ -1,20 +1,14 @@
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt;
-use std::io::{self, Cursor, Read, Write};
-use std::net::TcpStream;
+use std::collections::{HashMap, HashSet};
+use std::io::{self, Read, Write};
 use std::net::ToSocketAddrs;
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant as StdInstant};
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use rustls::server::{ClientHello, ResolvesServerCert};
-use rustls::sign::CertifiedKey;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::{tcp, udp};
@@ -35,7 +29,6 @@ const TLS_READ_BUFFER_BYTES: usize = 16 * 1024;
 const DNS_PACKET_BUFFER_BYTES: usize = 4096;
 const DNS_PROTECTED_TEST_IP: [u8; 4] = [10, 1, 2, 3];
 const DNS_PUBLIC_TEST_IP: [u8; 4] = [93, 184, 216, 34];
-const MITM_CERT_CACHE_LIMIT: usize = 256;
 const NAT_FLOW_IDLE_TTL: Duration = Duration::from_secs(300);
 const NAT_FLOW_CLOSING_TTL: Duration = Duration::from_secs(30);
 const NETWORK_IDLE_WAKE_INTERVAL: Duration = Duration::from_millis(100);
@@ -43,8 +36,6 @@ const HOST_HTTP_PROBE_RESPONSE: &[u8] =
     b"HTTP/1.1 200 OK\r\ncontent-length: 25\r\nconnection: close\r\n\r\nsandbox explicit network\n";
 const OUTBOUND_DENIED_RESPONSE: &[u8] =
     b"HTTP/1.1 403 Forbidden\r\ncontent-length: 15\r\nconnection: close\r\n\r\noutbound denied";
-const UPSTREAM_FAILURE_RESPONSE: &[u8] =
-    b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 20\r\nconnection: close\r\n\r\nupstream unavailable";
 static SPECIAL_USE_IPV4_RANGES: LazyLock<Vec<CidrRange>> = LazyLock::new(|| {
     [
         "0.0.0.0/8",
@@ -97,14 +88,14 @@ impl HostNetwork {
         http: Option<Arc<dyn HttpInterceptRuntime>>,
     ) -> io::Result<Self> {
         let (host, guest) = UnixStream::pair()?;
-        let tls_acceptor = tls_config.map(TlsAcceptor::new).transpose()?;
+        let tls_enabled = tls_config.is_some();
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = shutdown.clone();
         let worker = thread::spawn(move || {
             run_network_service(
                 host,
                 worker_shutdown,
-                tls_acceptor,
+                tls_enabled,
                 outbound_rules,
                 http,
             )
@@ -133,7 +124,7 @@ impl Drop for HostNetwork {
 fn run_network_service(
     stream: UnixStream,
     shutdown: Arc<AtomicBool>,
-    tls_acceptor: Option<TlsAcceptor>,
+    tls_enabled: bool,
     outbound_rules: Option<Vec<OutboundRulePlan>>,
     http: Option<Arc<dyn HttpInterceptRuntime>>,
 ) {
@@ -154,14 +145,13 @@ fn run_network_service(
     let mut sockets = SocketSet::new(Vec::new());
     let dns_handle = add_dns_socket(&mut sockets);
     let mut http_sockets = HashMap::new();
-    let mut http_connections = HashMap::new();
+    let mut http_responses = HashMap::new();
     add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTP_PORT);
     add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTP_PROBE_PORT);
-    if tls_acceptor.is_some() {
+    if tls_enabled {
         add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTPS_PORT);
         add_http_listener(&mut sockets, &mut http_sockets, HOST_ALT_HTTPS_PORT);
     }
-    let mut tls_connections = HashMap::new();
 
     while !shutdown.load(Ordering::Acquire) {
         let timestamp = Instant::now();
@@ -176,8 +166,7 @@ fn run_network_service(
             &mut sockets,
             &mut http_sockets,
             &active_nat_ports,
-            &http_connections,
-            &tls_connections,
+            &http_responses,
         );
         for (port, handle) in http_sockets
             .iter()
@@ -189,11 +178,10 @@ fn run_network_service(
                 handle,
                 port,
                 &device.nat,
-                tls_acceptor.as_ref(),
+                tls_enabled,
                 outbound_rules.as_deref(),
                 http.as_deref(),
-                &mut http_connections,
-                &mut tls_connections,
+                &mut http_responses,
             );
         }
         wait_for_network_event(&device, iface.poll_delay(Instant::now(), &sockets));
@@ -295,8 +283,7 @@ fn prune_dynamic_http_listeners(
     sockets: &mut SocketSet<'_>,
     http_sockets: &mut HashMap<u16, Vec<SocketHandle>>,
     active_nat_ports: &HashSet<u16>,
-    http_connections: &HashMap<SocketHandle, HttpConnection>,
-    tls_connections: &HashMap<SocketHandle, TlsConnection>,
+    http_responses: &HashMap<SocketHandle, HttpResponseConnection>,
 ) {
     let stale_ports = http_sockets
         .iter()
@@ -304,8 +291,7 @@ fn prune_dynamic_http_listeners(
             (!is_static_listener_port(*port)
                 && !active_nat_ports.contains(port)
                 && handles.iter().all(|handle| {
-                    !http_connections.contains_key(handle)
-                        && !tls_connections.contains_key(handle)
+                    !http_responses.contains_key(handle)
                         && !sockets.get::<tcp::Socket>(*handle).is_active()
                 }))
             .then_some(*port)
@@ -333,62 +319,28 @@ fn poll_http_socket(
     handle: SocketHandle,
     port: u16,
     nat: &TransparentTcpNat,
-    tls_acceptor: Option<&TlsAcceptor>,
+    tls_enabled: bool,
     outbound_rules: Option<&[OutboundRulePlan]>,
     _http: Option<&dyn HttpInterceptRuntime>,
-    http_connections: &mut HashMap<SocketHandle, HttpConnection>,
-    tls_connections: &mut HashMap<SocketHandle, TlsConnection>,
+    http_responses: &mut HashMap<SocketHandle, HttpResponseConnection>,
 ) {
-    let http_proxy_port = None;
     let socket = sockets.get_mut::<tcp::Socket>(handle);
     if !socket.is_active() {
-        http_connections.remove(&handle);
-        tls_connections.remove(&handle);
+        http_responses.remove(&handle);
         let _ = socket.listen(port);
         return;
     }
 
-    if tls_connections.contains_key(&handle) {
-        poll_tls_http_socket(
-            socket,
-            handle,
-            nat,
-            http_proxy_port,
-            tls_acceptor,
-            tls_connections,
-            &[],
-        );
-        return;
-    }
-    if http_connections.contains_key(&handle) {
-        poll_plain_http_socket(
-            socket,
-            handle,
-            nat,
-            http_proxy_port,
-            outbound_rules,
-            http_connections,
-            &[],
-        );
+    if let Some(response) = http_responses.get_mut(&handle) {
+        flush_http_response(socket, response);
+        if response.close_after_response && response.to_guest.is_empty() {
+            socket.close();
+        }
         return;
     }
 
     if is_prelistened_tls_port(port) {
-        if socket.can_recv() {
-            let mut request = [0; TLS_READ_BUFFER_BYTES];
-            let received = socket.recv_slice(&mut request).unwrap_or(0);
-            if received > 0 {
-                poll_tls_http_socket(
-                    socket,
-                    handle,
-                    nat,
-                    http_proxy_port,
-                    tls_acceptor,
-                    tls_connections,
-                    &request[..received],
-                );
-            }
-        }
+        socket.close();
         return;
     }
 
@@ -398,26 +350,16 @@ fn poll_http_socket(
     } else {
         0
     };
-    if received > 0 && looks_like_tls(&initial[..received]) && tls_acceptor.is_some() {
-        poll_tls_http_socket(
-            socket,
-            handle,
-            nat,
-            http_proxy_port,
-            tls_acceptor,
-            tls_connections,
-            &initial[..received],
-        );
+    if received > 0 && looks_like_tls(&initial[..received]) && tls_enabled {
+        socket.close();
         return;
     }
     poll_plain_http_socket(
         socket,
         handle,
         nat,
-        http_proxy_port,
         outbound_rules,
-        http_connections,
-        &initial[..received],
+        http_responses,
     );
 }
 
@@ -452,10 +394,8 @@ fn poll_plain_http_socket(
     socket: &mut tcp::Socket<'_>,
     handle: SocketHandle,
     nat: &TransparentTcpNat,
-    http_proxy_port: Option<u16>,
     outbound_rules: Option<&[OutboundRulePlan]>,
-    http_connections: &mut HashMap<SocketHandle, HttpConnection>,
-    received: &[u8],
+    http_responses: &mut HashMap<SocketHandle, HttpResponseConnection>,
 ) {
     let Some(destination) = original_http_destination(socket, nat) else {
         socket.close();
@@ -464,178 +404,35 @@ fn poll_plain_http_socket(
     if outbound_rules
         .is_some_and(|rules| !is_allowed_outbound_tcp(&destination.ip, destination.port, rules))
     {
-        let connection = http_connections.entry(handle).or_default();
-        connection
+        let response = http_responses.entry(handle).or_default();
+        response
             .to_guest
             .extend_from_slice(OUTBOUND_DENIED_RESPONSE);
-        connection.close_after_response = true;
-        flush_plain_proxy_response(socket, connection);
-        if connection.to_guest.is_empty() {
+        response.close_after_response = true;
+        flush_http_response(socket, response);
+        if response.to_guest.is_empty() {
             socket.close();
         }
         return;
     }
 
-    let Some(proxy_port) = http_proxy_port else {
-        let connection = http_connections.entry(handle).or_default();
-        connection
-            .to_guest
-            .extend_from_slice(HOST_HTTP_PROBE_RESPONSE);
-        connection.close_after_response = true;
-        flush_plain_proxy_response(socket, connection);
-        if connection.to_guest.is_empty() {
-            socket.close();
-        }
-        return;
-    };
-
-    let connection = http_connections.entry(handle).or_insert_with(|| {
-        HttpConnection::connect_proxy(proxy_port, destination, None)
-            .unwrap_or_else(|_| HttpConnection::failed())
-    });
-    if connection.failed {
-        connection
-            .to_guest
-            .extend_from_slice(UPSTREAM_FAILURE_RESPONSE);
-        connection.close_after_response = true;
-    } else {
-        connection.flush_to_proxy();
-        if !received.is_empty() {
-            connection.write_to_proxy(received);
-        }
-        connection.flush_to_proxy();
-        while socket.can_recv() {
-            let mut chunk = [0; TLS_READ_BUFFER_BYTES];
-            let received = socket.recv_slice(&mut chunk).unwrap_or(0);
-            if received == 0 {
-                break;
-            }
-            connection.write_to_proxy(&chunk[..received]);
-            connection.flush_to_proxy();
-        }
-        connection.read_from_proxy();
-    }
-    flush_plain_proxy_response(socket, connection);
-    if connection.close_after_response && connection.to_guest.is_empty() {
+    let response = http_responses.entry(handle).or_default();
+    response.to_guest.extend_from_slice(HOST_HTTP_PROBE_RESPONSE);
+    response.close_after_response = true;
+    flush_http_response(socket, response);
+    if response.to_guest.is_empty() {
         socket.close();
     }
 }
 
-fn poll_tls_http_socket(
-    socket: &mut tcp::Socket<'_>,
-    handle: SocketHandle,
-    nat: &TransparentTcpNat,
-    http_proxy_port: Option<u16>,
-    tls_acceptor: Option<&TlsAcceptor>,
-    tls_connections: &mut HashMap<SocketHandle, TlsConnection>,
-    received: &[u8],
-) {
-    let Some(tls_acceptor) = tls_acceptor else {
-        socket.close();
-        return;
-    };
-    let Some(proxy_port) = http_proxy_port else {
-        socket.close();
-        return;
-    };
-    let connection = tls_connections
-        .entry(handle)
-        .or_insert_with(|| tls_acceptor.connection());
-    if !received.is_empty() {
-        let mut reader = Cursor::new(received);
-        if connection.tls.read_tls(&mut reader).is_err()
-            || connection.tls.process_new_packets().is_err()
-        {
-            socket.close();
-            return;
-        }
-    }
-    while socket.can_recv() {
-        let mut chunk = [0; 8192];
-        let received = socket.recv_slice(&mut chunk).unwrap_or(0);
-        if received == 0 {
-            break;
-        }
-        let mut reader = Cursor::new(&chunk[..received]);
-        if connection.tls.read_tls(&mut reader).is_err()
-            || connection.tls.process_new_packets().is_err()
-        {
-            socket.close();
-            return;
-        }
-    }
-    let mut plaintext = Vec::new();
-    let _ = connection.tls.reader().read_to_end(&mut plaintext);
-    if connection.proxy.is_none() {
-        let Some(destination) = original_http_destination(socket, nat) else {
-            socket.close();
-            return;
-        };
-        connection.proxy = Some(
-            HttpConnection::connect_proxy(proxy_port, destination, tls_metadata(&connection.tls))
-                .unwrap_or_else(|_| HttpConnection::failed()),
-        );
-    }
-    if let Some(proxy) = connection.proxy.as_mut() {
-        proxy.flush_to_proxy();
-        if !plaintext.is_empty() {
-            proxy.write_to_proxy(&plaintext);
-        }
-        proxy.flush_to_proxy();
-        proxy.read_from_proxy();
-        if !proxy.to_guest.is_empty() {
-            let _ = connection.tls.writer().write_all(&proxy.to_guest);
-            proxy.to_guest.clear();
-        }
-        if proxy.close_after_response {
-            connection.tls.send_close_notify();
-        }
-    }
-
-    let mut encrypted = Vec::new();
-    let _ = connection.tls.write_tls(&mut encrypted);
-    if !encrypted.is_empty() {
-        connection.encrypted_to_guest.extend_from_slice(&encrypted);
-    }
-    while socket.can_send() && !connection.encrypted_to_guest.is_empty() {
-        let sent = socket
-            .send_slice(&connection.encrypted_to_guest)
-            .unwrap_or(0);
+fn flush_http_response(socket: &mut tcp::Socket<'_>, response: &mut HttpResponseConnection) {
+    while socket.can_send() && !response.to_guest.is_empty() {
+        let sent = socket.send_slice(&response.to_guest).unwrap_or(0);
         if sent == 0 {
             break;
         }
-        connection.encrypted_to_guest.drain(..sent);
+        response.to_guest.drain(..sent);
     }
-    if connection
-        .proxy
-        .as_ref()
-        .is_some_and(|proxy| proxy.close_after_response)
-        && connection.encrypted_to_guest.is_empty()
-    {
-        socket.close();
-    }
-}
-
-fn flush_plain_proxy_response(socket: &mut tcp::Socket<'_>, connection: &mut HttpConnection) {
-    while socket.can_send() && !connection.to_guest.is_empty() {
-        let sent = socket.send_slice(&connection.to_guest).unwrap_or(0);
-        if sent == 0 {
-            break;
-        }
-        connection.to_guest.drain(..sent);
-    }
-}
-
-fn tls_metadata(connection: &rustls::ServerConnection) -> Option<HostTlsMetadata> {
-    Some(HostTlsMetadata {
-        server_name: connection.server_name().map(str::to_string),
-        alpn_protocol: connection
-            .alpn_protocol()
-            .map(|value| String::from_utf8_lossy(value).to_string()),
-        protocol: connection
-            .protocol_version()
-            .map(|version| format!("{version:?}")),
-    })
 }
 
 fn is_allowed_outbound_tcp(
@@ -921,267 +718,10 @@ impl phy::TxToken for LibkrunTxToken<'_> {
     }
 }
 
-struct TlsAcceptor {
-    config: Arc<rustls::ServerConfig>,
-}
-
-struct HttpConnection {
-    proxy: Option<TcpStream>,
-    to_proxy: PendingWriteBuffer,
+#[derive(Default)]
+struct HttpResponseConnection {
     to_guest: Vec<u8>,
     close_after_response: bool,
-    failed: bool,
-}
-
-impl Default for HttpConnection {
-    fn default() -> Self {
-        Self {
-            proxy: None,
-            to_proxy: PendingWriteBuffer::default(),
-            to_guest: Vec::new(),
-            close_after_response: false,
-            failed: false,
-        }
-    }
-}
-
-struct TlsConnection {
-    tls: rustls::ServerConnection,
-    proxy: Option<HttpConnection>,
-    encrypted_to_guest: Vec<u8>,
-}
-
-impl HttpConnection {
-    fn connect_proxy(
-        proxy_port: u16,
-        destination: HttpDestination,
-        tls: Option<HostTlsMetadata>,
-    ) -> io::Result<Self> {
-        let mut proxy = TcpStream::connect(("127.0.0.1", proxy_port))?;
-        let preface = proxy_preface(destination, tls);
-        proxy.write_all(preface.as_bytes())?;
-        proxy.set_nonblocking(true)?;
-        Ok(Self {
-            proxy: Some(proxy),
-            to_proxy: PendingWriteBuffer::default(),
-            to_guest: Vec::new(),
-            close_after_response: false,
-            failed: false,
-        })
-    }
-
-    fn failed() -> Self {
-        Self {
-            proxy: None,
-            to_proxy: PendingWriteBuffer::default(),
-            to_guest: Vec::new(),
-            close_after_response: true,
-            failed: true,
-        }
-    }
-
-    fn write_to_proxy(&mut self, bytes: &[u8]) {
-        self.to_proxy.push(bytes);
-        self.flush_to_proxy();
-    }
-
-    fn flush_to_proxy(&mut self) {
-        let Some(proxy) = self.proxy.as_mut() else {
-            return;
-        };
-        match self.to_proxy.flush(proxy) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-            Err(_) => {
-                self.close_after_response = true;
-            }
-        }
-    }
-
-    fn read_from_proxy(&mut self) {
-        let Some(proxy) = self.proxy.as_mut() else {
-            return;
-        };
-        let mut buffer = [0; 16 * 1024];
-        loop {
-            match proxy.read(&mut buffer) {
-                Ok(0) => {
-                    self.close_after_response = true;
-                    return;
-                }
-                Ok(read) => self.to_guest.extend_from_slice(&buffer[..read]),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
-                Err(_) => {
-                    self.close_after_response = true;
-                    return;
-                }
-            }
-        }
-    }
-}
-
-#[derive(Default)]
-struct PendingWriteBuffer {
-    bytes: Vec<u8>,
-}
-
-impl PendingWriteBuffer {
-    fn push(&mut self, bytes: &[u8]) {
-        self.bytes.extend_from_slice(bytes);
-    }
-
-    fn flush(&mut self, writer: &mut impl Write) -> io::Result<()> {
-        while !self.bytes.is_empty() {
-            match writer.write(&self.bytes) {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "buffered write closed",
-                    ));
-                }
-                Ok(written) => {
-                    self.bytes.drain(..written);
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Err(error),
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-}
-
-fn proxy_preface(destination: HttpDestination, tls: Option<HostTlsMetadata>) -> String {
-    let tls = tls.unwrap_or(HostTlsMetadata {
-        server_name: None,
-        alpn_protocol: None,
-        protocol: None,
-    });
-    format!(
-        "SANDBOX_HTTP_PROXY 1 {} {} {} {} {}\n",
-        destination.ip,
-        destination.port,
-        tls.server_name.unwrap_or_else(|| "-".to_string()),
-        tls.alpn_protocol.unwrap_or_else(|| "-".to_string()),
-        tls.protocol.unwrap_or_else(|| "-".to_string()),
-    )
-}
-
-impl TlsAcceptor {
-    fn new(config: MitmTlsConfig) -> io::Result<Self> {
-        let ca_key = rcgen::KeyPair::from_pem(&config.ca_private_key_pem)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        let ca = rcgen::Issuer::from_ca_cert_pem(&config.ca_certificate_pem, ca_key)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        let config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_cert_resolver(Arc::new(DynamicMitmCertResolver::new(ca)));
-        let mut config = config;
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        Ok(Self {
-            config: Arc::new(config),
-        })
-    }
-
-    fn connection(&self) -> TlsConnection {
-        TlsConnection {
-            tls: rustls::ServerConnection::new(self.config.clone())
-                .expect("TLS server config should create connections"),
-            proxy: None,
-            encrypted_to_guest: Vec::new(),
-        }
-    }
-}
-
-struct DynamicMitmCertResolver {
-    issuer: Mutex<MitmCertIssuer>,
-}
-
-struct MitmCertIssuer {
-    ca: rcgen::Issuer<'static, rcgen::KeyPair>,
-    cache: HashMap<String, Arc<CertifiedKey>>,
-    cache_order: VecDeque<String>,
-}
-
-impl DynamicMitmCertResolver {
-    fn new(ca: rcgen::Issuer<'static, rcgen::KeyPair>) -> Self {
-        Self {
-            issuer: Mutex::new(MitmCertIssuer {
-                ca,
-                cache: HashMap::new(),
-                cache_order: VecDeque::new(),
-            }),
-        }
-    }
-}
-
-impl fmt::Debug for DynamicMitmCertResolver {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("DynamicMitmCertResolver")
-    }
-}
-
-impl ResolvesServerCert for DynamicMitmCertResolver {
-    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        let server_name = client_hello.server_name().unwrap_or("127.0.0.1");
-        self.issuer.lock().ok()?.certificate_for(server_name).ok()
-    }
-}
-
-impl MitmCertIssuer {
-    fn certificate_for(&mut self, server_name: &str) -> io::Result<Arc<CertifiedKey>> {
-        if let Some(certificate) = self.cache.get(server_name) {
-            return Ok(certificate.clone());
-        }
-
-        let certificate = Arc::new(self.generate_certificate(server_name)?);
-        self.insert_cached_certificate(server_name.to_string(), certificate.clone());
-        Ok(certificate)
-    }
-
-    fn insert_cached_certificate(&mut self, server_name: String, certificate: Arc<CertifiedKey>) {
-        if self.cache.contains_key(&server_name) {
-            self.cache.insert(server_name, certificate);
-            return;
-        }
-        while self.cache.len() >= MITM_CERT_CACHE_LIMIT {
-            let Some(evicted) = self.cache_order.pop_front() else {
-                break;
-            };
-            self.cache.remove(&evicted);
-        }
-        self.cache_order.push_back(server_name.clone());
-        self.cache.insert(server_name, certificate);
-    }
-
-    fn generate_certificate(&self, server_name: &str) -> io::Result<CertifiedKey> {
-        let leaf_key = rcgen::KeyPair::generate()
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        let mut leaf_params = rcgen::CertificateParams::new(vec![server_name.to_string()])
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        leaf_params.distinguished_name = rcgen::DistinguishedName::new();
-        leaf_params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, server_name.to_string());
-        leaf_params.is_ca = rcgen::IsCa::ExplicitNoCa;
-        leaf_params.key_usages = vec![
-            rcgen::KeyUsagePurpose::DigitalSignature,
-            rcgen::KeyUsagePurpose::KeyEncipherment,
-        ];
-        leaf_params.insert_extended_key_usage(rcgen::ExtendedKeyUsagePurpose::ServerAuth);
-        let leaf = leaf_params
-            .signed_by(&leaf_key, &self.ca)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        let cert_chain = vec![CertificateDer::from(leaf.der().to_vec())];
-        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
-        let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key_der)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        Ok(CertifiedKey::new(cert_chain, signing_key))
-    }
 }
 
 #[derive(Debug)]
@@ -1604,30 +1144,6 @@ mod tests {
     }
 
     #[test]
-    fn pending_write_buffer_preserves_unwritten_suffix_after_would_block() {
-        let mut buffer = PendingWriteBuffer::default();
-        buffer.push(b"abcdef");
-        let mut writer = PartialWouldBlockWriter {
-            first_write_len: 2,
-            writes: Vec::new(),
-            blocked: false,
-        };
-
-        assert_eq!(
-            buffer.flush(&mut writer).unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
-        assert_eq!(writer.writes, vec![b"ab".to_vec()]);
-        assert!(!buffer.is_empty());
-
-        let mut writer = Vec::new();
-        buffer.flush(&mut writer).unwrap();
-
-        assert_eq!(writer, b"cdef");
-        assert!(buffer.is_empty());
-    }
-
-    #[test]
     fn dns_unsupported_query_type_returns_nodata_for_known_name() {
         let response = dns_response(&dns_query("public.sandbox.test", 28)).unwrap();
 
@@ -1641,28 +1157,6 @@ mod tests {
 
         assert_eq!(&response[2..4], &[0x81, 0x83]);
         assert_eq!(&response[6..8], &[0, 0]);
-    }
-
-    struct PartialWouldBlockWriter {
-        first_write_len: usize,
-        writes: Vec<Vec<u8>>,
-        blocked: bool,
-    }
-
-    impl Write for PartialWouldBlockWriter {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            if self.blocked {
-                return Err(io::Error::new(io::ErrorKind::WouldBlock, "blocked"));
-            }
-            let written = self.first_write_len.min(bytes.len());
-            self.writes.push(bytes[..written].to_vec());
-            self.blocked = true;
-            Ok(written)
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
     }
 
     fn dns_query(name: &str, qtype: u16) -> Vec<u8> {
