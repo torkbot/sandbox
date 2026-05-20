@@ -30,6 +30,7 @@ const HOST_DNS_PORT: u16 = 53;
 const HTTP_LISTENERS_PER_PORT: usize = 16;
 const HTTP_SOCKET_BUFFER_BYTES: usize = 256 * 1024;
 const TLS_READ_BUFFER_BYTES: usize = 16 * 1024;
+const MAX_INTERCEPT_HEAD_BYTES: usize = 64 * 1024;
 const DNS_PACKET_BUFFER_BYTES: usize = 4096;
 const DNS_PROTECTED_TEST_IP: [u8; 4] = [10, 1, 2, 3];
 const DNS_PUBLIC_TEST_IP: [u8; 4] = [93, 184, 216, 34];
@@ -466,7 +467,7 @@ fn poll_plain_http_socket(
         return;
     }
 
-    let connection = if port_is_probe(destination.port) || http.is_none() {
+    let connection = if port_is_probe(destination.port) {
         HttpConnection::response(HOST_HTTP_PROBE_RESPONSE)
     } else {
         HttpConnection::intercept(
@@ -1529,10 +1530,17 @@ impl TlsInterceptConnection {
                 self.pending_upstream_plaintext
                     .extend_from_slice(&plaintext);
             } else {
-                self.close_after_flush = true;
+                if client.writer().write_all(&plaintext).is_err() {
+                    self.close_after_flush = true;
+                    return;
+                }
+                let _ = client.write_tls(&mut self.to_upstream);
             }
         } else {
             self.plaintext_head.extend_from_slice(&plaintext);
+            if self.plaintext_head.len() > MAX_INTERCEPT_HEAD_BYTES {
+                self.close_after_flush = true;
+            }
         }
     }
 
@@ -1751,6 +1759,9 @@ impl InterceptConnection {
         self.flush_upstream();
         self.read_upstream();
         self.flush_guest(socket);
+        if matches!(self.state, InterceptState::Relaying) {
+            self.relay_guest_body(socket);
+        }
         self.flush_upstream();
         self.read_upstream();
         self.flush_guest(socket);
@@ -1767,6 +1778,12 @@ impl InterceptConnection {
                 break;
             }
             guest_head.extend_from_slice(&buffer[..received]);
+            if guest_head.len() > MAX_INTERCEPT_HEAD_BYTES {
+                self.to_guest.extend_from_slice(OUTBOUND_DENIED_RESPONSE);
+                self.close_after_flush = true;
+                self.state = InterceptState::Closing;
+                return;
+            }
             if looks_like_tls(guest_head) {
                 let maybe_server_name = tls_client_hello_sni(guest_head);
                 if !tls_record_complete(guest_head) {
@@ -1779,35 +1796,14 @@ impl InterceptConnection {
                 };
                 let sni = maybe_server_name;
                 let server_name = tls_intercept_server_name(&self.destination, sni.as_deref());
-                let destination = InterceptedDestination {
-                    ip: self.destination.ip.clone(),
-                    port: self.destination.port,
-                };
-                if self.runtime.as_deref().is_some_and(|runtime| {
-                    runtime.rejects_rebound_authority(
-                        "https",
-                        &server_name,
-                        &destination,
-                        &destination,
-                    )
-                }) {
-                    self.to_guest.extend_from_slice(OUTBOUND_DENIED_RESPONSE);
-                    self.close_after_flush = true;
-                    self.state = InterceptState::Closing;
-                } else {
-                    match TlsInterceptConnection::new(
-                        authority.clone(),
-                        &server_name,
-                        sni,
-                        guest_head,
-                    ) {
-                        Ok(tls) => {
-                            self.state = InterceptState::Tls(tls);
-                        }
-                        Err(_) => {
-                            self.close_after_flush = true;
-                            self.state = InterceptState::Closing;
-                        }
+                match TlsInterceptConnection::new(authority.clone(), &server_name, sni, guest_head)
+                {
+                    Ok(tls) => {
+                        self.state = InterceptState::Tls(tls);
+                    }
+                    Err(_) => {
+                        self.close_after_flush = true;
+                        self.state = InterceptState::Closing;
                     }
                 }
                 return;
@@ -1847,6 +1843,17 @@ impl InterceptConnection {
                     return;
                 }
             }
+        }
+    }
+
+    fn relay_guest_body(&mut self, socket: &mut tcp::Socket<'_>) {
+        while socket.can_recv() {
+            let mut buffer = [0; TLS_READ_BUFFER_BYTES];
+            let received = socket.recv_slice(&mut buffer).unwrap_or(0);
+            if received == 0 {
+                break;
+            }
+            self.to_upstream.extend_from_slice(&buffer[..received]);
         }
     }
 
