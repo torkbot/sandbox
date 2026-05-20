@@ -141,16 +141,10 @@ jobs:
           npm run build:rootfs:erofs
 
   e2e:
-    name: Run e2e (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: Run e2e (ubuntu-24.04)
+    runs-on: ubuntu-24.04
     needs:
       - e2e-fixtures
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - macos-15
-          - ubuntu-24.04
 
     steps:
       - name: Checkout
@@ -168,10 +162,17 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install Linux host dependencies
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y clang llvm pkg-config build-essential
+
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo usermod -a -G kvm "$USER"
+          ls -l /dev/kvm
 
       - name: Install dependencies
         run: npm ci

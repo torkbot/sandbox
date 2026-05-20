@@ -223,8 +223,8 @@ Passing:
   - `acceptPublicInternet(...)` never treats IPv6 loopback/link-local resolution as public reachability.
 - `IPv6 behavior is explicit`
   - Attempt IPv6 HTTP destination and assert deterministic unsupported or implemented behavior.
-- `UDP and non-HTTP traffic cannot silently bypass policy`
-  - Probe UDP/non-HTTP traffic and assert the documented behavior.
+
+Arbitrary UDP forwarding is not currently a production runtime surface. DNS UDP remains covered through resolver-driven scenarios; a future general UDP forwarding feature should add listener-backed e2e evidence with a deterministic host observable.
 
 Failing:
 

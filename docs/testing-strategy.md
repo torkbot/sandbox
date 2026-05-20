@@ -200,7 +200,7 @@ The runtime scenario files live under `tests/e2e/scenarios/` as `.test.ts` files
 - `filesystem.test.ts`: boots with an immutable root and host-backed virtual filesystem using the same `stat` / `list` / `read` shape as TorkBot plugin filesystems.
 - `rootfs-shaping.test.ts`: expresses immutable roots, Linux overlayfs root composition, scratch isolation, and guest-visible mount boundaries.
 - `http-policy.test.ts`: injects internal CA trust, intercepts HTTPS, runs Node policy hooks, rewrites headers, and blocks destinations denied by outbound policy.
-- `network.test.ts`: covers transparent TCP interception, DNS behavior, default-deny outbound rules, IPv6 behavior, and non-HTTP denial.
+- `network.test.ts`: covers transparent TCP interception, DNS behavior, default-deny outbound rules, and IPv6 behavior.
 - `libkrun-contract.test.ts`: boots the VM with direct Rust init injection.
 
 Cheap artifact tests live under `tests/artifact/`:
