@@ -84,16 +84,21 @@ jobs:
           {
             printf 'runner-arch=%s\n' '${{ runner.arch }}'
             git submodule status --recursive deps/libkrun deps/libkrunfw
-            shasum -a 256 \
+            # Keep this broad and obvious: hash the tracked guest-init crates rather than
+            # hand-maintaining individual Rust source files. If the dependency graph grows,
+            # use `cargo metadata` here to derive the local path-dependency closure.
+            git ls-files -z \
               package-lock.json \
               Cargo.lock \
-              crates/sandbox-init/Cargo.toml \
-              crates/sandbox-init/src/main.rs \
+              Cargo.toml \
+              crates/sandbox-init \
+              crates/sandbox-protocol \
               scripts/build-kernel.ts \
               scripts/build-init.ts \
               scripts/build-libkrun-init.ts \
               scripts/build-rootfs.ts \
-              scripts/build-rootfs-erofs.ts
+              scripts/build-rootfs-erofs.ts \
+              | xargs -0 shasum -a 256
           } > fixture-cache-inputs.txt
           key_hash="$(shasum -a 256 fixture-cache-inputs.txt | cut -d ' ' -f1)"
           echo "key=sandbox-fixtures-${{ runner.arch }}-${key_hash}" >> "$GITHUB_OUTPUT"
@@ -152,16 +157,21 @@ jobs:
           {
             printf 'runner-arch=%s\n' '${{ runner.arch }}'
             git submodule status --recursive deps/libkrun deps/libkrunfw
-            shasum -a 256 \
+            # Keep this broad and obvious: hash the tracked guest-init crates rather than
+            # hand-maintaining individual Rust source files. If the dependency graph grows,
+            # use `cargo metadata` here to derive the local path-dependency closure.
+            git ls-files -z \
               package-lock.json \
               Cargo.lock \
-              crates/sandbox-init/Cargo.toml \
-              crates/sandbox-init/src/main.rs \
+              Cargo.toml \
+              crates/sandbox-init \
+              crates/sandbox-protocol \
               scripts/build-kernel.ts \
               scripts/build-init.ts \
               scripts/build-libkrun-init.ts \
               scripts/build-rootfs.ts \
-              scripts/build-rootfs-erofs.ts
+              scripts/build-rootfs-erofs.ts \
+              | xargs -0 shasum -a 256
           } > fixture-cache-inputs.txt
           key_hash="$(shasum -a 256 fixture-cache-inputs.txt | cut -d ' ' -f1)"
           echo "key=sandbox-fixtures-${{ runner.arch }}-${key_hash}" >> "$GITHUB_OUTPUT"
@@ -251,16 +261,21 @@ jobs:
           {
             printf 'runner-arch=%s\n' '${{ runner.arch }}'
             git submodule status --recursive deps/libkrun deps/libkrunfw
-            shasum -a 256 \
+            # Keep this broad and obvious: hash the tracked guest-init crates rather than
+            # hand-maintaining individual Rust source files. If the dependency graph grows,
+            # use `cargo metadata` here to derive the local path-dependency closure.
+            git ls-files -z \
               package-lock.json \
               Cargo.lock \
-              crates/sandbox-init/Cargo.toml \
-              crates/sandbox-init/src/main.rs \
+              Cargo.toml \
+              crates/sandbox-init \
+              crates/sandbox-protocol \
               scripts/build-kernel.ts \
               scripts/build-init.ts \
               scripts/build-libkrun-init.ts \
               scripts/build-rootfs.ts \
-              scripts/build-rootfs-erofs.ts
+              scripts/build-rootfs-erofs.ts \
+              | xargs -0 shasum -a 256
           } > fixture-cache-inputs.txt
           key_hash="$(shasum -a 256 fixture-cache-inputs.txt | cut -d ' ' -f1)"
           echo "key=sandbox-fixtures-${{ runner.arch }}-${key_hash}" >> "$GITHUB_OUTPUT"
@@ -276,7 +291,42 @@ jobs:
           enableCrossOsArchive: true
           fail-on-cache-miss: true
 
+      - name: Compute package artifact cache key
+        id: package-cache-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            printf 'runner-os=%s\n' '${{ runner.os }}'
+            printf 'runner-arch=%s\n' '${{ runner.arch }}'
+            printf 'fixture-key=%s\n' '${{ steps.fixture-cache-key.outputs.key }}'
+            git submodule status --recursive deps/libkrun deps/libkrunfw
+            git ls-files -z \
+              package.json \
+              package-lock.json \
+              Cargo.lock \
+              Cargo.toml \
+              crates \
+              scripts \
+              src \
+              tsconfig*.json \
+              | xargs -0 shasum -a 256
+          } > package-cache-inputs.txt
+          key_hash="$(shasum -a 256 package-cache-inputs.txt | cut -d ' ' -f1)"
+          echo "key=sandbox-package-${{ runner.os }}-${{ runner.arch }}-${key_hash}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore package artifact cache
+        id: package-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            dist
+            target/release/sandbox-host
+            crates/sandbox-node/index.linux-x64-gnu.node
+          key: ${{ steps.package-cache-key.outputs.key }}
+
       - name: Build package artifacts
+        if: steps.package-cache.outputs.cache-hit != 'true'
         run: npm run build
 
       - name: Run artifact tests
