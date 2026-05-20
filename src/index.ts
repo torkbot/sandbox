@@ -412,6 +412,8 @@ class ConfiguredSandboxBuilder implements SandboxBuilder {
 
   readonly #options: SandboxOptions;
   readonly #requestHeaderHooks = new Set<RegisteredHttpRequestHeadersHook>();
+  #nextRequestHeaderHookId = 1;
+  #runStarted = false;
   #vm: SandboxVm | null = null;
   #closed = false;
 
@@ -420,8 +422,11 @@ class ConfiguredSandboxBuilder implements SandboxBuilder {
     this.http = {
       onRequestHeaders: (pattern, hook) => {
         this.#assertOpen();
+        if (this.#runStarted) {
+          throw new Error("sandbox has already been run");
+        }
         const registration: RegisteredHttpRequestHeadersHook = {
-          id: `http-request-headers-${this.#requestHeaderHooks.size + 1}`,
+          id: `http-request-headers-${this.#nextRequestHeaderHookId++}`,
           pattern,
           hook,
           active: true,
@@ -434,9 +439,10 @@ class ConfiguredSandboxBuilder implements SandboxBuilder {
 
   async run(): Promise<SandboxVm> {
     this.#assertOpen();
-    if (this.#vm !== null) {
+    if (this.#runStarted) {
       throw new Error("sandbox has already been run");
     }
+    this.#runStarted = true;
     const registrations = Array.from(this.#requestHeaderHooks);
     const nativeOptions = toNativeSpawnOptions(this.#options, registrations);
     const nativeVm = await HostProcessSandboxVm.spawn(
@@ -592,6 +598,12 @@ function toNativeSpawnOptions(
   requestHeaderHooks: readonly SpawnHttpRequestHeadersHook[],
 ): NativeSpawnSandboxOptions {
   const rootfs = lowerNativeRootfs(options.rootfs);
+  if (
+    (requestHeaderHooks.length > 0 || options.network?.http !== undefined)
+    && options.network?.outbound === undefined
+  ) {
+    throw new Error("invalid spawnSandbox options: network.outbound is required when HTTP interception is configured");
+  }
   const network = options.network === undefined && requestHeaderHooks.length === 0
     ? undefined
     : {

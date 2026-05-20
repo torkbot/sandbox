@@ -469,7 +469,12 @@ fn poll_plain_http_socket(
     let connection = if port_is_probe(destination.port) || http.is_none() {
         HttpConnection::response(HOST_HTTP_PROBE_RESPONSE)
     } else {
-        HttpConnection::intercept(destination, http, tls_authority)
+        HttpConnection::intercept(
+            destination,
+            http,
+            tls_authority,
+            outbound_rules.map(<[OutboundRulePlan]>::to_vec),
+        )
     };
     let connection = http_connections.entry(handle).or_insert(connection);
     poll_http_connection(socket, connection);
@@ -516,12 +521,27 @@ fn rewrite_intercepted_head(
     destination: &HttpDestination,
     scheme: &str,
     tls: Option<HostTlsMetadata>,
+    outbound_rules: Option<&[OutboundRulePlan]>,
     runtime: Option<&dyn HttpInterceptRuntime>,
 ) -> io::Result<Option<RewrittenHead>> {
     if guest_head.starts_with(H2_PREFACE) {
-        return rewrite_h2_head(guest_head, destination, scheme, tls, runtime);
+        return rewrite_h2_head(
+            guest_head,
+            destination,
+            scheme,
+            tls,
+            outbound_rules,
+            runtime,
+        );
     }
-    rewrite_h1_head(guest_head, destination, scheme, tls, runtime)
+    rewrite_h1_head(
+        guest_head,
+        destination,
+        scheme,
+        tls,
+        outbound_rules,
+        runtime,
+    )
 }
 
 fn rewrite_h1_head(
@@ -529,6 +549,7 @@ fn rewrite_h1_head(
     destination: &HttpDestination,
     scheme: &str,
     tls: Option<HostTlsMetadata>,
+    outbound_rules: Option<&[OutboundRulePlan]>,
     runtime: Option<&dyn HttpInterceptRuntime>,
 ) -> io::Result<Option<RewrittenHead>> {
     let Some(head_end) = find_header_end(guest_head) else {
@@ -552,6 +573,7 @@ fn rewrite_h1_head(
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "HTTP/1.1 request missing host"))?
         .to_string();
     let upstream = resolve_upstream_authority(&authority, default_port_for_scheme(scheme))?;
+    validate_upstream_allowed(&upstream, outbound_rules)?;
     let mut pairs = request
         .headers
         .iter()
@@ -605,6 +627,7 @@ fn rewrite_h2_head(
     destination: &HttpDestination,
     scheme_override: &str,
     tls: Option<HostTlsMetadata>,
+    outbound_rules: Option<&[OutboundRulePlan]>,
     runtime: Option<&dyn HttpInterceptRuntime>,
 ) -> io::Result<Option<RewrittenHead>> {
     let mut cursor = H2_PREFACE.len();
@@ -629,7 +652,10 @@ fn rewrite_h2_head(
             ));
         }
 
-        let mut block = rama_core::bytes::BytesMut::from(&guest_head[cursor + 9..frame_end]);
+        let payload = &guest_head[cursor + 9..frame_end];
+        let (header_prefix, header_block, header_padding) =
+            split_h2_headers_payload(payload, flags)?;
+        let mut block = rama_core::bytes::BytesMut::from(header_block);
         let mut decoder = rama_http::proto::h2::hpack::Decoder::new(4096);
         let mut decoded = Vec::new();
         decoder
@@ -676,6 +702,7 @@ fn rewrite_h2_head(
             scheme = "https".to_string();
         }
         let upstream = resolve_upstream_authority(&authority, default_port_for_scheme(&scheme))?;
+        validate_upstream_allowed(&upstream, outbound_rules)?;
         let request = InterceptedHttpRequest {
             protocol: HttpRequestProtocol::Http2,
             method,
@@ -748,16 +775,18 @@ fn rewrite_h2_head(
         );
         let mut rewritten = Vec::new();
         rewritten.extend_from_slice(&guest_head[..cursor]);
-        let encoded_length = encoded.len();
+        let rewritten_payload_len = header_prefix.len() + encoded.len() + header_padding.len();
         rewritten.extend_from_slice(&[
-            ((encoded_length >> 16) & 0xff) as u8,
-            ((encoded_length >> 8) & 0xff) as u8,
-            (encoded_length & 0xff) as u8,
+            ((rewritten_payload_len >> 16) & 0xff) as u8,
+            ((rewritten_payload_len >> 8) & 0xff) as u8,
+            (rewritten_payload_len & 0xff) as u8,
             frame_type,
             flags,
         ]);
         rewritten.extend_from_slice(&guest_head[cursor + 5..cursor + 9]);
+        rewritten.extend_from_slice(header_prefix);
         rewritten.extend_from_slice(&encoded);
+        rewritten.extend_from_slice(header_padding);
         rewritten.extend_from_slice(&guest_head[frame_end..]);
         return Ok(Some(RewrittenHead {
             bytes: rewritten,
@@ -766,6 +795,45 @@ fn rewrite_h2_head(
         }));
     }
     Ok(None)
+}
+
+fn split_h2_headers_payload(payload: &[u8], flags: u8) -> io::Result<(&[u8], &[u8], &[u8])> {
+    let mut block_start = 0;
+    if flags & 0x8 != 0 {
+        if payload.is_empty() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "HTTP/2 padded HEADERS frame is missing pad length",
+            ));
+        }
+        block_start = 1;
+    }
+    if flags & 0x20 != 0 {
+        if payload.len() < block_start + 5 {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "HTTP/2 priority HEADERS frame is missing priority fields",
+            ));
+        }
+        block_start += 5;
+    }
+    let padding_len = if flags & 0x8 != 0 {
+        payload[0] as usize
+    } else {
+        0
+    };
+    if payload.len() < block_start + padding_len {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "HTTP/2 HEADERS frame padding exceeds payload length",
+        ));
+    }
+    let block_end = payload.len() - padding_len;
+    Ok((
+        &payload[..block_start],
+        &payload[block_start..block_end],
+        &payload[block_end..],
+    ))
 }
 
 trait HpackHeaderExt {
@@ -834,6 +902,21 @@ fn resolve_upstream_authority(authority: &str, default_port: u16) -> io::Result<
         ip: address.ip().to_string(),
         port,
     })
+}
+
+fn validate_upstream_allowed(
+    upstream: &UpstreamEndpoint,
+    outbound_rules: Option<&[OutboundRulePlan]>,
+) -> io::Result<()> {
+    if outbound_rules
+        .is_some_and(|rules| is_allowed_outbound_tcp(&upstream.ip, upstream.port, rules))
+    {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        ErrorKind::PermissionDenied,
+        "rewritten upstream destination is not allowed by outbound policy",
+    ))
 }
 
 fn default_port_for_scheme(scheme: &str) -> u16 {
@@ -1224,11 +1307,13 @@ impl HttpConnection {
         destination: HttpDestination,
         runtime: Option<Arc<dyn HttpInterceptRuntime>>,
         tls_authority: Option<Arc<MitmTlsAuthority>>,
+        outbound_rules: Option<Vec<OutboundRulePlan>>,
     ) -> Self {
         Self::Intercept(InterceptConnection {
             destination,
             runtime,
             tls_authority,
+            outbound_rules,
             state: InterceptState::ReadingHead {
                 guest_head: Vec::new(),
             },
@@ -1268,6 +1353,7 @@ struct InterceptConnection {
     destination: HttpDestination,
     runtime: Option<Arc<dyn HttpInterceptRuntime>>,
     tls_authority: Option<Arc<MitmTlsAuthority>>,
+    outbound_rules: Option<Vec<OutboundRulePlan>>,
     state: InterceptState,
     upstream: Option<TcpStream>,
     to_guest: Vec<u8>,
@@ -1315,6 +1401,7 @@ impl TlsInterceptConnection {
         socket: &mut tcp::Socket<'_>,
         destination: &HttpDestination,
         runtime: Option<&dyn HttpInterceptRuntime>,
+        outbound_rules: Option<&[OutboundRulePlan]>,
     ) {
         while socket.can_recv() {
             let mut buffer = [0; TLS_READ_BUFFER_BYTES];
@@ -1325,7 +1412,7 @@ impl TlsInterceptConnection {
             self.read_guest_tls(&buffer[..received]);
         }
         self.flush_guest_tls(socket);
-        self.maybe_connect_upstream(destination, runtime);
+        self.maybe_connect_upstream(destination, runtime, outbound_rules);
         self.flush_upstream_tls();
         self.read_upstream_tls();
         self.flush_upstream_tls();
@@ -1381,6 +1468,7 @@ impl TlsInterceptConnection {
         &mut self,
         destination: &HttpDestination,
         runtime: Option<&dyn HttpInterceptRuntime>,
+        outbound_rules: Option<&[OutboundRulePlan]>,
     ) {
         if self.client.is_some() {
             return;
@@ -1401,6 +1489,7 @@ impl TlsInterceptConnection {
             destination,
             "https",
             Some(metadata),
+            outbound_rules,
             runtime,
         ) {
             Ok(Some(rewrite)) => rewrite,
@@ -1573,7 +1662,12 @@ impl InterceptConnection {
             self.read_guest_head(socket);
         }
         if let InterceptState::Tls(tls) = &mut self.state {
-            tls.poll(socket, &self.destination, self.runtime.as_deref());
+            tls.poll(
+                socket,
+                &self.destination,
+                self.runtime.as_deref(),
+                self.outbound_rules.as_deref(),
+            );
             if tls.is_finished() {
                 self.close_after_flush = true;
             }
@@ -1649,6 +1743,7 @@ impl InterceptConnection {
                 &self.destination,
                 "http",
                 None,
+                self.outbound_rules.as_deref(),
                 self.runtime.as_deref(),
             ) {
                 Ok(Some(rewritten)) => {
@@ -2140,6 +2235,29 @@ mod tests {
         ] {
             assert!(!is_allowed_outbound_tcp(address, 80, &rules), "{address}");
         }
+    }
+
+    #[test]
+    fn h2_headers_payload_splits_padded_and_priority_fields() {
+        let payload = [
+            2, // pad length
+            0x80, 0, 0, 1, 7, // priority fields
+            0x82, 0x87, // HPACK block
+            0, 0, // padding
+        ];
+
+        let (prefix, block, padding) = split_h2_headers_payload(&payload, 0x8 | 0x20).unwrap();
+
+        assert_eq!(prefix, &payload[..6]);
+        assert_eq!(block, &payload[6..8]);
+        assert_eq!(padding, &payload[8..]);
+    }
+
+    #[test]
+    fn h2_headers_payload_rejects_invalid_padding() {
+        let error = split_h2_headers_payload(&[4, 0x82], 0x8).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
     }
 
     #[test]

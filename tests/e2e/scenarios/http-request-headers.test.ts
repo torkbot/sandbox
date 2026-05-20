@@ -74,6 +74,9 @@ test("HTTP request-header hook injects host credentials only on the upstream leg
     await sandbox[Symbol.asyncDispose]();
   });
 
+  const disposedBeforeRun = sandbox.http.onRequestHeaders(`${origin.url}/disposed/*`, () => {
+    throw new Error("disposed hook should not run");
+  });
   const hook = sandbox.http.onRequestHeaders(`${origin.url}/*`, (request) => {
     assert.equal(request.protocol, "http/1.1");
     assert.equal(request.method, "GET");
@@ -94,9 +97,17 @@ test("HTTP request-header hook injects host credentials only on the upstream leg
     request.headers.set("authorization", "Bearer host-only-token");
     request.headers.set("x-sandbox-http-protocol", request.protocol);
   });
+  await disposedBeforeRun[Symbol.asyncDispose]();
+  sandbox.http.onRequestHeaders(`${origin.url}/other/*`, () => {
+    throw new Error("non-matching hook should not run");
+  });
 
   const vm = await sandbox.run();
   await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+  assert.throws(
+    () => sandbox.http.onRequestHeaders(`${origin.url}/late/*`, () => {}),
+    /sandbox has already been run/,
+  );
 
   const result = await execGuest(vm, {
     id: "curl-host-authorized",
@@ -610,6 +621,76 @@ test("HTTP request-header hooks default allow when no pattern matches", async (t
   });
   assert.equal(observed.length, 1);
   assert.equal(observed[0]?.authorization, undefined);
+  assert.equal(hookInvocations, 0);
+});
+
+test("HTTP request-header hooks cannot dial an upstream denied by outbound policy", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const origin = await startTestHttpOrigin({
+    respond() {
+      return {
+        status: 500,
+        body: "origin should not receive denied rewritten upstream requests",
+      };
+    },
+  });
+
+  t.after(async () => {
+    await origin.close();
+  });
+
+  const sandbox = createSandbox({
+    name: "http-rewritten-upstream-denied",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      outbound: {
+        policy: "deny",
+        rules: [
+          acceptTcp({ cidr: "203.0.113.10/32", ports: [80] }),
+        ],
+      },
+    },
+  });
+
+  t.after(async () => {
+    await sandbox[Symbol.asyncDispose]();
+  });
+
+  let hookInvocations = 0;
+  sandbox.http.onRequestHeaders("http://169.254.169.254/*", (request) => {
+    hookInvocations += 1;
+    request.headers.set("authorization", "Bearer host-only-token");
+  });
+
+  const vm = await sandbox.run();
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuest(vm, {
+    id: "curl-rewritten-upstream-denied",
+    argv: [
+      "curl",
+      "--max-time",
+      "5",
+      "-sS",
+      "-o",
+      "/dev/null",
+      "-w",
+      "%{http_code}",
+      "-H",
+      "Host: 169.254.169.254",
+      ...interceptedHttpArgs(`${origin.url}/user`),
+    ],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stdout, "403");
   assert.equal(hookInvocations, 0);
 });
 
