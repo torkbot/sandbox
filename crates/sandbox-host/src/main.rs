@@ -1,15 +1,22 @@
 use std::env;
 use std::io::{self, Read};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
-use bson::Document;
+use bson::{Bson, Document, doc};
 use sandbox::config::MountSpec;
 use sandbox::config::{
     HttpRequestHeaderHookSpec, HttpSpecInput, MicroVmSpecInput, MountSpecInput, OutboundPolicy,
     OutboundRuleSpec, OutboundSpec,
+};
+use sandbox::http_flow::{
+    HookBackedHttpInterceptRuntime, HttpHookExecutor, InterceptedHttpRequest,
+};
+use sandbox::http_interception::{
+    RequestHeaderHookDecision, RequestHeaderHookRule, RequestHeaderMatch,
 };
 use sandbox::runtime::{HostServices, VirtualFsDevice};
 
@@ -63,7 +70,9 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
     let spec = sandbox::MicroVmSpec::build(parse_spawn(spawn_document)?)?;
     let bridge = HostIoBridge::new();
     let virtual_fs = virtual_fs_devices(&spec, bridge.clone());
-    let services = HostServices::default();
+    let services = HostServices {
+        http: http_intercept_runtime(&spec, bridge.clone())?,
+    };
     let mut vm = sandbox::runtime::KrunVm::create_with_services(&spec, virtual_fs, services)?;
     vm.start()?;
 
@@ -100,6 +109,136 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
 
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn http_intercept_runtime(
+    spec: &sandbox::MicroVmSpec,
+    bridge: Arc<HostIoBridge>,
+) -> Result<Option<Arc<dyn sandbox::http_flow::HttpInterceptRuntime>>, Box<dyn std::error::Error>> {
+    let Some(http) = spec.network.as_ref().and_then(|network| network.http.as_ref()) else {
+        return Ok(None);
+    };
+    if http.request_header_hooks.is_empty() {
+        return Ok(None);
+    }
+    let hooks = http
+        .request_header_hooks
+        .iter()
+        .map(|hook| {
+            Ok(NodeRequestHeaderHook {
+                id: hook.id.clone(),
+                rule: RequestHeaderHookRule::parse(&hook.pattern)?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(Some(Arc::new(HookBackedHttpInterceptRuntime::new(
+        NodeHttpHookExecutor { bridge, hooks },
+    ))))
+}
+
+#[derive(Debug)]
+struct NodeHttpHookExecutor {
+    bridge: Arc<HostIoBridge>,
+    hooks: Vec<NodeRequestHeaderHook>,
+}
+
+#[derive(Debug)]
+struct NodeRequestHeaderHook {
+    id: String,
+    rule: RequestHeaderHookRule,
+}
+
+impl HttpHookExecutor for NodeHttpHookExecutor {
+    fn apply_request_headers(
+        &self,
+        request: InterceptedHttpRequest,
+    ) -> io::Result<Vec<(String, String)>> {
+        let parts = request_url_parts(&request.url)?;
+        let mut hook_ids = Vec::new();
+        for hook in &self.hooks {
+            match hook.rule.evaluate(&RequestHeaderMatch {
+                protocol: request.protocol,
+                scheme: parts.scheme,
+                authority: parts.authority,
+                path: parts.path,
+                original_destination_ip: &request.original_destination.ip,
+                upstream_dial_ip: &request.upstream_dial.ip,
+            }) {
+                RequestHeaderHookDecision::Apply => hook_ids.push(hook.id.clone()),
+                RequestHeaderHookDecision::RejectReboundDestination => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "request-header hook rejected rebound destination",
+                    ));
+                }
+                RequestHeaderHookDecision::Ignore => {}
+            }
+        }
+        if hook_ids.is_empty() {
+            return Ok(request.headers);
+        }
+
+        let response = self.bridge.request(doc! {
+            "type": "host.http.requestHeaders",
+            "hookIds": hook_ids,
+            "protocol": match request.protocol {
+                sandbox::http_interception::HttpRequestProtocol::Http1 => "http/1.1",
+                sandbox::http_interception::HttpRequestProtocol::Http2 => "h2",
+            },
+            "method": request.method,
+            "url": request.url,
+            "originalDestinationIp": request.original_destination.ip,
+            "originalDestinationPort": i32::from(request.original_destination.port),
+            "upstreamDialIp": request.upstream_dial.ip,
+            "upstreamDialPort": i32::from(request.upstream_dial.port),
+            "headers": request.headers.into_iter().map(|(name, value)| {
+                Bson::Array(vec![Bson::String(name), Bson::String(value)])
+            }).collect::<Vec<_>>(),
+            "tls": request.tls.map(|tls| doc! {
+                "sni": tls.server_name,
+                "alpn": tls.alpn_protocol,
+            }),
+        })?;
+        response_header_pairs(&response)
+    }
+}
+
+struct RequestUrlParts<'a> {
+    scheme: &'a str,
+    authority: &'a str,
+    path: &'a str,
+}
+
+fn request_url_parts(url: &str) -> io::Result<RequestUrlParts<'_>> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "request URL missing scheme"))?;
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    Ok(RequestUrlParts {
+        scheme,
+        authority,
+        path: if path.is_empty() { "/" } else { &url[url.len() - path.len() - 1..] },
+    })
+}
+
+fn response_header_pairs(document: &Document) -> io::Result<Vec<(String, String)>> {
+    document
+        .get_array("headers")
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?
+        .iter()
+        .map(|value| {
+            let values = value.as_array().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "header entry must be an array")
+            })?;
+            let name = values.first().and_then(Bson::as_str).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "header name must be a string")
+            })?;
+            let header_value = values.get(1).and_then(Bson::as_str).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "header value must be a string")
+            })?;
+            Ok((name.to_string(), header_value.to_string()))
+        })
+        .collect()
 }
 
 fn read_document_packet(reader: &mut impl Read) -> Result<Document, Box<dyn std::error::Error>> {

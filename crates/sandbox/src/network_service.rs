@@ -21,7 +21,7 @@ use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
 
-use crate::http_interception::HttpRequestProtocol;
+use crate::http_flow::HttpInterceptRuntime;
 use crate::network::{CidrRange, OutboundRulePlan};
 
 const HOST_HTTP_PROBE_PORT: u16 = 8080;
@@ -81,26 +81,6 @@ pub struct MitmTlsConfig {
     pub ca_private_key_pem: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct HttpRequestHeaderHookInput {
-    pub protocol: HttpRequestProtocol,
-    pub method: String,
-    pub url: String,
-    pub original_destination_ip: String,
-    pub original_destination_port: u16,
-    pub upstream_dial_ip: String,
-    pub upstream_dial_port: u16,
-    pub headers: Vec<(String, String)>,
-    pub tls: Option<HostTlsMetadata>,
-}
-
-pub trait HttpRequestHeaderHookService: Send + Sync + fmt::Debug {
-    fn apply_request_headers(
-        &self,
-        input: HttpRequestHeaderHookInput,
-    ) -> io::Result<Vec<(String, String)>>;
-}
-
 /// Host-owned endpoint for libkrun's explicit virtio-net unixstream backend.
 #[derive(Debug)]
 pub struct HostNetwork {
@@ -113,7 +93,7 @@ impl HostNetwork {
     pub fn new(
         tls_config: Option<MitmTlsConfig>,
         outbound_rules: Option<Vec<OutboundRulePlan>>,
-        http_request_headers: Option<Arc<dyn HttpRequestHeaderHookService>>,
+        http: Option<Arc<dyn HttpInterceptRuntime>>,
     ) -> io::Result<Self> {
         let (host, guest) = UnixStream::pair()?;
         let tls_acceptor = tls_config.map(TlsAcceptor::new).transpose()?;
@@ -125,7 +105,7 @@ impl HostNetwork {
                 worker_shutdown,
                 tls_acceptor,
                 outbound_rules,
-                http_request_headers,
+                http,
             )
         });
         Ok(Self {
@@ -154,7 +134,7 @@ fn run_network_service(
     shutdown: Arc<AtomicBool>,
     tls_acceptor: Option<TlsAcceptor>,
     outbound_rules: Option<Vec<OutboundRulePlan>>,
-    http_request_headers: Option<Arc<dyn HttpRequestHeaderHookService>>,
+    http: Option<Arc<dyn HttpInterceptRuntime>>,
 ) {
     let _ = stream.set_nonblocking(true);
     let tx = match stream.try_clone() {
@@ -210,7 +190,7 @@ fn run_network_service(
                 &device.nat,
                 tls_acceptor.as_ref(),
                 outbound_rules.as_deref(),
-                http_request_headers.as_deref(),
+                http.as_deref(),
                 &mut http_connections,
                 &mut tls_connections,
             );
@@ -319,7 +299,7 @@ fn poll_http_socket(
     nat: &TransparentTcpNat,
     tls_acceptor: Option<&TlsAcceptor>,
     outbound_rules: Option<&[OutboundRulePlan]>,
-    _http_request_headers: Option<&dyn HttpRequestHeaderHookService>,
+    _http: Option<&dyn HttpInterceptRuntime>,
     http_connections: &mut HashMap<SocketHandle, HttpConnection>,
     tls_connections: &mut HashMap<SocketHandle, TlsConnection>,
 ) {

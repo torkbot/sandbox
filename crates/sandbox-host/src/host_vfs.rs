@@ -13,6 +13,7 @@ use sandbox::vfs::{
     virtual_writable_directory_entry, virtual_writable_file_entry,
 };
 
+#[derive(Debug)]
 pub struct HostIoBridge {
     stdout: Mutex<io::Stdout>,
     next_id: AtomicU64,

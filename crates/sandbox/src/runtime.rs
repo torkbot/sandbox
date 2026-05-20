@@ -12,8 +12,9 @@ use base64::Engine;
 use crate::MicroVmSpec;
 use crate::config::{KernelFormat, RootfsFormat};
 use crate::control::INIT_CONTROL_PORT;
+use crate::http_flow::HttpInterceptRuntime;
 use crate::network::OutboundRulePlan;
-use crate::network_service::{HostNetwork, HttpRequestHeaderHookService, MitmTlsConfig};
+use crate::network_service::{HostNetwork, MitmTlsConfig};
 use crate::vfs::VirtioVirtualFsBackend;
 
 #[derive(Debug)]
@@ -24,7 +25,7 @@ pub struct KrunContext {
 
 #[derive(Default, Clone)]
 pub struct HostServices {
-    pub http_request_headers: Option<Arc<dyn HttpRequestHeaderHookService>>,
+    pub http: Option<Arc<dyn HttpInterceptRuntime>>,
 }
 
 #[derive(Debug)]
@@ -132,7 +133,7 @@ impl KrunContext {
         let network = HostNetwork::new(
             tls_config,
             outbound_rules,
-            _services.http_request_headers.clone(),
+            _services.http.clone(),
         )
             .map_err(|_| KrunError::new("HostNetwork::new", -libc::EIO))?;
         let guest_fd = network.guest_fd();
