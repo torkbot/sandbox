@@ -92,6 +92,12 @@ impl MitmTlsAuthority {
             rustls::pki_types::CertificateDer::from_pem_slice(config.ca_certificate_pem.as_bytes())
                 .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
         let mut client_roots = rustls::RootCertStore::empty();
+        let native_certs = rustls_native_certs::load_native_certs();
+        for cert in native_certs.certs {
+            client_roots
+                .add(cert)
+                .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
+        }
         client_roots
             .add(ca_certificate)
             .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
@@ -614,7 +620,20 @@ fn rewrite_h1_head(
         tls,
     };
     let request = match runtime {
-        Some(runtime) => runtime.handle_request_head(request)?,
+        Some(runtime) => {
+            if runtime.rejects_rebound_authority(
+                scheme,
+                &authority,
+                &request.original_destination,
+                &request.upstream_dial,
+            ) {
+                return Err(io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "request authority resolved to a rebound destination",
+                ));
+            }
+            runtime.handle_request_head(request)?
+        }
         None => request,
     };
     let mut rewritten = Vec::new();
@@ -739,7 +758,20 @@ fn rewrite_h2_head(
             tls,
         };
         let request = match runtime {
-            Some(runtime) => runtime.handle_request_head(request)?,
+            Some(runtime) => {
+                if runtime.rejects_rebound_authority(
+                    &scheme,
+                    &authority,
+                    &request.original_destination,
+                    &request.upstream_dial,
+                ) {
+                    return Err(io::Error::new(
+                        ErrorKind::PermissionDenied,
+                        "request authority resolved to a rebound destination",
+                    ));
+                }
+                runtime.handle_request_head(request)?
+            }
             None => request,
         };
         let mut encoded = rama_core::bytes::BytesMut::new();

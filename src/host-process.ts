@@ -269,7 +269,9 @@ export class HostProcessSandboxVm implements HostControlChannel {
     const id = typeof document.id === "string" ? document.id : "";
     try {
       const hookIds = assertStringArray(document.hookIds, "hookIds");
-      const headers = new Headers(assertHeaderPairs(document.headers, "headers"));
+      const originalHeaders = assertHeaderPairs(document.headers, "headers");
+      const headers = new Headers(originalHeaders);
+      const mutatedHeaders = trackHeaderMutations(headers);
       const request = {
         protocol: assertProtocol(document.protocol),
         url: new URL(assertString(document.url, "url")),
@@ -295,7 +297,9 @@ export class HostProcessSandboxVm implements HostControlChannel {
         type: "host.http.response",
         id,
         ok: true,
-        headers: Array.from(headers.entries()),
+        headers: mutatedHeaders()
+          ? Array.from(headers.entries())
+          : originalHeaders,
       }));
     } catch (error) {
       this.#tryWriteToHost(encodePacket({
@@ -570,6 +574,34 @@ function assertHeaderPairs(value: unknown, field: string): [string, string][] {
   return value as [string, string][];
 }
 
+function trackHeaderMutations(headers: Headers): () => boolean {
+  let mutated = false;
+  const set = headers.set.bind(headers);
+  const append = headers.append.bind(headers);
+  const deleteHeader = headers.delete.bind(headers);
+  Object.defineProperties(headers, {
+    set: {
+      value(name: string, value: string) {
+        mutated = true;
+        set(name, value);
+      },
+    },
+    append: {
+      value(name: string, value: string) {
+        mutated = true;
+        append(name, value);
+      },
+    },
+    delete: {
+      value(name: string) {
+        mutated = true;
+        deleteHeader(name);
+      },
+    },
+  });
+  return () => mutated;
+}
+
 function assertProtocol(value: unknown): "http/1.1" | "h2" {
   if (value === "http/1.1" || value === "h2") {
     return value;
@@ -586,8 +618,12 @@ function optionalTlsMetadata(value: unknown): { readonly sni?: string; readonly 
   }
   const document = value as Record<string, unknown>;
   return {
-    sni: document.sni === undefined ? undefined : assertString(document.sni, "tls.sni"),
-    alpn: document.alpn === undefined ? undefined : assertString(document.alpn, "tls.alpn"),
+    sni: document.sni === undefined || document.sni === null
+      ? undefined
+      : assertString(document.sni, "tls.sni"),
+    alpn: document.alpn === undefined || document.alpn === null
+      ? undefined
+      : assertString(document.alpn, "tls.alpn"),
   };
 }
 
