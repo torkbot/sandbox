@@ -222,8 +222,8 @@ This runtime e2e file owns fork-specific contracts that require booting a VM.
 
 Passing:
 
-- `direct Rust init injection boots without libkrun stage-1 init`
-  - Boot `sandbox-init` directly without relying on libkrun stage-1 init.
+- `boots sandbox-init as PID 1`
+  - Boot `sandbox-init` as the first guest userspace process.
 
 Failing:
 

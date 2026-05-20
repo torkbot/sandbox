@@ -206,7 +206,11 @@ impl KrunContext {
                 let path = cstring_path("krun_set_root", &spec.rootfs.path)?;
                 check_krun("krun_set_root", unsafe {
                     krun::krun_set_root(self.id, path.as_ptr())
-                })
+                })?;
+                check_krun(
+                    "krun_set_direct_init",
+                    krun::krun_set_direct_init(self.id, "/sandbox-init".to_string()),
+                )
             }
             RootfsFormat::Erofs => {
                 let block_id = CString::new("root").unwrap();
@@ -242,8 +246,8 @@ impl KrunContext {
         spec: &MicroVmSpec,
         virtual_fs: &[VirtualFsDevice],
     ) -> Result<(), KrunError> {
-        // Keep exec metadata populated for directory-root compatibility. EROFS
-        // roots boot directly through krun_set_direct_block_root.
+        // Keep exec metadata populated so libkrun serializes argv/env into
+        // krun_env while the kernel command line boots /sandbox-init directly.
         let exec_path = CString::new("/sandbox-init").unwrap();
         let encoded_mounts = encode_virtual_fs_mounts(virtual_fs);
         let mount_arg = CString::new(format!("--virtiofs-mounts={encoded_mounts}")).unwrap();

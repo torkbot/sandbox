@@ -13,7 +13,6 @@
     "build": "npm run build:native && npm run build:host && tsgo --project tsconfig.build.json --pretty",
     "build:host": "node ./scripts/build-host.ts",
     "build:init": "node ./scripts/build-init.ts",
-    "build:libkrun-init": "node ./scripts/build-libkrun-init.ts",
     "build:kernel": "node ./scripts/build-kernel.ts",
     "build:rootfs": "node ./scripts/build-rootfs.ts",
     "build:rootfs:erofs": "node ./scripts/build-rootfs-erofs.ts",

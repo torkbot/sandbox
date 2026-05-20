@@ -95,7 +95,6 @@ jobs:
               crates/sandbox-protocol \
               scripts/build-kernel.ts \
               scripts/build-init.ts \
-              scripts/build-libkrun-init.ts \
               scripts/build-rootfs.ts \
               scripts/build-rootfs-erofs.ts \
               | xargs -0 shasum -a 256
@@ -127,10 +126,6 @@ jobs:
       - name: Build sandbox init fixture
         if: steps.fixture-cache.outputs.cache-hit != 'true'
         run: npm run build:init
-
-      - name: Build libkrun stage-0 init fixture
-        if: steps.fixture-cache.outputs.cache-hit != 'true'
-        run: npm run build:libkrun-init
 
       - name: Build rootfs fixture
         if: steps.fixture-cache.outputs.cache-hit != 'true'
@@ -168,7 +163,6 @@ jobs:
               crates/sandbox-protocol \
               scripts/build-kernel.ts \
               scripts/build-init.ts \
-              scripts/build-libkrun-init.ts \
               scripts/build-rootfs.ts \
               scripts/build-rootfs-erofs.ts \
               | xargs -0 shasum -a 256
@@ -200,10 +194,6 @@ jobs:
       - name: Build sandbox init fixture
         if: steps.fixture-cache.outputs.cache-hit != 'true'
         run: npm run build:init
-
-      - name: Build libkrun stage-0 init fixture
-        if: steps.fixture-cache.outputs.cache-hit != 'true'
-        run: npm run build:libkrun-init
 
       - name: Build rootfs fixture
         if: steps.fixture-cache.outputs.cache-hit != 'true'
@@ -272,7 +262,6 @@ jobs:
               crates/sandbox-protocol \
               scripts/build-kernel.ts \
               scripts/build-init.ts \
-              scripts/build-libkrun-init.ts \
               scripts/build-rootfs.ts \
               scripts/build-rootfs-erofs.ts \
               | xargs -0 shasum -a 256

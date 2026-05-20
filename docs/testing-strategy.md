@@ -68,7 +68,7 @@ Evidence:
 - host sends a command and receives an acknowledged response.
 - guest sees the expected kernel command line and mounted root.
 - guest shutdown is clean and host observes the exit status.
-- no required C `init.krun` stage remains once the libkrun fork supports direct Rust init injection.
+- guest process 1 is `sandbox-init`, not a libkrun-provided init stage.
 
 ### Tier 3: Filesystem E2E
 
@@ -76,7 +76,7 @@ Runs with a real VM.
 
 Fixture:
 
-- immutable read-only root, initially from extracted Docker rootfs and eventually from EROFS.
+- immutable read-only EROFS root generated from the rootfs fixture.
 - virtual procfs-like mount implemented by host callbacks.
 
 Evidence:
@@ -175,7 +175,7 @@ Detected capabilities:
 ## Success Criteria By Project Goal
 
 - Spawn microVMs from Node.js: Node e2e creates a VM, receives readiness, sends commands, and shuts down cleanly.
-- Custom init: the Rust guest init from this repository performs setup, reports readiness, and supervises a test workload. Any libkrun-provided init stage is a temporary bridge and should be removed from the passing target suite once direct Rust init injection lands.
+- Custom init: the Rust guest init from this repository runs as PID 1, performs setup, reports readiness, and supervises a test workload.
 - Static linking: linkage report shows no dynamic `libkrun` or `libkrunfw` dependency.
 - Immutable root: guest root writes fail unless an explicit overlay root is configured.
 - Rootfs composition: explicit `linuxOverlayFs(...)` can compose a prebuilt lower and scratch upper without mutating the lower.
@@ -211,4 +211,4 @@ Cheap artifact tests live under `tests/artifact/`:
 
 Expensive build reproducibility tests live under `tests/reproducibility/` and run only through `npm run test:reproducibility`.
 
-These tests are expected to fail until the runtime exists. A failing test is useful when the failure points at the next missing runtime boundary; a passing placeholder is not.
+New tests should fail only when they point at a missing or regressed runtime boundary; a passing placeholder is not useful evidence.
