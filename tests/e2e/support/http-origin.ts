@@ -129,6 +129,101 @@ export async function startTestHttpsOrigin(input: {
     readonly body?: string | Uint8Array;
   };
 }): Promise<TestHttpsOrigin> {
+  const origin = await createSignedOriginCertificate(input.ca, input.hostname ?? "127.0.0.1");
+  const server = https.createServer({
+    key: await readFile(origin.keyPath),
+    cert: await readFile(origin.certPath),
+  }, async (request, response) => {
+    const body = await collectBody(request);
+    const result = await input.respond({
+      body,
+      headers: normalizeHeaders(request.headers),
+      url: request.url ?? "/",
+    });
+    response.writeHead(result.status, result.headers);
+    response.end(result.body ?? "");
+  });
+
+  await listen(server);
+
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("test HTTPS origin did not bind a TCP port");
+  }
+  const certificatePem = await readFile(origin.certPath, "utf8");
+
+  return {
+    url: `https://127.0.0.1:${address.port}`,
+    pinnedPublicKeySha256: publicKeyPin(certificatePem),
+    async close() {
+      await close(server);
+      await rm(origin.workDir, { recursive: true, force: true });
+    },
+  };
+}
+
+export async function startTestHttps2Origin(input: {
+  readonly ca: Pick<TestCertificateAuthority, "certificatePem" | "privateKeyPem">;
+  readonly hostname?: string;
+  respond(request: {
+    readonly body: Uint8Array;
+    readonly headers: Record<string, string>;
+    readonly url: string;
+  }): Promise<{
+    readonly status: number;
+    readonly headers?: Record<string, string>;
+    readonly body?: string | Uint8Array;
+  }> | {
+    readonly status: number;
+    readonly headers?: Record<string, string>;
+    readonly body?: string | Uint8Array;
+  };
+}): Promise<TestHttpsOrigin> {
+  const origin = await createSignedOriginCertificate(input.ca, input.hostname ?? "127.0.0.1");
+  const server = http2.createSecureServer({
+    key: await readFile(origin.keyPath),
+    cert: await readFile(origin.certPath),
+  });
+  server.on("stream", async (stream, headers) => {
+    const body = await collectHttp2Body(stream);
+    const result = await input.respond({
+      body,
+      headers: normalizeHttp2Headers(headers),
+      url: String(headers[":path"] ?? "/"),
+    });
+    stream.respond({
+      ":status": result.status,
+      ...result.headers,
+    });
+    stream.end(result.body ?? "");
+  });
+
+  await listen(server);
+
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("test HTTPS/2 origin did not bind a TCP port");
+  }
+  const certificatePem = await readFile(origin.certPath, "utf8");
+
+  return {
+    url: `https://127.0.0.1:${address.port}`,
+    pinnedPublicKeySha256: publicKeyPin(certificatePem),
+    async close() {
+      await close(server);
+      await rm(origin.workDir, { recursive: true, force: true });
+    },
+  };
+}
+
+async function createSignedOriginCertificate(
+  ca: Pick<TestCertificateAuthority, "certificatePem" | "privateKeyPem">,
+  hostname: string,
+): Promise<{
+  readonly workDir: string;
+  readonly keyPath: string;
+  readonly certPath: string;
+}> {
   const workDir = await mkdtemp(join(tmpdir(), "sandbox-origin-"));
   const caKeyPath = join(workDir, "ca.key");
   const caCertPath = join(workDir, "ca.pem");
@@ -136,12 +231,11 @@ export async function startTestHttpsOrigin(input: {
   const csrPath = join(workDir, "origin.csr");
   const certPath = join(workDir, "origin.pem");
   const configPath = join(workDir, "openssl.cnf");
-  const hostname = input.hostname ?? "127.0.0.1";
   const subjectAltName = isIpv4Address(hostname)
     ? `IP:${hostname}`
     : `DNS:${hostname}`;
-  await writeFile(caKeyPath, input.ca.privateKeyPem);
-  await writeFile(caCertPath, input.ca.certificatePem);
+  await writeFile(caKeyPath, ca.privateKeyPem);
+  await writeFile(caCertPath, ca.certificatePem);
   await writeFile(configPath, [
     "[req]",
     "distinguished_name=req_distinguished_name",
@@ -184,37 +278,7 @@ export async function startTestHttpsOrigin(input: {
     "-extfile",
     configPath,
   ]);
-
-  const server = https.createServer({
-    key: await readFile(keyPath),
-    cert: await readFile(certPath),
-  }, async (request, response) => {
-    const body = await collectBody(request);
-    const result = await input.respond({
-      body,
-      headers: normalizeHeaders(request.headers),
-      url: request.url ?? "/",
-    });
-    response.writeHead(result.status, result.headers);
-    response.end(result.body ?? "");
-  });
-
-  await listen(server);
-
-  const address = server.address();
-  if (address === null || typeof address === "string") {
-    throw new Error("test HTTPS origin did not bind a TCP port");
-  }
-  const certificatePem = await readFile(certPath, "utf8");
-
-  return {
-    url: `https://127.0.0.1:${address.port}`,
-    pinnedPublicKeySha256: publicKeyPin(certificatePem),
-    async close() {
-      await close(server);
-      await rm(workDir, { recursive: true, force: true });
-    },
-  };
+  return { workDir, keyPath, certPath };
 }
 
 function publicKeyPin(certificatePem: string): string {
