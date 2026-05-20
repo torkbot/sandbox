@@ -129,7 +129,8 @@ export async function startTestHttpsOrigin(input: {
     readonly body?: string | Uint8Array;
   };
 }): Promise<TestHttpsOrigin> {
-  const origin = await createSignedOriginCertificate(input.ca, input.hostname ?? "127.0.0.1");
+  const hostname = input.hostname ?? "127.0.0.1";
+  const origin = await createSignedOriginCertificate(input.ca, hostname);
   const server = https.createServer({
     key: await readFile(origin.keyPath),
     cert: await readFile(origin.certPath),
@@ -153,7 +154,7 @@ export async function startTestHttpsOrigin(input: {
   const certificatePem = await readFile(origin.certPath, "utf8");
 
   return {
-    url: `https://127.0.0.1:${address.port}`,
+    url: `https://${hostname}:${address.port}`,
     pinnedPublicKeySha256: publicKeyPin(certificatePem),
     async close() {
       await close(server);
@@ -179,7 +180,8 @@ export async function startTestHttps2Origin(input: {
     readonly body?: string | Uint8Array;
   };
 }): Promise<TestHttpsOrigin> {
-  const origin = await createSignedOriginCertificate(input.ca, input.hostname ?? "127.0.0.1");
+  const hostname = input.hostname ?? "127.0.0.1";
+  const origin = await createSignedOriginCertificate(input.ca, hostname);
   const server = http2.createSecureServer({
     key: await readFile(origin.keyPath),
     cert: await readFile(origin.certPath),
@@ -207,7 +209,7 @@ export async function startTestHttps2Origin(input: {
   const certificatePem = await readFile(origin.certPath, "utf8");
 
   return {
-    url: `https://127.0.0.1:${address.port}`,
+    url: `https://${hostname}:${address.port}`,
     pinnedPublicKeySha256: publicKeyPin(certificatePem),
     async close() {
       await close(server);

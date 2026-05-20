@@ -19,6 +19,7 @@ use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address}
 use crate::http_flow::{HttpInterceptRuntime, InterceptedDestination, InterceptedHttpRequest};
 use crate::http_interception::HttpRequestProtocol;
 use crate::network::{CidrRange, OutboundRulePlan};
+use rustls::pki_types::pem::PemObject;
 
 const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const HOST_HTTP_PROBE_PORT: u16 = 8080;
@@ -39,6 +40,7 @@ const HOST_HTTP_PROBE_RESPONSE: &[u8] =
     b"HTTP/1.1 200 OK\r\ncontent-length: 25\r\nconnection: close\r\n\r\nsandbox explicit network\n";
 const OUTBOUND_DENIED_RESPONSE: &[u8] =
     b"HTTP/1.1 403 Forbidden\r\ncontent-length: 15\r\nconnection: close\r\n\r\noutbound denied";
+
 static SPECIAL_USE_IPV4_RANGES: LazyLock<Vec<CidrRange>> = LazyLock::new(|| {
     [
         "0.0.0.0/8",
@@ -76,6 +78,73 @@ pub struct MitmTlsConfig {
     pub ca_private_key_pem: String,
 }
 
+#[derive(Debug)]
+struct MitmTlsAuthority {
+    ca_certificate_pem: String,
+    ca_private_key_pem: String,
+    client_roots: rustls::RootCertStore,
+}
+
+impl MitmTlsAuthority {
+    fn new(config: MitmTlsConfig) -> io::Result<Self> {
+        let ca_certificate =
+            rustls::pki_types::CertificateDer::from_pem_slice(config.ca_certificate_pem.as_bytes())
+                .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
+        let mut client_roots = rustls::RootCertStore::empty();
+        client_roots
+            .add(ca_certificate)
+            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
+        Ok(Self {
+            ca_certificate_pem: config.ca_certificate_pem,
+            ca_private_key_pem: config.ca_private_key_pem,
+            client_roots,
+        })
+    }
+
+    fn server_connection(&self, server_name: &str) -> io::Result<rustls::ServerConnection> {
+        let key_pair = rcgen::KeyPair::generate()
+            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
+        let ca_key = rcgen::KeyPair::from_pem(&self.ca_private_key_pem)
+            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
+        let ca = rcgen::Issuer::from_ca_cert_pem(&self.ca_certificate_pem, ca_key)
+            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
+        let mut params = rcgen::CertificateParams::new(vec![server_name.to_string()])
+            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, server_name);
+        let certificate = params
+            .signed_by(&key_pair, &ca)
+            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
+        let private_key = rustls::pki_types::PrivateKeyDer::Pkcs8(key_pair.serialize_der().into());
+        let mut config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate.der().clone()], private_key)
+            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        rustls::ServerConnection::new(Arc::new(config))
+            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))
+    }
+
+    fn client_connection(
+        &self,
+        server_name: &str,
+        alpn_protocol: Option<&str>,
+    ) -> io::Result<rustls::ClientConnection> {
+        let mut config = rustls::ClientConfig::builder()
+            .with_root_certificates(self.client_roots.clone())
+            .with_no_client_auth();
+        if let Some(alpn_protocol) = alpn_protocol {
+            config.alpn_protocols = vec![alpn_protocol.as_bytes().to_vec()];
+        }
+        let server_name = rustls::pki_types::ServerName::try_from(server_name.to_string())
+            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
+        rustls::ClientConnection::new(Arc::new(config), server_name)
+            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))
+    }
+}
+
 /// Host-owned endpoint for libkrun's explicit virtio-net unixstream backend.
 #[derive(Debug)]
 pub struct HostNetwork {
@@ -91,11 +160,14 @@ impl HostNetwork {
         http: Option<Arc<dyn HttpInterceptRuntime>>,
     ) -> io::Result<Self> {
         let (host, guest) = UnixStream::pair()?;
-        let tls_enabled = tls_config.is_some();
+        let tls_authority = tls_config
+            .map(MitmTlsAuthority::new)
+            .transpose()?
+            .map(Arc::new);
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = shutdown.clone();
         let worker = thread::spawn(move || {
-            run_network_service(host, worker_shutdown, tls_enabled, outbound_rules, http)
+            run_network_service(host, worker_shutdown, tls_authority, outbound_rules, http)
         });
         Ok(Self {
             guest_fd: guest.into_raw_fd(),
@@ -121,7 +193,7 @@ impl Drop for HostNetwork {
 fn run_network_service(
     stream: UnixStream,
     shutdown: Arc<AtomicBool>,
-    tls_enabled: bool,
+    tls_authority: Option<Arc<MitmTlsAuthority>>,
     outbound_rules: Option<Vec<OutboundRulePlan>>,
     http: Option<Arc<dyn HttpInterceptRuntime>>,
 ) {
@@ -145,7 +217,7 @@ fn run_network_service(
     let mut http_connections = HashMap::new();
     add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTP_PORT);
     add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTP_PROBE_PORT);
-    if tls_enabled {
+    if tls_authority.is_some() {
         add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTPS_PORT);
         add_http_listener(&mut sockets, &mut http_sockets, HOST_ALT_HTTPS_PORT);
     }
@@ -177,6 +249,7 @@ fn run_network_service(
                 &device.nat,
                 outbound_rules.as_deref(),
                 http.clone(),
+                tls_authority.clone(),
                 &mut http_connections,
             );
         }
@@ -317,6 +390,7 @@ fn poll_http_socket(
     nat: &TransparentTcpNat,
     outbound_rules: Option<&[OutboundRulePlan]>,
     http: Option<Arc<dyn HttpInterceptRuntime>>,
+    tls_authority: Option<Arc<MitmTlsAuthority>>,
     http_connections: &mut HashMap<SocketHandle, HttpConnection>,
 ) {
     let socket = sockets.get_mut::<tcp::Socket>(handle);
@@ -335,7 +409,15 @@ fn poll_http_socket(
         return;
     }
 
-    poll_plain_http_socket(socket, handle, nat, outbound_rules, http, http_connections);
+    poll_plain_http_socket(
+        socket,
+        handle,
+        nat,
+        outbound_rules,
+        http,
+        tls_authority,
+        http_connections,
+    );
 }
 
 fn looks_like_tls(bytes: &[u8]) -> bool {
@@ -367,6 +449,7 @@ fn poll_plain_http_socket(
     nat: &TransparentTcpNat,
     outbound_rules: Option<&[OutboundRulePlan]>,
     http: Option<Arc<dyn HttpInterceptRuntime>>,
+    tls_authority: Option<Arc<MitmTlsAuthority>>,
     http_connections: &mut HashMap<SocketHandle, HttpConnection>,
 ) {
     let Some(destination) = original_http_destination(socket, nat) else {
@@ -386,7 +469,7 @@ fn poll_plain_http_socket(
     let connection = if port_is_probe(destination.port) || http.is_none() {
         HttpConnection::response(HOST_HTTP_PROBE_RESPONSE)
     } else {
-        HttpConnection::intercept(destination, http)
+        HttpConnection::intercept(destination, http, tls_authority)
     };
     let connection = http_connections.entry(handle).or_insert(connection);
     poll_http_connection(socket, connection);
@@ -419,24 +502,33 @@ fn flush_http_response(socket: &mut tcp::Socket<'_>, response: &mut HttpResponse
 
 struct RewrittenHead {
     bytes: Vec<u8>,
-    upstream_host: String,
+    upstream_ip: String,
     upstream_port: u16,
+}
+
+struct UpstreamEndpoint {
+    ip: String,
+    port: u16,
 }
 
 fn rewrite_intercepted_head(
     guest_head: &[u8],
     destination: &HttpDestination,
+    scheme: &str,
+    tls: Option<HostTlsMetadata>,
     runtime: Option<&dyn HttpInterceptRuntime>,
 ) -> io::Result<Option<RewrittenHead>> {
     if guest_head.starts_with(H2_PREFACE) {
-        return rewrite_h2_head(guest_head, destination, runtime);
+        return rewrite_h2_head(guest_head, destination, scheme, tls, runtime);
     }
-    rewrite_h1_head(guest_head, destination, runtime)
+    rewrite_h1_head(guest_head, destination, scheme, tls, runtime)
 }
 
 fn rewrite_h1_head(
     guest_head: &[u8],
     destination: &HttpDestination,
+    scheme: &str,
+    tls: Option<HostTlsMetadata>,
     runtime: Option<&dyn HttpInterceptRuntime>,
 ) -> io::Result<Option<RewrittenHead>> {
     let Some(head_end) = find_header_end(guest_head) else {
@@ -459,7 +551,7 @@ fn rewrite_h1_head(
         .and_then(|header| std::str::from_utf8(header.value).ok())
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "HTTP/1.1 request missing host"))?
         .to_string();
-    let (upstream_host, upstream_port) = split_authority(&authority, 80)?;
+    let upstream = resolve_upstream_authority(&authority, default_port_for_scheme(scheme))?;
     let mut pairs = request
         .headers
         .iter()
@@ -475,17 +567,17 @@ fn rewrite_h1_head(
     let request = InterceptedHttpRequest {
         protocol: HttpRequestProtocol::Http1,
         method,
-        url: format!("http://{authority}{path}"),
+        url: format!("{scheme}://{authority}{path}"),
         original_destination: InterceptedDestination {
             ip: destination.ip.clone(),
             port: destination.port,
         },
         upstream_dial: InterceptedDestination {
-            ip: upstream_host.clone(),
-            port: upstream_port,
+            ip: upstream.ip.clone(),
+            port: upstream.port,
         },
         headers: std::mem::take(&mut pairs),
-        tls: None,
+        tls,
     };
     let request = match runtime {
         Some(runtime) => runtime.handle_request_head(request)?,
@@ -503,14 +595,16 @@ fn rewrite_h1_head(
     rewritten.extend_from_slice(&guest_head[head_end..]);
     Ok(Some(RewrittenHead {
         bytes: rewritten,
-        upstream_host,
-        upstream_port,
+        upstream_ip: upstream.ip,
+        upstream_port: upstream.port,
     }))
 }
 
 fn rewrite_h2_head(
     guest_head: &[u8],
     destination: &HttpDestination,
+    scheme_override: &str,
+    tls: Option<HostTlsMetadata>,
     runtime: Option<&dyn HttpInterceptRuntime>,
 ) -> io::Result<Option<RewrittenHead>> {
     let mut cursor = H2_PREFACE.len();
@@ -578,7 +672,10 @@ fn rewrite_h2_head(
         let authority = authority.ok_or_else(|| {
             io::Error::new(ErrorKind::InvalidData, "HTTP/2 request missing :authority")
         })?;
-        let (upstream_host, upstream_port) = split_authority(&authority, 80)?;
+        if scheme == "http" && scheme_override == "https" {
+            scheme = "https".to_string();
+        }
+        let upstream = resolve_upstream_authority(&authority, default_port_for_scheme(&scheme))?;
         let request = InterceptedHttpRequest {
             protocol: HttpRequestProtocol::Http2,
             method,
@@ -588,11 +685,11 @@ fn rewrite_h2_head(
                 port: destination.port,
             },
             upstream_dial: InterceptedDestination {
-                ip: upstream_host.clone(),
-                port: upstream_port,
+                ip: upstream.ip.clone(),
+                port: upstream.port,
             },
             headers: pairs,
-            tls: None,
+            tls,
         };
         let request = match runtime {
             Some(runtime) => runtime.handle_request_head(request)?,
@@ -664,8 +761,8 @@ fn rewrite_h2_head(
         rewritten.extend_from_slice(&guest_head[frame_end..]);
         return Ok(Some(RewrittenHead {
             bytes: rewritten,
-            upstream_host,
-            upstream_port,
+            upstream_ip: upstream.ip,
+            upstream_port: upstream.port,
         }));
     }
     Ok(None)
@@ -720,6 +817,27 @@ fn split_authority(authority: &str, default_port: u16) -> io::Result<(String, u1
         }
     }
     Ok((authority.to_string(), default_port))
+}
+
+fn resolve_upstream_authority(authority: &str, default_port: u16) -> io::Result<UpstreamEndpoint> {
+    let (host, port) = split_authority(authority, default_port)?;
+    let address = (host.as_str(), port)
+        .to_socket_addrs()?
+        .find(|address| address.is_ipv4())
+        .ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::AddrNotAvailable,
+                format!("no IPv4 address resolved for {authority}"),
+            )
+        })?;
+    Ok(UpstreamEndpoint {
+        ip: address.ip().to_string(),
+        port,
+    })
+}
+
+fn default_port_for_scheme(scheme: &str) -> u16 {
+    if scheme == "https" { 443 } else { 80 }
 }
 
 fn tls_client_hello_sni(bytes: &[u8]) -> Option<String> {
@@ -1105,10 +1223,12 @@ impl HttpConnection {
     fn intercept(
         destination: HttpDestination,
         runtime: Option<Arc<dyn HttpInterceptRuntime>>,
+        tls_authority: Option<Arc<MitmTlsAuthority>>,
     ) -> Self {
         Self::Intercept(InterceptConnection {
             destination,
             runtime,
+            tls_authority,
             state: InterceptState::ReadingHead {
                 guest_head: Vec::new(),
             },
@@ -1139,6 +1259,7 @@ struct HttpResponseConnection {
 
 enum InterceptState {
     ReadingHead { guest_head: Vec<u8> },
+    Tls(TlsInterceptConnection),
     Relaying,
     Closing,
 }
@@ -1146,6 +1267,7 @@ enum InterceptState {
 struct InterceptConnection {
     destination: HttpDestination,
     runtime: Option<Arc<dyn HttpInterceptRuntime>>,
+    tls_authority: Option<Arc<MitmTlsAuthority>>,
     state: InterceptState,
     upstream: Option<TcpStream>,
     to_guest: Vec<u8>,
@@ -1153,10 +1275,309 @@ struct InterceptConnection {
     close_after_flush: bool,
 }
 
+struct TlsInterceptConnection {
+    authority: Arc<MitmTlsAuthority>,
+    server_name: String,
+    server: rustls::ServerConnection,
+    client: Option<rustls::ClientConnection>,
+    upstream: Option<TcpStream>,
+    plaintext_head: Vec<u8>,
+    pending_upstream_plaintext: Vec<u8>,
+    to_guest: Vec<u8>,
+    to_upstream: Vec<u8>,
+    close_after_flush: bool,
+}
+
+impl TlsInterceptConnection {
+    fn new(
+        authority: Arc<MitmTlsAuthority>,
+        server_name: &str,
+        initial_guest_tls: &[u8],
+    ) -> io::Result<Self> {
+        let mut connection = Self {
+            server: authority.server_connection(server_name)?,
+            authority,
+            server_name: server_name.to_string(),
+            client: None,
+            upstream: None,
+            plaintext_head: Vec::new(),
+            pending_upstream_plaintext: Vec::new(),
+            to_guest: Vec::new(),
+            to_upstream: Vec::new(),
+            close_after_flush: false,
+        };
+        connection.read_guest_tls(initial_guest_tls);
+        Ok(connection)
+    }
+
+    fn poll(
+        &mut self,
+        socket: &mut tcp::Socket<'_>,
+        destination: &HttpDestination,
+        runtime: Option<&dyn HttpInterceptRuntime>,
+    ) {
+        while socket.can_recv() {
+            let mut buffer = [0; TLS_READ_BUFFER_BYTES];
+            let received = socket.recv_slice(&mut buffer).unwrap_or(0);
+            if received == 0 {
+                break;
+            }
+            self.read_guest_tls(&buffer[..received]);
+        }
+        self.flush_guest_tls(socket);
+        self.maybe_connect_upstream(destination, runtime);
+        self.flush_upstream_tls();
+        self.read_upstream_tls();
+        self.flush_upstream_tls();
+        self.flush_guest_tls(socket);
+    }
+
+    fn read_guest_tls(&mut self, bytes: &[u8]) {
+        let mut cursor = std::io::Cursor::new(bytes);
+        while cursor.position() < bytes.len() as u64 {
+            match self.server.read_tls(&mut cursor) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => {
+                    self.close_after_flush = true;
+                    return;
+                }
+            }
+            if self.server.process_new_packets().is_err() {
+                self.close_after_flush = true;
+                return;
+            }
+        }
+        self.drain_server_tls();
+        let mut plaintext = Vec::new();
+        loop {
+            let mut buffer = [0; TLS_READ_BUFFER_BYTES];
+            match self.server.reader().read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => plaintext.extend_from_slice(&buffer[..read]),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(_) => {
+                    self.close_after_flush = true;
+                    return;
+                }
+            }
+        }
+        if plaintext.is_empty() {
+            return;
+        }
+        if let Some(client) = &mut self.client {
+            if client.is_handshaking() {
+                self.pending_upstream_plaintext
+                    .extend_from_slice(&plaintext);
+            } else if client.writer().write_all(&plaintext).is_err() {
+                self.close_after_flush = true;
+            }
+        } else {
+            self.plaintext_head.extend_from_slice(&plaintext);
+        }
+    }
+
+    fn maybe_connect_upstream(
+        &mut self,
+        destination: &HttpDestination,
+        runtime: Option<&dyn HttpInterceptRuntime>,
+    ) {
+        if self.client.is_some() {
+            return;
+        }
+        let alpn = self
+            .server
+            .alpn_protocol()
+            .and_then(|protocol| std::str::from_utf8(protocol).ok())
+            .unwrap_or("http/1.1")
+            .to_string();
+        let metadata = HostTlsMetadata {
+            server_name: Some(self.server_name.clone()),
+            alpn_protocol: Some(alpn.clone()),
+            protocol: Some("tls".to_string()),
+        };
+        let rewrite = match rewrite_intercepted_head(
+            &self.plaintext_head,
+            destination,
+            "https",
+            Some(metadata),
+            runtime,
+        ) {
+            Ok(Some(rewrite)) => rewrite,
+            Ok(None) => return,
+            Err(_) => {
+                self.close_after_flush = true;
+                return;
+            }
+        };
+        let upstream =
+            match TcpStream::connect((rewrite.upstream_ip.as_str(), rewrite.upstream_port)) {
+                Ok(upstream) => upstream,
+                Err(_) => {
+                    self.close_after_flush = true;
+                    return;
+                }
+            };
+        let _ = upstream.set_nonblocking(true);
+        let mut client = match self
+            .authority
+            .client_connection(&self.server_name, Some(&alpn))
+        {
+            Ok(client) => client,
+            Err(_) => {
+                self.close_after_flush = true;
+                return;
+            }
+        };
+        self.pending_upstream_plaintext
+            .extend_from_slice(&rewrite.bytes);
+        let _ = client.write_tls(&mut self.to_upstream);
+        self.client = Some(client);
+        self.upstream = Some(upstream);
+        self.plaintext_head.clear();
+    }
+
+    fn flush_upstream_tls(&mut self) {
+        self.flush_pending_upstream_plaintext();
+        let Some(upstream) = &mut self.upstream else {
+            return;
+        };
+        if let Some(client) = &mut self.client {
+            let _ = client.write_tls(&mut self.to_upstream);
+        }
+        while !self.to_upstream.is_empty() {
+            match upstream.write(&self.to_upstream) {
+                Ok(0) => break,
+                Ok(written) => {
+                    self.to_upstream.drain(..written);
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(_) => {
+                    self.close_after_flush = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn read_upstream_tls(&mut self) {
+        let (Some(upstream), Some(client)) = (&mut self.upstream, &mut self.client) else {
+            return;
+        };
+        let mut flush_pending = false;
+        loop {
+            let mut buffer = [0; TLS_READ_BUFFER_BYTES];
+            match upstream.read(&mut buffer) {
+                Ok(0) => {
+                    self.close_after_flush = true;
+                    let _ = upstream.shutdown(Shutdown::Both);
+                    break;
+                }
+                Ok(read) => {
+                    let mut cursor = std::io::Cursor::new(&buffer[..read]);
+                    while cursor.position() < read as u64 {
+                        match client.read_tls(&mut cursor) {
+                            Ok(0) => break,
+                            Ok(_) => {}
+                            Err(_) => {
+                                self.close_after_flush = true;
+                                break;
+                            }
+                        }
+                        if client.process_new_packets().is_err() {
+                            self.close_after_flush = true;
+                            break;
+                        }
+                    }
+                    if self.close_after_flush {
+                        break;
+                    }
+                    let mut plaintext = Vec::new();
+                    loop {
+                        let mut buffer = [0; TLS_READ_BUFFER_BYTES];
+                        match client.reader().read(&mut buffer) {
+                            Ok(0) => break,
+                            Ok(read) => plaintext.extend_from_slice(&buffer[..read]),
+                            Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                            Err(_) => {
+                                self.close_after_flush = true;
+                                break;
+                            }
+                        }
+                    }
+                    if self.close_after_flush {
+                        break;
+                    }
+                    if !plaintext.is_empty() && self.server.writer().write_all(&plaintext).is_err()
+                    {
+                        self.close_after_flush = true;
+                        break;
+                    }
+                    flush_pending = true;
+                    let _ = self.server.write_tls(&mut self.to_guest);
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(_) => {
+                    self.close_after_flush = true;
+                    break;
+                }
+            }
+        }
+        if flush_pending {
+            self.flush_pending_upstream_plaintext();
+        }
+    }
+
+    fn drain_server_tls(&mut self) {
+        let _ = self.server.write_tls(&mut self.to_guest);
+    }
+
+    fn flush_pending_upstream_plaintext(&mut self) {
+        let Some(client) = &mut self.client else {
+            return;
+        };
+        if client.is_handshaking() || self.pending_upstream_plaintext.is_empty() {
+            return;
+        }
+        if client
+            .writer()
+            .write_all(&self.pending_upstream_plaintext)
+            .is_err()
+        {
+            self.close_after_flush = true;
+            return;
+        }
+        self.pending_upstream_plaintext.clear();
+        let _ = client.write_tls(&mut self.to_upstream);
+    }
+
+    fn flush_guest_tls(&mut self, socket: &mut tcp::Socket<'_>) {
+        self.drain_server_tls();
+        while socket.can_send() && !self.to_guest.is_empty() {
+            let sent = socket.send_slice(&self.to_guest).unwrap_or(0);
+            if sent == 0 {
+                break;
+            }
+            self.to_guest.drain(..sent);
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.close_after_flush && self.to_guest.is_empty()
+    }
+}
+
 impl InterceptConnection {
     fn poll(&mut self, socket: &mut tcp::Socket<'_>) {
         if matches!(self.state, InterceptState::ReadingHead { .. }) {
             self.read_guest_head(socket);
+        }
+        if let InterceptState::Tls(tls) = &mut self.state {
+            tls.poll(socket, &self.destination, self.runtime.as_deref());
+            if tls.is_finished() {
+                self.close_after_flush = true;
+            }
+            return;
         }
         self.flush_upstream();
         self.read_upstream();
@@ -1181,7 +1602,10 @@ impl InterceptConnection {
             }
             guest_head.extend_from_slice(&buffer[..received]);
             if looks_like_tls(guest_head) {
-                if let Some(server_name) = tls_client_hello_sni(guest_head) {
+                let maybe_server_name = tls_client_hello_sni(guest_head);
+                if let (Some(authority), Some(server_name)) =
+                    (self.tls_authority.as_ref(), maybe_server_name)
+                {
                     let destination = InterceptedDestination {
                         ip: self.destination.ip.clone(),
                         port: self.destination.port,
@@ -1195,7 +1619,24 @@ impl InterceptConnection {
                         )
                     }) {
                         self.to_guest.extend_from_slice(OUTBOUND_DENIED_RESPONSE);
+                        self.close_after_flush = true;
+                        self.state = InterceptState::Closing;
+                    } else {
+                        match TlsInterceptConnection::new(
+                            authority.clone(),
+                            &server_name,
+                            guest_head,
+                        ) {
+                            Ok(tls) => {
+                                self.state = InterceptState::Tls(tls);
+                            }
+                            Err(_) => {
+                                self.close_after_flush = true;
+                                self.state = InterceptState::Closing;
+                            }
+                        }
                     }
+                    return;
                 } else if !tls_record_complete(guest_head) {
                     continue;
                 }
@@ -1203,10 +1644,16 @@ impl InterceptConnection {
                 self.state = InterceptState::Closing;
                 return;
             }
-            match rewrite_intercepted_head(guest_head, &self.destination, self.runtime.as_deref()) {
+            match rewrite_intercepted_head(
+                guest_head,
+                &self.destination,
+                "http",
+                None,
+                self.runtime.as_deref(),
+            ) {
                 Ok(Some(rewritten)) => {
                     match TcpStream::connect((
-                        rewritten.upstream_host.as_str(),
+                        rewritten.upstream_ip.as_str(),
                         rewritten.upstream_port,
                     )) {
                         Ok(upstream) => {

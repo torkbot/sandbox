@@ -183,6 +183,7 @@ test("HTTPS request-header hook injects host credentials after guest-trusted MIT
   }> = [];
   const origin = await startTestHttpsOrigin({
     ca,
+    hostname: "api.github.test",
     respond(request) {
       observed.push(request.headers);
       return {
@@ -199,6 +200,7 @@ test("HTTPS request-header hook injects host credentials after guest-trusted MIT
   t.after(async () => {
     await origin.close();
   });
+  const interceptUrl = origin.url.replace("https://api.github.test:", "https://127.0.0.1:");
 
   const sandbox = createSandbox({
     name: "https-request-header-hook",
@@ -218,7 +220,7 @@ test("HTTPS request-header hook injects host credentials after guest-trusted MIT
         policy: "deny",
         rules: [
           acceptTcp({ cidr: "127.0.0.1/32", ports: [urlPort(origin.url)] }),
-          acceptTcp({ cidr: "203.0.113.10/32", ports: [443] }),
+          acceptTcp({ cidr: "93.184.216.34/32", ports: [443] }),
         ],
       },
     },
@@ -228,15 +230,15 @@ test("HTTPS request-header hook injects host credentials after guest-trusted MIT
     await sandbox[Symbol.asyncDispose]();
   });
 
-  sandbox.http.onRequestHeaders(`${origin.url}/*`, (request) => {
+  sandbox.http.onRequestHeaders(`${interceptUrl}/*`, (request) => {
     assert.equal(request.protocol, "http/1.1");
     assert.equal(request.method, "GET");
-    assert.equal(request.url.href, `${origin.url}/user`);
-    assert.equal(request.destination.originalIp, "203.0.113.10");
+    assert.equal(request.url.href, `${interceptUrl}/user`);
+    assert.equal(request.destination.originalIp, "93.184.216.34");
     assert.equal(request.destination.originalPort, 443);
     assert.equal(request.destination.upstreamIp, "127.0.0.1");
     assert.equal(request.destination.upstreamPort, urlPort(origin.url));
-    assert.equal(request.tls?.sni, "127.0.0.1");
+    assert.equal(request.tls?.sni, "api.github.test");
     assert.equal(request.tls?.alpn, "http/1.1");
     hookRequests.push({
       protocol: request.protocol,
@@ -260,9 +262,12 @@ test("HTTPS request-header hook injects host credentials after guest-trusted MIT
     id: "curl-https-host-authorized",
     argv: [
       "curl",
+      "--http1.1",
       "--max-time",
       "5",
       "-fsS",
+      "-H",
+      `Host: 127.0.0.1:${urlPort(origin.url)}`,
       ...interceptedHttpsArgs(`${origin.url}/user`),
     ],
   });
@@ -277,12 +282,12 @@ test("HTTPS request-header hook injects host credentials after guest-trusted MIT
   assert.deepEqual(hookRequests, [{
     protocol: "http/1.1",
     method: "GET",
-    url: `${origin.url}/user`,
-    originalIp: "203.0.113.10",
+    url: `${interceptUrl}/user`,
+    originalIp: "93.184.216.34",
     originalPort: 443,
     upstreamIp: "127.0.0.1",
     upstreamPort: urlPort(origin.url),
-    sni: "127.0.0.1",
+    sni: "api.github.test",
     alpn: "http/1.1",
   }]);
 });
@@ -311,6 +316,7 @@ test("HTTPS/2 request-header hook injects host credentials after ALPN negotiatio
   }> = [];
   const origin = await startTestHttps2Origin({
     ca,
+    hostname: "api.github.test",
     respond(request) {
       observed.push(request.headers);
       return {
@@ -327,6 +333,7 @@ test("HTTPS/2 request-header hook injects host credentials after ALPN negotiatio
   t.after(async () => {
     await origin.close();
   });
+  const interceptUrl = origin.url.replace("https://api.github.test:", "https://127.0.0.1:");
 
   const sandbox = createSandbox({
     name: "https2-request-header-hook",
@@ -346,7 +353,7 @@ test("HTTPS/2 request-header hook injects host credentials after ALPN negotiatio
         policy: "deny",
         rules: [
           acceptTcp({ cidr: "127.0.0.1/32", ports: [urlPort(origin.url)] }),
-          acceptTcp({ cidr: "203.0.113.10/32", ports: [443] }),
+          acceptTcp({ cidr: "93.184.216.34/32", ports: [443] }),
         ],
       },
     },
@@ -356,15 +363,15 @@ test("HTTPS/2 request-header hook injects host credentials after ALPN negotiatio
     await sandbox[Symbol.asyncDispose]();
   });
 
-  sandbox.http.onRequestHeaders(`${origin.url}/*`, (request) => {
+  sandbox.http.onRequestHeaders(`${interceptUrl}/*`, (request) => {
     assert.equal(request.protocol, "h2");
     assert.equal(request.method, "GET");
-    assert.equal(request.url.href, `${origin.url}/user`);
-    assert.equal(request.destination.originalIp, "203.0.113.10");
+    assert.equal(request.url.href, `${interceptUrl}/user`);
+    assert.equal(request.destination.originalIp, "93.184.216.34");
     assert.equal(request.destination.originalPort, 443);
     assert.equal(request.destination.upstreamIp, "127.0.0.1");
     assert.equal(request.destination.upstreamPort, urlPort(origin.url));
-    assert.equal(request.tls?.sni, "127.0.0.1");
+    assert.equal(request.tls?.sni, "api.github.test");
     assert.equal(request.tls?.alpn, "h2");
     hookRequests.push({
       protocol: request.protocol,
@@ -392,6 +399,8 @@ test("HTTPS/2 request-header hook injects host credentials after ALPN negotiatio
       "--max-time",
       "5",
       "-fsS",
+      "-H",
+      `Host: 127.0.0.1:${urlPort(origin.url)}`,
       ...interceptedHttpsArgs(`${origin.url}/user`),
     ],
   });
@@ -407,12 +416,12 @@ test("HTTPS/2 request-header hook injects host credentials after ALPN negotiatio
   assert.deepEqual(hookRequests, [{
     protocol: "h2",
     method: "GET",
-    url: `${origin.url}/user`,
-    originalIp: "203.0.113.10",
+    url: `${interceptUrl}/user`,
+    originalIp: "93.184.216.34",
     originalPort: 443,
     upstreamIp: "127.0.0.1",
     upstreamPort: urlPort(origin.url),
-    sni: "127.0.0.1",
+    sni: "api.github.test",
     alpn: "h2",
   }]);
 });
@@ -680,7 +689,7 @@ function interceptedHttpsArgs(url: string): string[] {
   const parsed = new URL(url);
   return [
     "--connect-to",
-    `${parsed.hostname}:${parsed.port}:203.0.113.10:443`,
+    `${parsed.hostname}:${parsed.port}:93.184.216.34:443`,
     url,
   ];
 }
