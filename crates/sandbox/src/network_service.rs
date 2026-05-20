@@ -3,7 +3,7 @@ use std::fmt;
 use std::io::{self, Cursor, Read, Write};
 use std::net::TcpStream;
 use std::net::ToSocketAddrs;
-use std::os::fd::{IntoRawFd, RawFd};
+use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -38,6 +38,7 @@ const DNS_PUBLIC_TEST_IP: [u8; 4] = [93, 184, 216, 34];
 const MITM_CERT_CACHE_LIMIT: usize = 256;
 const NAT_FLOW_IDLE_TTL: Duration = Duration::from_secs(300);
 const NAT_FLOW_CLOSING_TTL: Duration = Duration::from_secs(30);
+const NETWORK_IDLE_WAKE_INTERVAL: Duration = Duration::from_millis(100);
 const HOST_HTTP_PROBE_RESPONSE: &[u8] =
     b"HTTP/1.1 200 OK\r\ncontent-length: 25\r\nconnection: close\r\n\r\nsandbox explicit network\n";
 const OUTBOUND_DENIED_RESPONSE: &[u8] =
@@ -195,8 +196,43 @@ fn run_network_service(
                 &mut tls_connections,
             );
         }
-        thread::sleep(Duration::from_millis(1));
+        wait_for_network_event(&device, iface.poll_delay(Instant::now(), &sockets));
     }
+}
+
+fn wait_for_network_event(device: &LibkrunNetDevice, poll_delay: Option<smoltcp::time::Duration>) {
+    let timeout_ms = poll_timeout_millis(poll_delay);
+    if timeout_ms == 0 {
+        return;
+    }
+
+    let mut events = libc::POLLIN;
+    if device.has_pending_tx() {
+        events |= libc::POLLOUT;
+    }
+    let mut poll_fd = libc::pollfd {
+        fd: device.raw_fd(),
+        events,
+        revents: 0,
+    };
+    loop {
+        let result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        if result >= 0 {
+            return;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return;
+        }
+    }
+}
+
+fn poll_timeout_millis(poll_delay: Option<smoltcp::time::Duration>) -> i32 {
+    let delay = poll_delay
+        .map(|delay| Duration::from_micros(delay.total_micros()))
+        .unwrap_or(NETWORK_IDLE_WAKE_INTERVAL)
+        .min(NETWORK_IDLE_WAKE_INTERVAL);
+    i32::try_from(delay.as_millis()).unwrap_or(i32::MAX)
 }
 
 fn add_dns_socket(sockets: &mut SocketSet<'_>) -> SocketHandle {
@@ -757,6 +793,14 @@ impl LibkrunNetDevice {
             rx_buffer: Vec::new(),
             pending_tx: Vec::new(),
         }
+    }
+
+    fn raw_fd(&self) -> RawFd {
+        self.rx.as_raw_fd()
+    }
+
+    fn has_pending_tx(&self) -> bool {
+        !self.pending_tx.is_empty()
     }
 
     fn read_frame(&mut self) -> io::Result<Option<Vec<u8>>> {
@@ -1460,6 +1504,31 @@ mod tests {
         rx_writer.write_all(&packet[2..]).unwrap();
 
         assert_eq!(device.read_frame().unwrap(), Some(ethernet.to_vec()));
+    }
+
+    #[test]
+    fn network_poll_timeout_uses_smoltcp_deadline() {
+        assert_eq!(
+            poll_timeout_millis(Some(smoltcp::time::Duration::from_millis(17))),
+            17,
+        );
+    }
+
+    #[test]
+    fn network_poll_timeout_caps_idle_wakeups() {
+        assert_eq!(poll_timeout_millis(None), 100);
+        assert_eq!(
+            poll_timeout_millis(Some(smoltcp::time::Duration::from_secs(30))),
+            100,
+        );
+    }
+
+    #[test]
+    fn network_poll_timeout_preserves_immediate_repoll() {
+        assert_eq!(
+            poll_timeout_millis(Some(smoltcp::time::Duration::from_millis(0))),
+            0,
+        );
     }
 
     #[test]
