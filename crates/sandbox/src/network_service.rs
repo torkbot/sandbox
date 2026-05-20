@@ -509,6 +509,7 @@ struct RewrittenHead {
     bytes: Vec<u8>,
     upstream_ip: String,
     upstream_port: u16,
+    upstream_server_name: String,
 }
 
 struct UpstreamEndpoint {
@@ -579,6 +580,7 @@ fn rewrite_h1_head(
     let authority = std::str::from_utf8(host_headers[0].value)
         .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?
         .to_string();
+    let (upstream_server_name, _) = split_authority(&authority, default_port_for_scheme(scheme))?;
     let upstream = resolve_upstream_authority(&authority, default_port_for_scheme(scheme))?;
     validate_upstream_allowed(&upstream, outbound_rules)?;
     let mut pairs = request
@@ -628,6 +630,7 @@ fn rewrite_h1_head(
         bytes: rewritten,
         upstream_ip: upstream.ip,
         upstream_port: upstream.port,
+        upstream_server_name,
     }))
 }
 
@@ -715,6 +718,8 @@ fn rewrite_h2_head(
         if scheme == "http" && scheme_override == "https" {
             scheme = "https".to_string();
         }
+        let (upstream_server_name, _) =
+            split_authority(&authority, default_port_for_scheme(&scheme))?;
         let upstream = resolve_upstream_authority(&authority, default_port_for_scheme(&scheme))?;
         validate_upstream_allowed(&upstream, outbound_rules)?;
         let request = InterceptedHttpRequest {
@@ -807,6 +812,7 @@ fn rewrite_h2_head(
             bytes: rewritten,
             upstream_ip: upstream.ip,
             upstream_port: upstream.port,
+            upstream_server_name,
         }));
     }
     Ok(None)
@@ -1038,6 +1044,11 @@ fn tls_client_hello_sni(bytes: &[u8]) -> Option<String> {
 
 fn tls_record_complete(bytes: &[u8]) -> bool {
     bytes.len() >= 5 && bytes.len() >= 5 + u16::from_be_bytes([bytes[3], bytes[4]]) as usize
+}
+
+fn tls_intercept_server_name(destination: &HttpDestination, sni: Option<&str>) -> String {
+    sni.map(str::to_string)
+        .unwrap_or_else(|| destination.ip.clone())
 }
 
 fn tls_sni_from_extension(extension: &[u8]) -> Option<String> {
@@ -1423,7 +1434,7 @@ struct InterceptConnection {
 
 struct TlsInterceptConnection {
     authority: Arc<MitmTlsAuthority>,
-    server_name: String,
+    sni: Option<String>,
     server: rustls::ServerConnection,
     client: Option<rustls::ClientConnection>,
     upstream: Option<TcpStream>,
@@ -1438,12 +1449,13 @@ impl TlsInterceptConnection {
     fn new(
         authority: Arc<MitmTlsAuthority>,
         server_name: &str,
+        sni: Option<String>,
         initial_guest_tls: &[u8],
     ) -> io::Result<Self> {
         let mut connection = Self {
             server: authority.server_connection(server_name)?,
             authority,
-            server_name: server_name.to_string(),
+            sni,
             client: None,
             upstream: None,
             plaintext_head: Vec::new(),
@@ -1540,7 +1552,7 @@ impl TlsInterceptConnection {
             .unwrap_or("http/1.1")
             .to_string();
         let metadata = HostTlsMetadata {
-            server_name: Some(self.server_name.clone()),
+            server_name: self.sni.clone(),
             alpn_protocol: Some(alpn.clone()),
             protocol: Some("tls".to_string()),
         };
@@ -1568,10 +1580,13 @@ impl TlsInterceptConnection {
                 }
             };
         let _ = upstream.set_nonblocking(true);
-        let mut client = match self
-            .authority
-            .client_connection(&self.server_name, Some(&alpn))
-        {
+        let mut client = match self.authority.client_connection(
+            self.sni
+                .as_deref()
+                .filter(|server_name| server_name.parse::<std::net::IpAddr>().is_err())
+                .unwrap_or(rewrite.upstream_server_name.as_str()),
+            Some(&alpn),
+        ) {
             Ok(client) => client,
             Err(_) => {
                 self.close_after_flush = true;
@@ -1754,45 +1769,47 @@ impl InterceptConnection {
             guest_head.extend_from_slice(&buffer[..received]);
             if looks_like_tls(guest_head) {
                 let maybe_server_name = tls_client_hello_sni(guest_head);
-                if let (Some(authority), Some(server_name)) =
-                    (self.tls_authority.as_ref(), maybe_server_name)
-                {
-                    let destination = InterceptedDestination {
-                        ip: self.destination.ip.clone(),
-                        port: self.destination.port,
-                    };
-                    if self.runtime.as_deref().is_some_and(|runtime| {
-                        runtime.rejects_rebound_authority(
-                            "https",
-                            &server_name,
-                            &destination,
-                            &destination,
-                        )
-                    }) {
-                        self.to_guest.extend_from_slice(OUTBOUND_DENIED_RESPONSE);
-                        self.close_after_flush = true;
-                        self.state = InterceptState::Closing;
-                    } else {
-                        match TlsInterceptConnection::new(
-                            authority.clone(),
-                            &server_name,
-                            guest_head,
-                        ) {
-                            Ok(tls) => {
-                                self.state = InterceptState::Tls(tls);
-                            }
-                            Err(_) => {
-                                self.close_after_flush = true;
-                                self.state = InterceptState::Closing;
-                            }
-                        }
-                    }
-                    return;
-                } else if !tls_record_complete(guest_head) {
+                if !tls_record_complete(guest_head) {
                     continue;
                 }
-                self.close_after_flush = true;
-                self.state = InterceptState::Closing;
+                let Some(authority) = self.tls_authority.as_ref() else {
+                    self.close_after_flush = true;
+                    self.state = InterceptState::Closing;
+                    return;
+                };
+                let sni = maybe_server_name;
+                let server_name = tls_intercept_server_name(&self.destination, sni.as_deref());
+                let destination = InterceptedDestination {
+                    ip: self.destination.ip.clone(),
+                    port: self.destination.port,
+                };
+                if self.runtime.as_deref().is_some_and(|runtime| {
+                    runtime.rejects_rebound_authority(
+                        "https",
+                        &server_name,
+                        &destination,
+                        &destination,
+                    )
+                }) {
+                    self.to_guest.extend_from_slice(OUTBOUND_DENIED_RESPONSE);
+                    self.close_after_flush = true;
+                    self.state = InterceptState::Closing;
+                } else {
+                    match TlsInterceptConnection::new(
+                        authority.clone(),
+                        &server_name,
+                        sni,
+                        guest_head,
+                    ) {
+                        Ok(tls) => {
+                            self.state = InterceptState::Tls(tls);
+                        }
+                        Err(_) => {
+                            self.close_after_flush = true;
+                            self.state = InterceptState::Closing;
+                        }
+                    }
+                }
                 return;
             }
             match rewrite_intercepted_head(
@@ -2312,8 +2329,7 @@ mod tests {
             ip: "93.184.216.34".to_string(),
             port: 80,
         };
-        let request =
-            b"GET / HTTP/1.1\r\nHost: example.com\r\nHost: attacker.example\r\n\r\n";
+        let request = b"GET / HTTP/1.1\r\nHost: example.com\r\nHost: attacker.example\r\n\r\n";
 
         let error = match rewrite_h1_head(request, &destination, "http", None, None, None) {
             Ok(_) => panic!("duplicate Host headers must be rejected"),
@@ -2381,6 +2397,23 @@ mod tests {
         assert_eq!(rewritten.bytes[cursor + 3], 0x1);
         assert_eq!(rewritten.bytes[cursor + 4] & 0x4, 0x4);
         assert_eq!(rewritten.bytes.len(), cursor + 9 + length);
+    }
+
+    #[test]
+    fn tls_intercept_server_name_falls_back_to_destination_ip_without_sni() {
+        let destination = HttpDestination {
+            ip: "93.184.216.34".to_string(),
+            port: 443,
+        };
+
+        assert_eq!(
+            tls_intercept_server_name(&destination, Some("api.github.test")),
+            "api.github.test",
+        );
+        assert_eq!(
+            tls_intercept_server_name(&destination, None),
+            "93.184.216.34",
+        );
     }
 
     #[test]

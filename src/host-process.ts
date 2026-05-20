@@ -249,12 +249,15 @@ export class HostProcessSandboxVm implements HostControlChannel {
       && type !== "host.vfs.symlink"
       && type !== "host.vfs.readlink"
       && type !== "host.http.requestHeaders"
+      && type !== "host.http.activeRequestHeaderHooks"
     ) {
       return false;
     }
 
     if (type === "host.http.requestHeaders") {
       void this.#handleHttpRequestHeaders(document);
+    } else if (type === "host.http.activeRequestHeaderHooks") {
+      void this.#handleActiveRequestHeaderHooks(document);
     } else {
       void this.#handleVirtualFsRequest(document);
     }
@@ -292,6 +295,26 @@ export class HostProcessSandboxVm implements HostControlChannel {
         id,
         ok: true,
         headers: Array.from(headers.entries()),
+      }));
+    } catch (error) {
+      this.#tryWriteToHost(encodePacket({
+        type: "host.http.response",
+        id,
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    }
+  }
+
+  async #handleActiveRequestHeaderHooks(document: Record<string, unknown>): Promise<void> {
+    const id = typeof document.id === "string" ? document.id : "";
+    try {
+      const hookIds = assertStringArray(document.hookIds, "hookIds");
+      this.#tryWriteToHost(encodePacket({
+        type: "host.http.response",
+        id,
+        ok: true,
+        hookIds: hookIds.filter((hookId) => this.#requestHeaderHooks.get(hookId)?.active === true),
       }));
     } catch (error) {
       this.#tryWriteToHost(encodePacket({

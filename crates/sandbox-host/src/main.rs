@@ -213,14 +213,45 @@ impl HttpHookExecutor for NodeHttpHookExecutor {
         original_destination: &sandbox::http_flow::InterceptedDestination,
         upstream_dial: &sandbox::http_flow::InterceptedDestination,
     ) -> bool {
-        self.hooks.iter().any(|hook| {
-            hook.rule.rejects_rebound_authority(
-                scheme,
-                authority,
-                &original_destination.ip,
-                &upstream_dial.ip,
-            )
-        })
+        let candidate_hook_ids = self
+            .hooks
+            .iter()
+            .filter(|hook| {
+                hook.rule.rejects_rebound_authority(
+                    scheme,
+                    authority,
+                    &original_destination.ip,
+                    &upstream_dial.ip,
+                )
+            })
+            .map(|hook| hook.id.clone())
+            .collect::<Vec<_>>();
+        if candidate_hook_ids.is_empty() {
+            return false;
+        }
+        match self.active_hook_ids(candidate_hook_ids) {
+            Ok(active_hook_ids) => !active_hook_ids.is_empty(),
+            Err(_) => true,
+        }
+    }
+}
+
+impl NodeHttpHookExecutor {
+    fn active_hook_ids(&self, hook_ids: Vec<String>) -> io::Result<Vec<String>> {
+        let response = self.bridge.request(doc! {
+            "type": "host.http.activeRequestHeaderHooks",
+            "hookIds": hook_ids,
+        })?;
+        response
+            .get_array("hookIds")
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+            .iter()
+            .map(|value| {
+                value.as_str().map(str::to_string).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "hook id must be a string")
+                })
+            })
+            .collect()
     }
 }
 
