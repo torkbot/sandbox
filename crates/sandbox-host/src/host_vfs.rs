@@ -13,6 +13,7 @@ use sandbox::vfs::{
     virtual_writable_directory_entry, virtual_writable_file_entry,
 };
 
+#[derive(Debug)]
 pub struct HostIoBridge {
     stdout: Mutex<io::Stdout>,
     next_id: AtomicU64,
@@ -73,7 +74,8 @@ impl HostIoBridge {
 
     pub fn route_response(&self, document: Document) -> bool {
         let response_type = document.get_str("type").ok();
-        if response_type != Some("host.vfs.response") {
+        if response_type != Some("host.vfs.response") && response_type != Some("host.http.response")
+        {
             return false;
         }
         let Ok(id) = document.get_str("id") else {

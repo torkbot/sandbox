@@ -1,14 +1,19 @@
 use std::env;
 use std::io::{self, Read};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
-use bson::Document;
+use bson::{Bson, Document, doc};
 use sandbox::config::MountSpec;
 use sandbox::config::{
-    HttpSpecInput, MicroVmSpecInput, MountSpecInput, OutboundPolicy, OutboundRuleSpec, OutboundSpec,
+    HttpRequestHeaderHookSpec, HttpSpecInput, MicroVmSpecInput, MountSpecInput, OutboundPolicy,
+    OutboundRuleSpec, OutboundSpec,
+};
+use sandbox::http_flow::{
+    HookBackedHttpInterceptRuntime, HttpHookExecutor, InterceptedHttpRequest,
 };
 use sandbox::runtime::{HostServices, VirtualFsDevice};
 
@@ -62,7 +67,9 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
     let spec = sandbox::MicroVmSpec::build(parse_spawn(spawn_document)?)?;
     let bridge = HostIoBridge::new();
     let virtual_fs = virtual_fs_devices(&spec, bridge.clone());
-    let services = HostServices;
+    let services = HostServices {
+        http: http_intercept_runtime(&spec, bridge.clone())?,
+    };
     let mut vm = sandbox::runtime::KrunVm::create_with_services(&spec, virtual_fs, services)?;
     vm.start()?;
 
@@ -99,6 +106,302 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
 
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn http_intercept_runtime(
+    spec: &sandbox::MicroVmSpec,
+    bridge: Arc<HostIoBridge>,
+) -> Result<Option<Arc<dyn sandbox::http_flow::HttpInterceptRuntime>>, Box<dyn std::error::Error>> {
+    let Some(http) = spec
+        .network
+        .as_ref()
+        .and_then(|network| network.http.as_ref())
+    else {
+        return Ok(None);
+    };
+    let hooks = http
+        .request_header_hooks
+        .iter()
+        .map(|hook| {
+            Ok(NodeRequestHeaderHook {
+                id: hook.id.clone(),
+                selector: RequestHookSelector::parse(&hook.origin)?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(Some(Arc::new(HookBackedHttpInterceptRuntime::new(
+        NodeHttpHookExecutor { bridge, hooks },
+    ))))
+}
+
+#[derive(Debug, Clone)]
+struct RequestHookSelector {
+    scheme: String,
+    authority: String,
+}
+
+impl RequestHookSelector {
+    fn parse(origin: &str) -> Result<Self, String> {
+        let (scheme, rest) = origin
+            .split_once("://")
+            .ok_or_else(|| "HTTP request selector origin must include a scheme".to_string())?;
+        if scheme != "http" && scheme != "https" {
+            return Err("HTTP request selector origin scheme must be http or https".to_string());
+        }
+        let authority = rest.trim_end_matches('/');
+        if authority.is_empty() || authority.contains('/') {
+            return Err(
+                "HTTP request selector origin must be an origin, not a URL path".to_string(),
+            );
+        }
+        Ok(Self {
+            scheme: scheme.to_string(),
+            authority: canonical_authority(scheme, authority)?,
+        })
+    }
+
+    fn matches(&self, url: &str) -> bool {
+        let Ok(parts) = request_url_origin(url) else {
+            return false;
+        };
+        self.scheme == parts.scheme
+            && canonical_authority(parts.scheme, parts.authority)
+                .is_ok_and(|authority| authority == self.authority)
+    }
+
+    fn matches_rebound_authority(&self, scheme: &str, authority: &str) -> bool {
+        self.scheme == scheme
+            && canonical_authority(scheme, authority)
+                .is_ok_and(|authority| authority == self.authority)
+            && is_hostname(&self.authority)
+    }
+}
+
+#[derive(Debug)]
+struct NodeHttpHookExecutor {
+    bridge: Arc<HostIoBridge>,
+    hooks: Vec<NodeRequestHeaderHook>,
+}
+
+#[derive(Debug)]
+struct NodeRequestHeaderHook {
+    id: String,
+    selector: RequestHookSelector,
+}
+
+impl HttpHookExecutor for NodeHttpHookExecutor {
+    fn apply_request_headers(
+        &self,
+        request: InterceptedHttpRequest,
+    ) -> io::Result<Vec<(String, String)>> {
+        let matching_hook_ids = self
+            .hooks
+            .iter()
+            .filter(|hook| hook.selector.matches(&request.url))
+            .map(|hook| hook.id.clone())
+            .collect();
+        let hook_ids = self.active_hook_ids(matching_hook_ids)?;
+        if hook_ids.is_empty() {
+            return Ok(request.headers);
+        }
+
+        let response = self.bridge.request(doc! {
+            "type": "host.http.requestHeaders",
+            "hookIds": hook_ids,
+            "protocol": match request.protocol {
+                sandbox::http_interception::HttpRequestProtocol::Http1 => "http/1.1",
+                sandbox::http_interception::HttpRequestProtocol::Http2 => "h2",
+            },
+            "method": request.method,
+            "url": request.url,
+            "originalDestinationIp": request.original_destination.ip,
+            "originalDestinationPort": i32::from(request.original_destination.port),
+            "upstreamDialIp": request.upstream_dial.ip,
+            "upstreamDialPort": i32::from(request.upstream_dial.port),
+            "headers": request.headers.into_iter().map(|(name, value)| {
+                Bson::Array(vec![Bson::String(name), Bson::String(value)])
+            }).collect::<Vec<_>>(),
+            "tls": request.tls.map(|tls| doc! {
+                "sni": tls.server_name,
+                "alpn": tls.alpn_protocol,
+            }),
+        })?;
+        response_header_pairs(&response)
+    }
+
+    fn rejects_rebound_authority(
+        &self,
+        scheme: &str,
+        authority: &str,
+        original_destination: &sandbox::http_flow::InterceptedDestination,
+        upstream_dial: &sandbox::http_flow::InterceptedDestination,
+    ) -> bool {
+        let candidate_hook_ids = self
+            .hooks
+            .iter()
+            .filter(|hook| hook.selector.matches_rebound_authority(scheme, authority))
+            .map(|hook| hook.id.clone())
+            .collect::<Vec<_>>();
+        if candidate_hook_ids.is_empty()
+            || !is_rebound_authority(authority, original_destination, upstream_dial)
+        {
+            return false;
+        }
+        match self.active_hook_ids(candidate_hook_ids) {
+            Ok(active_hook_ids) => !active_hook_ids.is_empty(),
+            Err(_) => true,
+        }
+    }
+}
+
+impl NodeHttpHookExecutor {
+    fn active_hook_ids(&self, hook_ids: Vec<String>) -> io::Result<Vec<String>> {
+        if hook_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let response = self.bridge.request(doc! {
+            "type": "host.http.activeRequestHeaderHooks",
+            "hookIds": hook_ids,
+        })?;
+        response
+            .get_array("hookIds")
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+            .iter()
+            .map(|value| {
+                value.as_str().map(str::to_string).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "hook id must be a string")
+                })
+            })
+            .collect()
+    }
+}
+
+fn is_rebound_authority(
+    authority: &str,
+    original_destination: &sandbox::http_flow::InterceptedDestination,
+    upstream_dial: &sandbox::http_flow::InterceptedDestination,
+) -> bool {
+    let Some(host) = authority_host(authority) else {
+        return false;
+    };
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    original_destination.ip != upstream_dial.ip
+        && (is_special_use_ip(&original_destination.ip) || is_special_use_ip(&upstream_dial.ip))
+}
+
+struct RequestUrlOrigin<'a> {
+    scheme: &'a str,
+    authority: &'a str,
+}
+
+fn request_url_origin(url: &str) -> io::Result<RequestUrlOrigin<'_>> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "request URL missing scheme"))?;
+    let authority = rest
+        .split_once('/')
+        .map_or(rest, |(authority, _)| authority);
+    Ok(RequestUrlOrigin { scheme, authority })
+}
+
+fn canonical_authority(scheme: &str, authority: &str) -> Result<String, String> {
+    let authority = authority.trim();
+    if authority.is_empty() {
+        return Err("HTTP request selector authority must not be empty".to_string());
+    }
+    let (host, port) = split_authority(authority);
+    let host = host.to_ascii_lowercase();
+    match (scheme, port) {
+        ("http", Some(80)) | ("https", Some(443)) | (_, None) => Ok(host),
+        (_, Some(port)) => Ok(format!("{host}:{port}")),
+    }
+}
+
+fn is_hostname(authority: &str) -> bool {
+    authority_host(authority)
+        .map(|host| host.parse::<std::net::IpAddr>().is_err())
+        .unwrap_or(false)
+}
+
+fn authority_host(authority: &str) -> Option<&str> {
+    let without_userinfo = authority.rsplit('@').next().unwrap_or(authority);
+    if let Some(rest) = without_userinfo.strip_prefix('[') {
+        return rest.split_once(']').map(|(host, _)| host);
+    }
+    Some(
+        without_userinfo
+            .split_once(':')
+            .map_or(without_userinfo, |(host, _)| host),
+    )
+}
+
+fn split_authority(authority: &str) -> (&str, Option<u16>) {
+    if authority.starts_with('[') {
+        let Some(end) = authority.find(']') else {
+            return (authority, None);
+        };
+        let host = &authority[..=end];
+        let port = authority
+            .get(end + 1..)
+            .and_then(|rest| rest.strip_prefix(':'))
+            .and_then(|port| port.parse().ok());
+        return (host, port);
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') => (host, port.parse().ok()),
+        _ => (authority, None),
+    }
+}
+
+fn is_special_use_ip(value: &str) -> bool {
+    match value.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            let octets = ip.octets();
+            ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || octets[0] == 0
+                || octets[0] == 100 && (octets[1] & 0b1100_0000) == 0b0100_0000
+                || octets[0] == 192 && octets[1] == 0 && octets[2] == 0
+                || octets[0] == 192 && octets[1] == 88 && octets[2] == 99
+                || octets[0] == 198 && (octets[1] == 18 || octets[1] == 19)
+                || octets[0] >= 240
+        }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || ip.is_multicast()
+        }
+        Err(_) => true,
+    }
+}
+
+fn response_header_pairs(document: &Document) -> io::Result<Vec<(String, String)>> {
+    document
+        .get_array("headers")
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?
+        .iter()
+        .map(|value| {
+            let values = value.as_array().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "header entry must be an array")
+            })?;
+            let name = values.first().and_then(Bson::as_str).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "header name must be a string")
+            })?;
+            let header_value = values.get(1).and_then(Bson::as_str).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "header value must be a string")
+            })?;
+            Ok((name.to_string(), header_value.to_string()))
+        })
+        .collect()
 }
 
 fn read_document_packet(reader: &mut impl Read) -> Result<Document, Box<dyn std::error::Error>> {
@@ -260,9 +563,30 @@ fn parse_network_http(
         protected_ranges,
         ca_certificate_pem: optional_string(document, "caCertificatePem"),
         ca_private_key_pem: optional_string(document, "caPrivateKeyPem"),
-        host_proxy_port: optional_i32(document, "hostProxyPort")
-            .and_then(|port| u16::try_from(port).ok()),
+        request_header_hooks: parse_request_header_hooks(
+            document.get_array("requestHeaderHooks").ok(),
+        )?,
     }))
+}
+
+fn parse_request_header_hooks(
+    values: Option<&Vec<bson::Bson>>,
+) -> Result<Vec<HttpRequestHeaderHookSpec>, Box<dyn std::error::Error>> {
+    let Some(values) = values else {
+        return Ok(Vec::new());
+    };
+    values
+        .iter()
+        .map(|value| {
+            let document = value
+                .as_document()
+                .ok_or("requestHeaderHooks entries must be documents")?;
+            Ok(HttpRequestHeaderHookSpec {
+                id: document.get_str("id")?.to_string(),
+                origin: document.get_str("origin")?.to_string(),
+            })
+        })
+        .collect()
 }
 
 fn optional_string(document: &Document, key: &str) -> Option<String> {

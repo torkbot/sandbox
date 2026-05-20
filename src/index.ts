@@ -156,25 +156,46 @@ export type FileSystemBindingConfig = {
 
 export type MountConfig = VirtualFsMountConfig;
 
-export interface HttpPolicyRequest {
+export interface SandboxHttpRequest {
+  readonly protocol: "http/1.1" | "h2";
+  readonly url: URL;
   readonly method: string;
-  readonly url: string;
-  readonly destinationIp: string;
-  readonly destinationPort: number;
-  readonly headers: Record<string, string>;
+  readonly headers: Headers;
+  readonly destination: {
+    readonly originalIp: string;
+    readonly originalPort: number;
+    readonly upstreamIp: string;
+    readonly upstreamPort: number;
+  };
   readonly tls?: {
-    readonly serverName?: string;
-    readonly alpnProtocol?: string;
-    readonly protocol?: string;
+    readonly sni?: string;
+    readonly alpn?: string;
   };
 }
 
-export type HttpPolicyDecision =
-  | { readonly action: "allow"; readonly headers?: Record<string, string> }
-  | { readonly action: "deny"; readonly reason: string };
+export type SandboxHttpRequestHook = (
+  request: SandboxHttpRequest,
+) => void | Promise<void>;
 
-export interface HttpInterceptionConfig {
-  policy(request: HttpPolicyRequest): Promise<HttpPolicyDecision>;
+export interface SandboxHttpRequestSelector {
+  readonly origin: string;
+}
+
+export interface SandboxHttpHook extends AsyncDisposable {
+  [Symbol.asyncDispose](): Promise<void>;
+}
+
+export interface SandboxHttpHooks {
+  onRequest(
+    selector: SandboxHttpRequestSelector,
+    hook: SandboxHttpRequestHook,
+  ): SandboxHttpHook;
+}
+
+export interface SandboxBuilder extends AsyncDisposable {
+  readonly http: SandboxHttpHooks;
+  run(): Promise<SandboxVm>;
+  [Symbol.asyncDispose](): Promise<void>;
 }
 
 export type OutboundNetworkRule =
@@ -203,7 +224,12 @@ export interface OutboundNetworkPolicy {
 
 export interface NetworkConfig {
   readonly outbound?: OutboundNetworkPolicy;
-  readonly http?: HttpInterceptionConfig;
+  readonly http?: {
+    readonly certificateAuthority?: {
+      readonly certificatePem: string;
+      readonly privateKeyPem: string;
+    };
+  };
 }
 
 export interface SandboxOptions {
@@ -363,9 +389,116 @@ export function acceptPublicInternet(input: {
 
 export async function spawnSandbox(options: SandboxOptions): Promise<SandboxVm> {
   validateSandboxOptions(options);
-  const nativeOptions = toNativeSpawnOptions(options);
-  const nativeVm = await HostProcessSandboxVm.spawn(options, nativeOptions);
+  const nativeOptions = toNativeSpawnOptions(options, []);
+  const nativeVm = await HostProcessSandboxVm.spawn(options, nativeOptions, new Map());
   return new NativeBackedSandboxVm(nativeVm, options);
+}
+
+export function createSandbox(options: SandboxOptions): SandboxBuilder {
+  validateSandboxOptions(options);
+  return new ConfiguredSandboxBuilder(options);
+}
+
+type RegisteredHttpRequestHeadersHook = {
+  readonly id: string;
+  readonly selector: SandboxHttpRequestSelector;
+  readonly hook: SandboxHttpRequestHook;
+  active: boolean;
+};
+
+type SpawnHttpRequestHeadersHook = {
+  readonly id: string;
+  readonly selector: SandboxHttpRequestSelector;
+};
+
+class ConfiguredSandboxBuilder implements SandboxBuilder {
+  readonly http: SandboxHttpHooks;
+
+  readonly #options: SandboxOptions;
+  readonly #requestHeaderHooks = new Set<RegisteredHttpRequestHeadersHook>();
+  #nextRequestHeaderHookId = 1;
+  #runStarted = false;
+  #vm: SandboxVm | null = null;
+  #closed = false;
+
+  constructor(options: SandboxOptions) {
+    this.#options = options;
+    this.http = {
+      onRequest: (selector, hook) => {
+        this.#assertOpen();
+        if (this.#runStarted) {
+          throw new Error("sandbox has already been run");
+        }
+        const registration: RegisteredHttpRequestHeadersHook = {
+          id: `http-request-headers-${this.#nextRequestHeaderHookId++}`,
+          selector,
+          hook,
+          active: true,
+        };
+        this.#requestHeaderHooks.add(registration);
+        return new ConfiguredSandboxHttpHook(this, registration);
+      },
+    };
+  }
+
+  async run(): Promise<SandboxVm> {
+    this.#assertOpen();
+    if (this.#runStarted) {
+      throw new Error("sandbox has already been run");
+    }
+    this.#runStarted = true;
+    const registrations = Array.from(this.#requestHeaderHooks);
+    const nativeOptions = toNativeSpawnOptions(this.#options, registrations);
+    const nativeVm = await HostProcessSandboxVm.spawn(
+      this.#options,
+      nativeOptions,
+      new Map(registrations.map((registration) => [registration.id, registration])),
+    );
+    this.#vm = new NativeBackedSandboxVm(nativeVm, this.#options);
+    return this.#vm;
+  }
+
+  async [Symbol.asyncDispose](): Promise<void> {
+    if (this.#closed) {
+      return;
+    }
+    this.#closed = true;
+    await this.#vm?.close();
+    this.#requestHeaderHooks.clear();
+  }
+
+  async removeHook(registration: RegisteredHttpRequestHeadersHook): Promise<void> {
+    registration.active = false;
+    this.#requestHeaderHooks.delete(registration);
+  }
+
+  #assertOpen(): void {
+    if (this.#closed) {
+      throw new Error("sandbox is closed");
+    }
+  }
+}
+
+class ConfiguredSandboxHttpHook implements SandboxHttpHook {
+  readonly #sandbox: ConfiguredSandboxBuilder;
+  readonly #registration: RegisteredHttpRequestHeadersHook;
+  #disposed = false;
+
+  constructor(
+    sandbox: ConfiguredSandboxBuilder,
+    registration: RegisteredHttpRequestHeadersHook,
+  ) {
+    this.#sandbox = sandbox;
+    this.#registration = registration;
+  }
+
+  async [Symbol.asyncDispose](): Promise<void> {
+    if (this.#disposed) {
+      return;
+    }
+    this.#disposed = true;
+    await this.#sandbox.removeHook(this.#registration);
+  }
 }
 
 class NativeBackedSandboxVm implements SandboxVm {
@@ -464,8 +597,33 @@ class ConfiguredSandboxMounts implements SandboxMounts {
   }
 }
 
-function toNativeSpawnOptions(options: SandboxOptions): NativeSpawnSandboxOptions {
+function toNativeSpawnOptions(
+  options: SandboxOptions,
+  requestHeaderHooks: readonly SpawnHttpRequestHeadersHook[],
+): NativeSpawnSandboxOptions {
   const rootfs = lowerNativeRootfs(options.rootfs);
+  if (
+    (requestHeaderHooks.length > 0 || options.network?.http !== undefined)
+    && options.network?.outbound === undefined
+  ) {
+    throw new Error("invalid spawnSandbox options: network.outbound is required when HTTP interception is configured");
+  }
+  const network = options.network === undefined && requestHeaderHooks.length === 0
+    ? undefined
+    : {
+      outbound: options.network?.outbound,
+      http: requestHeaderHooks.length === 0
+        && options.network?.http?.certificateAuthority === undefined
+        ? undefined
+        : {
+          caCertificatePem: options.network?.http?.certificateAuthority?.certificatePem,
+          caPrivateKeyPem: options.network?.http?.certificateAuthority?.privateKeyPem,
+          requestHeaderHooks: requestHeaderHooks.map((hook) => ({
+            id: hook.id,
+            origin: hook.selector.origin,
+          })),
+        },
+    };
 
   return {
     name: options.name,
@@ -492,14 +650,7 @@ function toNativeSpawnOptions(options: SandboxOptions): NativeSpawnSandboxOption
         writable: isSandboxWritableFileSystem(mount.fileSystem),
       };
     }),
-    network: options.network === undefined
-      ? undefined
-      : {
-          outbound: options.network.outbound,
-          http: options.network.http === undefined
-            ? undefined
-            : {},
-        },
+    network,
   };
 }
 
@@ -559,10 +710,6 @@ function validateSandboxOptions(options: SandboxOptions): void {
   if (options.network?.outbound?.policy !== undefined && options.network.outbound.policy !== "deny") {
     throw new Error("invalid spawnSandbox options: network.outbound.policy must be deny");
   }
-  if (options.network?.http !== undefined && options.network.outbound === undefined) {
-    throw new Error("invalid spawnSandbox options: network.http requires network.outbound");
-  }
-
   for (const rule of options.network?.outbound?.rules ?? []) {
     if ("cidr" in rule) {
       validateCidr(rule.cidr);

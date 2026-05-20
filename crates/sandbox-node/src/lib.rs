@@ -1,7 +1,8 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use sandbox::config::{
-    HttpSpecInput, MicroVmSpecInput, MountSpecInput, OutboundPolicy, OutboundRuleSpec, OutboundSpec,
+    HttpRequestHeaderHookSpec, HttpSpecInput, MicroVmSpecInput, MountSpecInput, OutboundPolicy,
+    OutboundRuleSpec, OutboundSpec,
 };
 
 #[napi]
@@ -109,7 +110,13 @@ pub struct NativeHttpOptions {
     pub protected_ranges: Option<Vec<String>>,
     pub ca_certificate_pem: Option<String>,
     pub ca_private_key_pem: Option<String>,
-    pub host_proxy_port: Option<u16>,
+    pub request_header_hooks: Option<Vec<NativeHttpRequestHeaderHookOptions>>,
+}
+
+#[napi(object)]
+pub struct NativeHttpRequestHeaderHookOptions {
+    pub id: String,
+    pub origin: String,
 }
 
 #[napi(object)]
@@ -229,7 +236,15 @@ impl NativeSpawnSandboxOptions {
                     protected_ranges: http.protected_ranges.unwrap_or_default(),
                     ca_certificate_pem: http.ca_certificate_pem,
                     ca_private_key_pem: http.ca_private_key_pem,
-                    host_proxy_port: http.host_proxy_port,
+                    request_header_hooks: http
+                        .request_header_hooks
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|hook| HttpRequestHeaderHookSpec {
+                            id: hook.id,
+                            origin: hook.origin,
+                        })
+                        .collect(),
                 })
             }),
         }

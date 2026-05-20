@@ -1,0 +1,776 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import {
+  acceptTcp,
+  createSandbox,
+  prebuiltRootfs,
+  projectInit,
+  projectKernel,
+} from "../../../src/index.ts";
+import { collectAsync, writeEvidence } from "../support/evidence.ts";
+import { execGuest } from "../support/guest-control.ts";
+import {
+  createTestCertificateAuthority,
+  startTestHttp2Origin,
+  startTestHttpOrigin,
+  startTestHttps2Origin,
+  startTestHttpsOrigin,
+} from "../support/http-origin.ts";
+import { requireVmLaunchSupport } from "../support/capabilities.ts";
+
+test("HTTP request-header hook injects host credentials only on the upstream leg", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const observed: Record<string, string>[] = [];
+  const hookRequests: Array<{
+    readonly protocol: string;
+    readonly method: string;
+    readonly url: string;
+    readonly originalIp: string;
+    readonly originalPort: number;
+    readonly upstreamIp: string;
+    readonly upstreamPort: number;
+  }> = [];
+  const origin = await startTestHttpOrigin({
+    respond(request) {
+      observed.push(request.headers);
+      return {
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          authorized: request.headers.authorization === "Bearer host-only-token",
+          protocol: request.headers["x-sandbox-http-protocol"] ?? null,
+          guestSuppliedAuthorization: request.headers["x-guest-authorization"] ?? null,
+        }),
+      };
+    },
+  });
+
+  t.after(async () => {
+    await origin.close();
+  });
+
+  const sandbox = createSandbox({
+    name: "http-request-header-hook",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      outbound: {
+        policy: "deny",
+        rules: [
+          acceptTcp({ cidr: "127.0.0.1/32", ports: [urlPort(origin.url)] }),
+          acceptTcp({ cidr: "203.0.113.10/32", ports: [80] }),
+        ],
+      },
+    },
+  });
+
+  t.after(async () => {
+    await sandbox[Symbol.asyncDispose]();
+  });
+
+  const disposedBeforeRun = sandbox.http.onRequest({ origin: new URL(origin.url).origin }, () => {
+    throw new Error("disposed hook should not run");
+  });
+  const hook = sandbox.http.onRequest({ origin: new URL(origin.url).origin }, (request) => {
+    assert.equal(request.protocol, "http/1.1");
+    assert.equal(request.method, "GET");
+    assert.equal(request.url.href, `${origin.url}/user`);
+    assert.equal(request.destination.originalIp, "203.0.113.10");
+    assert.equal(request.destination.originalPort, 80);
+    assert.equal(request.destination.upstreamIp, "127.0.0.1");
+    assert.equal(request.destination.upstreamPort, urlPort(origin.url));
+    hookRequests.push({
+      protocol: request.protocol,
+      method: request.method,
+      url: request.url.href,
+      originalIp: request.destination.originalIp,
+      originalPort: request.destination.originalPort,
+      upstreamIp: request.destination.upstreamIp,
+      upstreamPort: request.destination.upstreamPort,
+    });
+    request.headers.set("authorization", "Bearer host-only-token");
+    request.headers.set("x-sandbox-http-protocol", request.protocol);
+  });
+  await disposedBeforeRun[Symbol.asyncDispose]();
+
+  const vm = await sandbox.run();
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+  assert.throws(
+    () => sandbox.http.onRequest({ origin: new URL(origin.url).origin }, () => {}),
+    /sandbox has already been run/,
+  );
+
+  const result = await execGuest(vm, {
+    id: "curl-host-authorized",
+    argv: [
+      "curl",
+      "--max-time",
+      "5",
+      "-fsS",
+      "-H",
+      "x-guest-authorization: none",
+      ...interceptedHttpArgs(`${origin.url}/user`),
+    ],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    authorized: true,
+    protocol: "http/1.1",
+    guestSuppliedAuthorization: "none",
+  });
+  assert.equal(observed.length, 1);
+  assert.equal(observed[0]?.authorization, "Bearer host-only-token");
+  assert.deepEqual(hookRequests, [{
+    protocol: "http/1.1",
+    method: "GET",
+    url: `${origin.url}/user`,
+    originalIp: "203.0.113.10",
+    originalPort: 80,
+    upstreamIp: "127.0.0.1",
+    upstreamPort: urlPort(origin.url),
+  }]);
+
+  await hook[Symbol.asyncDispose]();
+
+  const afterDispose = await execGuest(vm, {
+    id: "curl-after-hook-dispose",
+    argv: [
+      "curl",
+      "--max-time",
+      "5",
+      "-fsS",
+      ...interceptedHttpArgs(`${origin.url}/after-dispose`),
+    ],
+  });
+
+  assert.equal(afterDispose.exitCode, 0, afterDispose.stderr);
+  assert.deepEqual(JSON.parse(afterDispose.stdout), {
+    authorized: false,
+    protocol: null,
+    guestSuppliedAuthorization: null,
+  });
+  assert.equal(observed.length, 2);
+  assert.equal(observed[1]?.authorization, undefined);
+  assert.equal(hookRequests.length, 1);
+
+  await writeEvidence("http-request-headers.json", {
+    hookRequests,
+    observed,
+    origin: origin.url,
+  });
+});
+
+test("HTTPS request-header hook injects host credentials after guest-trusted MITM", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const ca = await createTestCertificateAuthority();
+  t.after(async () => {
+    await ca.close();
+  });
+
+  const observed: Record<string, string>[] = [];
+  const hookRequests: Array<{
+    readonly protocol: string;
+    readonly method: string;
+    readonly url: string;
+    readonly originalIp: string;
+    readonly originalPort: number;
+    readonly upstreamIp: string;
+    readonly upstreamPort: number;
+    readonly sni?: string;
+    readonly alpn?: string;
+  }> = [];
+  const origin = await startTestHttpsOrigin({
+    ca,
+    hostname: "api.github.test",
+    respond(request) {
+      observed.push(request.headers);
+      return {
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          authorized: request.headers.authorization === "Bearer host-only-token",
+          protocol: request.headers["x-sandbox-http-protocol"] ?? null,
+        }),
+      };
+    },
+  });
+
+  t.after(async () => {
+    await origin.close();
+  });
+  const interceptUrl = origin.url.replace("https://api.github.test:", "https://127.0.0.1:");
+
+  const sandbox = createSandbox({
+    name: "https-request-header-hook",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      http: {
+        certificateAuthority: {
+          certificatePem: ca.certificatePem,
+          privateKeyPem: ca.privateKeyPem,
+        },
+      },
+      outbound: {
+        policy: "deny",
+        rules: [
+          acceptTcp({ cidr: "127.0.0.1/32", ports: [urlPort(origin.url)] }),
+          acceptTcp({ cidr: "93.184.216.34/32", ports: [443] }),
+        ],
+      },
+    },
+  });
+
+  t.after(async () => {
+    await sandbox[Symbol.asyncDispose]();
+  });
+
+  sandbox.http.onRequest({ origin: new URL(interceptUrl).origin }, (request) => {
+    assert.equal(request.protocol, "http/1.1");
+    assert.equal(request.method, "GET");
+    assert.equal(request.url.href, `${interceptUrl}/user`);
+    assert.equal(request.destination.originalIp, "93.184.216.34");
+    assert.equal(request.destination.originalPort, 443);
+    assert.equal(request.destination.upstreamIp, "127.0.0.1");
+    assert.equal(request.destination.upstreamPort, urlPort(origin.url));
+    assert.equal(request.tls?.sni, "api.github.test");
+    assert.equal(request.tls?.alpn, "http/1.1");
+    hookRequests.push({
+      protocol: request.protocol,
+      method: request.method,
+      url: request.url.href,
+      originalIp: request.destination.originalIp,
+      originalPort: request.destination.originalPort,
+      upstreamIp: request.destination.upstreamIp,
+      upstreamPort: request.destination.upstreamPort,
+      sni: request.tls?.sni,
+      alpn: request.tls?.alpn,
+    });
+    request.headers.set("authorization", "Bearer host-only-token");
+    request.headers.set("x-sandbox-http-protocol", request.protocol);
+  });
+
+  const vm = await sandbox.run();
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuest(vm, {
+    id: "curl-https-host-authorized",
+    argv: [
+      "curl",
+      "--http1.1",
+      "--max-time",
+      "5",
+      "-fsS",
+      "-H",
+      `Host: 127.0.0.1:${urlPort(origin.url)}`,
+      ...interceptedHttpsArgs(`${origin.url}/user`),
+    ],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    authorized: true,
+    protocol: "http/1.1",
+  });
+  assert.equal(observed.length, 1);
+  assert.equal(observed[0]?.authorization, "Bearer host-only-token");
+  assert.deepEqual(hookRequests, [{
+    protocol: "http/1.1",
+    method: "GET",
+    url: `${interceptUrl}/user`,
+    originalIp: "93.184.216.34",
+    originalPort: 443,
+    upstreamIp: "127.0.0.1",
+    upstreamPort: urlPort(origin.url),
+    sni: "api.github.test",
+    alpn: "http/1.1",
+  }]);
+});
+
+test("HTTPS/2 request-header hook injects host credentials after ALPN negotiation", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const ca = await createTestCertificateAuthority();
+  t.after(async () => {
+    await ca.close();
+  });
+
+  const observed: Record<string, string>[] = [];
+  const hookRequests: Array<{
+    readonly protocol: string;
+    readonly method: string;
+    readonly url: string;
+    readonly originalIp: string;
+    readonly originalPort: number;
+    readonly upstreamIp: string;
+    readonly upstreamPort: number;
+    readonly sni?: string;
+    readonly alpn?: string;
+  }> = [];
+  const origin = await startTestHttps2Origin({
+    ca,
+    hostname: "api.github.test",
+    respond(request) {
+      observed.push(request.headers);
+      return {
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          authorized: request.headers.authorization === "Bearer host-only-token",
+          protocol: request.headers["x-sandbox-http-protocol"] ?? null,
+        }),
+      };
+    },
+  });
+
+  t.after(async () => {
+    await origin.close();
+  });
+  const interceptUrl = origin.url.replace("https://api.github.test:", "https://127.0.0.1:");
+
+  const sandbox = createSandbox({
+    name: "https2-request-header-hook",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      http: {
+        certificateAuthority: {
+          certificatePem: ca.certificatePem,
+          privateKeyPem: ca.privateKeyPem,
+        },
+      },
+      outbound: {
+        policy: "deny",
+        rules: [
+          acceptTcp({ cidr: "127.0.0.1/32", ports: [urlPort(origin.url)] }),
+          acceptTcp({ cidr: "93.184.216.34/32", ports: [443] }),
+        ],
+      },
+    },
+  });
+
+  t.after(async () => {
+    await sandbox[Symbol.asyncDispose]();
+  });
+
+  sandbox.http.onRequest({ origin: new URL(interceptUrl).origin }, (request) => {
+    assert.equal(request.protocol, "h2");
+    assert.equal(request.method, "GET");
+    assert.equal(request.url.href, `${interceptUrl}/user`);
+    assert.equal(request.destination.originalIp, "93.184.216.34");
+    assert.equal(request.destination.originalPort, 443);
+    assert.equal(request.destination.upstreamIp, "127.0.0.1");
+    assert.equal(request.destination.upstreamPort, urlPort(origin.url));
+    assert.equal(request.tls?.sni, "api.github.test");
+    assert.equal(request.tls?.alpn, "h2");
+    hookRequests.push({
+      protocol: request.protocol,
+      method: request.method,
+      url: request.url.href,
+      originalIp: request.destination.originalIp,
+      originalPort: request.destination.originalPort,
+      upstreamIp: request.destination.upstreamIp,
+      upstreamPort: request.destination.upstreamPort,
+      sni: request.tls?.sni,
+      alpn: request.tls?.alpn,
+    });
+    request.headers.set("authorization", "Bearer host-only-token");
+    request.headers.set("x-sandbox-http-protocol", request.protocol);
+  });
+
+  const vm = await sandbox.run();
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuest(vm, {
+    id: "curl-https2-host-authorized",
+    argv: [
+      "curl",
+      "--http2",
+      "--max-time",
+      "5",
+      "-fsS",
+      "-H",
+      `Host: 127.0.0.1:${urlPort(origin.url)}`,
+      ...interceptedHttpsArgs(`${origin.url}/user`),
+    ],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    authorized: true,
+    protocol: "h2",
+  });
+  assert.equal(observed.length, 1);
+  assert.equal(observed[0]?.authorization, "Bearer host-only-token");
+  assert.equal(observed[0]?.["x-sandbox-http-protocol"], "h2");
+  assert.deepEqual(hookRequests, [{
+    protocol: "h2",
+    method: "GET",
+    url: `${interceptUrl}/user`,
+    originalIp: "93.184.216.34",
+    originalPort: 443,
+    upstreamIp: "127.0.0.1",
+    upstreamPort: urlPort(origin.url),
+    sni: "api.github.test",
+    alpn: "h2",
+  }]);
+});
+
+test("HTTP/2 request-header hook injects host credentials only on the upstream leg", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const observed: Record<string, string>[] = [];
+  const hookRequests: Array<{
+    readonly protocol: string;
+    readonly method: string;
+    readonly url: string;
+    readonly originalIp: string;
+    readonly originalPort: number;
+    readonly upstreamIp: string;
+    readonly upstreamPort: number;
+  }> = [];
+  const origin = await startTestHttp2Origin({
+    respond(request) {
+      observed.push(request.headers);
+      return {
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          authorized: request.headers.authorization === "Bearer host-only-token",
+          protocol: request.headers["x-sandbox-http-protocol"] ?? null,
+        }),
+      };
+    },
+  });
+
+  t.after(async () => {
+    await origin.close();
+  });
+
+  const sandbox = createSandbox({
+    name: "http2-request-header-hook",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      outbound: {
+        policy: "deny",
+        rules: [
+          acceptTcp({ cidr: "127.0.0.1/32", ports: [urlPort(origin.url)] }),
+          acceptTcp({ cidr: "203.0.113.10/32", ports: [80] }),
+        ],
+      },
+    },
+  });
+
+  t.after(async () => {
+    await sandbox[Symbol.asyncDispose]();
+  });
+
+  sandbox.http.onRequest({ origin: new URL(origin.url).origin }, (request) => {
+    assert.equal(request.protocol, "h2");
+    assert.equal(request.method, "GET");
+    assert.equal(request.url.href, `${origin.url}/user`);
+    assert.equal(request.destination.originalIp, "203.0.113.10");
+    assert.equal(request.destination.originalPort, 80);
+    assert.equal(request.destination.upstreamIp, "127.0.0.1");
+    assert.equal(request.destination.upstreamPort, urlPort(origin.url));
+    hookRequests.push({
+      protocol: request.protocol,
+      method: request.method,
+      url: request.url.href,
+      originalIp: request.destination.originalIp,
+      originalPort: request.destination.originalPort,
+      upstreamIp: request.destination.upstreamIp,
+      upstreamPort: request.destination.upstreamPort,
+    });
+    request.headers.set("authorization", "Bearer host-only-token");
+    request.headers.set("x-sandbox-http-protocol", request.protocol);
+  });
+
+  const vm = await sandbox.run();
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuest(vm, {
+    id: "curl-http2-host-authorized",
+    argv: [
+      "curl",
+      "--http2-prior-knowledge",
+      "--max-time",
+      "5",
+      "-fsS",
+      ...interceptedHttpArgs(`${origin.url}/user`),
+    ],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    authorized: true,
+    protocol: "h2",
+  });
+  assert.equal(observed.length, 1);
+  assert.equal(observed[0]?.authorization, "Bearer host-only-token");
+  assert.equal(observed[0]?.["x-sandbox-http-protocol"], "h2");
+  assert.deepEqual(hookRequests, [{
+    protocol: "h2",
+    method: "GET",
+    url: `${origin.url}/user`,
+    originalIp: "203.0.113.10",
+    originalPort: 80,
+    upstreamIp: "127.0.0.1",
+    upstreamPort: urlPort(origin.url),
+  }]);
+});
+
+test("HTTP request hooks default allow when user code does not mutate", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const observed: Record<string, string>[] = [];
+  const origin = await startTestHttpOrigin({
+    respond(request) {
+      observed.push(request.headers);
+      return {
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          authorized: request.headers.authorization === "Bearer host-only-token",
+          protocol: request.headers["x-sandbox-http-protocol"] ?? null,
+        }),
+      };
+    },
+  });
+
+  t.after(async () => {
+    await origin.close();
+  });
+
+  const sandbox = createSandbox({
+    name: "http-request-header-default-allow",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      outbound: {
+        policy: "deny",
+        rules: [
+          acceptTcp({ cidr: "127.0.0.1/32", ports: [urlPort(origin.url)] }),
+          acceptTcp({ cidr: "203.0.113.10/32", ports: [80] }),
+        ],
+      },
+    },
+  });
+
+  t.after(async () => {
+    await sandbox[Symbol.asyncDispose]();
+  });
+
+  let hookInvocations = 0;
+  sandbox.http.onRequest({ origin: new URL(origin.url).origin }, (request) => {
+    if (request.url.pathname !== "/private") {
+      return;
+    }
+    hookInvocations += 1;
+    request.headers.set("authorization", "Bearer host-only-token");
+    request.headers.set("x-sandbox-http-protocol", request.protocol);
+  });
+
+  const vm = await sandbox.run();
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuest(vm, {
+    id: "curl-http-default-allow",
+    argv: [
+      "curl",
+      "--max-time",
+      "5",
+      "-fsS",
+      ...interceptedHttpArgs(`${origin.url}/public`),
+    ],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    authorized: false,
+    protocol: null,
+  });
+  assert.equal(observed.length, 1);
+  assert.equal(observed[0]?.authorization, undefined);
+  assert.equal(hookInvocations, 0);
+});
+
+test("HTTP request-header hooks cannot dial an upstream denied by outbound policy", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const origin = await startTestHttpOrigin({
+    respond() {
+      return {
+        status: 500,
+        body: "origin should not receive denied rewritten upstream requests",
+      };
+    },
+  });
+
+  t.after(async () => {
+    await origin.close();
+  });
+
+  const sandbox = createSandbox({
+    name: "http-rewritten-upstream-denied",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      outbound: {
+        policy: "deny",
+        rules: [
+          acceptTcp({ cidr: "203.0.113.10/32", ports: [80] }),
+        ],
+      },
+    },
+  });
+
+  t.after(async () => {
+    await sandbox[Symbol.asyncDispose]();
+  });
+
+  let hookInvocations = 0;
+  sandbox.http.onRequest({ origin: "http://169.254.169.254" }, (request) => {
+    hookInvocations += 1;
+    request.headers.set("authorization", "Bearer host-only-token");
+  });
+
+  const vm = await sandbox.run();
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuest(vm, {
+    id: "curl-rewritten-upstream-denied",
+    argv: [
+      "curl",
+      "--max-time",
+      "5",
+      "-sS",
+      "-o",
+      "/dev/null",
+      "-w",
+      "%{http_code}",
+      "-H",
+      "Host: 169.254.169.254",
+      ...interceptedHttpArgs(`${origin.url}/user`),
+    ],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stdout, "403");
+  assert.equal(hookInvocations, 0);
+});
+
+test("HTTP credential hooks do not authorize DNS-rebound private destinations", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const sandbox = createSandbox({
+    name: "http-request-header-dns-rebinding",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      outbound: {
+        policy: "deny",
+        rules: [
+          acceptTcp({ cidr: "169.254.169.254/32", ports: [443] }),
+        ],
+      },
+    },
+  });
+
+  t.after(async () => {
+    await sandbox[Symbol.asyncDispose]();
+  });
+
+  let hookInvocations = 0;
+  sandbox.http.onRequest({ origin: "https://api.github.com" }, (request) => {
+    hookInvocations += 1;
+    request.headers.set("authorization", "Bearer host-only-token");
+  });
+
+  const vm = await sandbox.run();
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuest(vm, {
+    id: "curl-rebound-github",
+    argv: [
+      "curl",
+      "--max-time",
+      "5",
+      "-sS",
+      "-o",
+      "/dev/null",
+      "-w",
+      "%{http_code}",
+      "--connect-to",
+      "api.github.com:443:169.254.169.254:443",
+      "https://api.github.com/user",
+    ],
+  });
+
+  assert.notEqual(result.exitCode, 0);
+  assert.equal(result.stdout, "000");
+  assert.equal(hookInvocations, 0);
+});
+
+function urlPort(url: string): number {
+  const port = Number(new URL(url).port);
+  assert.ok(Number.isInteger(port) && port > 0);
+  return port;
+}
+
+function interceptedHttpArgs(url: string): string[] {
+  const parsed = new URL(url);
+  return [
+    "--connect-to",
+    `${parsed.hostname}:${parsed.port}:203.0.113.10:80`,
+    url,
+  ];
+}
+
+function interceptedHttpsArgs(url: string): string[] {
+  const parsed = new URL(url);
+  return [
+    "--connect-to",
+    `${parsed.hostname}:${parsed.port}:93.184.216.34:443`,
+    url,
+  ];
+}

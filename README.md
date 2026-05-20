@@ -6,7 +6,7 @@ The target shape is:
 
 - boot a guest from a prebuilt read-only rootfs artifact, likely EROFS,
 - mount host-implemented virtual filesystems,
-- intercept guest HTTP traffic through host TypeScript policy,
+- intercept guest HTTP request headers through host TypeScript hooks,
 - communicate with guest init over a bidirectional transport,
 - ship as a statically linked host artifact.
 
@@ -21,13 +21,13 @@ import {
   projectInit,
   projectKernel,
   scratchFs,
-  spawnSandbox,
+  createSandbox,
   type SandboxWritableFileSystem,
 } from "@torkbot/sandbox";
 
 declare const workspaceFs: SandboxWritableFileSystem;
 
-await using vm = await spawnSandbox({
+await using sandbox = createSandbox({
   kernel: projectKernel(),
   init: projectInit(),
   rootfs: linuxOverlayFs({
@@ -87,23 +87,14 @@ await using vm = await spawnSandbox({
         acceptPublicInternet({ ports: [443] }),
       ],
     },
-    http: {
-      async policy(request) {
-        if (request.url.includes("/blocked")) {
-          return { action: "deny", reason: "blocked by host policy" };
-        }
-
-        return {
-          action: "allow",
-          headers: {
-            ...request.headers,
-            "x-sandbox": "1",
-          },
-        };
-      },
-    },
   },
 });
+
+sandbox.http.onRequest({ origin: "https://api.github.com" }, (request) => {
+  request.headers.set("authorization", `Bearer ${process.env.GITHUB_TOKEN}`);
+});
+
+await using vm = await sandbox.run();
 ```
 
 Incremental guest operations are explicit:
@@ -157,7 +148,7 @@ const grep = await workspace.bash({
 Root filesystems are immutable by default. A writable root is expressed as an explicit Linux overlayfs composition:
 
 ```ts
-await using vm = await spawnSandbox({
+await using sandbox = createSandbox({
   kernel: projectKernel(),
   init: projectInit(),
   rootfs: linuxOverlayFs({
@@ -165,6 +156,8 @@ await using vm = await spawnSandbox({
     upper: scratchFs(),
   }),
 });
+
+await using vm = await sandbox.run();
 
 await vm.control.exec({
   id: "install-toolchain",
@@ -178,9 +171,9 @@ The guest contract is intentionally narrow:
 
 - `/` is read-only unless the rootfs is a `linuxOverlayFs(...)` composition.
 - `/sandbox` is implemented by the host.
-- HTTP policy and header rewriting happen in TypeScript on the host.
+- HTTP request-header hooks are registered in TypeScript and enforced by the Rust host data plane.
 - Network egress starts from deny; outbound rules opt in the exact protocols, ranges, and ports the guest can reach.
-- The HTTP interception CA is generated and injected by Sandbox. Callers provide policy, not certificate plumbing.
+- The HTTP interception CA is generated and injected by Sandbox. Callers provide request-header hooks, not certificate plumbing.
 
 ## Design Targets
 
@@ -193,7 +186,7 @@ The guest contract is intentionally narrow:
 - root filesystem composition through small explicit primitives such as `linuxOverlayFs(...)` and `scratchFs()`, with lower and upper expressed as filesystem values,
 - `mount(...)` only for guest-visible mounts; `binding(...)` only for host-side attachment points,
 - programmable virtual filesystems backed by TypeScript callbacks,
-- transparent HTTP interception with TypeScript policy hooks,
+- transparent HTTP interception with TypeScript request-header hooks,
 - default-deny outbound networking with explicit accept rules for protocols, CIDR ranges, public internet reachability, and ports,
 - Rust-native or statically linkable networking components; sidecar network daemons are references, not default runtime dependencies,
 - macOS HVF entitlement signing verified as part of the integration test flow.

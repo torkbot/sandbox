@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   acceptTcp,
   binding,
+  createSandbox,
   linuxOverlayFs,
   prebuiltRootfs,
   projectInit,
@@ -275,26 +276,6 @@ test("spawnSandbox rejects unsupported init crates before runtime launch", async
   );
 });
 
-test("spawnSandbox rejects HTTP interception without an explicit outbound policy", async () => {
-  await assert.rejects(
-    spawnSandbox({
-      kernel: projectKernel(),
-      init: projectInit(),
-      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
-        format: "erofs",
-      }),
-      network: {
-        http: {
-          async policy(request) {
-            return { action: "allow", headers: request.headers };
-          },
-        },
-      },
-    }),
-    /invalid spawnSandbox options: network\.http requires network\.outbound/,
-  );
-});
-
 test("spawnSandbox rejects invalid outbound CIDR ranges before runtime launch", async () => {
   await assert.rejects(
     spawnSandbox({
@@ -349,6 +330,22 @@ test("spawnSandbox rejects IPv6 outbound CIDR ranges until IPv6 egress is suppor
       },
     }),
     /invalid spawnSandbox options: IPv6 outbound CIDR ranges are not supported yet: 2001:db8::\/32/,
+  );
+});
+
+test("createSandbox requires outbound policy when request-header hooks are configured", async () => {
+  const sandbox = createSandbox({
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+  });
+  sandbox.http.onRequest({ origin: "https://api.github.com" }, () => {});
+
+  await assert.rejects(
+    sandbox.run(),
+    /invalid spawnSandbox options: network\.outbound is required when HTTP interception is configured/,
   );
 });
 

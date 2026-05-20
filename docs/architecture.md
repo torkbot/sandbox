@@ -2,7 +2,7 @@
 
 ## Goal
 
-Provide a Node.js library that starts libkrun microVMs and lets the host program control networking, filesystems, and guest lifecycle through programmable policy hooks.
+Provide a Node.js library that starts libkrun microVMs and lets the host program control networking, filesystems, HTTP request-header interception, and guest lifecycle through narrow programmable hooks.
 
 The library is not a generic VM manager. It is a constrained runtime for running untrusted workloads with explicit host-mediated capabilities.
 
@@ -16,7 +16,9 @@ Sandbox should make whole classes of bugs unrepresentable at the boundary where 
 - Nonblocking I/O owns pending bytes explicitly. `WouldBlock` is a scheduling event, not permission to drop proxy prefaces, guest request bytes, or encrypted TLS response bytes.
 - Long-lived per-flow host state has an owner and a reclamation path. NAT flows, dynamic listeners, proxy connections, callback waiters, and child processes should not outlive the VM lifecycle that created them.
 - Host callback responses are lifecycle-aware. API/control writes fail strictly after close, while late service callback responses from in-flight filesystem or policy work are ignored once the VM is already closing.
-- Network reachability is decided by `network.outbound` before JavaScript HTTP policy. HTTP policy can deny or rewrite egress headers, but it cannot grant reachability outside the default-deny firewall rules.
+- Network reachability is decided by `network.outbound`. The HTTP layer defaults to pass-through and cannot grant reachability outside the default-deny firewall rules.
+- HTTP request-header hooks mutate only the host-to-upstream request. Injected credentials are not written back into guest-visible request bytes.
+- Credential hooks are applied only after the Rust data plane binds request authority to connection state: original destination, upstream dial address, TLS metadata, and the matched URL authority.
 
 ## Upstream Grounding
 
@@ -96,7 +98,7 @@ Snapshotting a modified rootfs back into EROFS is deferred. The near-term contra
 Sandbox needs two networking layers:
 
 - A packet/socket layer that connects the guest to the host.
-- An HTTP interception layer that terminates TLS, runs Node.js policy and header transforms, then forwards traffic.
+- An HTTP interception layer that terminates TLS when required, parses request headers, applies registered header hooks, and forwards traffic.
 
 The first implementation should prefer virtio-net connected to a userspace backend that we control, because HTTP interception and outbound policy are clearer when traffic passes through a host process. libkrun's TSI path remains useful for host control sockets or later transparent socket work, but TSI makes the VMM itself the network proxy and should be treated carefully.
 
@@ -113,33 +115,60 @@ The likely path is: start with conventional virtio-net connected to a Rust host 
 Outbound networking is default-deny. The public API should look like a small firewall ruleset, not a bag of proxy options:
 
 ```ts
-network: {
-  outbound: {
-    policy: "deny",
-    rules: [
-      acceptTcp({ cidr: "127.0.0.1/32", ports: [origin.port] }),
-      acceptPublicInternet({ ports: [443] }),
-    ],
-  },
-  http: {
-    async policy(request) {
-      return { action: "allow", headers: request.headers };
+const sandbox = createSandbox({
+  kernel,
+  init,
+  rootfs,
+  network: {
+    outbound: {
+      policy: "deny",
+      rules: [
+        acceptTcp({ cidr: "127.0.0.1/32", ports: [origin.port] }),
+        acceptPublicInternet({ ports: [443] }),
+      ],
     },
   },
-}
+});
+
+sandbox.http.onRequest({ origin: "https://api.github.com" }, (request) => {
+  request.headers.set("authorization", `Bearer ${process.env.GITHUB_TOKEN}`);
+});
 ```
 
-`network.outbound` decides reachability. `network.http.policy` can deny requests and rewrite egress headers, but it cannot grant network reachability that the outbound rules did not already provide. The host must enforce outbound rules before invoking JavaScript policy, and it must re-check them for DNS results, CONNECT targets, TLS SNI routing, redirects, and the final upstream dial target.
+The lifecycle separates local configuration from launch:
 
-The HTTP interception CA is Sandbox infrastructure, not public API. Guest init should receive Sandbox-generated CA material and update the guest trust store before starting the workload. Callers should only provide the HTTP policy callback. If a future caller needs bring-your-own CA, that should be designed as a separate explicit capability rather than leaking certificate plumbing into the first API.
+```ts
+const sandbox = createSandbox({
+  kernel,
+  init,
+  rootfs,
+  network: {
+    outbound: {
+      policy: "deny",
+      rules: [acceptPublicInternet({ ports: [443] })],
+    },
+  },
+});
 
-Host policy must cover:
+await using _github = sandbox.http.onRequest({ origin: "https://api.github.com" }, (request) => {
+  request.headers.set("authorization", `Bearer ${process.env.GITHUB_TOKEN}`);
+});
+
+await using vm = await sandbox.run();
+```
+
+`network.outbound` decides reachability. HTTP hooks are default-allow request-header transforms. The origin selector is a host-side interest declaration: requests outside registered origins never cross into JavaScript. Matching hook mutations are applied only to the upstream request after the Rust data plane verifies the original destination and final upstream dial target are still allowed for that authority.
+
+The HTTP interception CA is Sandbox infrastructure, not public API. Guest init should receive Sandbox-generated CA material and update the guest trust store before starting the workload. Callers should only provide request-header hooks. If a future caller needs bring-your-own CA, that should be designed as a separate explicit capability rather than leaking certificate plumbing into the first API.
+
+Host networking must cover:
 
 - default-deny outbound reachability with explicit accept rules for protocol, CIDR or public-internet scope, and ports,
 - loopback and link-local handling,
 - DNS policy and post-resolution enforcement,
 - CONNECT and TLS interception behavior,
-- egress request header modification in Node.js with request bodies and responses passed through.
+- egress request header modification with request bodies and responses passed through,
+- DNS-rebinding resistance by validating original destination and upstream dial address at the point credentials are applied.
 
 ## Filesystems
 
@@ -196,7 +225,7 @@ macOS needs a separate signing track. HVF requires the correct Hypervisor entitl
 
 The napi-rs addon can still provide efficient local primitives, validation, and non-HVF fast paths, but it must not be the only VM launch path on macOS unless the embedding executable is known to be signed with the HVF entitlement. The addon may be ad-hoc signed as a loadable native module, but it should not carry the HVF entitlement.
 
-The first helper protocol is deliberately small. Node starts `sandbox-host --stdio`, sends one length-prefixed BSON `host.spawn` document containing the validated VM spec, then both sides reuse the existing length-prefixed guest control frames for `init.ready` and `guest.exec`. Filesystem callbacks, HTTP policy, and other host services need explicit protocol additions before their required e2e scenarios can pass.
+The first helper protocol is deliberately small. Node starts `sandbox-host --stdio`, sends one length-prefixed BSON `host.spawn` document containing the validated VM spec, then both sides reuse the existing length-prefixed guest control frames for `init.ready` and `guest.exec`. Filesystem callbacks, HTTP hook registration, and other host services need explicit protocol additions before their required e2e scenarios can pass.
 
 ## Phased Implementation
 
@@ -205,6 +234,6 @@ The first helper protocol is deliberately small. Node starts `sandbox-host --std
 3. Add a vsock control channel and adapt it to the TypeScript `Transport` interface.
 4. Add build-time Docker image export/extract rootfs tooling, then consume a prebuilt immutable read-only root volume at VM instantiation.
 5. Add `linuxOverlayFs({ lower: prebuiltRootfs(...), upper: scratchFs() })` so `/` can be writable while the prebuilt lower remains immutable.
-6. Add CA injection and a host HTTP proxy with Node.js policy callbacks.
+6. Add CA injection and Rust-owned HTTP request-header interception using Rama.
 7. Add a vhost-user filesystem backend for virtual and writable host-implemented guest mounts.
 8. Move any required libkrun changes into `torkbot/libkrun` and keep them upstream-shaped.

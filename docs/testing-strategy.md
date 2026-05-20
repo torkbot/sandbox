@@ -44,8 +44,8 @@ Runs without a hypervisor.
 
 Evidence:
 
-- HTTP policy hooks receive normalized request metadata and can allow, deny, and rewrite headers.
-- outbound network policy is default-deny, and explicit accept rules are enforced before forwarding or JavaScript policy.
+- HTTP request-header hooks receive normalized request metadata and can mutate upstream request headers.
+- outbound network policy is default-deny, and explicit accept rules are enforced before forwarding or HTTP hook execution.
 - virtual filesystem callbacks are deterministic and return expected metadata, directory entries, and file contents.
 - mounted filesystems are inspectable from JavaScript with the same `stat` / `list` / `read` shape exposed to the host runtime.
 - the `Transport` adapter preserves message order, close behavior, and backpressure.
@@ -100,9 +100,9 @@ Evidence:
 - `mount(path, fs)` creates a guest-visible mount boundary.
 - `binding(path, fs)` creates a host-side attachment point without a guest-visible mount boundary.
 
-### Tier 4: Network And HTTP Policy E2E
+### Tier 4: Network And HTTP Interception E2E
 
-Runs with a real VM and host proxy.
+Runs with a real VM and the Rust host HTTP data plane.
 
 Fixture:
 
@@ -114,12 +114,13 @@ Fixture:
 Evidence:
 
 - HTTPS request succeeds only through the host interception layer.
-- Node.js policy sees method, URL, destination IP, headers, and TLS metadata.
-- allowed requests reach the test origin with expected header rewrites.
-- denied requests fail with a deterministic guest-visible error.
-- destinations without matching outbound accept rules are blocked before JavaScript policy.
+- request-header hooks see method, URL, destination IPs, headers, and TLS metadata.
+- matching requests reach the test origin with expected upstream-only header mutations.
+- unmatched HTTP requests pass through by default when L4 policy allows the destination.
+- destinations without matching outbound accept rules are blocked before HTTP hook execution.
 - public-internet, loopback, and port-specific accept rules are enforced consistently for DNS results, CONNECT targets, redirects, and final upstream dials.
-- DNS policy is observable in the proxy trace.
+- DNS-rebinding attempts do not receive credentials even when the URL authority matches a credential hook.
+- DNS policy is observable in the HTTP trace.
 
 ### Tier 5: libkrun Fork Contract Tests
 
@@ -147,7 +148,7 @@ Evidence:
 
 ## Test Harness Shape
 
-Use a TypeScript e2e runner as the orchestration layer because the public library is Node-facing and policy hooks are TypeScript. Run it directly on Node.js 24+ using the built-in type-stripping support, matching the neighboring TorkBot repositories. The runner should call the `sandbox-host` binary for VM launch on every platform so VM lifetime is bounded by a process that can be terminated by `close()`. It should collect structured evidence into `test-results/e2e/<run-id>/`.
+Use a TypeScript e2e runner as the orchestration layer because the public library is Node-facing and request-header hooks are TypeScript. Run it directly on Node.js 24+ using the built-in type-stripping support, matching the neighboring TorkBot repositories. The runner should call the `sandbox-host` binary for VM launch on every platform so VM lifetime is bounded by a process that can be terminated by `close()`. It should collect structured evidence into `test-results/e2e/<run-id>/`.
 
 Each e2e test should emit:
 
@@ -155,7 +156,7 @@ Each e2e test should emit:
 - `host.log`: host runtime logs.
 - `guest-console.log`: guest console output.
 - `control.jsonl`: host/guest control-channel transcript.
-- `proxy.jsonl`: HTTP proxy observations and decisions.
+- `http.jsonl`: HTTP request-header hook matches, connection identity, and upstream mutation evidence.
 - `fs.json`: filesystem assertions and database state summaries.
 - `linkage.json`: static-link and signing verification from `npm run test:artifact`.
 
@@ -179,15 +180,15 @@ Detected capabilities:
 - Immutable root: guest root writes fail unless an explicit overlay root is configured.
 - Rootfs composition: explicit `linuxOverlayFs(...)` can compose a prebuilt lower and scratch upper without mutating the lower.
 - Virtual filesystem: guest reads host-generated files and metadata through a mounted virtual tree.
-- HTTP interception: TLS traffic is intercepted with guest-trusted CA, policy hooks run in Node.js, headers are modified, and forwarding is transparent.
-- Network policy: default-deny outbound rules block unmatched destinations with deterministic evidence before JavaScript policy.
+- HTTP interception: TLS traffic is intercepted with guest-trusted CA, request-header hooks mutate upstream headers only, credentials are not exposed to the guest, and forwarding is transparent.
+- Network policy: default-deny outbound rules block unmatched destinations with deterministic evidence before HTTP hook execution.
 - Host/guest transport: bidirectional messages preserve ordering, errors, and close semantics.
 - macOS support: HVF entitlement signing is verified on `sandbox-host` and VM boot goes through that signed helper, not through a signed copy of Node.
 
 ## First Implementation Slice
 
 1. Add the e2e runner with capability detection and result-directory creation.
-2. Add host-only tests for `Transport`, HTTP policy, and virtual filesystem behavior.
+2. Add host-only tests for `Transport`, HTTP request-header hooks, and virtual filesystem behavior.
 3. Add build-time Docker export/extract rootfs fixture generation.
 4. Add the first boot smoke test with guest `init.ready`.
 5. Add static-link and macOS entitlement checks as soon as a host artifact exists.
@@ -199,8 +200,8 @@ The runtime scenario files live under `tests/e2e/scenarios/` as `.test.ts` files
 - `boot-smoke.test.ts`: boots a VM, waits for `init.ready`, sends a control command, and checks command output.
 - `filesystem.test.ts`: boots with an immutable root and host-backed virtual filesystem using the same `stat` / `list` / `read` shape as TorkBot plugin filesystems.
 - `rootfs-shaping.test.ts`: expresses immutable roots, Linux overlayfs root composition, scratch isolation, and guest-visible mount boundaries.
-- `http-policy.test.ts`: injects internal CA trust, intercepts HTTPS, runs Node policy hooks, rewrites headers, and blocks destinations denied by outbound policy.
-- `network.test.ts`: covers transparent TCP interception, DNS behavior, default-deny outbound rules, and IPv6 behavior.
+- `http-request-headers.test.ts`: injects internal CA trust, intercepts HTTP/HTTPS request headers, applies upstream-only credential mutations, and proves DNS-rebinding attempts do not receive credentials.
+- `network.test.ts`: covers transparent TCP interception, DNS behavior, default-deny outbound rules, IPv6 behavior, and non-HTTP denial.
 - `libkrun-contract.test.ts`: boots the VM with direct Rust init injection.
 
 Cheap artifact tests live under `tests/artifact/`:

@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 base64 = "0.22"
+httparse = "1.10"
 rcgen = { version = "0.14.8", features = ["x509-parser"] }
 krun-devices = { path = "../../deps/libkrun/src/devices", default-features = false, features = ["blk", "net"] }
 krun = { package = "libkrun", path = "../../deps/libkrun/src/libkrun", default-features = false, features = ["blk", "net"] }
@@ -15,6 +16,9 @@ ipnet = "2.11"
 sandbox-protocol = { path = "../sandbox-protocol" }
 smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-raw", "socket-tcp", "socket-udp"] }
 rustls = "0.23.40"
+rustls-native-certs = "0.8"
+rama-core = { git = "https://github.com/plabayo/rama", rev = "09ea1a0ff0cd5941ba65421ff5b0f263f6cf5211", version = "0.3.0-rc1" }
+rama-http = { git = "https://github.com/plabayo/rama", rev = "09ea1a0ff0cd5941ba65421ff5b0f263f6cf5211", version = "0.3.0-rc1" }
 
 [build-dependencies]
 cc = "1.2"

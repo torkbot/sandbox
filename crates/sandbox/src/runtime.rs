@@ -12,6 +12,7 @@ use base64::Engine;
 use crate::MicroVmSpec;
 use crate::config::{KernelFormat, RootfsFormat};
 use crate::control::INIT_CONTROL_PORT;
+use crate::http_flow::HttpInterceptRuntime;
 use crate::network::OutboundRulePlan;
 use crate::network_service::{HostNetwork, MitmTlsConfig};
 use crate::vfs::VirtioVirtualFsBackend;
@@ -23,7 +24,9 @@ pub struct KrunContext {
 }
 
 #[derive(Default, Clone)]
-pub struct HostServices;
+pub struct HostServices {
+    pub http: Option<Arc<dyn HttpInterceptRuntime>>,
+}
 
 #[derive(Debug)]
 pub struct KrunVm {
@@ -115,7 +118,6 @@ impl KrunContext {
                 ca_private_key_pem: http.ca_private_key_pem.clone()?,
             })
         });
-        let http_proxy_port = network.http.as_ref().and_then(|http| http.host_proxy_port);
         let outbound_rules = network
             .outbound
             .as_ref()
@@ -128,7 +130,7 @@ impl KrunContext {
                     .map_err(|_| KrunError::new("NetworkPlan::from_spec", -libc::EINVAL))
             })
             .transpose()?;
-        let network = HostNetwork::new(http_proxy_port, tls_config, outbound_rules)
+        let network = HostNetwork::new(tls_config, outbound_rules, _services.http.clone())
             .map_err(|_| KrunError::new("HostNetwork::new", -libc::EIO))?;
         let guest_fd = network.guest_fd();
         let mac = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xef];
