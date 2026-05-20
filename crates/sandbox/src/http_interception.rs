@@ -14,11 +14,18 @@ struct RequestPattern {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestHeaderMatch<'a> {
+    pub protocol: HttpRequestProtocol,
     pub scheme: &'a str,
     pub authority: &'a str,
     pub path: &'a str,
     pub original_destination_ip: &'a str,
     pub upstream_dial_ip: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpRequestProtocol {
+    Http1,
+    Http2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +133,7 @@ mod tests {
         assert_eq!(
             rule.evaluate(&RequestHeaderMatch {
                 scheme: "https",
+                protocol: HttpRequestProtocol::Http1,
                 authority: "api.github.com",
                 path: "/user",
                 original_destination_ip: "140.82.112.6",
@@ -142,6 +150,7 @@ mod tests {
         assert_eq!(
             rule.evaluate(&RequestHeaderMatch {
                 scheme: "https",
+                protocol: HttpRequestProtocol::Http2,
                 authority: "api.github.com",
                 path: "/user",
                 original_destination_ip: "169.254.169.254",

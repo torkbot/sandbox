@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { createHash, X509Certificate } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
+import http2 from "node:http2";
 import https from "node:https";
 import type { IncomingHttpHeaders } from "node:http";
 import { tmpdir } from "node:os";
@@ -57,6 +58,50 @@ export async function startTestHttpOrigin(input: {
   const address = server.address();
   if (address === null || typeof address === "string") {
     throw new Error("test HTTP origin did not bind a TCP port");
+  }
+
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    async close() {
+      await close(server);
+    },
+  };
+}
+
+export async function startTestHttp2Origin(input: {
+  respond(request: {
+    readonly body: Uint8Array;
+    readonly headers: Record<string, string>;
+    readonly url: string;
+  }): Promise<{
+    readonly status: number;
+    readonly headers?: Record<string, string>;
+    readonly body?: string | Uint8Array;
+  }> | {
+    readonly status: number;
+    readonly headers?: Record<string, string>;
+    readonly body?: string | Uint8Array;
+  };
+}): Promise<TestHttpOrigin> {
+  const server = http2.createServer();
+  server.on("stream", async (stream, headers) => {
+    const body = await collectHttp2Body(stream);
+    const result = await input.respond({
+      body,
+      headers: normalizeHttp2Headers(headers),
+      url: String(headers[":path"] ?? "/"),
+    });
+    stream.respond({
+      ":status": result.status,
+      ...result.headers,
+    });
+    stream.end(result.body ?? "");
+  });
+
+  await listen(server);
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("test HTTP/2 origin did not bind a TCP port");
   }
 
   return {
@@ -198,6 +243,21 @@ async function collectBody(request: http.IncomingMessage): Promise<Uint8Array> {
   return body;
 }
 
+async function collectHttp2Body(stream: http2.ServerHttp2Stream): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of stream) {
+    chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+  }
+  const size = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
+  const body = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
 export async function createTestCertificateAuthority(): Promise<TestCertificateAuthority> {
   const workDir = await mkdtemp(join(tmpdir(), "sandbox-ca-"));
   const keyPath = join(workDir, "ca.key");
@@ -227,7 +287,7 @@ export async function createTestCertificateAuthority(): Promise<TestCertificateA
   };
 }
 
-async function listen(server: http.Server | https.Server): Promise<void> {
+async function listen(server: http.Server | http2.Http2Server | https.Server): Promise<void> {
   await new Promise<void>((resolvePromise, reject) => {
     server.once("error", reject);
     server.listen(0, "127.0.0.1", () => {
@@ -237,10 +297,20 @@ async function listen(server: http.Server | https.Server): Promise<void> {
   });
 }
 
-async function close(server: http.Server | https.Server): Promise<void> {
+async function close(server: http.Server | http2.Http2Server | https.Server): Promise<void> {
   await new Promise<void>((resolvePromise) => {
     server.close(() => resolvePromise());
   });
+}
+
+function normalizeHttp2Headers(headers: http2.IncomingHttpHeaders): Record<string, string> {
+  const normalized: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (typeof value === "string") {
+      normalized[key] = value;
+    }
+  }
+  return normalized;
 }
 
 function normalizeHeaders(headers: IncomingHttpHeaders): Record<string, string> {

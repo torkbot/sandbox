@@ -157,6 +157,7 @@ export type FileSystemBindingConfig = {
 export type MountConfig = VirtualFsMountConfig;
 
 export interface SandboxHttpRequestHeaders {
+  readonly protocol: "http/1.1" | "h2";
   readonly url: URL;
   readonly method: string;
   readonly headers: Headers;

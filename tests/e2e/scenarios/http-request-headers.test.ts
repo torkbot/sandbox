@@ -9,7 +9,7 @@ import {
 } from "../../../src/index.ts";
 import { collectAsync, writeEvidence } from "../support/evidence.ts";
 import { execGuest } from "../support/guest-control.ts";
-import { startTestHttpOrigin } from "../support/http-origin.ts";
+import { startTestHttp2Origin, startTestHttpOrigin } from "../support/http-origin.ts";
 import { requireVmLaunchSupport } from "../support/capabilities.ts";
 
 test("HTTP request-header hook injects host credentials only on the upstream leg", async (t) => {
@@ -26,6 +26,7 @@ test("HTTP request-header hook injects host credentials only on the upstream leg
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           authorization: request.headers.authorization ?? null,
+          protocol: request.headers["x-sandbox-http-protocol"] ?? null,
           guestSuppliedAuthorization: request.headers["x-guest-authorization"] ?? null,
         }),
       };
@@ -59,7 +60,9 @@ test("HTTP request-header hook injects host credentials only on the upstream leg
   });
 
   const hook = sandbox.http.onRequestHeaders(`${origin.url}/*`, (request) => {
+    assert.equal(request.protocol, "http/1.1");
     request.headers.set("authorization", "Bearer host-only-token");
+    request.headers.set("x-sandbox-http-protocol", request.protocol);
   });
 
   const vm = await sandbox.run();
@@ -81,6 +84,7 @@ test("HTTP request-header hook injects host credentials only on the upstream leg
   assert.equal(result.exitCode, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.stdout), {
     authorization: "Bearer host-only-token",
+    protocol: "http/1.1",
     guestSuppliedAuthorization: "none",
   });
   assert.equal(observed.length, 1);
@@ -102,6 +106,7 @@ test("HTTP request-header hook injects host credentials only on the upstream leg
   assert.equal(afterDispose.exitCode, 0, afterDispose.stderr);
   assert.deepEqual(JSON.parse(afterDispose.stdout), {
     authorization: null,
+    protocol: null,
     guestSuppliedAuthorization: null,
   });
   assert.equal(observed.length, 2);
@@ -111,6 +116,83 @@ test("HTTP request-header hook injects host credentials only on the upstream leg
     observed,
     origin: origin.url,
   });
+});
+
+test("HTTP/2 request-header hook injects host credentials only on the upstream leg", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const observed: Record<string, string>[] = [];
+  const origin = await startTestHttp2Origin({
+    respond(request) {
+      observed.push(request.headers);
+      return {
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          authorization: request.headers.authorization ?? null,
+          protocol: request.headers["x-sandbox-http-protocol"] ?? null,
+        }),
+      };
+    },
+  });
+
+  t.after(async () => {
+    await origin.close();
+  });
+
+  const sandbox = createSandbox({
+    name: "http2-request-header-hook",
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: prebuiltRootfs("dist/rootfs/alpine-3.20.erofs", {
+      format: "erofs",
+    }),
+    network: {
+      outbound: {
+        policy: "deny",
+        rules: [
+          acceptTcp({ cidr: "127.0.0.1/32", ports: [urlPort(origin.url)] }),
+          acceptTcp({ cidr: "203.0.113.10/32", ports: [80] }),
+        ],
+      },
+    },
+  });
+
+  t.after(async () => {
+    await sandbox[Symbol.asyncDispose]();
+  });
+
+  sandbox.http.onRequestHeaders(`${origin.url}/*`, (request) => {
+    assert.equal(request.protocol, "h2");
+    request.headers.set("authorization", "Bearer host-only-token");
+    request.headers.set("x-sandbox-http-protocol", request.protocol);
+  });
+
+  const vm = await sandbox.run();
+  await collectAsync(vm.control.incoming, (event) => event.type === "init.ready");
+
+  const result = await execGuest(vm, {
+    id: "curl-http2-host-authorized",
+    argv: [
+      "curl",
+      "--http2-prior-knowledge",
+      "--max-time",
+      "5",
+      "-fsS",
+      ...interceptedHttpArgs(`${origin.url}/user`),
+    ],
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    authorization: "Bearer host-only-token",
+    protocol: "h2",
+  });
+  assert.equal(observed.length, 1);
+  assert.equal(observed[0]?.authorization, "Bearer host-only-token");
+  assert.equal(observed[0]?.["x-sandbox-http-protocol"], "h2");
 });
 
 test("HTTP credential hooks do not authorize DNS-rebound private destinations", async (t) => {
