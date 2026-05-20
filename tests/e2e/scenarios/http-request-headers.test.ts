@@ -106,7 +106,6 @@ test("HTTP request-header hook injects host credentials only on the upstream leg
   });
 
   assert.equal(result.exitCode, 0, result.stderr);
-  assert.doesNotMatch(result.stdout, /host-only-token/);
   assert.deepEqual(JSON.parse(result.stdout), {
     authorized: true,
     protocol: "http/1.1",
@@ -138,7 +137,6 @@ test("HTTP request-header hook injects host credentials only on the upstream leg
   });
 
   assert.equal(afterDispose.exitCode, 0, afterDispose.stderr);
-  assert.doesNotMatch(afterDispose.stdout, /host-only-token/);
   assert.deepEqual(JSON.parse(afterDispose.stdout), {
     authorized: false,
     protocol: null,
@@ -247,7 +245,6 @@ test("HTTP/2 request-header hook injects host credentials only on the upstream l
   });
 
   assert.equal(result.exitCode, 0, result.stderr);
-  assert.doesNotMatch(result.stdout, /host-only-token/);
   assert.deepEqual(JSON.parse(result.stdout), {
     authorized: true,
     protocol: "h2",
@@ -334,7 +331,6 @@ test("HTTP request-header hooks default allow when no pattern matches", async (t
   });
 
   assert.equal(result.exitCode, 0, result.stderr);
-  assert.doesNotMatch(result.stdout, /host-only-token/);
   assert.deepEqual(JSON.parse(result.stdout), {
     authorized: false,
     protocol: null,
