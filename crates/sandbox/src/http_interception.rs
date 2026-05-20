@@ -52,10 +52,7 @@ impl RequestHeaderHookRule {
             return Err("request-header hook pattern authority must not be empty".to_string());
         }
 
-        let path_prefix = path
-            .strip_suffix('*')
-            .map(str::to_string)
-            .unwrap_or(path);
+        let path_prefix = path.strip_suffix('*').map(str::to_string).unwrap_or(path);
         if !path_prefix.starts_with('/') {
             return Err("request-header hook pattern path must be absolute".to_string());
         }
@@ -86,6 +83,19 @@ impl RequestHeaderHookRule {
 
         RequestHeaderHookDecision::Apply
     }
+
+    pub fn rejects_rebound_authority(
+        &self,
+        scheme: &str,
+        authority: &str,
+        original_destination_ip: &str,
+        upstream_dial_ip: &str,
+    ) -> bool {
+        self.pattern.scheme == scheme
+            && self.pattern.authority == authority
+            && is_hostname(&self.pattern.authority)
+            && (!is_public_ipv4(original_destination_ip) || !is_public_ipv4(upstream_dial_ip))
+    }
 }
 
 pub fn header_map_from_pairs<'a>(
@@ -105,7 +115,9 @@ pub fn header_map_from_pairs<'a>(
 }
 
 fn is_hostname(authority: &str) -> bool {
-    let host = authority.split_once(':').map_or(authority, |(host, _)| host);
+    let host = authority
+        .split_once(':')
+        .map_or(authority, |(host, _)| host);
     host.parse::<std::net::IpAddr>().is_err()
 }
 

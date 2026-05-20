@@ -130,11 +130,7 @@ impl KrunContext {
                     .map_err(|_| KrunError::new("NetworkPlan::from_spec", -libc::EINVAL))
             })
             .transpose()?;
-        let network = HostNetwork::new(
-            tls_config,
-            outbound_rules,
-            _services.http.clone(),
-        )
+        let network = HostNetwork::new(tls_config, outbound_rules, _services.http.clone())
             .map_err(|_| KrunError::new("HostNetwork::new", -libc::EIO))?;
         let guest_fd = network.guest_fd();
         let mac = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xef];

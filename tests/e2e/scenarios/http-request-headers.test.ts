@@ -396,7 +396,8 @@ test("HTTP credential hooks do not authorize DNS-rebound private destinations", 
     ],
   });
 
-  assert.equal(result.stdout, "403");
+  assert.notEqual(result.exitCode, 0);
+  assert.equal(result.stdout, "000");
   assert.equal(hookInvocations, 0);
 });
 

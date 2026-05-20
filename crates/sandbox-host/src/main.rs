@@ -115,7 +115,11 @@ fn http_intercept_runtime(
     spec: &sandbox::MicroVmSpec,
     bridge: Arc<HostIoBridge>,
 ) -> Result<Option<Arc<dyn sandbox::http_flow::HttpInterceptRuntime>>, Box<dyn std::error::Error>> {
-    let Some(http) = spec.network.as_ref().and_then(|network| network.http.as_ref()) else {
+    let Some(http) = spec
+        .network
+        .as_ref()
+        .and_then(|network| network.http.as_ref())
+    else {
         return Ok(None);
     };
     if http.request_header_hooks.is_empty() {
@@ -201,6 +205,23 @@ impl HttpHookExecutor for NodeHttpHookExecutor {
         })?;
         response_header_pairs(&response)
     }
+
+    fn rejects_rebound_authority(
+        &self,
+        scheme: &str,
+        authority: &str,
+        original_destination: &sandbox::http_flow::InterceptedDestination,
+        upstream_dial: &sandbox::http_flow::InterceptedDestination,
+    ) -> bool {
+        self.hooks.iter().any(|hook| {
+            hook.rule.rejects_rebound_authority(
+                scheme,
+                authority,
+                &original_destination.ip,
+                &upstream_dial.ip,
+            )
+        })
+    }
 }
 
 struct RequestUrlParts<'a> {
@@ -217,7 +238,11 @@ fn request_url_parts(url: &str) -> io::Result<RequestUrlParts<'_>> {
     Ok(RequestUrlParts {
         scheme,
         authority,
-        path: if path.is_empty() { "/" } else { &url[url.len() - path.len() - 1..] },
+        path: if path.is_empty() {
+            "/"
+        } else {
+            &url[url.len() - path.len() - 1..]
+        },
     })
 }
 
