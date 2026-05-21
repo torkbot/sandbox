@@ -1,0 +1,206 @@
+name: Release
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish to npm via GitHub OIDC trusted publishing
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify release gates
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+          submodules: recursive
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install Linux host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm pkg-config build-essential
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test unit
+        run: npm run test:unit
+
+      - name: Check Rust workspace
+        run: cargo check --workspace
+
+      - name: Validate release tag matches package version
+        if: github.event_name == 'release'
+        run: |
+          node <<'EOF'
+          const fs = require('node:fs');
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const tag = process.env.RELEASE_TAG || '';
+          const normalizedTag = tag.startsWith('v') ? tag.slice(1) : tag;
+
+          if (pkg.version !== normalizedTag) {
+            throw new Error(`Release tag ${tag} does not match package.json version ${pkg.version}`);
+          }
+          EOF
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+
+  build-platform:
+    name: Build platform package (${{ matrix.os }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-15
+          - ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+          submodules: recursive
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-platform-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install Linux host dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm pkg-config build-essential
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build platform artifacts
+        run: npm run build:host
+
+      - name: Prepare platform package
+        run: node ./scripts/prepare-npm-packages.ts --platform --current
+
+      - name: Pack platform package
+        run: npm pack ./dist/npm/sandbox-* --pack-destination dist/npm
+
+      - name: Upload platform package
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-platform-${{ runner.os }}-${{ runner.arch }}
+          path: dist/npm/*.tgz
+          if-no-files-found: error
+
+  build-root:
+    name: Build root package
+    needs: verify
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build TypeScript package
+        run: npm run build:ts
+
+      - name: Prepare root package
+        run: node ./scripts/prepare-npm-packages.ts --root
+
+      - name: Pack root package
+        run: npm pack ./dist/npm/sandbox --pack-destination dist/npm
+
+      - name: Upload root package
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-root
+          path: dist/npm/*.tgz
+          if-no-files-found: error
+
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-24.04
+    needs:
+      - build-platform
+      - build-root
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download package tarballs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: npm-*
+          merge-multiple: true
+          path: dist/npm
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Publish platform packages
+        run: |
+          set -euo pipefail
+          for tarball in dist/npm/torkbot-sandbox-*-0.1.0.tgz; do
+            case "$tarball" in
+              *torkbot-sandbox-0.1.0.tgz) continue ;;
+            esac
+            npm publish "$tarball" --provenance --access public
+          done
+
+      - name: Publish root package
+        run: npm publish dist/npm/torkbot-sandbox-0.1.0.tgz --provenance --access public

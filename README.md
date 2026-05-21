@@ -203,3 +203,38 @@ See [docs/architecture.md](docs/architecture.md) for the initial design.
 
 Kernel artifacts are built separately from runtime VM creation. See [docs/kernel-build.md](docs/kernel-build.md) for the Docker-based `deps/libkrunfw` build entrypoint.
 See [docs/testing-strategy.md](docs/testing-strategy.md) for the integration and e2e verification plan.
+
+## Publishing
+
+The npm package is published as `@torkbot/sandbox`. It does not use post-install scripts. The root package contains the TypeScript API and declares platform artifacts as optional dependencies:
+
+- `@torkbot/sandbox-darwin-arm64`
+- `@torkbot/sandbox-linux-x64-gnu`
+
+Each platform package contains the N-API binding and the `sandbox-host` helper for that target. Runtime artifact resolution only loads the installed optional dependency for the current platform. Local development uses the same layout by materializing the current platform package under `node_modules`.
+
+### macOS signing setup
+
+For now, the macOS `sandbox-host` artifact is not Developer ID signed or notarized. This is an explicit, possibly temporary workaround for publishing before this project has an Apple Developer account.
+
+macOS users must sign the installed helper locally before launching a VM:
+
+```sh
+npx @torkbot/sandbox setup-macos
+```
+
+This performs an ad-hoc local `codesign` with the `com.apple.security.hypervisor` entitlement required by Hypervisor.framework. It does not contact Apple and does not require an Apple Developer account. If a macOS user tries to launch a VM before running setup, Sandbox throws a runtime error that points back to this command.
+
+The release workflow verifies the tag, builds platform packages on their native runners, publishes the platform packages first, and then publishes the root package. That keeps the installable root package from pointing at missing optional artifacts while staying as close as npm allows to a single coordinated release operation.
+
+Local release packaging sanity check:
+
+```sh
+npm run release:pack
+```
+
+After rebuilding local native artifacts, refresh the local optional package layout with:
+
+```sh
+npm run artifacts:link-current
+```
