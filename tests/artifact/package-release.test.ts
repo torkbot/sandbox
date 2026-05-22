@@ -44,4 +44,7 @@ test("release workflow builds platform packages before publishing the root packa
   assert.match(workflow, /require\('\.\/package\.json'\)\.version/);
   assert.doesNotMatch(workflow, /0\.1\.0\.tgz/);
   assert.match(workflow, /id-token: write/);
+
+  const publishJob = workflow.slice(workflow.indexOf("  publish:"));
+  assert.match(publishJob, /uses: actions\/checkout@v4/);
 });
