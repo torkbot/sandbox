@@ -74,16 +74,18 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
 
-  build-platform:
-    name: Build platform package (${{ matrix.os }})
+  build-kernel:
+    name: Build kernel artifact (${{ matrix.kernel_arch }})
     needs: verify
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - macos-15
-          - ubuntu-24.04
+        include:
+          - kernel_arch: arm64
+            runner: ubuntu-24.04-arm
+          - kernel_arch: x86_64
+            runner: ubuntu-24.04
 
     steps:
       - name: Checkout
@@ -91,6 +93,55 @@ jobs:
         with:
           ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
           submodules: recursive
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build kernel artifact
+        run: npm run build:kernel
+        env:
+          SANDBOX_KERNEL_ARCH: ${{ matrix.kernel_arch }}
+
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ matrix.kernel_arch }}
+          path: dist/kernel
+          if-no-files-found: error
+
+  build-platform:
+    name: Build platform package (${{ matrix.os }})
+    needs:
+      - verify
+      - build-kernel
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            kernel_arch: arm64
+          - os: ubuntu-24.04
+            kernel_arch: x86_64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+          submodules: recursive
+
+      - name: Download kernel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-${{ matrix.kernel_arch }}
+          path: dist/kernel
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -195,12 +246,15 @@ jobs:
       - name: Publish platform packages
         run: |
           set -euo pipefail
-          for tarball in dist/npm/torkbot-sandbox-*-0.1.0.tgz; do
+          version="$(node -p "require('./package.json').version")"
+          for tarball in dist/npm/torkbot-sandbox-*-"${version}".tgz; do
             case "$tarball" in
-              *torkbot-sandbox-0.1.0.tgz) continue ;;
+              *torkbot-sandbox-"${version}".tgz) continue ;;
             esac
             npm publish "$tarball" --provenance --access public
           done
 
       - name: Publish root package
-        run: npm publish dist/npm/torkbot-sandbox-0.1.0.tgz --provenance --access public
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          npm publish "dist/npm/torkbot-sandbox-${version}.tgz" --provenance --access public

@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 
 const require = createRequire(import.meta.url);
 
@@ -72,16 +72,20 @@ function assertMacosHostIsSigned(path: string): void {
   }
 
   let entitlements: string;
-  try {
-    entitlements = execFileSync("codesign", ["-d", "--entitlements", ":-", path], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(macosSigningError(path, detail));
+  const result = spawnSync("codesign", ["-d", "--entitlements", ":-", path], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  if (result.error !== undefined) {
+    throw new Error(macosSigningError(path, result.error.message));
   }
 
+  if (result.status !== 0) {
+    throw new Error(macosSigningError(path, `${result.stdout}\n${result.stderr}`.trim()));
+  }
+
+  entitlements = `${result.stdout}\n${result.stderr}`;
   if (!entitlements.includes("<key>com.apple.security.hypervisor</key>")) {
     throw new Error(macosSigningError(path, "missing com.apple.security.hypervisor entitlement"));
   }
