@@ -1,8 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
-import { existsSync } from "node:fs";
-import { resolve } from "node:path";
 import { Binary, BSON } from "bson";
+import { hostBinaryPath } from "./artifacts.ts";
 import type { HostControlChannel } from "./control.ts";
 import type { HostSpawnSandboxOptions } from "./spawn-options.ts";
 import { isSandboxWritableFileSystem } from "./vfs.ts";
@@ -530,13 +529,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
   }
 }
 
-export function hostBinaryPath(): string {
-  const path = resolve(import.meta.dirname, "../target/release/sandbox-host");
-  if (!existsSync(path)) {
-    throw new Error(`sandbox-host is not built: ${path}`);
-  }
-  return path;
-}
+export { hostBinaryPath };
 
 function assertString(value: unknown, field: string): string {
   if (typeof value !== "string") {

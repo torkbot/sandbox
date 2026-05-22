@@ -1,29 +1,51 @@
 {
   "name": "@torkbot/sandbox",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
   "type": "module",
+  "description": "A TypeScript-first Node.js library for spawning libkrun-backed microVMs.",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/torkbot/sandbox"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     }
   },
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "sandbox": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
-    "build": "npm run build:host && tsgo --project tsconfig.build.json --pretty",
+    "build": "npm run build:host && npm run build:ts",
     "build:host": "node ./scripts/build-host.ts",
     "build:init": "node ./scripts/build-init.ts",
     "build:kernel": "node ./scripts/build-kernel.ts",
     "build:rootfs": "node ./scripts/build-rootfs.ts",
     "build:rootfs:erofs": "node ./scripts/build-rootfs-erofs.ts",
+    "build:ts": "rm -f dist/*.js dist/*.js.map dist/*.d.ts dist/*.d.ts.map && tsgo --project tsconfig.build.json --pretty",
+    "artifacts:link-current": "node ./scripts/prepare-npm-packages.ts --platform --current --install",
     "benchmark:e2e:lifecycle": "node ./scripts/benchmark-e2e-lifecycle.ts",
     "check:rust": "cargo check --workspace",
-    "test:artifact": "node --test tests/artifact/*.test.ts",
+    "test:artifact": "npm run artifacts:link-current && node --test tests/artifact/*.test.ts",
     "test:e2e": "node ./tests/e2e/run.ts",
     "test:reproducibility": "node --test tests/reproducibility/*.test.ts",
     "test:rust": "cargo test --workspace",
     "test:unit": "node --test tests/unit/*.test.ts",
-    "typecheck": "tsgo --noEmit --pretty"
+    "typecheck": "tsgo --noEmit --pretty",
+    "release:prepare": "node --run build && node ./scripts/prepare-npm-packages.ts",
+    "release:pack": "npm run build:ts && node ./scripts/prepare-npm-packages.ts --clean --root && node ./scripts/prepare-npm-packages.ts --platform --current && npm pack --dry-run ./dist/npm/sandbox && npm pack --dry-run ./dist/npm/sandbox-*",
+    "prepublishOnly": "node --run release:prepare"
   },
   "devDependencies": {
     "@types/node": "^24.12.0",
@@ -36,5 +58,9 @@
   "dependencies": {
     "bson": "^7.2.0",
     "just-bash": "^2.14.5"
+  },
+  "optionalDependencies": {
+    "@torkbot/sandbox-darwin-arm64": "0.1.0",
+    "@torkbot/sandbox-linux-x64-gnu": "0.1.0"
   }
 }
