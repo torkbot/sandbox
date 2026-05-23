@@ -42,9 +42,7 @@ export function currentSandboxTarget(): SandboxTarget {
 }
 
 export function hostBinaryPath(): string {
-  const path = rawHostBinaryPath();
-  assertMacosHostIsSigned(path);
-  return path;
+  return rawHostBinaryPath();
 }
 
 export function rawHostBinaryPath(): string {
@@ -66,7 +64,7 @@ function resolveArtifactPath(
   }
 }
 
-function assertMacosHostIsSigned(path: string): void {
+export function assertMacosHostIsSigned(path: string): void {
   if (process.platform !== "darwin") {
     return;
   }
@@ -101,4 +99,17 @@ function macosSigningError(path: string, detail: string): string {
     `Artifact: ${path}`,
     `Reason: ${detail}`,
   ].join("\n");
+}
+
+export function macosHostSigningError(path: string): Error | null {
+  if (process.platform !== "darwin") {
+    return null;
+  }
+
+  try {
+    assertMacosHostIsSigned(path);
+    return null;
+  } catch (error) {
+    return error instanceof Error ? error : new Error(String(error));
+  }
 }

@@ -1,5 +1,7 @@
+import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { access, mkdir, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { createReadStream, existsSync } from "node:fs";
 import { platform } from "node:os";
 import { resolve } from "node:path";
 
@@ -46,7 +48,7 @@ const repoRoot = resolve(import.meta.dirname, "..");
 const runId = new Date().toISOString().replaceAll(":", "-").replaceAll(".", "-");
 const config = parseArgs(process.argv.slice(2));
 
-await assertVmLaunchSupport(config.rootfs);
+const artifacts = await assertVmLaunchSupport(config.rootfs);
 await mkdir(resolve(repoRoot, config.output), { recursive: true });
 
 const timings: IterationTiming[] = [];
@@ -76,6 +78,12 @@ const report = {
   arch: process.arch,
   command: config.command,
   rootfs: config.rootfs,
+  git: gitMetadata(),
+  node: {
+    execPath: process.execPath,
+    version: process.version,
+  },
+  artifacts,
   iterations: config.iterations,
   warmups: config.warmups,
   stats: {
@@ -182,15 +190,62 @@ async function collectAsync<T>(
   }
 }
 
-async function assertVmLaunchSupport(rootfs: string): Promise<void> {
-  hostBinaryPath();
+async function assertVmLaunchSupport(rootfs: string): Promise<{
+  readonly hostBinary: ArtifactMetadata;
+  readonly rootfs: ArtifactMetadata;
+}> {
+  const hostBinary = hostBinaryPath();
   if (process.platform === "linux" && !existsSync("/dev/kvm")) {
     throw new Error("Linux KVM is not available on this host");
   }
   if (process.platform !== "darwin" && process.platform !== "linux") {
     throw new Error(`unsupported VM launch host platform: ${process.platform}`);
   }
-  await access(resolve(repoRoot, rootfs));
+  const rootfsPath = resolve(repoRoot, rootfs);
+  await access(rootfsPath);
+  return {
+    hostBinary: await artifactMetadata(hostBinary),
+    rootfs: await artifactMetadata(rootfsPath),
+  };
+}
+
+type ArtifactMetadata = {
+  readonly path: string;
+  readonly sha256: string;
+  readonly bytes: number;
+};
+
+async function artifactMetadata(path: string): Promise<ArtifactMetadata> {
+  const hash = createHash("sha256");
+  let bytes = 0;
+  for await (const chunk of createReadStream(path)) {
+    const data = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+    bytes += data.byteLength;
+    hash.update(data);
+  }
+  return {
+    path,
+    sha256: hash.digest("hex"),
+    bytes,
+  };
+}
+
+function gitMetadata(): { readonly commit: string | null; readonly dirty: boolean | null } {
+  try {
+    const commit = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    const dirty = execFileSync("git", ["status", "--porcelain"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim().length > 0;
+    return { commit, dirty };
+  } catch {
+    return { commit: null, dirty: null };
+  }
 }
 
 function parseArgs(args: readonly string[]): BenchmarkConfig {

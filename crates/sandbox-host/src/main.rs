@@ -2,9 +2,8 @@ use std::env;
 use std::io::{self, Read};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::mpsc::{self, TryRecvError};
+use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
 
 use bson::{Bson, Document, doc};
 use sandbox::config::MountSpec;
@@ -73,38 +72,60 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut vm = sandbox::runtime::KrunVm::create_with_services(&spec, virtual_fs, services)?;
     vm.start()?;
 
-    let (command_tx, command_rx) = mpsc::channel::<Vec<u8>>();
+    let mut guest_writer = vm.control_socket().try_clone()?;
+    let mut guest_reader = vm.control_socket().try_clone()?;
+    let (bridge_tx, bridge_rx) = mpsc::channel::<Result<(), String>>();
+
+    let start_status = vm.start_status_observer();
+    let status_tx = bridge_tx.clone();
+    thread::spawn(move || {
+        if let Err(error) = start_status.wait() {
+            let _ = status_tx.send(Err(error.to_string()));
+        }
+    });
+
     let stdin_bridge = bridge.clone();
+    let stdin_tx = bridge_tx.clone();
     thread::spawn(move || {
         let mut stdin = io::stdin().lock();
         while let Ok((packet, document)) = read_packet(&mut stdin) {
             if stdin_bridge.route_response(document) {
                 continue;
             }
-            if command_tx.send(packet).is_err() {
-                break;
+            if let Err(error) = guest_writer.write_packet(&packet) {
+                let _ = stdin_tx.send(Err(format!("write guest control packet: {error}")));
+                return;
+            }
+        }
+        let _ = stdin_tx.send(Ok(()));
+    });
+
+    let guest_tx = bridge_tx.clone();
+    thread::spawn(move || {
+        loop {
+            let packet = match guest_reader.read_packet() {
+                Ok(packet) => packet,
+                Err(error) => {
+                    let _ = guest_tx.send(Err(format!("read guest control packet: {error}")));
+                    return;
+                }
+            };
+            if let Err(error) = bridge.write_raw_packet(&packet) {
+                let _ = guest_tx.send(Err(format!("write host control packet: {error}")));
+                return;
             }
         }
     });
 
-    loop {
-        if let Some(result) = vm.start_status() {
-            result?;
-        }
-
-        loop {
-            match command_rx.try_recv() {
-                Ok(packet) => vm.control_socket_mut().write_packet(&packet)?,
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return Ok(()),
+    match bridge_rx.recv() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            if let Some(result) = vm.start_status() {
+                result?;
             }
+            Err(error.into())
         }
-
-        if let Some(packet) = vm.control_socket_mut().try_read_packet()? {
-            bridge.write_raw_packet(&packet)?;
-        }
-
-        thread::sleep(Duration::from_millis(10));
+        Err(error) => Err(format!("control bridge stopped: {error}").into()),
     }
 }
 

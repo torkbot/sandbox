@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
 import { Binary, BSON } from "bson";
-import { hostBinaryPath } from "./artifacts.ts";
+import { hostBinaryPath, macosHostSigningError } from "./artifacts.ts";
 import type { HostControlChannel } from "./control.ts";
 import type { HostSpawnSandboxOptions } from "./spawn-options.ts";
 import { isSandboxWritableFileSystem } from "./vfs.ts";
@@ -21,11 +21,12 @@ type RegisteredHttpRequestHeadersHook = {
 
 export class HostProcessSandboxVm implements HostControlChannel {
   readonly hasControlSocket = true;
+  readonly packets: AsyncIterable<Uint8Array>;
 
   readonly #child: ChildProcessWithoutNullStreams;
   readonly #options: SandboxOptions;
-  readonly #packets: Uint8Array[] = [];
-  readonly #hostPacketWaiters: (() => void)[] = [];
+  readonly #packets = new AsyncQueue<Uint8Array>();
+  readonly #packetActivity = new AsyncSignal();
   readonly #hostFs = new Map<string, SandboxFileSystem>();
   readonly #requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook>;
   #buffer = new Uint8Array();
@@ -41,6 +42,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
   ) {
     this.#child = child;
     this.#options = options;
+    this.packets = this.#packets;
     this.#requestHeaderHooks = requestHeaderHooks;
     for (const mount of options.mounts ?? []) {
       if (mount.kind === "virtual-fs") {
@@ -74,6 +76,8 @@ export class HostProcessSandboxVm implements HostControlChannel {
       this.#exitError = new Error(
         this.#stderr.length === 0 ? exitText : `${exitText}\n${this.#stderr}`,
       );
+      this.#packets.close(this.#exitError);
+      this.#packetActivity.close(this.#exitError);
     });
   }
 
@@ -83,8 +87,9 @@ export class HostProcessSandboxVm implements HostControlChannel {
     requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook> = new Map(),
   ): Promise<HostProcessSandboxVm> {
     let vm: HostProcessSandboxVm | undefined;
+    const hostPath = hostBinaryPath();
     try {
-      const child = spawn(hostBinaryPath(), ["--stdio"], {
+      const child = spawn(hostPath, ["--stdio"], {
         stdio: ["pipe", "pipe", "pipe"],
       });
       vm = new HostProcessSandboxVm(child, options, requestHeaderHooks);
@@ -99,6 +104,10 @@ export class HostProcessSandboxVm implements HostControlChannel {
       return vm;
     } catch (error) {
       await vm?.close();
+      const signingError = macosHostSigningError(hostPath);
+      if (signingError !== null) {
+        throw signingError;
+      }
       throw error;
     }
   }
@@ -108,17 +117,14 @@ export class HostProcessSandboxVm implements HostControlChannel {
     this.#writeToHost(packet);
   }
 
-  tryReadControlPacket(): Uint8Array | null {
-    this.#assertOpen();
-    return this.#packets.shift() ?? null;
-  }
-
   async close(): Promise<void> {
     if (this.#closed) {
       return;
     }
 
     this.#closed = true;
+    this.#packets.close();
+    this.#packetActivity.close();
     const exited = this.#child.exitCode !== null || this.#child.signalCode !== null
       ? Promise.resolve()
       : once(this.#child, "exit").then(() => undefined);
@@ -219,7 +225,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
 
       const packet = this.#buffer.slice(0, packetLength);
       this.#buffer = this.#buffer.slice(packetLength);
-      this.#notifyHostPacket();
+      this.#packetActivity.notify();
       if (!this.#routeHostPacket(packet)) {
         this.#packets.push(packet);
       }
@@ -504,14 +510,8 @@ export class HostProcessSandboxVm implements HostControlChannel {
   }
 
   async #waitForLaunch(): Promise<void> {
-    if (this.#packets.length > 0) {
-      return;
-    }
-
     await Promise.race([
-      new Promise<void>((resolvePromise) => {
-        this.#hostPacketWaiters.push(resolvePromise);
-      }),
+      this.#packetActivity.wait(),
       once(this.#child, "exit").then(() => {
         throw this.#exitError ?? new Error("sandbox-host exited before VM launch completed");
       }),
@@ -519,13 +519,6 @@ export class HostProcessSandboxVm implements HostControlChannel {
         throw new Error("sandbox-host did not produce a launch acknowledgement");
       }),
     ]);
-  }
-
-  #notifyHostPacket(): void {
-    const waiters = this.#hostPacketWaiters.splice(0);
-    for (const waiter of waiters) {
-      waiter();
-    }
   }
 }
 
@@ -651,6 +644,125 @@ function assertPosixFileSystem(
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
+}
+
+class AsyncQueue<T> implements AsyncIterable<T> {
+  readonly #values: T[] = [];
+  readonly #nextWaiters: Array<{
+    resolve(result: IteratorResult<T>): void;
+    reject(error: unknown): void;
+  }> = [];
+  #closed = false;
+  #error: unknown;
+
+  get length(): number {
+    return this.#values.length;
+  }
+
+  push(value: T): void {
+    if (this.#closed) {
+      return;
+    }
+
+    const nextWaiter = this.#nextWaiters.shift();
+    if (nextWaiter !== undefined) {
+      nextWaiter.resolve({ value, done: false });
+    } else {
+      this.#values.push(value);
+    }
+
+  }
+
+  close(error?: unknown): void {
+    if (this.#closed) {
+      return;
+    }
+
+    this.#closed = true;
+    this.#error = error;
+    for (const waiter of this.#nextWaiters.splice(0)) {
+      if (error === undefined) {
+        waiter.resolve({ value: undefined, done: true });
+      } else {
+        waiter.reject(error);
+      }
+    }
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<T> {
+    return {
+      next: async () => {
+        const value = this.#values.shift();
+        if (value !== undefined) {
+          return { value, done: false };
+        }
+
+        if (this.#closed) {
+          if (this.#error !== undefined) {
+            throw this.#error;
+          }
+          return { value: undefined, done: true };
+        }
+
+        return await new Promise<IteratorResult<T>>((resolve, reject) => {
+          this.#nextWaiters.push({
+            resolve,
+            reject,
+          });
+        });
+      },
+    };
+  }
+}
+
+class AsyncSignal {
+  readonly #waiters: Array<{
+    resolve(): void;
+    reject(error: unknown): void;
+  }> = [];
+  #signaled = false;
+  #closed = false;
+  #error: unknown;
+
+  notify(): void {
+    if (this.#closed) {
+      return;
+    }
+    this.#signaled = true;
+    for (const waiter of this.#waiters.splice(0)) {
+      waiter.resolve();
+    }
+  }
+
+  close(error?: unknown): void {
+    if (this.#closed) {
+      return;
+    }
+    this.#closed = true;
+    this.#error = error;
+    for (const waiter of this.#waiters.splice(0)) {
+      if (error === undefined) {
+        waiter.resolve();
+      } else {
+        waiter.reject(error);
+      }
+    }
+  }
+
+  async wait(): Promise<void> {
+    if (this.#signaled) {
+      return;
+    }
+    if (this.#closed) {
+      if (this.#error !== undefined) {
+        throw this.#error;
+      }
+      throw new Error("sandbox-host packet activity closed");
+    }
+    return await new Promise<void>((resolve, reject) => {
+      this.#waiters.push({ resolve, reject });
+    });
+  }
 }
 
 function encodeHostSpawn(options: HostSpawnSandboxOptions): Uint8Array {

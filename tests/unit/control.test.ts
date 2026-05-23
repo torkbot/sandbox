@@ -74,7 +74,7 @@ test("HostControlTransport sends commands as packets", async () => {
 
 test("HostControlTransport pumps native packets into incoming events", async () => {
   const channel = new MemoryControlChannel();
-  channel.reads.push(
+  channel.packets.push(
     encodePacket({
       type: "init.ready",
       rootReadonly: true,
@@ -101,7 +101,7 @@ test("HostControlTransport exec waits for matching completion", async () => {
   const control = new HostControlTransport({ channel });
   const exec = control.exec({ id: "test", argv: ["/bin/true"] });
 
-  channel.reads.push(
+  channel.packets.push(
     encodePacket({
       type: "guest.exec.complete",
       id: "test",
@@ -127,7 +127,7 @@ test("HostControlTransport demultiplexes concurrent exec completions", async () 
   const first = control.exec({ id: "first", argv: ["/bin/true"] });
   const second = control.exec({ id: "second", argv: ["/bin/true"] });
 
-  channel.reads.push(
+  channel.packets.push(
     encodePacket({
       type: "guest.exec.complete",
       id: "second",
@@ -155,7 +155,7 @@ test("HostControlTransport exec is not starved by incoming consumers", async () 
   const iterator = control.incoming[Symbol.asyncIterator]();
   const exec = control.exec({ id: "test", argv: ["/bin/true"] });
 
-  channel.reads.push(
+  channel.packets.push(
     encodePacket({
       type: "guest.exec.complete",
       id: "test",
@@ -195,7 +195,7 @@ test("HostControlTransport rejects duplicate in-flight exec ids", async () => {
     /sandbox exec id is already in flight: duplicate/,
   );
 
-  channel.reads.push(
+  channel.packets.push(
     encodePacket({
       type: "guest.exec.complete",
       id: "duplicate",
@@ -215,7 +215,7 @@ test("HostControlTransport closes and rejects pending execs on malformed frames"
   const iterator = control.incoming[Symbol.asyncIterator]();
   const exec = control.exec({ id: "pending", argv: ["/bin/true"] });
 
-  channel.reads.push(encodePacket({ type: "unknown.control.frame" }));
+  channel.packets.push(encodePacket({ type: "unknown.control.frame" }));
 
   await assert.rejects(exec, /unknown control frame type: unknown.control.frame/);
   await assert.rejects(iterator.next(), /unknown control frame type: unknown.control.frame/);
@@ -227,14 +227,40 @@ test("HostControlTransport closes and rejects pending execs on malformed frames"
 
 class MemoryControlChannel implements HostControlChannel {
   readonly writes: Uint8Array[] = [];
-  readonly reads: Uint8Array[] = [];
+  readonly packets = new MemoryPacketStream();
 
   writeControlPacket(packet: Uint8Array): void {
     this.writes.push(packet);
   }
+}
 
-  tryReadControlPacket(): Uint8Array | null {
-    return this.reads.shift() ?? null;
+class MemoryPacketStream implements AsyncIterable<Uint8Array> {
+  readonly #queue: Uint8Array[] = [];
+  readonly #waiters: Array<(value: Uint8Array) => void> = [];
+
+  push(...packets: Uint8Array[]): void {
+    for (const packet of packets) {
+      const waiter = this.#waiters.shift();
+      if (waiter !== undefined) {
+        waiter(packet);
+      } else {
+        this.#queue.push(packet);
+      }
+    }
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<Uint8Array> {
+    return {
+      next: async () => {
+        const value = this.#queue.shift();
+        if (value !== undefined) {
+          return { value, done: false };
+        }
+        return await new Promise<IteratorResult<Uint8Array>>((resolve) => {
+          this.#waiters.push((packet) => resolve({ value: packet, done: false }));
+        });
+      },
+    };
   }
 }
 
