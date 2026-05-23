@@ -9,8 +9,8 @@ import {
 } from "./control-codec.ts";
 
 export interface HostControlChannel {
+  readonly packets: AsyncIterable<Uint8Array>;
   writeControlPacket(packet: Uint8Array): void;
-  tryReadControlPacket(): Uint8Array | null;
 }
 
 export class HostControlTransport implements SandboxControl {
@@ -105,33 +105,22 @@ export class HostControlTransport implements SandboxControl {
   }
 
   async #pumpIncoming(): Promise<void> {
-    while (!this.#closed && this.#channel !== null) {
-      let packet: Uint8Array | null;
-      try {
-        packet = this.#channel.tryReadControlPacket();
-      } catch (error) {
+    if (this.#channel === null) {
+      return;
+    }
+    try {
+      for await (const packet of this.#channel.packets) {
         if (this.#closed) {
           return;
         }
-        this.#fail(error);
+        const event = decodeControlEvent(packet);
+        this.#dispatchEvent(event);
+      }
+    } catch (error) {
+      if (this.#closed) {
         return;
       }
-      if (packet !== null) {
-        if (this.#closed) {
-          return;
-        }
-        let event: SandboxControlEvent;
-        try {
-          event = decodeControlEvent(packet);
-        } catch (error) {
-          this.#fail(error);
-          return;
-        }
-        this.#dispatchEvent(event);
-        continue;
-      }
-
-      await sleep(10);
+      this.#fail(error);
     }
   }
 
@@ -164,13 +153,6 @@ export class HostControlTransport implements SandboxControl {
     }
     this.#pendingExec.clear();
   }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    const timeout = setTimeout(resolve, ms);
-    timeout.unref();
-  });
 }
 
 class AsyncQueue<T> implements AsyncIterable<T> {

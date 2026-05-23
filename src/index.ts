@@ -508,8 +508,8 @@ class HostBackedSandboxVm implements SandboxVm {
 
   readonly #hostVm: {
     readonly hasControlSocket: boolean;
+    readonly packets: AsyncIterable<Uint8Array>;
     writeControlPacket(packet: Uint8Array): void;
-    tryReadControlPacket(): Uint8Array | null;
     close(): Promise<void> | void;
     terminateHostForTest?(): Promise<void>;
   };
@@ -518,8 +518,8 @@ class HostBackedSandboxVm implements SandboxVm {
   constructor(
     hostVm: {
       readonly hasControlSocket: boolean;
+      readonly packets: AsyncIterable<Uint8Array>;
       writeControlPacket(packet: Uint8Array): void;
-      tryReadControlPacket(): Uint8Array | null;
       close(): Promise<void> | void;
       terminateHostForTest?(): Promise<void>;
     },

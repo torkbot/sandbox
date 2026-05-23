@@ -5,7 +5,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { hostBinaryPath, rawHostBinaryPath } from "./artifacts.ts";
+import { assertMacosHostIsSigned, rawHostBinaryPath } from "./artifacts.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -49,7 +49,7 @@ async function setupMacos(): Promise<void> {
       hostPath,
     ]);
 
-    hostBinaryPath();
+    assertMacosHostIsSigned(hostPath);
     console.log(`Signed sandbox-host for macOS Hypervisor.framework access: ${hostPath}`);
   } finally {
     await rm(tempDir, { recursive: true, force: true });

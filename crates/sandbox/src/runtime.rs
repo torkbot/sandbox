@@ -4,7 +4,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Condvar, Mutex, Once};
 use std::thread::{self, JoinHandle};
 
 use base64::Engine;
@@ -34,7 +34,12 @@ pub struct KrunVm {
     control_socket: ControlSocket,
     guest_control_socket: UnixStream,
     worker: Option<JoinHandle<Result<(), KrunError>>>,
-    start_status: Arc<Mutex<Option<Result<(), KrunError>>>>,
+    start_status: StartStatusObserver,
+}
+
+#[derive(Debug, Clone)]
+pub struct StartStatusObserver {
+    inner: Arc<(Mutex<Option<Result<(), KrunError>>>, Condvar)>,
 }
 
 #[derive(Debug)]
@@ -42,6 +47,8 @@ pub struct ControlSocket {
     stream: UnixStream,
     read_buffer: Vec<u8>,
 }
+
+const MAX_CONTROL_FRAME_LEN: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KrunError {
@@ -390,7 +397,7 @@ impl KrunVm {
             },
             guest_control_socket: guest_socket,
             worker: None,
-            start_status: Arc::new(Mutex::new(None)),
+            start_status: StartStatusObserver::new(),
         })
     }
 
@@ -403,20 +410,21 @@ impl KrunVm {
             .context
             .take()
             .ok_or_else(|| KrunError::new("krun_start_enter", -libc::EINVAL))?;
-        let start_status = Arc::clone(&self.start_status);
+        let start_status = self.start_status.clone();
         self.worker = Some(thread::spawn(move || {
             let result = check_krun("krun_start_enter", krun::krun_start_enter(context.id()));
-            *start_status.lock().expect("start status lock poisoned") = Some(result.clone());
+            start_status.set(result.clone());
             result
         }));
         Ok(())
     }
 
     pub fn start_status(&self) -> Option<Result<(), KrunError>> {
-        self.start_status
-            .lock()
-            .expect("start status lock poisoned")
-            .clone()
+        self.start_status.get()
+    }
+
+    pub fn start_status_observer(&self) -> StartStatusObserver {
+        self.start_status.clone()
     }
 
     pub fn context(&self) -> &KrunContext {
@@ -438,14 +446,64 @@ impl KrunVm {
     }
 }
 
+impl StartStatusObserver {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new((Mutex::new(None), Condvar::new())),
+        }
+    }
+
+    fn set(&self, result: Result<(), KrunError>) {
+        let (lock, condvar) = &*self.inner;
+        *lock.lock().expect("start status lock poisoned") = Some(result);
+        condvar.notify_all();
+    }
+
+    pub fn get(&self) -> Option<Result<(), KrunError>> {
+        let (lock, _) = &*self.inner;
+        lock.lock().expect("start status lock poisoned").clone()
+    }
+
+    pub fn wait(&self) -> Result<(), KrunError> {
+        let (lock, condvar) = &*self.inner;
+        let mut status = lock.lock().expect("start status lock poisoned");
+        loop {
+            if let Some(result) = status.clone() {
+                return result;
+            }
+            status = condvar.wait(status).expect("start status lock poisoned");
+        }
+    }
+}
+
 impl ControlSocket {
     pub fn raw_fd(&self) -> RawFd {
         self.stream.as_raw_fd()
     }
 
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            stream: self.stream.try_clone()?,
+            read_buffer: Vec::new(),
+        })
+    }
+
     pub fn write_packet(&mut self, packet: &[u8]) -> io::Result<()> {
         self.stream.set_nonblocking(false)?;
         self.stream.write_all(packet)
+    }
+
+    pub fn read_packet(&mut self) -> io::Result<Vec<u8>> {
+        self.stream.set_nonblocking(false)?;
+        let mut len = [0; 4];
+        self.stream.read_exact(&mut len)?;
+        let frame_len = u32::from_le_bytes(len) as usize;
+        let packet_len = control_packet_len(frame_len)?;
+        let mut packet = Vec::with_capacity(packet_len);
+        packet.extend_from_slice(&len);
+        packet.resize(packet_len, 0);
+        self.stream.read_exact(&mut packet[4..])?;
+        Ok(packet)
     }
 
     pub fn try_read_packet(&mut self) -> io::Result<Option<Vec<u8>>> {
@@ -480,7 +538,7 @@ impl ControlSocket {
             self.read_buffer[3],
         ];
         let frame_len = u32::from_le_bytes(len) as usize;
-        let packet_len = 4 + frame_len;
+        let packet_len = control_packet_len(frame_len)?;
         if self.read_buffer.len() < packet_len {
             if saw_eof {
                 return Err(io::Error::new(
@@ -493,6 +551,23 @@ impl ControlSocket {
         let packet = self.read_buffer.drain(..packet_len).collect();
         Ok(Some(packet))
     }
+}
+
+fn control_packet_len(frame_len: usize) -> io::Result<usize> {
+    if frame_len > MAX_CONTROL_FRAME_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "guest control frame length {frame_len} exceeds maximum {MAX_CONTROL_FRAME_LEN}"
+            ),
+        ));
+    }
+    frame_len.checked_add(4).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "guest control frame length overflows packet size",
+        )
+    })
 }
 
 impl Drop for KrunContext {
@@ -725,6 +800,38 @@ mod tests {
         let error = control_socket.try_read_packet().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         assert!(error.to_string().contains("control socket closed"));
+    }
+
+    #[test]
+    fn control_socket_rejects_oversized_nonblocking_packet() {
+        let (host_socket, mut guest_socket) = UnixStream::pair().unwrap();
+        let mut control_socket = ControlSocket {
+            stream: host_socket,
+            read_buffer: Vec::new(),
+        };
+
+        let oversized_len = ((MAX_CONTROL_FRAME_LEN + 1) as u32).to_le_bytes();
+        guest_socket.write_all(&oversized_len).unwrap();
+
+        let error = control_socket.try_read_packet().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn control_socket_rejects_oversized_blocking_packet() {
+        let (host_socket, mut guest_socket) = UnixStream::pair().unwrap();
+        let mut control_socket = ControlSocket {
+            stream: host_socket,
+            read_buffer: Vec::new(),
+        };
+
+        let oversized_len = ((MAX_CONTROL_FRAME_LEN + 1) as u32).to_le_bytes();
+        guest_socket.write_all(&oversized_len).unwrap();
+
+        let error = control_socket.read_packet().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds maximum"));
     }
 
     #[test]
