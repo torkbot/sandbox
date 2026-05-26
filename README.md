@@ -1,108 +1,64 @@
 # Sandbox
 
-Sandbox is a TypeScript-first Node.js library for spawning libkrun-backed microVMs.
-
-The target shape is:
-
-- boot a guest from a prebuilt read-only rootfs artifact, likely EROFS,
-- mount host-implemented virtual filesystems,
-- intercept guest HTTP request headers through host TypeScript hooks,
-- communicate with guest init over a bidirectional transport,
-- ship as a statically linked host artifact.
+Sandbox is a TypeScript-first Node.js library for running work inside
+libkrun-backed microVMs with host-controlled filesystems and network policy.
 
 ```ts
 import {
-  acceptPublicInternet,
-  acceptTcp,
-  binding,
-  linuxOverlayFs,
-  mount,
-  prebuiltRootfs,
-  projectInit,
-  projectKernel,
-  scratchFs,
-  createSandbox,
+  createSandboxConfig,
+  fs,
+  rootfs,
   type SandboxWritableFileSystem,
 } from "@torkbot/sandbox";
 
 declare const workspaceFs: SandboxWritableFileSystem;
 
-await using sandbox = createSandbox({
-  kernel: projectKernel(),
-  init: projectInit(),
-  rootfs: linuxOverlayFs({
-    lower: prebuiltRootfs("dist/rootfs/sandbox.erofs", { format: "erofs" }),
-    upper: scratchFs(),
-  }),
+const config = createSandboxConfig({
+  rootfs: rootfs.builtIn("alpine:3.20"),
+});
 
-  mounts: [
-    mount("/sandbox", {
-      async stat(path) {
-        if (path === "/") {
-          return {
-            type: "directory",
-            sizeBytes: null,
-            mediaType: null,
-            modifiedAtMs: null,
-          };
-        }
-
-        if (path === "/status.json") {
-          const body = JSON.stringify({ ready: true });
-          return {
-            type: "file",
-            sizeBytes: Buffer.byteLength(body),
-            mediaType: "application/json",
-            modifiedAtMs: null,
-          };
-        }
-
-        throw new Error(`missing path ${path}`);
-      },
-
-      async list(path) {
-        if (path !== "/") throw new Error(`missing directory ${path}`);
-        return [{ name: "status.json", type: "file" }];
-      },
-
-      async read(input) {
-        if (input.path !== "/status.json") {
-          throw new Error(`unknown virtual file: ${input.path}`);
-        }
-
-        return Buffer.from(JSON.stringify({ ready: true }));
-      },
-    }),
-  ],
-
-  bindings: [
-    binding("/workspace", workspaceFs),
-  ],
-
-  network: {
-    outbound: {
-      policy: "deny",
-      rules: [
-        acceptTcp({ cidr: "127.0.0.1/32", ports: [8080] }),
-        acceptPublicInternet({ ports: [443] }),
-      ],
-    },
+await using sandbox = await config.boot({
+  mounts: {
+    "/workspace": fs.virtual(workspaceFs),
   },
+  cwd: "/workspace",
 });
 
-sandbox.http.onRequest({ origin: "https://api.github.com" }, (request) => {
-  request.headers.set("authorization", `Bearer ${process.env.GITHUB_TOKEN}`);
-});
+const result = await sandbox.process.exec("npm", ["test"]);
 
-await using vm = await sandbox.run();
+if (result.exitCode !== 0) {
+  throw new Error(result.stderr);
+}
 ```
 
-Incremental guest operations are explicit:
+## Quick Start
+
+Create reusable machine configuration once, then boot one or more instances with
+the mounts each instance needs:
 
 ```ts
-const result = await vm.control.exec({
-  id: "tests",
-  argv: ["node", "--test", "test/**/*.test.ts"],
+import {
+  createSandboxConfig,
+  fs,
+  rootfs,
+  type SandboxWritableFileSystem,
+} from "@torkbot/sandbox";
+
+declare const workspaceFs: SandboxWritableFileSystem;
+
+const config = createSandboxConfig({
+  rootfs: rootfs.builtIn("alpine:3.20"),
+});
+
+await using sandbox = await config.boot({
+  mounts: {
+    "/workspace": fs.virtual(workspaceFs),
+  },
+  cwd: "/workspace",
+});
+
+const result = await sandbox.process.exec("npm", ["test"], {
+  env: { CI: "1" },
 });
 
 if (result.exitCode !== 0) {
@@ -110,70 +66,150 @@ if (result.exitCode !== 0) {
 }
 ```
 
-Mounted filesystems expose both the raw callback shape and a host-side tool surface for agent workflows:
+The public API is split into three layers:
+
+- `createSandboxConfig(...)` describes reusable machine configuration.
+- `config.boot(...)` creates a runtime instance with per-instance mounts.
+- `sandbox.process.*` runs work inside the booted instance.
+
+Expensive artifact preparation is intentionally outside `boot()`.
+`rootfs.builtIn("alpine:3.20")` selects a built-in rootfs artifact that must
+already be installed with Sandbox. It does not pull an image or build a rootfs
+at runtime.
+
+## API Overview
+
+### Configuration
 
 ```ts
-const sandboxProc = vm.mounts.virtualFs("/sandbox");
-const statusBytes = await sandboxProc.read({
-  path: "/status.json",
-  signal: AbortSignal.timeout(1_000),
-});
+type SandboxConfig = {
+  rootfs: Rootfs;
+  overlay?: SandboxWritableFileSystemSource;
+  network?: NetworkPolicy;
+};
+```
 
-console.log(JSON.parse(Buffer.from(statusBytes).toString("utf8")));
+`rootfs` selects the immutable base filesystem. The first public rootfs source
+is the built-in catalog:
 
-const workspace = vm.mounts.host("/workspace");
+```ts
+rootfs.builtIn("alpine:3.20");
+```
 
-const notes = await workspace.read({
-  path: "notes.md",
-  offset: 1,
-  limit: 80,
-});
+`overlay` is optional. When present, Sandbox uses that writable filesystem to
+store copy-on-write data and deletion masks over the immutable rootfs. When
+absent, the guest root filesystem is read-only.
 
-await workspace.write({
-  path: "plan.md",
-  content: "# Plan\n\nStart here.\n",
-});
-
-await workspace.patch({
-  path: "plan.md",
-  edits: [{ oldText: "Start here.", newText: "Ship the narrow slice." }],
-});
-
-const grep = await workspace.bash({
-  command: "grep \"Ship\" plan.md",
-  timeoutMs: 1_000,
+```ts
+createSandboxConfig({
+  rootfs: rootfs.builtIn("alpine:3.20"),
+  overlay: fs.virtual(rootOverlayFs),
 });
 ```
 
-Root filesystems are immutable by default. A writable root is expressed as an explicit Linux overlayfs composition:
+`network` is optional. When omitted, egress is denied. A network policy receives
+connection requests and grants only the traffic it explicitly allows:
 
 ```ts
-await using sandbox = createSandbox({
-  kernel: projectKernel(),
-  init: projectInit(),
-  rootfs: linuxOverlayFs({
-    lower: prebuiltRootfs("dist/rootfs/base.erofs", { format: "erofs" }),
-    upper: scratchFs(),
-  }),
-});
-
-await using vm = await sandbox.run();
-
-await vm.control.exec({
-  id: "install-toolchain",
-  argv: ["/bin/sh", "-lc", "apk add --no-cache git nodejs"],
+const policy = network.buildPolicy({
+  async onConnectionRequest(conn) {
+    if (conn.host === "registry.npmjs.org") {
+      conn.allowHttp();
+    }
+  },
 });
 ```
 
-`mount(...)` means a guest-visible mount boundary. `binding(...)` means a host-side attachment point into the same filesystem abstraction and does not create a guest mount.
+`conn.allow()` grants the raw connection. `conn.allowHttp(...)` grants
+HTTP(S)-classified traffic and can apply request middleware:
 
-The guest contract is intentionally narrow:
+```ts
+const policy = network.buildPolicy({
+  async onConnectionRequest(conn) {
+    if (conn.host !== "api.example.com") return;
 
-- `/` is read-only unless the rootfs is a `linuxOverlayFs(...)` composition.
-- `/sandbox` is implemented by the host.
-- HTTP request-header hooks are registered in TypeScript and enforced by the Rust host data plane.
-- Network egress starts from deny; outbound rules opt in the exact protocols, ranges, and ports the guest can reach.
-- The HTTP interception CA is generated and injected by Sandbox. Callers provide request-header hooks, not certificate plumbing.
+    conn.allowHttp(async (request) => {
+      request.headers.set(
+        "authorization",
+        `Bearer ${await credentialBroker.authorizationFor(request)}`,
+      );
+    });
+  },
+});
+```
+
+Deny remains the default. If the policy callback does not create a grant, the
+connection is blocked. The `NetworkGrant` returned by `allow()` and
+`allowHttp()` is reserved as the future extension point for instance-local
+state, such as remembering a grant for a time window.
+
+The runtime uses this policy shape to keep the JavaScript boundary explicit.
+Native rules can be added under the same model later without changing the
+caller-facing API.
+
+### Boot Options
+
+Mounts are per-instance because different sandbox instances often need
+different filesystems over the same reusable machine configuration:
+
+```ts
+await using sandbox = await config.boot({
+  mounts: {
+    "/workspace": fs.virtual(workspaceFs),
+    "/private": fs.virtual(privateFs),
+    "/shared": fs.virtual(sharedFs),
+  },
+  cwd: "/workspace",
+});
+```
+
+Sandbox does not special-case `/workspace`. Mount paths are just guest-visible
+paths backed by user-supplied filesystems.
+
+### Filesystems
+
+The first public filesystem source is `fs.virtual(...)`, which adapts a
+user-space JavaScript filesystem to Sandbox. The same filesystem abstraction can
+be used for mounts and for the root overlay:
+
+```ts
+const workspace = fs.virtual(workspaceFs);
+const rootOverlay = fs.virtual(rootOverlayFs);
+```
+
+### Processes
+
+`exec` is the simple buffered process API:
+
+```ts
+const result = await sandbox.process.exec("npm", ["test"], {
+  cwd: "/workspace",
+  env: { CI: "1" },
+  input: "y\n",
+});
+```
+
+## Internal Architecture
+
+Sandbox hides the kernel, init, transport, and host helper behind a small
+TypeScript API:
+
+- The runtime boots a libkrun-backed guest from a prebuilt read-only rootfs
+  artifact, likely EROFS.
+- Kernel and init artifacts are implementation details owned by Sandbox.
+- A signed `sandbox-host` helper owns the Node/Rust/libkrun boundary.
+- Guest control traffic uses an implicit fd-backed transport between the host
+  and Sandbox init.
+- Host-implemented virtual filesystems are mounted into the guest and can also
+  provide the root overlay's copy-on-write storage.
+- Network egress is default-deny. Native code should enforce fast-path policy
+  decisions and delegate to JavaScript only when a policy callback is required.
+- HTTP request middleware is caller-provided JavaScript, but Sandbox owns the
+  interception machinery and certificate plumbing.
+
+The intended boundary is that Sandbox knows how to launch, isolate, mount,
+intercept, and enforce. User-space owns artifact selection, filesystem
+durability, network policy state, confirmation flows, and credential brokering.
 
 ## Design Targets
 
@@ -182,12 +218,12 @@ The guest contract is intentionally narrow:
 - custom guest init owned by this repo,
 - implicit fd-backed host control sockets owned by Sandbox,
 - avoid host filesystem coordination unless it is intrinsic to the artifact; prefer file descriptors, database handles, bytes, and async iterables over paths,
-- build-time rootfs shaping, with prebuilt rootfs artifacts supplied at VM instantiation,
-- root filesystem composition through small explicit primitives such as `linuxOverlayFs(...)` and `scratchFs()`, with lower and upper expressed as filesystem values,
-- `mount(...)` only for guest-visible mounts; `binding(...)` only for host-side attachment points,
+- build-time rootfs shaping, with built-in rootfs artifacts selected by typed logical names at VM instantiation,
+- immutable rootfs by default, with optional copy-on-write overlay data supplied by a user-space writable filesystem,
+- generic guest-visible mounts backed by the same user-space filesystem abstraction,
 - programmable virtual filesystems backed by TypeScript callbacks,
 - transparent HTTP interception with TypeScript request-header hooks,
-- default-deny outbound networking with explicit accept rules for protocols, CIDR ranges, public internet reachability, and ports,
+- default-deny outbound networking with JavaScript policy callbacks only where native rules cannot decide,
 - Rust-native or statically linkable networking components; sidecar network daemons are references, not default runtime dependencies,
 - macOS HVF entitlement signing verified as part of the integration test flow.
 

@@ -14,6 +14,7 @@ fn run() -> Result<(), InitError> {
     let rootfs_overlay_enabled = prepare_rootfs_overlay(
         std::env::args().skip(1),
         std::env::var("SANDBOX_ROOTFS_OVERLAY").ok(),
+        std::env::var("SANDBOX_ROOTFS_OVERLAY_VIRTIOFS").ok(),
     )?;
     mount_kernel_filesystems()?;
     configure_http_network(std::env::args().skip(1))?;
@@ -33,12 +34,17 @@ fn run() -> Result<(), InitError> {
 fn prepare_rootfs_overlay(
     args: impl Iterator<Item = String>,
     mode: Option<String>,
+    virtiofs_tag: Option<String>,
 ) -> Result<bool, InitError> {
     mount_fs("proc", "/proc", "proc", 0)?;
+    let mut overlay_virtiofs = virtiofs_tag;
     let enabled = mode.as_deref() == Some("writable")
-        || args
-            .into_iter()
-            .any(|arg| arg == "--rootfs-overlay=writable")
+        || args.into_iter().any(|arg| {
+            if let Some(tag) = arg.strip_prefix("--rootfs-overlay-virtiofs=") {
+                overlay_virtiofs = Some(tag.to_string());
+            }
+            arg == "--rootfs-overlay=writable"
+        })
         || read_key_value_from_proc_cmdline("SANDBOX_ROOTFS_OVERLAY").as_deref()
             == Some("writable");
     if !enabled {
@@ -46,16 +52,30 @@ fn prepare_rootfs_overlay(
     }
 
     mount_fs("tmpfs", "/run", "tmpfs", 0)?;
-    std::fs::create_dir_all("/run/sandbox-rootfs-upper")
+    let (upperdir, workdir) = if let Some(tag) = overlay_virtiofs {
+        std::fs::create_dir_all("/run/sandbox-rootfs-overlay")
+            .map_err(|error| InitError(format!("create overlay virtiofs mountpoint: {error}")))?;
+        mount_virtiofs(&tag, "/run/sandbox-rootfs-overlay", false)?;
+        (
+            "/run/sandbox-rootfs-overlay/upper".to_string(),
+            "/run/sandbox-rootfs-overlay/work".to_string(),
+        )
+    } else {
+        (
+            "/run/sandbox-rootfs-upper".to_string(),
+            "/run/sandbox-rootfs-work".to_string(),
+        )
+    };
+    std::fs::create_dir_all(&upperdir)
         .map_err(|error| InitError(format!("create overlay upperdir: {error}")))?;
-    std::fs::create_dir_all("/run/sandbox-rootfs-work")
+    std::fs::create_dir_all(&workdir)
         .map_err(|error| InitError(format!("create overlay workdir: {error}")))?;
     std::fs::create_dir_all("/run/sandbox-rootfs-root")
         .map_err(|error| InitError(format!("create overlay root: {error}")))?;
 
     mount_overlay_root(
         "/run/sandbox-rootfs-root",
-        "lowerdir=/,upperdir=/run/sandbox-rootfs-upper,workdir=/run/sandbox-rootfs-work",
+        &format!("lowerdir=/,upperdir={upperdir},workdir={workdir}"),
     )?;
 
     std::env::set_current_dir("/run/sandbox-rootfs-root")
@@ -70,6 +90,7 @@ fn prepare_rootfs_overlay(
 fn prepare_rootfs_overlay(
     _args: impl Iterator<Item = String>,
     _mode: Option<String>,
+    _virtiofs_tag: Option<String>,
 ) -> Result<bool, InitError> {
     Ok(false)
 }
@@ -273,33 +294,42 @@ fn mount_virtual_filesystems(
             )));
         }
 
-        let source = CString::new(tag.as_str())
-            .map_err(|_| InitError(format!("virtual filesystem tag contains nul: {tag}")))?;
-        let target = CString::new(path.as_str())
-            .map_err(|_| InitError(format!("virtual filesystem path contains nul: {path}")))?;
-        let fstype = CString::new("virtiofs").unwrap();
         let readonly = *mode != "rw";
-        let options = CString::new(if readonly { "ro" } else { "rw" }).unwrap();
-
-        let result = unsafe {
-            libc::mount(
-                source.as_ptr(),
-                target.as_ptr(),
-                fstype.as_ptr(),
-                if readonly { libc::MS_RDONLY } else { 0 },
-                options.as_ptr().cast(),
-            )
-        };
-        if result < 0 {
-            return Err(InitError::last_os(&format!(
-                "mount virtiofs {tag} at {path}"
-            )));
-        }
+        mount_virtiofs(&tag, &path, readonly)?;
     }
 
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn mount_virtiofs(tag: &str, path: &str, readonly: bool) -> Result<(), InitError> {
+    use std::ffi::CString;
+
+    let source = CString::new(tag)
+        .map_err(|_| InitError(format!("virtual filesystem tag contains nul: {tag}")))?;
+    let target = CString::new(path)
+        .map_err(|_| InitError(format!("virtual filesystem path contains nul: {path}")))?;
+    let fstype = CString::new("virtiofs").unwrap();
+    let options = CString::new(if readonly { "ro" } else { "rw" }).unwrap();
+
+    let result = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            if readonly { libc::MS_RDONLY } else { 0 },
+            options.as_ptr().cast(),
+        )
+    };
+    if result < 0 {
+        return Err(InitError::last_os(&format!(
+            "mount virtiofs {tag} at {path}"
+        )));
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
 fn decode_mount_field(value: &str) -> Result<String, InitError> {
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(value)

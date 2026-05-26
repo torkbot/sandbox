@@ -13,6 +13,8 @@ import type {
   SandboxHttpRequestSelector,
 } from "./index.ts";
 
+const ROOT_OVERLAY_MOUNT_PATH = "__root_overlay__";
+
 type RegisteredHttpRequestHeadersHook = {
   readonly selector: SandboxHttpRequestSelector;
   readonly hook: SandboxHttpRequestHook;
@@ -44,6 +46,9 @@ export class HostProcessSandboxVm implements HostControlChannel {
     this.#options = options;
     this.packets = this.#packets;
     this.#requestHeaderHooks = requestHeaderHooks;
+    if (options.overlay !== undefined) {
+      this.#hostFs.set(ROOT_OVERLAY_MOUNT_PATH, options.overlay.fileSystem);
+    }
     for (const mount of options.mounts ?? []) {
       if (mount.kind === "virtual-fs") {
         this.#hostFs.set(mount.path, mount.fileSystem);
@@ -777,6 +782,7 @@ function encodeHostSpawn(options: HostSpawnSandboxOptions): Uint8Array {
     rootfsReadonly: options.rootfs.readonly,
     rootfsFormat: options.rootfs.format,
     rootfsOverlayMode: options.rootfsOverlay?.mode,
+    rootfsOverlaySource: options.rootfsOverlay?.source,
     mounts: options.mounts ?? [],
     networkOutbound: options.network?.outbound,
     networkHttp: options.network?.http === undefined ? undefined : options.network.http,

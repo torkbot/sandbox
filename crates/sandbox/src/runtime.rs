@@ -10,7 +10,7 @@ use std::thread::{self, JoinHandle};
 use base64::Engine;
 
 use crate::MicroVmSpec;
-use crate::config::{KernelFormat, RootfsFormat};
+use crate::config::{KernelFormat, RootfsFormat, RootfsOverlaySpec};
 use crate::control::INIT_CONTROL_PORT;
 use crate::http_flow::HttpInterceptRuntime;
 use crate::network::OutboundRulePlan;
@@ -260,10 +260,14 @@ impl KrunContext {
         let mount_arg = CString::new(format!("--virtiofs-mounts={encoded_mounts}")).unwrap();
         let http_network_arg = CString::new("--http-network").unwrap();
         let rootfs_overlay_arg = CString::new("--rootfs-overlay=writable").unwrap();
+        let rootfs_overlay_tag_arg =
+            CString::new("--rootfs-overlay-virtiofs=rootfs-overlay").unwrap();
         let network_enabled = spec.network.is_some();
         let mount_env = CString::new(format!("SANDBOX_VIRTIOFS_MOUNTS={encoded_mounts}")).unwrap();
         let http_network_env = CString::new("SANDBOX_HTTP_NETWORK=1").unwrap();
         let rootfs_overlay_env = CString::new("SANDBOX_ROOTFS_OVERLAY=writable").unwrap();
+        let rootfs_overlay_tag_env =
+            CString::new("SANDBOX_ROOTFS_OVERLAY_VIRTIOFS=rootfs-overlay").unwrap();
         let ca_env = spec
             .network
             .as_ref()
@@ -286,6 +290,10 @@ impl KrunContext {
         if spec.rootfs_overlay.is_some() {
             argv.push(rootfs_overlay_arg.as_ptr());
             envp.push(rootfs_overlay_env.as_ptr());
+        }
+        if spec.rootfs_overlay == Some(RootfsOverlaySpec::VirtualFs) {
+            argv.push(rootfs_overlay_tag_arg.as_ptr());
+            envp.push(rootfs_overlay_tag_env.as_ptr());
         }
         if let Some(ca_env) = ca_env.as_ref() {
             envp.push(ca_env.as_ptr());
@@ -630,6 +638,7 @@ mod tests {
             rootfs_readonly: Some(true),
             rootfs_format: "erofs".to_string(),
             rootfs_overlay_mode: None,
+            rootfs_overlay_source: None,
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
@@ -652,6 +661,7 @@ mod tests {
             rootfs_readonly: Some(true),
             rootfs_format: "directory".to_string(),
             rootfs_overlay_mode: None,
+            rootfs_overlay_source: None,
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
@@ -676,6 +686,7 @@ mod tests {
             rootfs_readonly: Some(true),
             rootfs_format: "erofs".to_string(),
             rootfs_overlay_mode: None,
+            rootfs_overlay_source: None,
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
@@ -712,6 +723,7 @@ mod tests {
             rootfs_readonly: Some(true),
             rootfs_format: "erofs".to_string(),
             rootfs_overlay_mode: None,
+            rootfs_overlay_source: None,
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
@@ -918,6 +930,7 @@ mod tests {
             rootfs_readonly: Some(true),
             rootfs_format: "erofs".to_string(),
             rootfs_overlay_mode: None,
+            rootfs_overlay_source: None,
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,

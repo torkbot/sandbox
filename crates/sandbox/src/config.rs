@@ -49,7 +49,8 @@ pub enum RootfsFormat {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootfsOverlaySpec {
-    Writable,
+    Scratch,
+    VirtualFs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,7 +200,7 @@ impl MicroVmSpec {
 
         let rootfs_overlay = input
             .rootfs_overlay_mode
-            .map(|mode| RootfsOverlaySpec::parse(&mode))
+            .map(|mode| RootfsOverlaySpec::parse(&mode, input.rootfs_overlay_source.as_deref()))
             .transpose()?;
 
         let mounts = input
@@ -268,9 +269,15 @@ impl RootfsFormat {
 }
 
 impl RootfsOverlaySpec {
-    fn parse(value: &str) -> Result<Self, SpecError> {
+    fn parse(value: &str, source: Option<&str>) -> Result<Self, SpecError> {
         match value {
-            "writable" => Ok(Self::Writable),
+            "writable" => match source {
+                None => Ok(Self::Scratch),
+                Some("virtual-fs") => Ok(Self::VirtualFs),
+                Some(other) => Err(SpecError::new(format!(
+                    "unsupported rootfsOverlay.source: {other}"
+                ))),
+            },
             other => Err(SpecError::new(format!(
                 "unsupported rootfsOverlay.mode: {other}"
             ))),
@@ -320,6 +327,7 @@ pub struct MicroVmSpecInput {
     pub rootfs_readonly: Option<bool>,
     pub rootfs_format: String,
     pub rootfs_overlay_mode: Option<String>,
+    pub rootfs_overlay_source: Option<String>,
     pub mounts: Vec<MountSpecInput>,
     pub network_outbound: Option<OutboundSpec>,
     pub network_http: Option<HttpSpecInput>,
@@ -355,6 +363,7 @@ mod tests {
             rootfs_readonly: None,
             rootfs_format: "erofs".to_string(),
             rootfs_overlay_mode: None,
+            rootfs_overlay_source: None,
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
@@ -408,7 +417,7 @@ mod tests {
 
         let spec = MicroVmSpec::build(input).unwrap();
 
-        assert_eq!(spec.rootfs_overlay, Some(RootfsOverlaySpec::Writable));
+        assert_eq!(spec.rootfs_overlay, Some(RootfsOverlaySpec::Scratch));
         assert_eq!(
             spec.mounts,
             vec![MountSpec::VirtualFs {
@@ -430,6 +439,17 @@ mod tests {
         let http = network.http.unwrap();
         assert_eq!(http.protected_ranges, vec!["127.0.0.0/8"]);
         assert_eq!(http.request_header_hooks[0].id, "github");
+    }
+
+    #[test]
+    fn supports_virtual_filesystem_rootfs_overlay_storage() {
+        let mut input = valid_input();
+        input.rootfs_overlay_mode = Some("writable".to_string());
+        input.rootfs_overlay_source = Some("virtual-fs".to_string());
+
+        let spec = MicroVmSpec::build(input).unwrap();
+
+        assert_eq!(spec.rootfs_overlay, Some(RootfsOverlaySpec::VirtualFs));
     }
 
     #[test]

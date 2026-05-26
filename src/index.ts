@@ -192,6 +192,95 @@ export interface SandboxHttpHooks {
   ): SandboxHttpHook;
 }
 
+export type BuiltInRootfsName = "alpine:3.20";
+
+export type BuiltInRootfsConfig = {
+  readonly kind: "built-in-rootfs";
+  readonly name: BuiltInRootfsName;
+};
+
+export type Rootfs = BuiltInRootfsConfig;
+
+export type SandboxFileSystemSource = {
+  readonly kind: "virtual-fs";
+  readonly fileSystem: SandboxVirtualFileSystem;
+};
+
+export type SandboxWritableFileSystemSource = {
+  readonly kind: "virtual-fs";
+  readonly fileSystem: SandboxWritableFileSystem;
+};
+
+export type HttpRequestMiddleware = (
+  request: SandboxHttpRequest,
+) => void | Promise<void>;
+
+export interface NetworkGrant {
+}
+
+export interface HttpNetworkGrant extends NetworkGrant {
+}
+
+export interface NetworkConnectionRequest {
+  readonly transport: "tcp" | "udp";
+  readonly host?: string;
+  readonly ip?: string;
+  readonly port: number;
+  allow(): NetworkGrant;
+  allowHttp(middleware?: HttpRequestMiddleware): HttpNetworkGrant;
+}
+
+export type NetworkConnectionRequestHandler = (
+  connection: NetworkConnectionRequest,
+) => void | Promise<void>;
+
+export type NetworkPolicy = {
+  readonly kind: "network-policy";
+  readonly onConnectionRequest: NetworkConnectionRequestHandler;
+};
+
+type NetworkPolicyHookRegistration = {
+  readonly hooks: readonly RegisteredHttpRequestHeadersHook[];
+  readonly network: NetworkConfig;
+};
+
+export interface SandboxConfigOptions {
+  readonly rootfs: Rootfs;
+  readonly overlay?: SandboxWritableFileSystemSource;
+  readonly network?: NetworkPolicy;
+}
+
+export interface SandboxBootOptions {
+  readonly mounts?: Readonly<Record<string, SandboxFileSystemSource>>;
+  readonly cwd?: string;
+}
+
+export interface SandboxConfig {
+  boot(options?: SandboxBootOptions): Promise<SandboxRuntime>;
+}
+
+export interface SandboxProcessExecOptions {
+  readonly cwd?: string;
+  readonly env?: Record<string, string>;
+  readonly input?: string | Uint8Array;
+  readonly timeoutMs?: number;
+  readonly signal?: AbortSignal;
+}
+
+export interface SandboxProcessExecResult {
+  readonly exitCode: number;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+export interface SandboxProcess {
+  exec(
+    command: string,
+    args?: readonly string[],
+    options?: SandboxProcessExecOptions,
+  ): Promise<SandboxProcessExecResult>;
+}
+
 export interface SandboxBuilder extends AsyncDisposable {
   readonly http: SandboxHttpHooks;
   run(): Promise<SandboxVm>;
@@ -239,6 +328,7 @@ export interface SandboxOptions {
   readonly kernel: KernelConfig;
   readonly init: InitConfig;
   readonly rootfs: RootfsConfig;
+  readonly overlay?: SandboxWritableFileSystemSource;
   readonly mounts?: readonly MountConfig[];
   readonly bindings?: readonly FileSystemBindingConfig[];
   readonly network?: NetworkConfig;
@@ -283,11 +373,14 @@ export interface SandboxControl extends Transport<SandboxControlEvent, SandboxCo
 
 export interface SandboxVm {
   readonly control: SandboxControl;
+  readonly process: SandboxProcess;
   readonly mounts: SandboxMounts;
   readonly diagnostics?: SandboxDiagnostics;
   close(): Promise<void>;
   [Symbol.asyncDispose](): Promise<void>;
 }
+
+export type SandboxRuntime = SandboxVm;
 
 export interface SandboxDiagnostics {
   terminateHostForTest(): Promise<void>;
@@ -353,6 +446,39 @@ export function binding(path: string, fileSystem: SandboxVirtualFileSystem): Fil
   };
 }
 
+export const rootfs = {
+  builtIn(name: BuiltInRootfsName): Rootfs {
+    return {
+      kind: "built-in-rootfs",
+      name,
+    };
+  },
+};
+
+export function virtualFs(fileSystem: SandboxWritableFileSystem): SandboxWritableFileSystemSource;
+export function virtualFs(fileSystem: SandboxVirtualFileSystem): SandboxFileSystemSource;
+export function virtualFs(fileSystem: SandboxVirtualFileSystem): SandboxFileSystemSource {
+  return {
+    kind: "virtual-fs",
+    fileSystem,
+  };
+}
+
+export const fs = {
+  virtual: virtualFs,
+};
+
+export const network = {
+  buildPolicy(input: {
+    readonly onConnectionRequest: NetworkConnectionRequestHandler;
+  }): NetworkPolicy {
+    return {
+      kind: "network-policy",
+      onConnectionRequest: input.onConnectionRequest,
+    };
+  },
+};
+
 export function acceptTcp(input: {
   readonly cidr: string;
   readonly ports?: readonly number[];
@@ -397,6 +523,11 @@ export async function spawnSandbox(options: SandboxOptions): Promise<SandboxVm> 
 export function createSandbox(options: SandboxOptions): SandboxBuilder {
   validateSandboxOptions(options);
   return new ConfiguredSandboxBuilder(options);
+}
+
+export function createSandboxConfig(options: SandboxConfigOptions): SandboxConfig {
+  validateSandboxConfigOptions(options);
+  return new ConfiguredSandboxConfig(options);
 }
 
 type RegisteredHttpRequestHeadersHook = {
@@ -501,9 +632,34 @@ class ConfiguredSandboxHttpHook implements SandboxHttpHook {
   }
 }
 
+class ConfiguredSandboxConfig implements SandboxConfig {
+  readonly #options: SandboxConfigOptions;
+
+  constructor(options: SandboxConfigOptions) {
+    this.#options = options;
+  }
+
+  async boot(options: SandboxBootOptions = {}): Promise<SandboxRuntime> {
+    validateSandboxBootOptions(options);
+    const networkPolicy = this.#options.network === undefined
+      ? undefined
+      : createNetworkPolicyHookRegistration(this.#options.network);
+    const launchOptions = toInternalSandboxOptions(this.#options, options, networkPolicy?.network);
+    validateSandboxOptions(launchOptions);
+    const hostOptions = toHostSpawnOptions(launchOptions, networkPolicy?.hooks ?? []);
+    const hostVm = await HostProcessSandboxVm.spawn(
+      launchOptions,
+      hostOptions,
+      new Map((networkPolicy?.hooks ?? []).map((hook) => [hook.id, hook])),
+    );
+    return new HostBackedSandboxVm(hostVm, launchOptions);
+  }
+}
+
 class HostBackedSandboxVm implements SandboxVm {
   readonly mounts: SandboxMounts;
   readonly control: SandboxControl;
+  readonly process: SandboxProcess;
   readonly diagnostics?: SandboxDiagnostics;
 
   readonly #hostVm: {
@@ -531,6 +687,7 @@ class HostBackedSandboxVm implements SandboxVm {
       connected: hostVm.hasControlSocket,
       channel: hostVm,
     });
+    this.process = new ControlBackedSandboxProcess(this.control);
     if (hostVm.terminateHostForTest !== undefined) {
       this.diagnostics = {
         terminateHostForTest: () => hostVm.terminateHostForTest?.() ?? Promise.resolve(),
@@ -551,6 +708,37 @@ class HostBackedSandboxVm implements SandboxVm {
   async [Symbol.asyncDispose](): Promise<void> {
     await this.close();
   }
+}
+
+class ControlBackedSandboxProcess implements SandboxProcess {
+  readonly #control: SandboxControl;
+
+  constructor(control: SandboxControl) {
+    this.#control = control;
+  }
+
+  async exec(
+    command: string,
+    args: readonly string[] = [],
+    options: SandboxProcessExecOptions = {},
+  ): Promise<SandboxProcessExecResult> {
+    const env = options.cwd === undefined
+      ? options.env
+      : {
+        ...options.env,
+        PWD: options.cwd,
+      };
+    const result = await this.#control.exec({
+      argv: [command, ...args],
+      env,
+    });
+    return {
+      exitCode: result.exitCode,
+      stdout: result.stdout,
+      stderr: result.stderr,
+    };
+  }
+
 }
 
 class ConfiguredSandboxMounts implements SandboxMounts {
@@ -641,7 +829,10 @@ function toHostSpawnOptions(
       format: rootfs.format,
     },
     rootfsOverlay: options.rootfs.kind === "linux-overlay-fs"
-      ? { mode: "writable" }
+      ? {
+        mode: "writable",
+        source: options.overlay === undefined ? undefined : "virtual-fs",
+      }
       : undefined,
     mounts: options.mounts?.map((mount) => {
       return {
@@ -652,6 +843,102 @@ function toHostSpawnOptions(
     }),
     network,
   };
+}
+
+function toInternalSandboxOptions(
+  config: SandboxConfigOptions,
+  boot: SandboxBootOptions,
+  network?: NetworkConfig,
+): SandboxOptions {
+  const baseRootfs = lowerBuiltInRootfs(config.rootfs);
+  return {
+    kernel: projectKernel(),
+    init: projectInit(),
+    rootfs: config.overlay === undefined
+      ? baseRootfs
+      : linuxOverlayFs({
+        lower: baseRootfs,
+        upper: scratchFs(),
+      }),
+    overlay: config.overlay,
+    mounts: Object.entries(boot.mounts ?? {}).map(([path, source]) => {
+      return mount(path, source.fileSystem);
+    }),
+    network,
+  };
+}
+
+function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPolicyHookRegistration {
+  const hook: SandboxHttpRequestHook = async (request) => {
+    const grants: Array<{
+      readonly kind: "raw" | "http";
+      readonly middleware?: HttpRequestMiddleware;
+    }> = [];
+    const connection: NetworkConnectionRequest = {
+      transport: "tcp",
+      host: request.url.hostname,
+      ip: request.destination.upstreamIp,
+      port: request.destination.originalPort,
+      allow() {
+        grants.push({ kind: "raw" });
+        return {};
+      },
+      allowHttp(middleware?: HttpRequestMiddleware) {
+        grants.push({ kind: "http", middleware });
+        return {};
+      },
+    };
+
+    await policy.onConnectionRequest(connection);
+
+    if (grants.length === 0) {
+      throw new Error(`network connection denied: ${request.url.origin}`);
+    }
+
+    for (const grant of grants) {
+      if (grant.kind === "http") {
+        await grant.middleware?.(request);
+      }
+    }
+  };
+  const hooks: RegisteredHttpRequestHeadersHook[] = [
+    {
+      id: "network-policy-http",
+      selector: { origin: "http://*" },
+      hook,
+      active: true,
+    },
+    {
+      id: "network-policy-https",
+      selector: { origin: "https://*" },
+      hook,
+      active: true,
+    },
+  ];
+  return {
+    hooks,
+    network: {
+      outbound: {
+        policy: "deny",
+        rules: [
+          acceptTcp({ cidr: "0.0.0.0/0", ports: [80, 443, 8080, 8443] }),
+          acceptUdp({ cidr: "10.0.2.1/32", ports: [53] }),
+        ],
+      },
+    },
+  };
+}
+
+function lowerBuiltInRootfs(rootfs: Rootfs): PrebuiltRootfsConfig {
+  const path = builtInRootfsPath(rootfs.name);
+  return prebuiltRootfs(path, { format: "erofs" });
+}
+
+function builtInRootfsPath(name: BuiltInRootfsName): string {
+  if (name === "alpine:3.20") {
+    return "dist/rootfs/alpine-3.20.erofs";
+  }
+  throw new Error(`unsupported built-in rootfs: ${name satisfies never}`);
 }
 
 function lowerNativeRootfs(rootfs: RootfsConfig): PrebuiltRootfsConfig {
@@ -669,6 +956,33 @@ function lowerNativeRootfs(rootfs: RootfsConfig): PrebuiltRootfsConfig {
     ...rootfs.lower,
     readonly: true,
   };
+}
+
+function validateSandboxConfigOptions(options: SandboxConfigOptions): void {
+  if (options.rootfs.kind !== "built-in-rootfs") {
+    throw new Error("invalid sandbox config: rootfs must be selected with rootfs.builtIn(...)");
+  }
+  builtInRootfsPath(options.rootfs.name);
+  if (options.overlay !== undefined && !isSandboxWritableFileSystem(options.overlay.fileSystem)) {
+    throw new Error("invalid sandbox config: overlay filesystem must be writable");
+  }
+  if (options.network !== undefined && options.network.kind !== "network-policy") {
+    throw new Error("invalid sandbox config: network must be created with network.buildPolicy(...)");
+  }
+}
+
+function validateSandboxBootOptions(options: SandboxBootOptions): void {
+  const mountPaths = new Set<string>();
+  for (const path of Object.keys(options.mounts ?? {})) {
+    validateGuestPath(path, "mount.path");
+    if (mountPaths.has(path)) {
+      throw new Error(`invalid sandbox boot options: duplicate mount path: ${path}`);
+    }
+    mountPaths.add(path);
+  }
+  if (options.cwd !== undefined && !options.cwd.startsWith("/")) {
+    throw new Error("invalid sandbox boot options: cwd must be absolute");
+  }
 }
 
 function validateSandboxOptions(options: SandboxOptions): void {

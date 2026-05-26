@@ -21,6 +21,7 @@ export type HostSpawnSandboxOptions = {
   };
   readonly rootfsOverlay?: {
     readonly mode: "writable";
+    readonly source?: "virtual-fs";
   };
   readonly mounts?: readonly {
     readonly kind: "virtual-fs";
