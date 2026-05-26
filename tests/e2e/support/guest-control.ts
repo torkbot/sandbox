@@ -1,37 +1,29 @@
-import type { SandboxControlEvent, SandboxVm } from "../../../src/index.ts";
-import { collectAsync } from "./evidence.ts";
-
-function isExecComplete(
-  id: string,
-): (event: SandboxControlEvent) => event is Extract<SandboxControlEvent, { type: "guest.exec.complete" }> {
-  return (event): event is Extract<SandboxControlEvent, { type: "guest.exec.complete" }> =>
-    event.type === "guest.exec.complete" && event.id === id;
-}
+import type { SandboxProcessExecResult, SandboxRuntime } from "../../../src/index.ts";
 
 export async function execGuest(
-  vm: SandboxVm,
+  vm: SandboxRuntime,
   input: {
     readonly id: string;
     readonly argv: readonly string[];
     readonly env?: Record<string, string>;
   },
-): Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>> {
-  return await vm.control.exec(input);
+): Promise<SandboxProcessExecResult> {
+  const [command, ...args] = input.argv;
+  if (command === undefined) {
+    throw new Error("argv must contain a command");
+  }
+  return await vm.process.exec(command, args, { env: input.env });
 }
 
 export async function execGuestShell(
-  vm: SandboxVm,
+  vm: SandboxRuntime,
   input: {
     readonly id: string;
     readonly script: string;
     readonly env?: Record<string, string>;
   },
-): Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>> {
-  return await execGuest(vm, {
-    id: input.id,
-    argv: ["/bin/sh", "-lc", input.script],
-    env: input.env,
-  });
+): Promise<SandboxProcessExecResult> {
+  return await vm.process.exec("/bin/sh", ["-lc", input.script], { env: input.env });
 }
 
 export async function withTimeout<T>(

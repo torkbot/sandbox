@@ -185,9 +185,12 @@ const rootOverlay = fs.virtual(rootOverlayFs);
 const result = await sandbox.process.exec("npm", ["test"], {
   cwd: "/workspace",
   env: { CI: "1" },
-  input: "y\n",
 });
 ```
+
+`exec` is intentionally small: it buffers stdout and stderr and returns when the
+process exits. Streaming stdin/stdout/stderr belongs in the future
+`sandbox.process.spawn(...)` API.
 
 ## Internal Architecture
 

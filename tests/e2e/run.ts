@@ -15,14 +15,7 @@ const manifest = {
   platform: platform(),
   status: "running",
   scenarios: [
-    "boot-smoke",
-    "filesystem",
-    "filesystem-posix-hardening",
-    "guest-hardening",
-    "http-request-headers",
-    "libkrun-contract",
-    "network",
-    "rootfs-shaping",
+    "sandbox-api",
   ],
 };
 

@@ -6,11 +6,8 @@ import { platform } from "node:os";
 import { resolve } from "node:path";
 
 import {
-  prebuiltRootfs,
-  projectInit,
-  projectKernel,
-  spawnSandbox,
-  type SandboxControlEvent,
+  createSandboxConfig,
+  rootfs,
 } from "../src/index.ts";
 import { hostBinaryPath } from "../src/host-process.ts";
 
@@ -107,27 +104,17 @@ async function runLifecycleIteration(
 ): Promise<IterationTiming> {
   const totalStart = nowMs();
   const bootStart = totalStart;
-  const vm = await spawnSandbox({
-    name: warmup ? `lifecycle-warmup-${iteration}` : `lifecycle-benchmark-${iteration}`,
-    cpu: { vcpus: 1 },
-    memory: { mib: 512 },
-    kernel: projectKernel(),
-    init: projectInit(),
-    rootfs: prebuiltRootfs(input.rootfs, {
-      format: "erofs",
-    }),
+  const sandboxConfig = createSandboxConfig({
+    rootfs: rootfs.builtIn("alpine:3.20"),
   });
 
+  const sandbox = await sandboxConfig.boot();
   let closed = false;
   try {
-    await collectAsync(vm.control.incoming, isInitReady, 10_000);
     const bootMs = nowMs() - bootStart;
 
     const execStart = nowMs();
-    const result = await vm.control.exec({
-      id: warmup ? `warmup-${iteration}` : `benchmark-${iteration}`,
-      argv: ["/bin/sh", "-lc", input.command],
-    });
+    const result = await sandbox.process.exec("/bin/sh", ["-lc", input.command]);
     const execMs = nowMs() - execStart;
     if (result.exitCode !== 0) {
       throw new Error(
@@ -136,7 +123,7 @@ async function runLifecycleIteration(
     }
 
     const closeStart = nowMs();
-    await vm.close();
+    await sandbox.close();
     closed = true;
     const closeMs = nowMs() - closeStart;
 
@@ -151,41 +138,7 @@ async function runLifecycleIteration(
     };
   } finally {
     if (!closed) {
-      await vm.close();
-    }
-  }
-}
-
-function isInitReady(event: SandboxControlEvent): event is Extract<SandboxControlEvent, { type: "init.ready" }> {
-  return event.type === "init.ready";
-}
-
-async function collectAsync<T>(
-  iterable: AsyncIterable<T>,
-  predicate: (item: T) => boolean,
-  timeoutMs: number,
-): Promise<T> {
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      (async () => {
-        for await (const item of iterable) {
-          if (predicate(item)) {
-            return item;
-          }
-        }
-        throw new Error("Async iterable ended before the expected event was observed");
-      })(),
-      new Promise<never>((_, reject) => {
-        timeout = setTimeout(() => {
-          reject(new Error(`Timed out after ${timeoutMs}ms waiting for expected event`));
-        }, timeoutMs);
-        timeout.unref();
-      }),
-    ]);
-  } finally {
-    if (timeout !== undefined) {
-      clearTimeout(timeout);
+      await sandbox.close();
     }
   }
 }

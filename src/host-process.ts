@@ -6,27 +6,22 @@ import type { HostControlChannel } from "./control.ts";
 import type { HostSpawnSandboxOptions } from "./spawn-options.ts";
 import { isSandboxWritableFileSystem } from "./vfs.ts";
 import type {
-  SandboxOptions,
   SandboxFileSystem,
   SandboxPosixFileSystem,
-  SandboxHttpRequestHook,
-  SandboxHttpRequestSelector,
 } from "./index.ts";
+import type {
+  InternalSandboxOptions,
+  RegisteredHttpRequestHeadersHook,
+} from "./launch-options.ts";
 
 const ROOT_OVERLAY_MOUNT_PATH = "__root_overlay__";
-
-type RegisteredHttpRequestHeadersHook = {
-  readonly selector: SandboxHttpRequestSelector;
-  readonly hook: SandboxHttpRequestHook;
-  active: boolean;
-};
 
 export class HostProcessSandboxVm implements HostControlChannel {
   readonly hasControlSocket = true;
   readonly packets: AsyncIterable<Uint8Array>;
 
   readonly #child: ChildProcessWithoutNullStreams;
-  readonly #options: SandboxOptions;
+  readonly #options: InternalSandboxOptions;
   readonly #packets = new AsyncQueue<Uint8Array>();
   readonly #packetActivity = new AsyncSignal();
   readonly #hostFs = new Map<string, SandboxFileSystem>();
@@ -39,7 +34,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
 
   private constructor(
     child: ChildProcessWithoutNullStreams,
-    options: SandboxOptions,
+    options: InternalSandboxOptions,
     requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook>,
   ) {
     this.#child = child;
@@ -50,9 +45,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
       this.#hostFs.set(ROOT_OVERLAY_MOUNT_PATH, options.overlay.fileSystem);
     }
     for (const mount of options.mounts ?? []) {
-      if (mount.kind === "virtual-fs") {
-        this.#hostFs.set(mount.path, mount.fileSystem);
-      }
+      this.#hostFs.set(mount.path, mount.fileSystem);
     }
     child.stdout.on("data", (chunk: Buffer) => {
       this.#receive(chunk);
@@ -87,7 +80,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
   }
 
   static async spawn(
-    options: SandboxOptions,
+    options: InternalSandboxOptions,
     hostOptions: HostSpawnSandboxOptions,
     requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook> = new Map(),
   ): Promise<HostProcessSandboxVm> {

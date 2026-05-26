@@ -1,4 +1,4 @@
-import type { OutboundNetworkRule } from "./index.ts";
+import type { InternalOutboundNetworkRule } from "./launch-options.ts";
 
 export type HostSpawnSandboxOptions = {
   readonly name?: string;
@@ -31,7 +31,7 @@ export type HostSpawnSandboxOptions = {
   readonly network?: {
     readonly outbound?: {
       readonly policy: "deny";
-      readonly rules: readonly OutboundNetworkRule[];
+      readonly rules: readonly InternalOutboundNetworkRule[];
     };
     readonly http?: {
       readonly caCertificatePem?: string;

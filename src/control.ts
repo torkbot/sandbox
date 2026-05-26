@@ -1,12 +1,25 @@
 import type {
-  SandboxControl,
   SandboxControlCommand,
   SandboxControlEvent,
-} from "./index.ts";
+} from "./control-codec.ts";
 import {
   decodeControlEvent,
   encodeControlCommand,
 } from "./control-codec.ts";
+
+export interface SandboxControl extends Transport<SandboxControlEvent, SandboxControlCommand> {
+  exec(input: {
+    readonly id?: string;
+    readonly argv: readonly string[];
+    readonly env?: Record<string, string>;
+  }): Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>>;
+}
+
+export interface Transport<TIncoming = unknown, TOutgoing = unknown> {
+  readonly incoming: AsyncIterable<TIncoming>;
+  send(message: TOutgoing): Promise<void>;
+  close(): Promise<void>;
+}
 
 export interface HostControlChannel {
   readonly packets: AsyncIterable<Uint8Array>;
