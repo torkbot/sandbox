@@ -2,6 +2,7 @@ import type {
   SandboxFileSystem,
   HttpRequestMiddleware,
   SandboxBlockStore,
+  SandboxBlockStoreContext,
 } from "./index.ts";
 
 export interface SandboxHttpRequestSelector {
@@ -60,6 +61,7 @@ export interface InternalSandboxOptions {
       readonly kind: "cow-block-store";
       readonly blockSize: number;
       readonly blockStore: SandboxBlockStore;
+      readonly context: SandboxBlockStoreContext;
     };
   };
   readonly mounts?: readonly InternalMount[];

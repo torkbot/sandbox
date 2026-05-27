@@ -138,16 +138,25 @@ The block store interface is intentionally storage-agnostic:
 ```ts
 interface SandboxBlockStore {
   readonly blockSize: number;
-  list(): Promise<readonly bigint[]>;
-  read(range: SandboxBlockRange): Promise<readonly SandboxBlockChunk[]>;
-  write(chunks: readonly SandboxBlockChunk[]): Promise<void>;
-  flush?(): Promise<void>;
+  list(context: SandboxBlockStoreContext): Promise<readonly bigint[]>;
+  read(
+    range: SandboxBlockRange,
+    context: SandboxBlockStoreContext,
+  ): Promise<readonly SandboxBlockChunk[]>;
+  write(
+    chunks: readonly SandboxBlockChunk[],
+    context: SandboxBlockStoreContext,
+  ): Promise<void>;
+  flush?(context: SandboxBlockStoreContext): Promise<void>;
 }
 ```
 
-`list()` returns the block IDs currently present in the COW store. The Rust
-block backend reads that manifest once at boot, so clean base-image blocks are
-served without asking JavaScript. Dirty blocks are read lazily and writes are
+The `context.base` value identifies the exact built-in base image for this boot.
+The sandbox library passes it through to every block-store operation; user-space
+storage can use it to namespace blocks, reject mismatched snapshots, or migrate
+state. `list()` returns the block IDs currently present in the COW store. The
+Rust block backend reads that manifest once at boot, so clean base-image blocks
+are served without asking JavaScript. Dirty blocks are read lazily and writes are
 batched back through `write(...)` on flush.
 
 A writable COW block store must be attached to at most one running sandbox

@@ -7,6 +7,7 @@ import type { HostSpawnSandboxOptions } from "./spawn-options.ts";
 import { isSandboxWritableFileSystem } from "./vfs.ts";
 import type {
   SandboxFileSystem,
+  SandboxBlockStoreContext,
   SandboxBlockStore,
   SandboxPosixFileSystem,
 } from "./index.ts";
@@ -28,6 +29,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
   readonly #launchReady = new AsyncSignal("sandbox-host launch acknowledgement closed");
   readonly #hostFs = new Map<string, SandboxFileSystem>();
   readonly #rootBlockStore?: SandboxBlockStore;
+  readonly #rootBlockStoreContext?: SandboxBlockStoreContext;
   readonly #requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook>;
   #buffer = new Uint8Array();
   #stderr = "";
@@ -45,6 +47,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
     this.packets = this.#packets;
     this.#requestHeaderHooks = requestHeaderHooks;
     this.#rootBlockStore = options.rootfs.storage?.blockStore;
+    this.#rootBlockStoreContext = options.rootfs.storage?.context;
     for (const mount of options.mounts ?? []) {
       this.#hostFs.set(mount.path, mount.fileSystem);
     }
@@ -621,7 +624,8 @@ export class HostProcessSandboxVm implements HostControlChannel {
     const id = typeof document.id === "string" ? document.id : "";
     try {
       const blockStore = this.#rootBlockStore;
-      if (blockStore === undefined) {
+      const blockStoreContext = this.#rootBlockStoreContext;
+      if (blockStore === undefined || blockStoreContext === undefined) {
         throw new Error("root block store is not configured");
       }
 
@@ -631,7 +635,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
             type: "host.block.response",
             id,
             ok: true,
-            blocks: (await blockStore.list()).map((block) => block.toString()),
+            blocks: (await blockStore.list(blockStoreContext)).map((block) => block.toString()),
           }));
           return;
         }
@@ -639,7 +643,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
           const chunks = await blockStore.read({
             start: BigInt(assertString(document.start, "start")),
             count: assertNumber(document.count, "count"),
-          });
+          }, blockStoreContext);
           this.#tryWriteToHost(encodePacket({
             type: "host.block.response",
             id,
@@ -656,7 +660,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
             start: BigInt(assertString(chunk.start, "chunks.start")),
             data: binaryField(chunk.data, "chunks.data"),
           }));
-          await blockStore.write(chunks);
+          await blockStore.write(chunks, blockStoreContext);
           this.#tryWriteToHost(encodePacket({
             type: "host.block.response",
             id,
@@ -665,7 +669,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
           return;
         }
         case "host.block.flush": {
-          await blockStore.flush?.();
+          await blockStore.flush?.(blockStoreContext);
           this.#tryWriteToHost(encodePacket({
             type: "host.block.response",
             id,

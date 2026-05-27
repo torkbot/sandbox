@@ -1,5 +1,5 @@
-import test from "node:test";
 import assert from "node:assert/strict";
+import test from "node:test";
 import {
   defineSandbox,
   fs,
@@ -19,7 +19,11 @@ test("new public API boots a built-in rootfs and runs a process", async (t) => {
 
   const result = await sandbox.exec("/bin/sh", ["-lc", "printf '%s' ready"]);
 
-  assert.equal(result.exitCode, 0, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+  assert.equal(
+    result.exitCode,
+    0,
+    `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+  );
   assert.equal(result.stdout, "ready");
   assert.equal(result.stderr, "");
 });
@@ -94,6 +98,8 @@ test("COW rootfs round-trips rootfs mutations across instances", async (t) => {
 
   assert.equal(read.exitCode, 0, read.stderr);
   assert.equal(read.stdout, "persisted");
+  assert.deepEqual(blockStore.observedBaseIdentities().length, 1);
+  assert.match(blockStore.observedBaseIdentities()[0] ?? "", /built-in:alpine:3\.20:ext4:/);
 });
 
 test("COW rootfs close sync ignores the instance cwd", async (t) => {
@@ -111,14 +117,18 @@ test("COW rootfs close sync ignores the instance cwd", async (t) => {
 
   const first = await sandboxDefinition.boot({ cwd: "/tmp/close-cwd" });
   try {
-    const prepare = await first.exec("/bin/mkdir", ["-p", "/tmp/close-cwd"], { cwd: "/" });
+    const prepare = await first.exec("/bin/mkdir", ["-p", "/tmp/close-cwd"], {
+      cwd: "/",
+    });
     assert.equal(prepare.exitCode, 0, prepare.stderr);
     const write = await first.exec("/bin/sh", [
       "-lc",
       "printf '%s' cwd-independent > /root/close-sync.txt",
     ]);
     assert.equal(write.exitCode, 0, write.stderr);
-    const removeCwd = await first.exec("/bin/rm", ["-rf", "/tmp/close-cwd"], { cwd: "/" });
+    const removeCwd = await first.exec("/bin/rm", ["-rf", "/tmp/close-cwd"], {
+      cwd: "/",
+    });
     assert.equal(removeCwd.exitCode, 0, removeCwd.stderr);
   } finally {
     await first.close();
@@ -131,14 +141,17 @@ test("COW rootfs close sync ignores the instance cwd", async (t) => {
   assert.equal(read.stdout, "cwd-independent");
 });
 
-function memoryBlockStore(): SandboxBlockStore {
+function memoryBlockStore(): SandboxBlockStore & { observedBaseIdentities(): readonly string[] } {
   const blocks = new Map<bigint, Uint8Array>();
+  const baseIdentities = new Set<string>();
   return {
     blockSize: 4096,
-    async list() {
+    async list(context) {
+      baseIdentities.add(context.base);
       return Array.from(blocks.keys());
     },
-    async read(range) {
+    async read(range, context) {
+      baseIdentities.add(context.base);
       const chunks = [];
       for (let offset = 0; offset < range.count; offset += 1) {
         const start = range.start + BigInt(offset);
@@ -149,10 +162,17 @@ function memoryBlockStore(): SandboxBlockStore {
       }
       return chunks;
     },
-    async write(chunks) {
+    async write(chunks, context) {
+      baseIdentities.add(context.base);
       for (const chunk of chunks) {
         blocks.set(chunk.start, chunk.data);
       }
+    },
+    async flush(context) {
+      baseIdentities.add(context.base);
+    },
+    observedBaseIdentities() {
+      return Array.from(baseIdentities);
     },
   };
 }

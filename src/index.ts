@@ -1,4 +1,7 @@
-import { builtInRootfsPath } from "./artifacts.ts";
+import {
+  builtInRootfsIdentity,
+  builtInRootfsPath,
+} from "./artifacts.ts";
 import { HostControlTransport } from "./control.ts";
 import { HostProcessSandboxVm } from "./host-process.ts";
 import { createMemoryFileSystem } from "./memory-fs.ts";
@@ -15,8 +18,6 @@ import type {
   RegisteredHttpRequestHeadersHook,
   SandboxHttpRequestSelector,
 } from "./launch-options.ts";
-
-const CLOSE_SYNC_TIMEOUT_MS = 1_000;
 
 export type SandboxFileType = "file" | "directory" | "symlink";
 
@@ -126,12 +127,16 @@ export type SandboxBlockChunk = {
   readonly data: Uint8Array;
 };
 
+export type SandboxBlockStoreContext = {
+  readonly base: string;
+};
+
 export interface SandboxBlockStore {
   readonly blockSize: number;
-  list(): Promise<readonly bigint[]>;
-  read(range: SandboxBlockRange): Promise<readonly SandboxBlockChunk[]>;
-  write(chunks: readonly SandboxBlockChunk[]): Promise<void>;
-  flush?(): Promise<void>;
+  list(context: SandboxBlockStoreContext): Promise<readonly bigint[]>;
+  read(range: SandboxBlockRange, context: SandboxBlockStoreContext): Promise<readonly SandboxBlockChunk[]>;
+  write(chunks: readonly SandboxBlockChunk[], context: SandboxBlockStoreContext): Promise<void>;
+  flush?(context: SandboxBlockStoreContext): Promise<void>;
 }
 
 export type HttpRequestMiddleware = (
@@ -350,11 +355,7 @@ class HostBackedSandboxVm implements SandboxVm {
     let syncError: unknown;
     if (this.#options.rootfs.storage !== undefined) {
       try {
-        const result = await withTimeout(
-          this.#rootExec.exec("/bin/sync"),
-          CLOSE_SYNC_TIMEOUT_MS,
-          "sandbox close sync timed out",
-        );
+        const result = await this.#rootExec.exec("/bin/sync");
         if (result.exitCode !== 0) {
           throw new Error(`sandbox close sync failed with exit code ${result.exitCode}: ${result.stderr}`);
         }
@@ -382,22 +383,6 @@ class HostBackedSandboxVm implements SandboxVm {
     options: SandboxExecOptions = {},
   ): Promise<SandboxExecResult> {
     return await this.#exec.exec(command, args, options);
-  }
-}
-
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<never>((_, reject) => {
-        timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timeout !== undefined) {
-      clearTimeout(timeout);
-    }
   }
 }
 
@@ -496,7 +481,7 @@ async function toInternalSandboxOptions(
   boot: SandboxBootOptions,
   network?: InternalNetworkConfig,
 ): Promise<InternalSandboxOptions> {
-  const rootfs = lowerRootfs(config.rootfs);
+  const rootfs = await lowerRootfs(config.rootfs);
   return {
     resources: config.resources,
     rootfs,
@@ -572,9 +557,9 @@ function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPoli
   };
 }
 
-function lowerRootfs(
+async function lowerRootfs(
   rootfs: Rootfs,
-): InternalSandboxOptions["rootfs"] {
+): Promise<InternalSandboxOptions["rootfs"]> {
   switch (rootfs.kind) {
     case "built-in-rootfs":
       return {
@@ -591,6 +576,9 @@ function lowerRootfs(
           kind: "cow-block-store",
           blockSize: rootfs.writable.blockSize,
           blockStore: rootfs.writable,
+          context: {
+            base: builtInRootfsIdentity(rootfs.base.name, "ext4"),
+          },
         },
       };
   }

@@ -64,6 +64,25 @@ export function builtInRootfsPath(name: "alpine:3.20", format: BuiltInRootfsForm
   throw new Error(`unsupported built-in rootfs: ${name satisfies never}`);
 }
 
+export function builtInRootfsIdentity(name: "alpine:3.20", format: BuiltInRootfsFormat): string {
+  if (name === "alpine:3.20") {
+    const target = currentSandboxTarget();
+    const packageVersion = platformPackageVersion(target);
+    return [
+      "built-in",
+      name,
+      format,
+      target.platform,
+      target.arch,
+      target.libc ?? "none",
+      target.packageName,
+      packageVersion,
+      target.rootfsNames[format],
+    ].join(":");
+  }
+  throw new Error(`unsupported built-in rootfs: ${name satisfies never}`);
+}
+
 export function rawHostBinaryPath(): string {
   const target = currentSandboxTarget();
   return resolveArtifactPath(target, target.hostBinaryName);
@@ -81,6 +100,17 @@ function resolveArtifactPath(
       `missing ${target.packageName} artifact ${artifactName}; reinstall @torkbot/sandbox for ${process.platform}-${process.arch}, or run npm run artifacts:link-current after building local artifacts. ${installError}`,
     );
   }
+}
+
+function platformPackageVersion(target: SandboxTarget): string {
+  try {
+    const packageJson = require(`${target.packageName}/package.json`) as { version?: unknown };
+    if (typeof packageJson.version === "string" && packageJson.version.length > 0) {
+      return packageJson.version;
+    }
+  } catch {
+  }
+  return "unknown";
 }
 
 export function assertMacosHostIsSigned(path: string): void {
