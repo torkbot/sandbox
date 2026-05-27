@@ -542,7 +542,7 @@ function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPoli
       outbound: {
         policy: "deny",
         rules: [
-          { action: "accept", protocol: "tcp", cidr: "0.0.0.0/0" },
+          { action: "accept", scope: "public-internet" },
           { action: "accept", protocol: "udp", cidr: "10.0.2.1/32", ports: [53] },
         ],
       },

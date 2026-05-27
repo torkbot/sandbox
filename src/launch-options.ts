@@ -20,6 +20,11 @@ export type InternalOutboundNetworkRule =
       readonly protocol: "udp";
       readonly cidr: string;
       readonly ports?: readonly number[];
+    }
+  | {
+      readonly action: "accept";
+      readonly scope: "public-internet";
+      readonly ports?: readonly number[];
     };
 
 export interface InternalNetworkConfig {
