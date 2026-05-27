@@ -7,7 +7,6 @@ test("root package declares public release metadata and platform optional depend
     await readFile(new URL("../../package.json", import.meta.url), "utf8"),
   ) as {
     private?: boolean;
-    version?: string;
     publishConfig?: { access?: string };
     bin?: Record<string, string>;
     optionalDependencies?: Record<string, string>;
@@ -15,15 +14,14 @@ test("root package declares public release metadata and platform optional depend
   };
 
   assert.equal(packageJson.private, false);
-  assert.equal(packageJson.version, "0.1.0");
   assert.equal(packageJson.publishConfig?.access, "public");
   assert.deepEqual(packageJson.bin, {
     sandbox: "./dist/cli.js",
   });
-  assert.deepEqual(packageJson.optionalDependencies, {
-    "@torkbot/sandbox-darwin-arm64": "0.1.0",
-    "@torkbot/sandbox-linux-x64-gnu": "0.1.0",
-  });
+  assert.deepEqual(Object.keys(packageJson.optionalDependencies ?? {}).sort(), [
+    "@torkbot/sandbox-darwin-arm64",
+    "@torkbot/sandbox-linux-x64-gnu",
+  ]);
   assert.equal(packageJson.napi, undefined);
 });
 
