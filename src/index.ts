@@ -3,7 +3,10 @@ import { resolve } from "node:path";
 import { HostControlTransport } from "./control.ts";
 import { HostProcessSandboxVm } from "./host-process.ts";
 import { createMemoryFileSystem } from "./memory-fs.ts";
-import { isSandboxWritableFileSystem } from "./vfs.ts";
+import {
+  isSandboxPosixFileSystem,
+  isSandboxWritableFileSystem,
+} from "./vfs.ts";
 import type { HostSpawnSandboxOptions } from "./spawn-options.ts";
 import type { SandboxControl } from "./control.ts";
 import type { SandboxControlEvent } from "./control-codec.ts";
@@ -103,7 +106,7 @@ export type SandboxFileSystemSource = {
 
 export type SandboxWritableFileSystemSource = {
   readonly kind: "virtual-fs";
-  readonly fileSystem: SandboxWritableFileSystem;
+  readonly fileSystem: SandboxPosixFileSystem;
 };
 
 export type HttpRequestMiddleware = (
@@ -537,8 +540,8 @@ function validateSandboxDefinitionOptions(options: SandboxDefinitionOptions): vo
   ) {
     throw new Error("invalid sandbox definition: resources.memoryMiB must be a positive integer");
   }
-  if (options.overlay !== undefined && !isSandboxWritableFileSystem(options.overlay.fileSystem)) {
-    throw new Error("invalid sandbox definition: overlay filesystem must be writable");
+  if (options.overlay !== undefined && !isSandboxPosixFileSystem(options.overlay.fileSystem)) {
+    throw new Error("invalid sandbox definition: overlay filesystem must support POSIX operations");
   }
   if (options.network !== undefined && options.network.kind !== "network-policy") {
     throw new Error("invalid sandbox definition: network must be created with network.policy(...)");

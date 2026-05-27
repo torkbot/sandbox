@@ -7,7 +7,6 @@ import {
   rootfs,
   type SandboxFileSystem,
   type SandboxWritableFileSystem,
-  type SandboxWritableFileSystemSource,
 } from "../../src/index.ts";
 
 test("rootfs.builtIn creates a typed built-in rootfs reference", () => {
@@ -69,6 +68,24 @@ test("fs.memory creates user overlay whiteouts for rename whiteout", async () =>
   assert.deepEqual(await fileSystem.getxattr("/source.txt", "user.overlay.whiteout"), new Uint8Array());
 });
 
+test("fs.memory reports symlink target size and refuses replacement", async () => {
+  const fileSystem = fs.memory({
+    files: {
+      "/existing.txt": "existing",
+    },
+  });
+
+  const stat = await fileSystem.symlink("target.txt", "/link.txt");
+
+  assert.equal(stat.type, "symlink");
+  assert.equal(stat.sizeBytes, new TextEncoder().encode("target.txt").byteLength);
+  assert.equal((await fileSystem.stat("/link.txt")).sizeBytes, stat.sizeBytes);
+  await assert.rejects(
+    fileSystem.symlink("target.txt", "/existing.txt"),
+    /path exists: \/existing\.txt/,
+  );
+});
+
 test("defineSandbox accepts resource limits", () => {
   const sandbox = defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.20"),
@@ -81,13 +98,13 @@ test("defineSandbox accepts resource limits", () => {
   assert.equal(typeof sandbox.boot, "function");
 });
 
-test("defineSandbox rejects read-only overlay filesystems", () => {
+test("defineSandbox rejects non-POSIX overlay filesystems", () => {
   assert.throws(
     () => defineSandbox({
       rootfs: rootfs.builtIn("alpine:3.20"),
-      overlay: fs.virtual(readOnlyFileSystem()) as SandboxWritableFileSystemSource,
+      overlay: fs.virtual(writableFileSystem()) as never,
     }),
-    /invalid sandbox definition: overlay filesystem must be writable/,
+    /invalid sandbox definition: overlay filesystem must support POSIX operations/,
   );
 });
 

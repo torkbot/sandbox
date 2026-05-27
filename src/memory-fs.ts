@@ -161,6 +161,9 @@ export function createMemoryFileSystem(options: MemoryFileSystemOptions = {}): S
     },
     async symlink(target, path) {
       const parent = ensureDirectory(parentPath(path));
+      if (parent.entries.has(baseName(path))) {
+        throw new Error(`path exists: ${path}`);
+      }
       const node: MemoryNode = {
         type: "symlink",
         target,
@@ -275,7 +278,11 @@ export function createMemoryFileSystem(options: MemoryFileSystemOptions = {}): S
 function nodeStat(node: MemoryNode): SandboxFileStat {
   return {
     type: node.type,
-    sizeBytes: node.type === "file" ? node.contents.byteLength : null,
+    sizeBytes: node.type === "file"
+      ? node.contents.byteLength
+      : node.type === "symlink"
+        ? new TextEncoder().encode(node.target).byteLength
+        : null,
     mediaType: null,
     modifiedAtMs: null,
     writable: node.writable,

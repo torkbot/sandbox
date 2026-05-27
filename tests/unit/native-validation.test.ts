@@ -6,7 +6,6 @@ import {
   rootfs,
   type SandboxFileSystem,
   type SandboxWritableFileSystem,
-  type SandboxWritableFileSystemSource,
 } from "../../src/index.ts";
 
 test("defineSandbox rejects non-built-in rootfs objects", () => {
@@ -27,13 +26,13 @@ test("defineSandbox rejects unsupported built-in rootfs names", () => {
   );
 });
 
-test("defineSandbox rejects read-only overlay filesystems", () => {
+test("defineSandbox rejects non-POSIX overlay filesystems", () => {
   assert.throws(
     () => defineSandbox({
       rootfs: rootfs.builtIn("alpine:3.20"),
-      overlay: fs.virtual(readOnlyFileSystem()) as SandboxWritableFileSystemSource,
+      overlay: fs.virtual(writableFileSystem()) as never,
     }),
-    /invalid sandbox definition: overlay filesystem must be writable/,
+    /invalid sandbox definition: overlay filesystem must support POSIX operations/,
   );
 });
 
