@@ -73,12 +73,13 @@ fn prepare_rootfs_overlay(
         .map_err(|error| InitError(format!("create overlay workdir: {error}")))?;
     std::fs::create_dir_all("/run/sandbox-rootfs-root")
         .map_err(|error| InitError(format!("create overlay root: {error}")))?;
-    diagnose_overlay_upper(&workdir);
+    let overlay_upper_diagnostics = diagnose_overlay_upper(&workdir);
 
     mount_overlay_root(
         "/run/sandbox-rootfs-root",
         &format!("lowerdir=/,upperdir={upperdir},workdir={workdir},userxattr"),
-    )?;
+    )
+    .map_err(|error| InitError(format!("{error}; {overlay_upper_diagnostics}")))?;
 
     std::env::set_current_dir("/run/sandbox-rootfs-root")
         .map_err(|error| InitError(format!("chdir overlay root: {error}")))?;
@@ -94,14 +95,17 @@ fn raise_console_log_level() {
 }
 
 #[cfg(target_os = "linux")]
-fn diagnose_overlay_upper(workdir: &str) {
-    diagnose_overlay_dtype(workdir);
-    diagnose_overlay_xattr(workdir);
-    diagnose_overlay_rename_whiteout(workdir);
+fn diagnose_overlay_upper(workdir: &str) -> String {
+    format!(
+        "overlay preflight: d_type={}, userxattr={}, rename_whiteout={}",
+        diagnose_overlay_dtype(workdir),
+        diagnose_overlay_xattr(workdir),
+        diagnose_overlay_rename_whiteout(workdir)
+    )
 }
 
 #[cfg(target_os = "linux")]
-fn diagnose_overlay_dtype(workdir: &str) {
+fn diagnose_overlay_dtype(workdir: &str) -> String {
     let path = format!("{workdir}/__sandbox_dtype_probe");
     let result = std::fs::create_dir(&path)
         .and_then(|()| {
@@ -115,17 +119,20 @@ fn diagnose_overlay_dtype(workdir: &str) {
             Ok(found)
         })
         .map_err(|error| error.to_string());
-    eprintln!("sandbox-init overlay preflight d_type={result:?}");
     let _ = std::fs::remove_dir(&path);
+    match result {
+        Ok(found) => found.to_string(),
+        Err(error) => format!("err:{error}"),
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn diagnose_overlay_xattr(workdir: &str) {
+fn diagnose_overlay_xattr(workdir: &str) -> String {
     use std::ffi::CString;
 
     let path = match CString::new(workdir) {
         Ok(path) => path,
-        Err(_) => return,
+        Err(error) => return format!("err:{error}"),
     };
     let name = CString::new("user.overlay.opaque").unwrap();
     let result = unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), b"0".as_ptr().cast(), 1, 0) };
@@ -134,12 +141,12 @@ fn diagnose_overlay_xattr(workdir: &str) {
     } else {
         std::io::Error::last_os_error().to_string()
     };
-    eprintln!("sandbox-init overlay preflight userxattr={status}");
     let _ = unsafe { libc::removexattr(path.as_ptr(), name.as_ptr()) };
+    status
 }
 
 #[cfg(target_os = "linux")]
-fn diagnose_overlay_rename_whiteout(workdir: &str) {
+fn diagnose_overlay_rename_whiteout(workdir: &str) -> String {
     use std::ffi::CString;
 
     let source = format!("{workdir}/__sandbox_rename_whiteout_source");
@@ -147,11 +154,11 @@ fn diagnose_overlay_rename_whiteout(workdir: &str) {
     let _ = std::fs::write(&source, b"x");
     let source_c = match CString::new(source.as_str()) {
         Ok(path) => path,
-        Err(_) => return,
+        Err(error) => return format!("err:{error}"),
     };
     let dest_c = match CString::new(dest.as_str()) {
         Ok(path) => path,
-        Err(_) => return,
+        Err(error) => return format!("err:{error}"),
     };
     let result = unsafe {
         libc::syscall(
@@ -163,18 +170,16 @@ fn diagnose_overlay_rename_whiteout(workdir: &str) {
             libc::RENAME_WHITEOUT,
         )
     };
-    if result != 0 {
-        eprintln!(
-            "sandbox-init overlay preflight rename_whiteout=err:{}",
-            std::io::Error::last_os_error()
-        );
+    let status = if result != 0 {
+        format!("err:{}", std::io::Error::last_os_error())
     } else {
         let whiteout_xattr = getxattr_size(&source, "user.overlay.whiteout")
             .map_or_else(|error| format!("err:{error}"), |size| format!("ok:{size}"));
-        eprintln!("sandbox-init overlay preflight rename_whiteout=ok xattr={whiteout_xattr}");
-    }
+        format!("ok xattr={whiteout_xattr}")
+    };
     let _ = std::fs::remove_file(&source);
     let _ = std::fs::remove_file(&dest);
+    status
 }
 
 #[cfg(target_os = "linux")]
