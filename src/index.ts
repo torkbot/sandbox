@@ -3,7 +3,6 @@ import { HostControlTransport } from "./control.ts";
 import { HostProcessSandboxVm } from "./host-process.ts";
 import { createMemoryFileSystem } from "./memory-fs.ts";
 import {
-  isSandboxPosixFileSystem,
   isSandboxWritableFileSystem,
 } from "./vfs.ts";
 import type { HostSpawnSandboxOptions } from "./spawn-options.ts";
@@ -108,6 +107,28 @@ export type SandboxWritableFileSystemSource = {
   readonly fileSystem: SandboxPosixFileSystem;
 };
 
+export type SandboxBlockRange = {
+  readonly start: bigint;
+  readonly count: number;
+};
+
+export type SandboxBlockChunk = {
+  readonly start: bigint;
+  readonly data: Uint8Array;
+};
+
+export interface SandboxBlockStore {
+  readonly blockSize: number;
+  read(range: SandboxBlockRange): Promise<readonly SandboxBlockChunk[]>;
+  write(chunks: readonly SandboxBlockChunk[]): Promise<void>;
+  flush?(): Promise<void>;
+}
+
+export type SandboxRootStorage = {
+  readonly kind: "cow-block-store";
+  readonly blockStore: SandboxBlockStore;
+};
+
 export type HttpRequestMiddleware = (
   request: SandboxHttpRequest,
 ) => void | Promise<void>;
@@ -150,7 +171,7 @@ type NetworkPolicyHookRegistration = {
 export interface SandboxDefinitionOptions {
   readonly rootfs: Rootfs;
   readonly resources?: SandboxResourceLimits;
-  readonly overlay?: SandboxWritableFileSystemSource;
+  readonly storage?: SandboxRootStorage;
   readonly network?: NetworkPolicy;
 }
 
@@ -221,6 +242,15 @@ export const fs = {
   virtual: virtualFs,
 };
 
+export const storage = {
+  cow(blockStore: SandboxBlockStore): SandboxRootStorage {
+    return {
+      kind: "cow-block-store",
+      blockStore,
+    };
+  },
+};
+
 export const network = {
   policy(onConnectionRequest: NetworkConnectionRequestHandler): NetworkPolicy {
     return {
@@ -249,6 +279,9 @@ class DefinedSandbox implements SandboxDefinition {
 
   async boot(options: SandboxBootOptions = {}): Promise<SandboxInstance> {
     validateSandboxBootOptions(options);
+    if (this.#options.storage !== undefined) {
+      throw new Error("unsupported sandbox options: storage.cow(...) root storage is not wired to the guest block device yet");
+    }
     const networkPolicy = this.#options.network === undefined
       ? undefined
       : createNetworkPolicyHookRegistration(this.#options.network);
@@ -403,12 +436,6 @@ function toHostSpawnOptions(
       crateName: "sandbox-init",
     },
     rootfs: options.rootfs,
-    rootfsOverlay: options.overlay === undefined
-      ? undefined
-      : {
-        mode: "writable",
-        source: "virtual-fs",
-      },
     mounts: options.mounts?.map((mount) => {
       return {
         kind: "virtual-fs",
@@ -429,7 +456,7 @@ function toInternalSandboxOptions(
   return {
     resources: config.resources,
     rootfs: baseRootfs,
-    overlay: config.overlay,
+    storage: config.storage,
     cwd: boot.cwd,
     mounts: Object.entries(boot.mounts ?? {}).map(([path, source]) => {
       return {
@@ -528,11 +555,23 @@ function validateSandboxDefinitionOptions(options: SandboxDefinitionOptions): vo
   ) {
     throw new Error("invalid sandbox definition: resources.memoryMiB must be a positive integer");
   }
-  if (options.overlay !== undefined && !isSandboxPosixFileSystem(options.overlay.fileSystem)) {
-    throw new Error("invalid sandbox definition: overlay filesystem must support POSIX operations");
+  if (options.storage !== undefined) {
+    validateRootStorage(options.storage);
   }
   if (options.network !== undefined && options.network.kind !== "network-policy") {
     throw new Error("invalid sandbox definition: network must be created with network.policy(...)");
+  }
+}
+
+function validateRootStorage(storage: SandboxRootStorage): void {
+  if (storage.kind !== "cow-block-store") {
+    throw new Error("invalid sandbox definition: storage must be created with storage.cow(...)");
+  }
+  if (!Number.isInteger(storage.blockStore.blockSize) || storage.blockStore.blockSize <= 0) {
+    throw new Error("invalid sandbox definition: storage block size must be a positive integer");
+  }
+  if (storage.blockStore.blockSize % 512 !== 0) {
+    throw new Error("invalid sandbox definition: storage block size must be a multiple of 512 bytes");
   }
 }
 

@@ -14,7 +14,6 @@ import type {
   RegisteredHttpRequestHeadersHook,
 } from "./launch-options.ts";
 
-const ROOT_OVERLAY_MOUNT_PATH = "__root_overlay__";
 const DEFAULT_LAUNCH_TIMEOUT_MS = 60_000;
 
 export class HostProcessSandboxVm implements HostControlChannel {
@@ -43,9 +42,6 @@ export class HostProcessSandboxVm implements HostControlChannel {
     this.#options = options;
     this.packets = this.#packets;
     this.#requestHeaderHooks = requestHeaderHooks;
-    if (options.overlay !== undefined) {
-      this.#hostFs.set(ROOT_OVERLAY_MOUNT_PATH, options.overlay.fileSystem);
-    }
     for (const mount of options.mounts ?? []) {
       this.#hostFs.set(mount.path, mount.fileSystem);
     }
@@ -917,8 +913,6 @@ function encodeHostSpawn(options: HostSpawnSandboxOptions): Uint8Array {
     rootfsPath: options.rootfs.path,
     rootfsReadonly: options.rootfs.readonly,
     rootfsFormat: options.rootfs.format,
-    rootfsOverlayMode: options.rootfsOverlay?.mode,
-    rootfsOverlaySource: options.rootfsOverlay?.source,
     mounts: options.mounts ?? [],
     networkOutbound: options.network?.outbound,
     networkHttp: options.network?.http === undefined ? undefined : options.network.http,

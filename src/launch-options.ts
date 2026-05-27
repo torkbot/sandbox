@@ -1,7 +1,7 @@
 import type {
   SandboxFileSystem,
   HttpRequestMiddleware,
-  SandboxWritableFileSystemSource,
+  SandboxRootStorage,
 } from "./index.ts";
 
 export interface SandboxHttpRequestSelector {
@@ -52,7 +52,7 @@ export interface InternalSandboxOptions {
     readonly readonly?: boolean;
     readonly format: "erofs";
   };
-  readonly overlay?: SandboxWritableFileSystemSource;
+  readonly storage?: SandboxRootStorage;
   readonly mounts?: readonly InternalMount[];
   readonly network?: InternalNetworkConfig;
   readonly cwd?: string;

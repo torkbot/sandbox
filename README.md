@@ -94,7 +94,7 @@ type SandboxDefinition = {
     cpus?: number;
     memoryMiB?: number;
   };
-  overlay?: SandboxWritableFileSystemSource;
+  storage?: SandboxRootStorage;
   network?: NetworkPolicy;
 };
 ```
@@ -119,15 +119,31 @@ defineSandbox({
 });
 ```
 
-`overlay` is optional. When present, Sandbox uses that writable filesystem to
-store copy-on-write data and deletion masks over the immutable rootfs. When
-absent, the guest root filesystem is read-only.
+`storage` is optional. When present, it describes copy-on-write block storage for
+rootfs mutations. The sandbox library owns the COW block-device contract;
+user-space owns the block store's durability, compression, migration, and
+checkpoint policy. When absent, the guest root filesystem is read-only.
 
 ```ts
+import { storage } from "@torkbot/sandbox";
+
+const rootBlocks = storage.cow(laneBlockStore);
+
 defineSandbox({
   rootfs: rootfs.builtIn("alpine:3.20"),
-  overlay: fs.virtual(rootOverlayFs),
+  storage: rootBlocks,
 });
+```
+
+The block store interface is intentionally storage-agnostic:
+
+```ts
+interface SandboxBlockStore {
+  readonly blockSize: number;
+  read(range: SandboxBlockRange): Promise<readonly SandboxBlockChunk[]>;
+  write(chunks: readonly SandboxBlockChunk[]): Promise<void>;
+  flush?(): Promise<void>;
+}
 ```
 
 `network` is optional. When omitted, egress is denied. A network policy receives
@@ -190,8 +206,7 @@ in the selected rootfs; the built-in Alpine rootfs includes `/workspace`,
 
 ### Filesystems
 
-`fs.memory(...)` creates a real in-memory POSIX filesystem that can be mounted
-or used as root overlay storage:
+`fs.memory(...)` creates a real in-memory POSIX filesystem that can be mounted:
 
 ```ts
 const workspaceFs = fs.memory({
@@ -202,12 +217,10 @@ const workspaceFs = fs.memory({
 ```
 
 `fs.virtual(...)` adapts any compatible user-space JavaScript filesystem to
-Sandbox. The same filesystem abstraction can be used for mounts and for the root
-overlay:
+Sandbox mounts:
 
 ```ts
 const workspace = fs.virtual(workspaceFs);
-const rootOverlay = fs.virtual(rootOverlayFs);
 ```
 
 ### Processes
@@ -236,8 +249,9 @@ TypeScript API:
 - A signed `sandbox-host` helper owns the Node/Rust/libkrun boundary.
 - Guest control traffic uses an implicit fd-backed transport between the host
   and Sandbox init.
-- Host-implemented virtual filesystems are mounted into the guest and can also
-  provide the root overlay's copy-on-write storage.
+- Host-implemented virtual filesystems are mounted into the guest.
+- Rootfs mutation persistence is modeled as block-level copy-on-write storage,
+  not as a guest-visible POSIX filesystem.
 - Network egress is default-deny. Native code should enforce fast-path policy
   decisions and delegate to JavaScript only when a policy callback is required.
 - HTTP request middleware is caller-provided JavaScript, but Sandbox owns the
@@ -255,7 +269,7 @@ durability, network policy state, confirmation flows, and credential brokering.
 - implicit fd-backed host control sockets owned by Sandbox,
 - avoid host filesystem coordination unless it is intrinsic to the artifact; prefer file descriptors, database handles, bytes, and async iterables over paths,
 - build-time rootfs shaping, with built-in rootfs artifacts selected by typed logical names at VM instantiation,
-- immutable rootfs by default, with optional copy-on-write overlay data supplied by a user-space writable filesystem,
+- immutable rootfs by default, with optional copy-on-write root storage supplied by a user-space block store,
 - generic guest-visible mounts backed by the same user-space filesystem abstraction,
 - programmable virtual filesystems backed by TypeScript callbacks,
 - transparent HTTP interception with TypeScript request-header hooks,

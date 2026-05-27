@@ -10,7 +10,7 @@ use std::thread::{self, JoinHandle};
 use base64::Engine;
 
 use crate::MicroVmSpec;
-use crate::config::{KernelFormat, RootfsFormat, RootfsOverlaySpec};
+use crate::config::{KernelFormat, RootfsFormat};
 use crate::control::INIT_CONTROL_PORT;
 use crate::http_flow::HttpInterceptRuntime;
 use crate::network::OutboundRulePlan;
@@ -259,15 +259,9 @@ impl KrunContext {
         let encoded_mounts = encode_virtual_fs_mounts(virtual_fs);
         let mount_arg = CString::new(format!("--virtiofs-mounts={encoded_mounts}")).unwrap();
         let http_network_arg = CString::new("--http-network").unwrap();
-        let rootfs_overlay_arg = CString::new("--rootfs-overlay=writable").unwrap();
-        let rootfs_overlay_tag_arg =
-            CString::new("--rootfs-overlay-virtiofs=rootfsoverlay").unwrap();
         let network_enabled = spec.network.is_some();
         let mount_env = CString::new(format!("SANDBOX_VIRTIOFS_MOUNTS={encoded_mounts}")).unwrap();
         let http_network_env = CString::new("SANDBOX_HTTP_NETWORK=1").unwrap();
-        let rootfs_overlay_env = CString::new("SANDBOX_ROOTFS_OVERLAY=writable").unwrap();
-        let rootfs_overlay_tag_env =
-            CString::new("SANDBOX_ROOTFS_OVERLAY_VIRTIOFS=rootfsoverlay").unwrap();
         let ca_env = spec
             .network
             .as_ref()
@@ -286,14 +280,6 @@ impl KrunContext {
         if network_enabled {
             argv.push(http_network_arg.as_ptr());
             envp.push(http_network_env.as_ptr());
-        }
-        if spec.rootfs_overlay.is_some() {
-            argv.push(rootfs_overlay_arg.as_ptr());
-            envp.push(rootfs_overlay_env.as_ptr());
-        }
-        if spec.rootfs_overlay == Some(RootfsOverlaySpec::VirtualFs) {
-            argv.push(rootfs_overlay_tag_arg.as_ptr());
-            envp.push(rootfs_overlay_tag_env.as_ptr());
         }
         if let Some(ca_env) = ca_env.as_ref() {
             envp.push(ca_env.as_ptr());
@@ -315,10 +301,7 @@ pub struct VirtualFsDevice {
 
 fn encode_virtual_fs_mounts(virtual_fs: &[VirtualFsDevice]) -> String {
     let mut value = String::new();
-    for device in virtual_fs
-        .iter()
-        .filter(|device| device.path != "__root_overlay__")
-    {
+    for device in virtual_fs {
         if !value.is_empty() {
             value.push(';');
         }
@@ -640,8 +623,6 @@ mod tests {
             rootfs_path: "rootfs.erofs".to_string(),
             rootfs_readonly: Some(true),
             rootfs_format: "erofs".to_string(),
-            rootfs_overlay_mode: None,
-            rootfs_overlay_source: None,
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
@@ -663,8 +644,6 @@ mod tests {
             rootfs_path: "/tmp/sandbox-root".to_string(),
             rootfs_readonly: Some(true),
             rootfs_format: "directory".to_string(),
-            rootfs_overlay_mode: None,
-            rootfs_overlay_source: None,
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
@@ -688,8 +667,6 @@ mod tests {
             rootfs_path: "rootfs.erofs".to_string(),
             rootfs_readonly: Some(true),
             rootfs_format: "erofs".to_string(),
-            rootfs_overlay_mode: None,
-            rootfs_overlay_source: None,
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
@@ -725,8 +702,6 @@ mod tests {
             rootfs_path: "rootfs.erofs".to_string(),
             rootfs_readonly: Some(true),
             rootfs_format: "erofs".to_string(),
-            rootfs_overlay_mode: None,
-            rootfs_overlay_source: None,
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
@@ -932,8 +907,6 @@ mod tests {
             rootfs_path: "bad\0root".to_string(),
             rootfs_readonly: Some(true),
             rootfs_format: "erofs".to_string(),
-            rootfs_overlay_mode: None,
-            rootfs_overlay_source: None,
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,

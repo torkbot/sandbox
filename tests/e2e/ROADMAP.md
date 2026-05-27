@@ -12,11 +12,11 @@ Passing:
   - Covers `defineSandbox`, `rootfs.builtIn(...)`, `sandbox.boot()`, and `lane.exec(...)`.
 - `boot options provide instance-specific virtual mounts`
   - Covers per-instance `mounts` and `fs.virtual(...)` without separate binding concepts.
-- `overlay supplies writable copy-on-write rootfs storage`
-  - Covers a user-space virtual filesystem as the rootfs copy-on-write store.
 
 Next:
 
+- Add block-level copy-on-write root storage coverage once `storage.cow(...)`
+  is wired through to the guest block-device path.
 - Add a deterministic local HTTP origin test for `network.policy(...)` once
   the guest image and DNS path can exercise the interception layer without
   depending on public internet behavior.

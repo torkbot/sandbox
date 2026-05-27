@@ -6,11 +6,11 @@ use std::sync::mpsc;
 use std::thread;
 
 use bson::{Bson, Document, doc};
+use sandbox::config::MountSpec;
 use sandbox::config::{
     HttpRequestHeaderHookSpec, HttpSpecInput, MicroVmSpecInput, MountSpecInput, OutboundPolicy,
     OutboundRuleSpec, OutboundSpec,
 };
-use sandbox::config::{MountSpec, RootfsOverlaySpec};
 use sandbox::http_flow::{
     HookBackedHttpInterceptRuntime, HttpHookExecutor, InterceptedHttpRequest,
 };
@@ -474,32 +474,21 @@ fn virtual_fs_devices(
     spec: &sandbox::MicroVmSpec,
     bridge: std::sync::Arc<HostIoBridge>,
 ) -> Vec<VirtualFsDevice> {
-    let mut devices = Vec::new();
-    if spec.rootfs_overlay == Some(RootfsOverlaySpec::VirtualFs) {
-        devices.push(VirtualFsDevice {
-            tag: "rootfsoverlay".to_string(),
-            path: "__root_overlay__".to_string(),
-            readonly: false,
-            backend: NodeVirtualFs::new("__root_overlay__".to_string(), bridge.clone()),
-        });
-    }
-    devices.extend(
-        spec.mounts
-            .iter()
-            .enumerate()
-            .filter_map(|(index, mount)| match mount {
-                MountSpec::VirtualFs { path, writable } => {
-                    let tag = format!("vfs{index}");
-                    Some(VirtualFsDevice {
-                        tag,
-                        path: path.clone(),
-                        readonly: !writable,
-                        backend: NodeVirtualFs::new(path.clone(), bridge.clone()),
-                    })
-                }
-            }),
-    );
-    devices
+    spec.mounts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, mount)| match mount {
+            MountSpec::VirtualFs { path, writable } => {
+                let tag = format!("vfs{index}");
+                Some(VirtualFsDevice {
+                    tag,
+                    path: path.clone(),
+                    readonly: !writable,
+                    backend: NodeVirtualFs::new(path.clone(), bridge.clone()),
+                })
+            }
+        })
+        .collect()
 }
 
 fn parse_spawn(document: Document) -> Result<MicroVmSpecInput, Box<dyn std::error::Error>> {
@@ -521,8 +510,6 @@ fn parse_spawn(document: Document) -> Result<MicroVmSpecInput, Box<dyn std::erro
         rootfs_path: document.get_str("rootfsPath")?.to_string(),
         rootfs_readonly: optional_bool(&document, "rootfsReadonly"),
         rootfs_format: document.get_str("rootfsFormat")?.to_string(),
-        rootfs_overlay_mode: optional_string(&document, "rootfsOverlayMode"),
-        rootfs_overlay_source: optional_string(&document, "rootfsOverlaySource"),
         mounts: parse_mounts(document.get_array("mounts")?)?,
         network_outbound: parse_network_outbound(document.get_document("networkOutbound").ok())?,
         network_http: parse_network_http(document.get_document("networkHttp").ok())?,

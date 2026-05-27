@@ -5,7 +5,9 @@ import {
   fs,
   network,
   rootfs,
+  storage,
   type SandboxFileSystem,
+  type SandboxBlockStore,
   type SandboxWritableFileSystem,
 } from "../../src/index.ts";
 
@@ -16,12 +18,21 @@ test("rootfs.builtIn creates a typed built-in rootfs reference", () => {
   });
 });
 
-test("fs.virtual wraps user-space filesystems for mounts and overlays", () => {
+test("fs.virtual wraps user-space filesystems for mounts", () => {
   const fileSystem = writableFileSystem();
 
   assert.deepEqual(fs.virtual(fileSystem), {
     kind: "virtual-fs",
     fileSystem,
+  });
+});
+
+test("storage.cow wraps user-space block stores for root storage", () => {
+  const blockStore = memoryBlockStore();
+
+  assert.deepEqual(storage.cow(blockStore), {
+    kind: "cow-block-store",
+    blockStore,
   });
 });
 
@@ -47,25 +58,12 @@ test("fs.memory supports POSIX hard links and extended attributes", async () => 
     "linked",
   );
 
-  await fileSystem.setxattr("/linked.txt", "trusted.overlay.whiteout", new Uint8Array([1, 2, 3]));
-  assert.deepEqual(await fileSystem.listxattr("/source.txt"), ["trusted.overlay.whiteout"]);
+  await fileSystem.setxattr("/linked.txt", "trusted.example", new Uint8Array([1, 2, 3]));
+  assert.deepEqual(await fileSystem.listxattr("/source.txt"), ["trusted.example"]);
   assert.deepEqual(
-    await fileSystem.getxattr("/source.txt", "trusted.overlay.whiteout"),
+    await fileSystem.getxattr("/source.txt", "trusted.example"),
     new Uint8Array([1, 2, 3]),
   );
-});
-
-test("fs.memory creates user overlay whiteouts for rename whiteout", async () => {
-  const fileSystem = fs.memory({
-    files: {
-      "/source.txt": "source",
-    },
-  });
-
-  await fileSystem.rename("/source.txt", "/renamed.txt", 4);
-
-  assert.deepEqual(await fileSystem.listxattr("/source.txt"), ["user.overlay.whiteout"]);
-  assert.deepEqual(await fileSystem.getxattr("/source.txt", "user.overlay.whiteout"), new Uint8Array());
 });
 
 test("fs.memory rejects unsupported rename flags before mutating entries", async () => {
@@ -77,6 +75,7 @@ test("fs.memory rejects unsupported rename flags before mutating entries", async
   });
 
   await assert.rejects(fileSystem.rename("/source.txt", "/target.txt", 2), /unsupported rename flags: 2/);
+  await assert.rejects(fileSystem.rename("/source.txt", "/target.txt", 4), /unsupported rename flags: 4/);
 
   assert.equal(
     new TextDecoder().decode(await fileSystem.read({
@@ -172,13 +171,25 @@ test("defineSandbox accepts resource limits", () => {
   assert.equal(typeof sandbox.boot, "function");
 });
 
-test("defineSandbox rejects non-POSIX overlay filesystems", () => {
+test("defineSandbox accepts COW block storage", () => {
+  const sandbox = defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.20"),
+    storage: storage.cow(memoryBlockStore()),
+  });
+
+  assert.equal(typeof sandbox.boot, "function");
+});
+
+test("defineSandbox rejects invalid COW block storage", () => {
   assert.throws(
     () => defineSandbox({
       rootfs: rootfs.builtIn("alpine:3.20"),
-      overlay: fs.virtual(writableFileSystem()) as never,
+      storage: storage.cow({
+        ...memoryBlockStore(),
+        blockSize: 1_000,
+      }),
     }),
-    /invalid sandbox definition: overlay filesystem must support POSIX operations/,
+    /invalid sandbox definition: storage block size must be a multiple of 512 bytes/,
   );
 });
 
@@ -217,6 +228,29 @@ function writableFileSystem(): SandboxWritableFileSystem {
     },
     async truncate() {
       throw new Error("not reached");
+    },
+  };
+}
+
+function memoryBlockStore(): SandboxBlockStore {
+  const blocks = new Map<bigint, Uint8Array>();
+  return {
+    blockSize: 4096,
+    async read(range) {
+      const chunks = [];
+      for (let offset = 0; offset < range.count; offset += 1) {
+        const start = range.start + BigInt(offset);
+        const data = blocks.get(start);
+        if (data !== undefined) {
+          chunks.push({ start, data });
+        }
+      }
+      return chunks;
+    },
+    async write(chunks) {
+      for (const chunk of chunks) {
+        blocks.set(chunk.start, chunk.data);
+      }
     },
   };
 }

@@ -63,23 +63,3 @@ test("boot cwd becomes the default process working directory", async (t) => {
   assert.equal(result.exitCode, 0);
   assert.equal(result.stdout.trim(), "/tmp");
 });
-
-test("overlay supplies writable copy-on-write rootfs storage", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
-    return;
-  }
-
-  const overlay = fs.memory();
-  await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.20"),
-    overlay: fs.virtual(overlay),
-  }).boot();
-
-  const result = await sandbox.exec("/bin/sh", [
-    "-lc",
-    "printf '%s' installed > /usr/local/bin/example && cat /usr/local/bin/example",
-  ]);
-
-  assert.equal(result.exitCode, 0, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
-  assert.equal(result.stdout, "installed");
-});

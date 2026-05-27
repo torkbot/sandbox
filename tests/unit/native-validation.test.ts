@@ -4,6 +4,8 @@ import {
   defineSandbox,
   fs,
   rootfs,
+  storage,
+  type SandboxBlockStore,
   type SandboxFileSystem,
   type SandboxWritableFileSystem,
 } from "../../src/index.ts";
@@ -26,13 +28,24 @@ test("defineSandbox rejects unsupported built-in rootfs names", () => {
   );
 });
 
-test("defineSandbox rejects non-POSIX overlay filesystems", () => {
+test("defineSandbox rejects invalid root storage", () => {
   assert.throws(
     () => defineSandbox({
       rootfs: rootfs.builtIn("alpine:3.20"),
-      overlay: fs.virtual(writableFileSystem()) as never,
+      storage: { kind: "other-storage", blockStore: memoryBlockStore() } as never,
     }),
-    /invalid sandbox definition: overlay filesystem must support POSIX operations/,
+    /invalid sandbox definition: storage must be created with storage\.cow\(\.\.\.\)/,
+  );
+
+  assert.throws(
+    () => defineSandbox({
+      rootfs: rootfs.builtIn("alpine:3.20"),
+      storage: storage.cow({
+        ...memoryBlockStore(),
+        blockSize: 0,
+      }),
+    }),
+    /invalid sandbox definition: storage block size must be a positive integer/,
   );
 });
 
@@ -74,6 +87,18 @@ test("boot rejects relative mount paths before runtime launch", async () => {
       },
     }),
     /invalid sandbox options: mount\.path must be absolute/,
+  );
+});
+
+test("boot rejects COW block storage until block-device wiring exists", async () => {
+  const sandbox = defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.20"),
+    storage: storage.cow(memoryBlockStore()),
+  });
+
+  await assert.rejects(
+    sandbox.boot(),
+    /unsupported sandbox options: storage\.cow\(\.\.\.\) root storage is not wired to the guest block device yet/,
   );
 });
 
@@ -141,6 +166,17 @@ function writableFileSystem(): SandboxWritableFileSystem {
     },
     async truncate() {
       throw new Error("not reached");
+    },
+  };
+}
+
+function memoryBlockStore(): SandboxBlockStore {
+  return {
+    blockSize: 4096,
+    async read() {
+      return [];
+    },
+    async write() {
     },
   };
 }

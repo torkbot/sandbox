@@ -9,7 +9,6 @@ pub struct MicroVmSpec {
     pub kernel: KernelSpec,
     pub init: InitSpec,
     pub rootfs: RootfsSpec,
-    pub rootfs_overlay: Option<RootfsOverlaySpec>,
     pub mounts: Vec<MountSpec>,
     pub network: Option<NetworkSpec>,
 }
@@ -45,12 +44,6 @@ pub struct RootfsSpec {
 pub enum RootfsFormat {
     Directory,
     Erofs,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RootfsOverlaySpec {
-    Scratch,
-    VirtualFs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,11 +191,6 @@ impl MicroVmSpec {
             ));
         }
 
-        let rootfs_overlay = input
-            .rootfs_overlay_mode
-            .map(|mode| RootfsOverlaySpec::parse(&mode, input.rootfs_overlay_source.as_deref()))
-            .transpose()?;
-
         let mounts = input
             .mounts
             .into_iter()
@@ -233,7 +221,6 @@ impl MicroVmSpec {
             kernel,
             init,
             rootfs,
-            rootfs_overlay,
             mounts,
             network,
         })
@@ -263,23 +250,6 @@ impl RootfsFormat {
             "erofs" => Ok(Self::Erofs),
             other => Err(SpecError::new(format!(
                 "unsupported rootfs.format: {other}"
-            ))),
-        }
-    }
-}
-
-impl RootfsOverlaySpec {
-    fn parse(value: &str, source: Option<&str>) -> Result<Self, SpecError> {
-        match value {
-            "writable" => match source {
-                None => Ok(Self::Scratch),
-                Some("virtual-fs") => Ok(Self::VirtualFs),
-                Some(other) => Err(SpecError::new(format!(
-                    "unsupported rootfsOverlay.source: {other}"
-                ))),
-            },
-            other => Err(SpecError::new(format!(
-                "unsupported rootfsOverlay.mode: {other}"
             ))),
         }
     }
@@ -326,8 +296,6 @@ pub struct MicroVmSpecInput {
     pub rootfs_path: String,
     pub rootfs_readonly: Option<bool>,
     pub rootfs_format: String,
-    pub rootfs_overlay_mode: Option<String>,
-    pub rootfs_overlay_source: Option<String>,
     pub mounts: Vec<MountSpecInput>,
     pub network_outbound: Option<OutboundSpec>,
     pub network_http: Option<HttpSpecInput>,
@@ -362,8 +330,6 @@ mod tests {
             rootfs_path: "rootfs.erofs".to_string(),
             rootfs_readonly: None,
             rootfs_format: "erofs".to_string(),
-            rootfs_overlay_mode: None,
-            rootfs_overlay_source: None,
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
@@ -385,7 +351,6 @@ mod tests {
     #[test]
     fn keeps_requested_mount_and_network_shape() {
         let mut input = valid_input();
-        input.rootfs_overlay_mode = Some("writable".to_string());
         input.mounts = vec![MountSpecInput {
             kind: "virtual-fs".to_string(),
             path: "/sandbox".to_string(),
@@ -417,7 +382,6 @@ mod tests {
 
         let spec = MicroVmSpec::build(input).unwrap();
 
-        assert_eq!(spec.rootfs_overlay, Some(RootfsOverlaySpec::Scratch));
         assert_eq!(
             spec.mounts,
             vec![MountSpec::VirtualFs {
@@ -439,17 +403,6 @@ mod tests {
         let http = network.http.unwrap();
         assert_eq!(http.protected_ranges, vec!["127.0.0.0/8"]);
         assert_eq!(http.request_header_hooks[0].id, "github");
-    }
-
-    #[test]
-    fn supports_virtual_filesystem_rootfs_overlay_storage() {
-        let mut input = valid_input();
-        input.rootfs_overlay_mode = Some("writable".to_string());
-        input.rootfs_overlay_source = Some("virtual-fs".to_string());
-
-        let spec = MicroVmSpec::build(input).unwrap();
-
-        assert_eq!(spec.rootfs_overlay, Some(RootfsOverlaySpec::VirtualFs));
     }
 
     #[test]

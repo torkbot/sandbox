@@ -652,7 +652,7 @@ fn join_guest_path(parent: &str, name: &str) -> String {
 }
 
 fn validate_rename_flags(flags: u32) -> io::Result<()> {
-    let supported = (bindings::LINUX_RENAME_NOREPLACE | bindings::LINUX_RENAME_WHITEOUT) as u32;
+    let supported = bindings::LINUX_RENAME_NOREPLACE as u32;
     if flags & !supported == 0 {
         Ok(())
     } else {
@@ -743,12 +743,17 @@ mod tests {
         validate_rename_flags(0).unwrap();
         validate_rename_flags(bindings::LINUX_RENAME_NOREPLACE as u32).unwrap();
 
-        let error = match validate_rename_flags(bindings::LINUX_RENAME_EXCHANGE as u32) {
-            Ok(_) => panic!("rename flags should be rejected"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert!(error.to_string().contains("rename flags"));
+        for flag in [
+            bindings::LINUX_RENAME_EXCHANGE as u32,
+            bindings::LINUX_RENAME_WHITEOUT as u32,
+        ] {
+            let error = match validate_rename_flags(flag) {
+                Ok(_) => panic!("rename flags should be rejected"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            assert!(error.to_string().contains("rename flags"));
+        }
     }
 
     #[test]

@@ -137,7 +137,7 @@ export function createMemoryFileSystem(options: MemoryFileSystemOptions = {}): S
       parent.entries.delete(baseName(path));
     },
     async rename(from, to, flags = 0) {
-      const supportedFlags = 1 | 4;
+      const supportedFlags = 1;
       if ((flags & ~supportedFlags) !== 0) {
         throw new Error(`unsupported rename flags: ${flags}`);
       }
@@ -160,14 +160,6 @@ export function createMemoryFileSystem(options: MemoryFileSystemOptions = {}): S
       }
       fromParent.entries.delete(baseName(from));
       toParent.entries.set(destinationName, node);
-      if ((flags & 4) !== 0) {
-        fromParent.entries.set(baseName(from), {
-          type: "file",
-          contents: new Uint8Array(),
-          xattrs: new Map([["user.overlay.whiteout", new Uint8Array()]]),
-          writable: true,
-        });
-      }
     },
     async link(from, to) {
       const node = lookup(from);
