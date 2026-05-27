@@ -15,6 +15,10 @@ declare const workspaceFs: SandboxWritableFileSystem;
 
 const sandbox = defineSandbox({
   rootfs: rootfs.builtIn("alpine:3.20"),
+  resources: {
+    cpus: 2,
+    memoryMiB: 2048,
+  },
 });
 
 await using lane = await sandbox.boot({
@@ -84,6 +88,10 @@ at runtime.
 ```ts
 type SandboxDefinition = {
   rootfs: Rootfs;
+  resources?: {
+    cpus?: number;
+    memoryMiB?: number;
+  };
   overlay?: SandboxWritableFileSystemSource;
   network?: NetworkPolicy;
 };
@@ -94,6 +102,19 @@ is the built-in catalog:
 
 ```ts
 rootfs.builtIn("alpine:3.20");
+```
+
+`resources` controls the VM shape used by every instance booted from the
+definition. Omitted values use Sandbox defaults.
+
+```ts
+defineSandbox({
+  rootfs: rootfs.builtIn("alpine:3.20"),
+  resources: {
+    cpus: 4,
+    memoryMiB: 4096,
+  },
+});
 ```
 
 `overlay` is optional. When present, Sandbox uses that writable filesystem to

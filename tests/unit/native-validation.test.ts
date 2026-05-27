@@ -37,6 +37,32 @@ test("defineSandbox rejects read-only overlay filesystems", () => {
   );
 });
 
+test("defineSandbox rejects invalid resource limits", () => {
+  assert.throws(
+    () => defineSandbox({
+      rootfs: rootfs.builtIn("alpine:3.20"),
+      resources: { cpus: 0 },
+    }),
+    /invalid sandbox definition: resources\.cpus must be a positive integer/,
+  );
+
+  assert.throws(
+    () => defineSandbox({
+      rootfs: rootfs.builtIn("alpine:3.20"),
+      resources: { cpus: 256 },
+    }),
+    /invalid sandbox definition: resources\.cpus must be less than or equal to 255/,
+  );
+
+  assert.throws(
+    () => defineSandbox({
+      rootfs: rootfs.builtIn("alpine:3.20"),
+      resources: { memoryMiB: 0 },
+    }),
+    /invalid sandbox definition: resources\.memoryMiB must be a positive integer/,
+  );
+});
+
 test("boot rejects relative mount paths before runtime launch", async () => {
   const sandbox = defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.20"),

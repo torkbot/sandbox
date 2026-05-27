@@ -43,6 +43,10 @@ export interface InternalMount {
 }
 
 export interface InternalSandboxOptions {
+  readonly resources?: {
+    readonly cpus?: number;
+    readonly memoryMiB?: number;
+  };
   readonly rootfs: {
     readonly path: string;
     readonly readonly?: boolean;

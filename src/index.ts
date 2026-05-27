@@ -131,8 +131,14 @@ type NetworkPolicyHookRegistration = {
 
 export interface SandboxDefinitionOptions {
   readonly rootfs: Rootfs;
+  readonly resources?: SandboxResourceLimits;
   readonly overlay?: SandboxWritableFileSystemSource;
   readonly network?: NetworkPolicy;
+}
+
+export interface SandboxResourceLimits {
+  readonly cpus?: number;
+  readonly memoryMiB?: number;
 }
 
 export interface SandboxBootOptions {
@@ -368,6 +374,12 @@ function toHostSpawnOptions(
     kernel: {
       format: undefined,
     },
+    cpu: {
+      vcpus: options.resources?.cpus,
+    },
+    memory: {
+      mib: options.resources?.memoryMiB,
+    },
     init: {
       crateName: "sandbox-init",
     },
@@ -396,6 +408,7 @@ function toInternalSandboxOptions(
 ): InternalSandboxOptions {
   const baseRootfs = lowerBuiltInRootfs(config.rootfs);
   return {
+    resources: config.resources,
     rootfs: baseRootfs,
     overlay: config.overlay,
     cwd: boot.cwd,
@@ -491,6 +504,18 @@ function validateSandboxDefinitionOptions(options: SandboxDefinitionOptions): vo
     throw new Error("invalid sandbox definition: rootfs must be selected with rootfs.builtIn(...)");
   }
   builtInRootfsPath(options.rootfs.name);
+  if (options.resources?.cpus !== undefined && (!Number.isInteger(options.resources.cpus) || options.resources.cpus <= 0)) {
+    throw new Error("invalid sandbox definition: resources.cpus must be a positive integer");
+  }
+  if (options.resources?.cpus !== undefined && options.resources.cpus > 255) {
+    throw new Error("invalid sandbox definition: resources.cpus must be less than or equal to 255");
+  }
+  if (
+    options.resources?.memoryMiB !== undefined
+    && (!Number.isInteger(options.resources.memoryMiB) || options.resources.memoryMiB <= 0)
+  ) {
+    throw new Error("invalid sandbox definition: resources.memoryMiB must be a positive integer");
+  }
   if (options.overlay !== undefined && !isSandboxWritableFileSystem(options.overlay.fileSystem)) {
     throw new Error("invalid sandbox definition: overlay filesystem must be writable");
   }

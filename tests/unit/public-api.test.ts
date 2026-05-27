@@ -26,6 +26,18 @@ test("fs.virtual wraps user-space filesystems for mounts and overlays", () => {
   });
 });
 
+test("defineSandbox accepts resource limits", () => {
+  const sandbox = defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.20"),
+    resources: {
+      cpus: 2,
+      memoryMiB: 1024,
+    },
+  });
+
+  assert.equal(typeof sandbox.boot, "function");
+});
+
 test("defineSandbox rejects read-only overlay filesystems", () => {
   assert.throws(
     () => defineSandbox({
