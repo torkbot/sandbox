@@ -11,6 +11,7 @@ test("root package declares public release metadata and platform optional depend
     bin?: Record<string, string>;
     optionalDependencies?: Record<string, string>;
     napi?: unknown;
+    version?: string;
   };
 
   assert.equal(packageJson.private, false);
@@ -22,6 +23,11 @@ test("root package declares public release metadata and platform optional depend
     "@torkbot/sandbox-darwin-arm64",
     "@torkbot/sandbox-linux-x64-gnu",
   ]);
+  for (const [packageName, packageVersion] of Object.entries(
+    packageJson.optionalDependencies ?? {},
+  )) {
+    assert.equal(packageVersion, packageJson.version, packageName);
+  }
   assert.equal(packageJson.napi, undefined);
 });
 

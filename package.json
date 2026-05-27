@@ -61,7 +61,7 @@
     "just-bash": "^2.14.5"
   },
   "optionalDependencies": {
-    "@torkbot/sandbox-darwin-arm64": "0.1.0",
-    "@torkbot/sandbox-linux-x64-gnu": "0.1.0"
+    "@torkbot/sandbox-darwin-arm64": "0.1.1",
+    "@torkbot/sandbox-linux-x64-gnu": "0.1.1"
   }
 }
