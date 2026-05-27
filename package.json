@@ -43,8 +43,8 @@
     "test:rust": "cargo test --workspace",
     "test:unit": "node --test tests/unit/*.test.ts",
     "typecheck": "tsgo --noEmit --pretty",
-    "release:prepare": "node --run build && node ./scripts/prepare-npm-packages.ts",
-    "release:pack": "npm run build:ts && node ./scripts/prepare-npm-packages.ts --clean --root && node ./scripts/prepare-npm-packages.ts --platform --current && npm pack --dry-run ./dist/npm/sandbox && npm pack --dry-run ./dist/npm/sandbox-*",
+    "release:prepare": "node --run build && node --run build:init && node --run build:rootfs && node --run build:rootfs:erofs && node ./scripts/prepare-npm-packages.ts --clean --root && node ./scripts/prepare-npm-packages.ts --platform --current",
+    "release:pack": "npm run build:ts && node --run build:init && node --run build:rootfs && node --run build:rootfs:erofs && node ./scripts/prepare-npm-packages.ts --clean --root && node ./scripts/prepare-npm-packages.ts --platform --current && npm pack --dry-run ./dist/npm/sandbox && npm pack --dry-run ./dist/npm/sandbox-*",
     "prepublishOnly": "node --run release:prepare"
   },
   "devDependencies": {

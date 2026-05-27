@@ -68,6 +68,32 @@ test("fs.memory creates user overlay whiteouts for rename whiteout", async () =>
   assert.deepEqual(await fileSystem.getxattr("/source.txt", "user.overlay.whiteout"), new Uint8Array());
 });
 
+test("fs.memory rejects unsupported rename flags before mutating entries", async () => {
+  const fileSystem = fs.memory({
+    files: {
+      "/source.txt": "source",
+      "/target.txt": "target",
+    },
+  });
+
+  await assert.rejects(fileSystem.rename("/source.txt", "/target.txt", 2), /unsupported rename flags: 2/);
+
+  assert.equal(
+    new TextDecoder().decode(await fileSystem.read({
+      path: "/source.txt",
+      signal: AbortSignal.timeout(1_000),
+    })),
+    "source",
+  );
+  assert.equal(
+    new TextDecoder().decode(await fileSystem.read({
+      path: "/target.txt",
+      signal: AbortSignal.timeout(1_000),
+    })),
+    "target",
+  );
+});
+
 test("fs.memory reports symlink target size and refuses replacement", async () => {
   const fileSystem = fs.memory({
     files: {

@@ -47,4 +47,26 @@ test("release workflow builds platform packages before publishing the root packa
 
   const publishJob = workflow.slice(workflow.indexOf("  publish:"));
   assert.match(publishJob, /uses: actions\/checkout@v4/);
+
+  const rootfsJob = workflow.slice(workflow.indexOf("  build-rootfs:"), workflow.lastIndexOf("  publish:"));
+  assert.match(rootfsJob, /submodules: recursive/);
+});
+
+test("local release scripts build current rootfs before packaging platform packages", async () => {
+  const packageJson = JSON.parse(
+    await readFile(new URL("../../package.json", import.meta.url), "utf8"),
+  ) as { scripts?: Record<string, string> };
+
+  for (const scriptName of ["release:prepare", "release:pack"]) {
+    const script = packageJson.scripts?.[scriptName] ?? "";
+    const buildRootfs = script.indexOf("node --run build:rootfs:erofs");
+    const packageCurrentPlatform = script.indexOf("prepare-npm-packages.ts --platform --current");
+
+    assert.notEqual(buildRootfs, -1, `${scriptName} should build the rootfs image`);
+    assert.notEqual(packageCurrentPlatform, -1, `${scriptName} should package the current platform`);
+    assert.ok(
+      buildRootfs < packageCurrentPlatform,
+      `${scriptName} should build the rootfs image before packaging the platform package`,
+    );
+  }
 });

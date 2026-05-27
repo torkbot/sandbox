@@ -137,6 +137,10 @@ export function createMemoryFileSystem(options: MemoryFileSystemOptions = {}): S
       parent.entries.delete(baseName(path));
     },
     async rename(from, to, flags = 0) {
+      const supportedFlags = 1 | 4;
+      if ((flags & ~supportedFlags) !== 0) {
+        throw new Error(`unsupported rename flags: ${flags}`);
+      }
       const fromParent = lookupDirectory(parentPath(from));
       const node = fromParent.entries.get(baseName(from));
       if (node === undefined) {
