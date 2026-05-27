@@ -73,6 +73,7 @@ fn prepare_rootfs_overlay(
         .map_err(|error| InitError(format!("create overlay workdir: {error}")))?;
     std::fs::create_dir_all("/run/sandbox-rootfs-root")
         .map_err(|error| InitError(format!("create overlay root: {error}")))?;
+    diagnose_overlay_upper(&workdir);
 
     mount_overlay_root(
         "/run/sandbox-rootfs-root",
@@ -90,6 +91,104 @@ fn prepare_rootfs_overlay(
 #[cfg(target_os = "linux")]
 fn raise_console_log_level() {
     let _ = std::fs::write("/proc/sys/kernel/printk", "8 4 1 7\n");
+}
+
+#[cfg(target_os = "linux")]
+fn diagnose_overlay_upper(workdir: &str) {
+    diagnose_overlay_dtype(workdir);
+    diagnose_overlay_xattr(workdir);
+    diagnose_overlay_rename_whiteout(workdir);
+}
+
+#[cfg(target_os = "linux")]
+fn diagnose_overlay_dtype(workdir: &str) {
+    let path = format!("{workdir}/__sandbox_dtype_probe");
+    let result = std::fs::create_dir(&path)
+        .and_then(|()| {
+            let mut found = false;
+            for entry in std::fs::read_dir(workdir)? {
+                let entry = entry?;
+                if entry.file_name() == "__sandbox_dtype_probe" {
+                    found = entry.file_type()?.is_dir();
+                }
+            }
+            Ok(found)
+        })
+        .map_err(|error| error.to_string());
+    eprintln!("sandbox-init overlay preflight d_type={result:?}");
+    let _ = std::fs::remove_dir(&path);
+}
+
+#[cfg(target_os = "linux")]
+fn diagnose_overlay_xattr(workdir: &str) {
+    use std::ffi::CString;
+
+    let path = match CString::new(workdir) {
+        Ok(path) => path,
+        Err(_) => return,
+    };
+    let name = CString::new("user.overlay.opaque").unwrap();
+    let result = unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), b"0".as_ptr().cast(), 1, 0) };
+    let status = if result == 0 {
+        "ok".to_string()
+    } else {
+        std::io::Error::last_os_error().to_string()
+    };
+    eprintln!("sandbox-init overlay preflight userxattr={status}");
+    let _ = unsafe { libc::removexattr(path.as_ptr(), name.as_ptr()) };
+}
+
+#[cfg(target_os = "linux")]
+fn diagnose_overlay_rename_whiteout(workdir: &str) {
+    use std::ffi::CString;
+
+    let source = format!("{workdir}/__sandbox_rename_whiteout_source");
+    let dest = format!("{workdir}/__sandbox_rename_whiteout_dest");
+    let _ = std::fs::write(&source, b"x");
+    let source_c = match CString::new(source.as_str()) {
+        Ok(path) => path,
+        Err(_) => return,
+    };
+    let dest_c = match CString::new(dest.as_str()) {
+        Ok(path) => path,
+        Err(_) => return,
+    };
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source_c.as_ptr(),
+            libc::AT_FDCWD,
+            dest_c.as_ptr(),
+            libc::RENAME_WHITEOUT,
+        )
+    };
+    if result != 0 {
+        eprintln!(
+            "sandbox-init overlay preflight rename_whiteout=err:{}",
+            std::io::Error::last_os_error()
+        );
+    } else {
+        let whiteout_xattr = getxattr_size(&source, "user.overlay.whiteout")
+            .map_or_else(|error| format!("err:{error}"), |size| format!("ok:{size}"));
+        eprintln!("sandbox-init overlay preflight rename_whiteout=ok xattr={whiteout_xattr}");
+    }
+    let _ = std::fs::remove_file(&source);
+    let _ = std::fs::remove_file(&dest);
+}
+
+#[cfg(target_os = "linux")]
+fn getxattr_size(path: &str, name: &str) -> Result<isize, std::io::Error> {
+    use std::ffi::CString;
+
+    let path = CString::new(path).unwrap();
+    let name = CString::new(name).unwrap();
+    let result = unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
+    if result < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(result)
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
