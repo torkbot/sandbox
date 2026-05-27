@@ -17,6 +17,7 @@ import type {
 } from "./launch-options.ts";
 
 const CLOSE_SYNC_TIMEOUT_MS = 1_000;
+const HTTP_INTERCEPT_PORTS = [80, 443, 8080, 8443] as const;
 
 export type SandboxFileType = "file" | "directory" | "symlink";
 
@@ -564,7 +565,7 @@ function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPoli
       outbound: {
         policy: "deny",
         rules: [
-          { action: "accept", scope: "public-internet" },
+          { action: "accept", scope: "public-internet", ports: HTTP_INTERCEPT_PORTS },
           { action: "accept", protocol: "udp", cidr: "10.0.2.1/32", ports: [53] },
         ],
       },
