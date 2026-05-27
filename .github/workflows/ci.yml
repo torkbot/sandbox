@@ -108,6 +108,7 @@ jobs:
 
           {
             printf 'runner-arch=%s\n' '${{ runner.arch }}'
+            printf 'init-key-hash=%s\n' "${init_key_hash}"
             git ls-files -z \
               scripts/build-rootfs.ts \
               scripts/build-rootfs-erofs.ts \
@@ -205,6 +206,7 @@ jobs:
 
           {
             printf 'runner-arch=%s\n' '${{ runner.arch }}'
+            printf 'init-key-hash=%s\n' "${init_key_hash}"
             git ls-files -z \
               scripts/build-rootfs.ts \
               scripts/build-rootfs-erofs.ts \
@@ -333,6 +335,7 @@ jobs:
 
           {
             printf 'runner-arch=%s\n' '${{ runner.arch }}'
+            printf 'init-key-hash=%s\n' "${init_key_hash}"
             git ls-files -z \
               scripts/build-rootfs.ts \
               scripts/build-rootfs-erofs.ts \
