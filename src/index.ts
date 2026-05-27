@@ -98,7 +98,13 @@ export type BuiltInRootfsConfig = {
   readonly name: BuiltInRootfsName;
 };
 
-export type Rootfs = BuiltInRootfsConfig;
+export type CowRootfsConfig = {
+  readonly kind: "cow-rootfs";
+  readonly base: BuiltInRootfsConfig;
+  readonly writable: SandboxBlockStore;
+};
+
+export type Rootfs = BuiltInRootfsConfig | CowRootfsConfig;
 
 export type SandboxFileSystemSource = {
   readonly kind: "virtual-fs";
@@ -127,11 +133,6 @@ export interface SandboxBlockStore {
   write(chunks: readonly SandboxBlockChunk[]): Promise<void>;
   flush?(): Promise<void>;
 }
-
-export type SandboxRootStorage = {
-  readonly kind: "cow-block-store";
-  readonly blockStore: SandboxBlockStore;
-};
 
 export type HttpRequestMiddleware = (
   request: SandboxHttpRequest,
@@ -175,7 +176,6 @@ type NetworkPolicyHookRegistration = {
 export interface SandboxDefinitionOptions {
   readonly rootfs: Rootfs;
   readonly resources?: SandboxResourceLimits;
-  readonly storage?: SandboxRootStorage;
   readonly network?: NetworkPolicy;
 }
 
@@ -224,10 +224,17 @@ interface SandboxDiagnostics {
 }
 
 export const rootfs = {
-  builtIn(name: BuiltInRootfsName): Rootfs {
+  builtIn(name: BuiltInRootfsName): BuiltInRootfsConfig {
     return {
       kind: "built-in-rootfs",
       name,
+    };
+  },
+  cow(options: { readonly base: BuiltInRootfsConfig; readonly writable: SandboxBlockStore }): Rootfs {
+    return {
+      kind: "cow-rootfs",
+      base: options.base,
+      writable: options.writable,
     };
   },
 };
@@ -244,15 +251,6 @@ function virtualFs(fileSystem: SandboxFileSystem): SandboxFileSystemSource {
 export const fs = {
   memory: createMemoryFileSystem,
   virtual: virtualFs,
-};
-
-export const storage = {
-  cow(blockStore: SandboxBlockStore): SandboxRootStorage {
-    return {
-      kind: "cow-block-store",
-      blockStore,
-    };
-  },
 };
 
 export const network = {
@@ -348,7 +346,7 @@ class HostBackedSandboxVm implements SandboxVm {
 
     this.#closed = true;
     let syncError: unknown;
-    if (this.#options.storage !== undefined) {
+    if (this.#options.rootfs.storage !== undefined) {
       try {
         await withTimeout(
           this.#exec.exec("/bin/sync"),
@@ -493,11 +491,10 @@ async function toInternalSandboxOptions(
   boot: SandboxBootOptions,
   network?: InternalNetworkConfig,
 ): Promise<InternalSandboxOptions> {
-  const baseRootfs = lowerBuiltInRootfs(config.rootfs, config.storage);
+  const rootfs = lowerRootfs(config.rootfs);
   return {
     resources: config.resources,
-    rootfs: baseRootfs.rootfs,
-    storage: config.storage,
+    rootfs,
     cwd: boot.cwd,
     mounts: Object.entries(boot.mounts ?? {}).map(([path, source]) => {
       return {
@@ -570,40 +567,69 @@ function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPoli
   };
 }
 
-function lowerBuiltInRootfs(
+function lowerRootfs(
   rootfs: Rootfs,
-  storage: SandboxRootStorage | undefined,
-): {
-  readonly rootfs: InternalSandboxOptions["rootfs"];
-} {
-  if (storage !== undefined) {
-    return {
-      rootfs: {
-        path: builtInRootfsPath(rootfs.name, "ext4"),
+): InternalSandboxOptions["rootfs"] {
+  switch (rootfs.kind) {
+    case "built-in-rootfs":
+      return {
+        path: builtInRootfsPath(rootfs.name),
+        readonly: true,
+        format: "erofs",
+      };
+    case "cow-rootfs":
+      return {
+        path: builtInRootfsPath(rootfs.base.name, "ext4"),
         readonly: false,
         format: "ext4",
         storage: {
-          kind: storage.kind,
-          blockSize: storage.blockStore.blockSize,
+          kind: "cow-block-store",
+          blockSize: rootfs.writable.blockSize,
+          blockStore: rootfs.writable,
         },
-      },
-    };
+      };
   }
-  const path = builtInRootfsPath(rootfs.name);
-  return {
-    rootfs: {
-      path,
-      readonly: true,
-      format: "erofs",
-    },
-  };
+}
+
+function validateRootfs(rootfs: Rootfs): void {
+  switch (rootfs.kind) {
+    case "built-in-rootfs":
+      validateBuiltInRootfsName(rootfs.name);
+      return;
+    case "cow-rootfs":
+      if (rootfs.base.kind !== "built-in-rootfs") {
+        throw new Error("invalid sandbox definition: rootfs.cow base must be created with rootfs.builtIn(...)");
+      }
+      validateBuiltInRootfsName(rootfs.base.name);
+      validateBlockStore(rootfs.writable);
+      return;
+    default:
+      throw new Error(
+        "invalid sandbox definition: rootfs must be created with rootfs.builtIn(...) or rootfs.cow(...)",
+      );
+  }
+}
+
+function validateBlockStore(blockStore: SandboxBlockStore): void {
+  if (!Number.isInteger(blockStore.blockSize) || blockStore.blockSize <= 0) {
+    throw new Error("invalid sandbox definition: rootfs COW block size must be a positive integer");
+  }
+  if (blockStore.blockSize % 512 !== 0) {
+    throw new Error("invalid sandbox definition: rootfs COW block size must be a multiple of 512 bytes");
+  }
+  if (typeof blockStore.list !== "function") {
+    throw new Error("invalid sandbox definition: rootfs COW block store must provide list()");
+  }
+  if (typeof blockStore.read !== "function") {
+    throw new Error("invalid sandbox definition: rootfs COW block store must provide read()");
+  }
+  if (typeof blockStore.write !== "function") {
+    throw new Error("invalid sandbox definition: rootfs COW block store must provide write()");
+  }
 }
 
 function validateSandboxDefinitionOptions(options: SandboxDefinitionOptions): void {
-  if (options.rootfs.kind !== "built-in-rootfs") {
-    throw new Error("invalid sandbox definition: rootfs must be selected with rootfs.builtIn(...)");
-  }
-  validateBuiltInRootfsName(options.rootfs.name);
+  validateRootfs(options.rootfs);
   if (options.resources?.cpus !== undefined && (!Number.isInteger(options.resources.cpus) || options.resources.cpus <= 0)) {
     throw new Error("invalid sandbox definition: resources.cpus must be a positive integer");
   }
@@ -616,32 +642,8 @@ function validateSandboxDefinitionOptions(options: SandboxDefinitionOptions): vo
   ) {
     throw new Error("invalid sandbox definition: resources.memoryMiB must be a positive integer");
   }
-  if (options.storage !== undefined) {
-    validateRootStorage(options.storage);
-  }
   if (options.network !== undefined && options.network.kind !== "network-policy") {
     throw new Error("invalid sandbox definition: network must be created with network.policy(...)");
-  }
-}
-
-function validateRootStorage(storage: SandboxRootStorage): void {
-  if (storage.kind !== "cow-block-store") {
-    throw new Error("invalid sandbox definition: storage must be created with storage.cow(...)");
-  }
-  if (!Number.isInteger(storage.blockStore.blockSize) || storage.blockStore.blockSize <= 0) {
-    throw new Error("invalid sandbox definition: storage block size must be a positive integer");
-  }
-  if (storage.blockStore.blockSize % 512 !== 0) {
-    throw new Error("invalid sandbox definition: storage block size must be a multiple of 512 bytes");
-  }
-  if (typeof storage.blockStore.list !== "function") {
-    throw new Error("invalid sandbox definition: storage block store must provide list()");
-  }
-  if (typeof storage.blockStore.read !== "function") {
-    throw new Error("invalid sandbox definition: storage block store must provide read()");
-  }
-  if (typeof storage.blockStore.write !== "function") {
-    throw new Error("invalid sandbox definition: storage block store must provide write()");
   }
 }
 

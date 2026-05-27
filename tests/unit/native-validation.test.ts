@@ -4,7 +4,6 @@ import {
   defineSandbox,
   fs,
   rootfs,
-  storage,
   type SandboxBlockStore,
   type SandboxFileSystem,
   type SandboxWritableFileSystem,
@@ -15,7 +14,7 @@ test("defineSandbox rejects non-built-in rootfs objects", () => {
     () => defineSandbox({
       rootfs: { kind: "prebuilt-rootfs", path: "rootfs.erofs", format: "erofs" } as never,
     }),
-    /invalid sandbox definition: rootfs must be selected with rootfs\.builtIn\(\.\.\.\)/,
+    /invalid sandbox definition: rootfs must be created with rootfs\.builtIn\(\.\.\.\) or rootfs\.cow\(\.\.\.\)/,
   );
 });
 
@@ -28,24 +27,25 @@ test("defineSandbox rejects unsupported built-in rootfs names", () => {
   );
 });
 
-test("defineSandbox rejects invalid root storage", () => {
+test("defineSandbox rejects invalid COW rootfs", () => {
   assert.throws(
     () => defineSandbox({
-      rootfs: rootfs.builtIn("alpine:3.20"),
-      storage: { kind: "other-storage", blockStore: memoryBlockStore() } as never,
+      rootfs: { kind: "cow-rootfs", base: { kind: "other-rootfs" }, writable: memoryBlockStore() } as never,
     }),
-    /invalid sandbox definition: storage must be created with storage\.cow\(\.\.\.\)/,
+    /invalid sandbox definition: rootfs.cow base must be created with rootfs\.builtIn\(\.\.\.\)/,
   );
 
   assert.throws(
     () => defineSandbox({
-      rootfs: rootfs.builtIn("alpine:3.20"),
-      storage: storage.cow({
-        ...memoryBlockStore(),
-        blockSize: 0,
+      rootfs: rootfs.cow({
+        base: rootfs.builtIn("alpine:3.20"),
+        writable: {
+          ...memoryBlockStore(),
+          blockSize: 0,
+        },
       }),
     }),
-    /invalid sandbox definition: storage block size must be a positive integer/,
+    /invalid sandbox definition: rootfs COW block size must be a positive integer/,
   );
 });
 

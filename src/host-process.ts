@@ -44,7 +44,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
     this.#options = options;
     this.packets = this.#packets;
     this.#requestHeaderHooks = requestHeaderHooks;
-    this.#rootBlockStore = options.storage?.blockStore;
+    this.#rootBlockStore = options.rootfs.storage?.blockStore;
     for (const mount of options.mounts ?? []) {
       this.#hostFs.set(mount.path, mount.fileSystem);
     }
@@ -1001,7 +1001,12 @@ function encodeHostSpawn(options: HostSpawnSandboxOptions): Uint8Array {
     rootfsPath: options.rootfs.path,
     rootfsReadonly: options.rootfs.readonly,
     rootfsFormat: options.rootfs.format,
-    rootfsStorage: options.rootfs.storage,
+    rootfsStorage: options.rootfs.storage === undefined
+      ? undefined
+      : {
+        kind: options.rootfs.storage.kind,
+        blockSize: options.rootfs.storage.blockSize,
+      },
     mounts: options.mounts ?? [],
     networkOutbound: options.network?.outbound,
     networkHttp: options.network?.http === undefined ? undefined : options.network.http,

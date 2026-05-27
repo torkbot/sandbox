@@ -94,13 +94,12 @@ type SandboxDefinition = {
     cpus?: number;
     memoryMiB?: number;
   };
-  storage?: SandboxRootStorage;
   network?: NetworkPolicy;
 };
 ```
 
-`rootfs` selects the immutable base filesystem. The first public rootfs source
-is the built-in catalog:
+`rootfs` selects the guest root filesystem. The first public rootfs source is
+the read-only built-in catalog:
 
 ```ts
 rootfs.builtIn("alpine:3.20");
@@ -119,21 +118,18 @@ defineSandbox({
 });
 ```
 
-`storage` is optional. When present, it describes copy-on-write block storage for
-rootfs mutations. The sandbox library owns the COW block-device contract;
-user-space owns the block store's durability, compression, migration, and
-checkpoint policy. When absent, the guest root filesystem is read-only. Built-in
-rootfs packages include a read-only EROFS image for normal boots and a writable
-ext4 image used as the COW base when `storage` is configured.
+Use `rootfs.cow(...)` when rootfs mutations should persist. The sandbox library
+owns the COW block-device contract; user-space owns the block store's
+durability, compression, migration, and checkpoint policy. Built-in rootfs
+packages include a read-only EROFS image for normal boots and a writable ext4
+image used as the COW base.
 
 ```ts
-import { storage } from "@torkbot/sandbox";
-
-const rootBlocks = storage.cow(laneBlockStore);
-
 defineSandbox({
-  rootfs: rootfs.builtIn("alpine:3.20"),
-  storage: rootBlocks,
+  rootfs: rootfs.cow({
+    base: rootfs.builtIn("alpine:3.20"),
+    writable: laneBlockStore,
+  }),
 });
 ```
 
@@ -252,13 +248,13 @@ Sandbox hides the kernel, init, transport, and host helper behind a small
 TypeScript API:
 
 - The runtime boots a libkrun-backed guest from a prebuilt rootfs artifact:
-  read-only EROFS by default, or writable ext4 when COW block storage is used.
+  read-only EROFS by default, or writable ext4 when a COW rootfs is used.
 - Kernel and init artifacts are implementation details owned by Sandbox.
 - A signed `sandbox-host` helper owns the Node/Rust/libkrun boundary.
 - Guest control traffic uses an implicit fd-backed transport between the host
   and Sandbox init.
 - Host-implemented virtual filesystems are mounted into the guest.
-- Rootfs mutation persistence is modeled as block-level copy-on-write storage,
+- Rootfs mutation persistence is modeled as block-level copy-on-write rootfs,
   not as a guest-visible POSIX filesystem.
 - Network egress is default-deny. Native code should enforce fast-path policy
   decisions and delegate to JavaScript only when a policy callback is required.
@@ -277,7 +273,7 @@ durability, network policy state, confirmation flows, and credential brokering.
 - implicit fd-backed host control sockets owned by Sandbox,
 - avoid host filesystem coordination unless it is intrinsic to the artifact; prefer file descriptors, database handles, bytes, and async iterables over paths,
 - build-time rootfs shaping, with built-in rootfs artifacts selected by typed logical names at VM instantiation,
-- immutable rootfs by default, with optional copy-on-write root storage supplied by a user-space block store,
+- immutable rootfs by default, with copy-on-write rootfs supplied by a user-space block store when requested,
 - generic guest-visible mounts backed by the same user-space filesystem abstraction,
 - programmable virtual filesystems backed by TypeScript callbacks,
 - transparent HTTP interception with TypeScript request-header hooks,

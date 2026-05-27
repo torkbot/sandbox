@@ -5,7 +5,6 @@ import {
   fs,
   network,
   rootfs,
-  storage,
   type SandboxFileSystem,
   type SandboxBlockStore,
   type SandboxWritableFileSystem,
@@ -27,12 +26,19 @@ test("fs.virtual wraps user-space filesystems for mounts", () => {
   });
 });
 
-test("storage.cow wraps user-space block stores for root storage", () => {
+test("rootfs.cow couples a built-in base with writable block storage", () => {
   const blockStore = memoryBlockStore();
 
-  assert.deepEqual(storage.cow(blockStore), {
-    kind: "cow-block-store",
-    blockStore,
+  assert.deepEqual(rootfs.cow({
+    base: rootfs.builtIn("alpine:3.20"),
+    writable: blockStore,
+  }), {
+    kind: "cow-rootfs",
+    base: {
+      kind: "built-in-rootfs",
+      name: "alpine:3.20",
+    },
+    writable: blockStore,
   });
 });
 
@@ -171,25 +177,29 @@ test("defineSandbox accepts resource limits", () => {
   assert.equal(typeof sandbox.boot, "function");
 });
 
-test("defineSandbox accepts COW block storage", () => {
+test("defineSandbox accepts COW rootfs", () => {
   const sandbox = defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.20"),
-    storage: storage.cow(memoryBlockStore()),
+    rootfs: rootfs.cow({
+      base: rootfs.builtIn("alpine:3.20"),
+      writable: memoryBlockStore(),
+    }),
   });
 
   assert.equal(typeof sandbox.boot, "function");
 });
 
-test("defineSandbox rejects invalid COW block storage", () => {
+test("defineSandbox rejects invalid COW rootfs block store", () => {
   assert.throws(
     () => defineSandbox({
-      rootfs: rootfs.builtIn("alpine:3.20"),
-      storage: storage.cow({
-        ...memoryBlockStore(),
-        blockSize: 1_000,
+      rootfs: rootfs.cow({
+        base: rootfs.builtIn("alpine:3.20"),
+        writable: {
+          ...memoryBlockStore(),
+          blockSize: 1_000,
+        },
       }),
     }),
-    /invalid sandbox definition: storage block size must be a multiple of 512 bytes/,
+    /invalid sandbox definition: rootfs COW block size must be a multiple of 512 bytes/,
   );
 });
 

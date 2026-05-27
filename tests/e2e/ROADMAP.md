@@ -15,7 +15,7 @@ Passing:
 
 Next:
 
-- Add block-level copy-on-write root storage coverage once `storage.cow(...)`
+- Add block-level copy-on-write rootfs coverage once `rootfs.cow(...)`
   is wired through to the guest block-device path.
 - Add a deterministic local HTTP origin test for `network.policy(...)` once
   the guest image and DNS path can exercise the interception layer without

@@ -4,7 +4,6 @@ import {
   defineSandbox,
   fs,
   rootfs,
-  storage,
   type SandboxBlockStore,
 } from "../../../src/index.ts";
 import { requireVmLaunchSupport } from "../support/capabilities.ts";
@@ -66,15 +65,17 @@ test("boot cwd becomes the default process working directory", async (t) => {
   assert.equal(result.stdout.trim(), "/tmp");
 });
 
-test("COW block root storage round-trips rootfs mutations across instances", async (t) => {
+test("COW rootfs round-trips rootfs mutations across instances", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
   }
 
   const blockStore = memoryBlockStore();
   const sandboxDefinition = defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.20"),
-    storage: storage.cow(blockStore),
+    rootfs: rootfs.cow({
+      base: rootfs.builtIn("alpine:3.20"),
+      writable: blockStore,
+    }),
   });
 
   const first = await sandboxDefinition.boot();
