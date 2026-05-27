@@ -75,7 +75,7 @@ fn prepare_rootfs_overlay(
 
     mount_overlay_root(
         "/run/sandbox-rootfs-root",
-        &format!("lowerdir=/,upperdir={upperdir},workdir={workdir}"),
+        &format!("lowerdir=/,upperdir={upperdir},workdir={workdir},userxattr"),
     )?;
 
     std::env::set_current_dir("/run/sandbox-rootfs-root")
