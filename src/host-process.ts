@@ -15,6 +15,7 @@ import type {
 } from "./launch-options.ts";
 
 const ROOT_OVERLAY_MOUNT_PATH = "__root_overlay__";
+const DEFAULT_LAUNCH_TIMEOUT_MS = 60_000;
 
 export class HostProcessSandboxVm implements HostControlChannel {
   readonly hasControlSocket = true;
@@ -607,16 +608,29 @@ export class HostProcessSandboxVm implements HostControlChannel {
   }
 
   async #waitForLaunch(): Promise<void> {
+    const timeoutMs = launchTimeoutMs();
     await Promise.race([
       this.#launchReady.wait(),
       once(this.#child, "exit").then(() => {
         throw this.#exitError ?? new Error("sandbox-host exited before VM launch completed");
       }),
-      delay(10_000).then(() => {
-        throw new Error("sandbox-host did not produce a launch acknowledgement");
+      unrefDelay(timeoutMs).then(() => {
+        throw new Error(`sandbox-host did not produce a launch acknowledgement within ${timeoutMs}ms`);
       }),
     ]);
   }
+}
+
+function launchTimeoutMs(): number {
+  const value = process.env.SANDBOX_LAUNCH_TIMEOUT_MS;
+  if (value === undefined || value.length === 0) {
+    return DEFAULT_LAUNCH_TIMEOUT_MS;
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`SANDBOX_LAUNCH_TIMEOUT_MS must be a positive integer, got ${value}`);
+  }
+  return parsed;
 }
 
 function encodeXattrNameList(names: readonly string[]): Uint8Array {
@@ -759,6 +773,13 @@ function assertPosixFileSystem(
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
+}
+
+function unrefDelay(milliseconds: number): Promise<void> {
+  return new Promise((resolvePromise) => {
+    const timeout = setTimeout(resolvePromise, milliseconds);
+    timeout.unref();
+  });
 }
 
 class AsyncQueue<T> implements AsyncIterable<T> {

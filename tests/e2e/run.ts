@@ -31,6 +31,7 @@ const child = spawn(
     cwd: repoRoot,
     env: {
       ...process.env,
+      SANDBOX_CONSOLE_OUTPUT: process.env.SANDBOX_CONSOLE_OUTPUT ?? join(resultDir, "console.log"),
       SANDBOX_E2E_RESULT_DIR: resultDir,
       SANDBOX_E2E_RUN_ID: runId,
     },

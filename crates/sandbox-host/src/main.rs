@@ -1,5 +1,5 @@
 use std::env;
-use std::io::{self, Read};
+use std::io::{self, ErrorKind, Read};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -86,9 +86,28 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
 
     let stdin_bridge = bridge.clone();
     let stdin_tx = bridge_tx.clone();
+    let stdin_start_status = vm.start_status_observer();
     thread::spawn(move || {
         let mut stdin = io::stdin().lock();
-        while let Ok((packet, document)) = read_packet(&mut stdin) {
+        loop {
+            let (packet, document) = match read_packet(&mut stdin) {
+                Ok(value) => value,
+                Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+                    let result = match stdin_start_status.get() {
+                        Some(Ok(())) => Ok(()),
+                        Some(Err(error)) => {
+                            Err(format!("VM exited after host stdin closed: {error}"))
+                        }
+                        None => Err("host stdin closed before VM launch completed".to_string()),
+                    };
+                    let _ = stdin_tx.send(result);
+                    return;
+                }
+                Err(error) => {
+                    let _ = stdin_tx.send(Err(format!("read host control packet: {error}")));
+                    return;
+                }
+            };
             if stdin_bridge.route_response(document) {
                 continue;
             }
@@ -97,7 +116,6 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             }
         }
-        let _ = stdin_tx.send(Ok(()));
     });
 
     let guest_tx = bridge_tx.clone();

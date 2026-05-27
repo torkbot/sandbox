@@ -10,8 +10,7 @@ use bson::{Bson, Document, doc};
 use sandbox::vfs::{
     GetxattrReply, ListxattrReply, VirtioFsDirEntry, VirtioFsEntry, VirtioVirtualFsBackend,
     VirtualFsAdapter, VirtualInode, bindings, virtual_directory_entry, virtual_file_entry,
-    virtual_symlink_entry,
-    virtual_writable_directory_entry, virtual_writable_file_entry,
+    virtual_symlink_entry, virtual_writable_directory_entry, virtual_writable_file_entry,
 };
 
 #[derive(Debug)]
@@ -401,9 +400,9 @@ impl sandbox::vfs::HostVirtualFileSystem for NodeVirtualFs {
         flags: u32,
     ) -> io::Result<()> {
         let path = self.path_for_inode(inode)?;
-        let name = name.to_str().map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "xattr name is not utf-8")
-        })?;
+        let name = name
+            .to_str()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "xattr name is not utf-8"))?;
         self.bridge.request(doc! {
             "type": "host.vfs.setxattr",
             "mountPath": &self.mount_path,
@@ -418,16 +417,11 @@ impl sandbox::vfs::HostVirtualFileSystem for NodeVirtualFs {
         Ok(())
     }
 
-    fn getxattr(
-        &self,
-        inode: VirtualInode,
-        name: &CStr,
-        size: u32,
-    ) -> io::Result<GetxattrReply> {
+    fn getxattr(&self, inode: VirtualInode, name: &CStr, size: u32) -> io::Result<GetxattrReply> {
         let path = self.path_for_inode(inode)?;
-        let name = name.to_str().map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "xattr name is not utf-8")
-        })?;
+        let name = name
+            .to_str()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "xattr name is not utf-8"))?;
         let response = self.bridge.request(doc! {
             "type": "host.vfs.getxattr",
             "mountPath": &self.mount_path,
@@ -467,9 +461,9 @@ impl sandbox::vfs::HostVirtualFileSystem for NodeVirtualFs {
 
     fn removexattr(&self, inode: VirtualInode, name: &CStr) -> io::Result<()> {
         let path = self.path_for_inode(inode)?;
-        let name = name.to_str().map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "xattr name is not utf-8")
-        })?;
+        let name = name
+            .to_str()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "xattr name is not utf-8"))?;
         self.bridge.request(doc! {
             "type": "host.vfs.removexattr",
             "mountPath": &self.mount_path,
@@ -623,8 +617,7 @@ fn join_guest_path(parent: &str, name: &str) -> String {
 }
 
 fn validate_rename_flags(flags: u32) -> io::Result<()> {
-    let supported = (bindings::LINUX_RENAME_NOREPLACE
-        | bindings::LINUX_RENAME_WHITEOUT) as u32;
+    let supported = (bindings::LINUX_RENAME_NOREPLACE | bindings::LINUX_RENAME_WHITEOUT) as u32;
     if flags & !supported == 0 {
         Ok(())
     } else {
@@ -654,9 +647,7 @@ fn to_io_error(error: impl std::fmt::Display) -> io::Error {
 fn host_vfs_error(message: String) -> io::Error {
     let errno = if message.starts_with("not found:") {
         Some(libc::ENOENT)
-    } else if message.starts_with("path exists:")
-        || message.starts_with("xattr already exists:")
-    {
+    } else if message.starts_with("path exists:") || message.starts_with("xattr already exists:") {
         Some(libc::EEXIST)
     } else if message.starts_with("xattr not found:") {
         Some(bindings::LINUX_ENODATA)

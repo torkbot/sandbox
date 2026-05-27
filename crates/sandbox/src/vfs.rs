@@ -7,8 +7,7 @@ use std::time::Duration;
 
 pub use krun_devices::virtio::bindings;
 pub use krun_devices::virtio::fs::{
-    Entry as VirtioFsEntry, GetxattrReply, ListxattrReply,
-    VirtualDirEntry as VirtioFsDirEntry,
+    Entry as VirtioFsEntry, GetxattrReply, ListxattrReply, VirtualDirEntry as VirtioFsDirEntry,
     VirtualFsBackend as VirtioVirtualFsBackend,
 };
 
@@ -133,12 +132,7 @@ pub trait HostVirtualFileSystem: Send + Sync + 'static {
         Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
     }
 
-    fn getxattr(
-        &self,
-        inode: VirtualInode,
-        name: &CStr,
-        size: u32,
-    ) -> io::Result<GetxattrReply> {
+    fn getxattr(&self, inode: VirtualInode, name: &CStr, size: u32) -> io::Result<GetxattrReply> {
         let _ = (inode, name, size);
         Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
     }
