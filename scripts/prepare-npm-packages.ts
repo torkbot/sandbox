@@ -15,6 +15,7 @@ type PlatformPackage = {
   readonly libc?: string[];
   readonly files: {
     readonly host: string;
+    readonly rootfs: string;
   };
 };
 
@@ -31,6 +32,7 @@ const platformPackages = [
     libc: undefined,
     files: {
       host: "sandbox-host",
+      rootfs: "rootfs/alpine-3.20.erofs",
     },
   },
   {
@@ -41,6 +43,7 @@ const platformPackages = [
     libc: ["glibc"],
     files: {
       host: "sandbox-host",
+      rootfs: "rootfs/alpine-3.20.erofs",
     },
   },
 ] as const satisfies readonly PlatformPackage[];
@@ -131,7 +134,7 @@ for (const platformPackage of preparePlatforms ? selectedPlatformPackages : []) 
     os: platformPackage.os,
     cpu: platformPackage.cpu,
     ...(platformPackage.libc === undefined ? {} : { libc: platformPackage.libc }),
-    files: [platformPackage.files.host, "README.md"],
+    files: [platformPackage.files.host, "rootfs", "README.md"],
   });
   await writeFile(
     resolve(packageRoot, "README.md"),
@@ -140,6 +143,11 @@ for (const platformPackage of preparePlatforms ? selectedPlatformPackages : []) 
   await copyFile(
     resolve(repoRoot, "target/release/sandbox-host"),
     resolve(packageRoot, platformPackage.files.host),
+  );
+  await mkdir(resolve(packageRoot, "rootfs"), { recursive: true });
+  await copyFile(
+    resolve(repoRoot, "dist/rootfs/alpine-3.20.erofs"),
+    resolve(packageRoot, platformPackage.files.rootfs),
   );
 
   if (installSelectedPlatforms) {
@@ -153,7 +161,7 @@ for (const platformPackage of preparePlatforms ? selectedPlatformPackages : []) 
 async function copyDist(source: string, destination: string): Promise<void> {
   await mkdir(destination, { recursive: true });
   for (const entry of await readdir(source, { withFileTypes: true })) {
-    if (entry.name === "npm" || entry.name === "init" || entry.name === "kernel") {
+    if (entry.name === "npm" || entry.name === "init" || entry.name === "kernel" || entry.name === "rootfs") {
       continue;
     }
 

@@ -34,8 +34,10 @@ test("release workflow builds platform packages before publishing the root packa
   assert.match(workflow, /npm run build:host/);
   assert.doesNotMatch(workflow, /build:native/);
   assert.match(workflow, /Build kernel artifact/);
+  assert.match(workflow, /Build rootfs artifact/);
   assert.match(workflow, /SANDBOX_KERNEL_ARCH/);
   assert.match(workflow, /Download kernel artifact/);
+  assert.match(workflow, /Download rootfs artifact/);
   assert.match(workflow, /prepare-npm-packages\.ts --platform --current/);
   assert.match(workflow, /Publish platform packages/);
   assert.match(workflow, /Publish root package/);

@@ -1,5 +1,4 @@
-import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { builtInRootfsPath } from "./artifacts.ts";
 import { HostControlTransport } from "./control.ts";
 import { HostProcessSandboxVm } from "./host-process.ts";
 import { createMemoryFileSystem } from "./memory-fs.ts";
@@ -512,22 +511,11 @@ function lowerBuiltInRootfs(rootfs: Rootfs): InternalSandboxOptions["rootfs"] {
   };
 }
 
-function builtInRootfsPath(name: BuiltInRootfsName): string {
-  if (name === "alpine:3.20") {
-    const packagedPath = resolve(import.meta.dirname, "rootfs/alpine-3.20.erofs");
-    if (existsSync(packagedPath)) {
-      return packagedPath;
-    }
-    return resolve(import.meta.dirname, "../dist/rootfs/alpine-3.20.erofs");
-  }
-  throw new Error(`unsupported built-in rootfs: ${name satisfies never}`);
-}
-
 function validateSandboxDefinitionOptions(options: SandboxDefinitionOptions): void {
   if (options.rootfs.kind !== "built-in-rootfs") {
     throw new Error("invalid sandbox definition: rootfs must be selected with rootfs.builtIn(...)");
   }
-  builtInRootfsPath(options.rootfs.name);
+  validateBuiltInRootfsName(options.rootfs.name);
   if (options.resources?.cpus !== undefined && (!Number.isInteger(options.resources.cpus) || options.resources.cpus <= 0)) {
     throw new Error("invalid sandbox definition: resources.cpus must be a positive integer");
   }
@@ -545,6 +533,12 @@ function validateSandboxDefinitionOptions(options: SandboxDefinitionOptions): vo
   }
   if (options.network !== undefined && options.network.kind !== "network-policy") {
     throw new Error("invalid sandbox definition: network must be created with network.policy(...)");
+  }
+}
+
+function validateBuiltInRootfsName(name: string): void {
+  if (name !== "alpine:3.20") {
+    throw new Error(`unsupported built-in rootfs: ${name}`);
   }
 }
 

@@ -283,7 +283,7 @@ The npm package is published as `@torkbot/sandbox`. It does not use post-install
 - `@torkbot/sandbox-darwin-arm64`
 - `@torkbot/sandbox-linux-x64-gnu`
 
-Each platform package contains the N-API binding and the `sandbox-host` helper for that target. Runtime artifact resolution only loads the installed optional dependency for the current platform. Local development uses the same layout by materializing the current platform package under `node_modules`.
+Each platform package contains the `sandbox-host` helper and built-in rootfs artifacts for that target. Runtime artifact resolution only loads the installed optional dependency for the current platform. Local development uses the same layout by materializing the current platform package under `node_modules`.
 
 ### macOS signing setup
 
