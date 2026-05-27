@@ -24,6 +24,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
   readonly #options: InternalSandboxOptions;
   readonly #packets = new AsyncQueue<Uint8Array>();
   readonly #packetActivity = new AsyncSignal();
+  readonly #launchReady = new AsyncSignal("sandbox-host launch acknowledgement closed");
   readonly #hostFs = new Map<string, SandboxFileSystem>();
   readonly #requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook>;
   #buffer = new Uint8Array();
@@ -76,6 +77,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
       );
       this.#packets.close(this.#exitError);
       this.#packetActivity.close(this.#exitError);
+      this.#launchReady.close(this.#exitError);
     });
   }
 
@@ -225,6 +227,9 @@ export class HostProcessSandboxVm implements HostControlChannel {
       this.#buffer = this.#buffer.slice(packetLength);
       this.#packetActivity.notify();
       if (!this.#routeHostPacket(packet)) {
+        if (isInitReadyPacket(packet)) {
+          this.#launchReady.notify();
+        }
         this.#packets.push(packet);
       }
     }
@@ -250,8 +255,13 @@ export class HostProcessSandboxVm implements HostControlChannel {
       && type !== "host.vfs.unlink"
       && type !== "host.vfs.rmdir"
       && type !== "host.vfs.rename"
+      && type !== "host.vfs.link"
       && type !== "host.vfs.symlink"
       && type !== "host.vfs.readlink"
+      && type !== "host.vfs.setxattr"
+      && type !== "host.vfs.getxattr"
+      && type !== "host.vfs.listxattr"
+      && type !== "host.vfs.removexattr"
       && type !== "host.http.requestHeaders"
       && type !== "host.http.activeRequestHeaderHooks"
     ) {
@@ -472,6 +482,18 @@ export class HostProcessSandboxVm implements HostControlChannel {
           }));
           return;
         }
+        case "host.vfs.link": {
+          const posix = assertPosixFileSystem(fileSystem, mountPath);
+          const from = assertString(document.from, "from");
+          const to = assertString(document.to, "to");
+          this.#tryWriteToHost(encodePacket({
+            type: "host.vfs.response",
+            id,
+            ok: true,
+            stat: await posix.link(from, to),
+          }));
+          return;
+        }
         case "host.vfs.symlink": {
           const path = assertString(document.path, "path");
           const posix = assertPosixFileSystem(fileSystem, mountPath);
@@ -496,6 +518,83 @@ export class HostProcessSandboxVm implements HostControlChannel {
           }));
           return;
         }
+        case "host.vfs.setxattr": {
+          const path = assertString(document.path, "path");
+          const name = assertString(document.name, "name");
+          const value = binaryField(document.value, "value");
+          const flags = assertNumber(document.flags, "flags");
+          const posix = assertPosixFileSystem(fileSystem, mountPath);
+          await posix.setxattr(path, name, value, flags);
+          this.#tryWriteToHost(encodePacket({
+            type: "host.vfs.response",
+            id,
+            ok: true,
+          }));
+          return;
+        }
+        case "host.vfs.getxattr": {
+          const path = assertString(document.path, "path");
+          const name = assertString(document.name, "name");
+          const size = assertNumber(document.size, "size");
+          const posix = assertPosixFileSystem(fileSystem, mountPath);
+          const value = await posix.getxattr(path, name);
+          if (size === 0) {
+            this.#tryWriteToHost(encodePacket({
+              type: "host.vfs.response",
+              id,
+              ok: true,
+              count: value.byteLength,
+            }));
+            return;
+          }
+          if (value.byteLength > size) {
+            throw new Error("xattr value is larger than requested size");
+          }
+          this.#tryWriteToHost(encodePacket({
+            type: "host.vfs.response",
+            id,
+            ok: true,
+            value: new Binary(value),
+          }));
+          return;
+        }
+        case "host.vfs.listxattr": {
+          const path = assertString(document.path, "path");
+          const size = assertNumber(document.size, "size");
+          const posix = assertPosixFileSystem(fileSystem, mountPath);
+          const names = encodeXattrNameList(await posix.listxattr(path));
+          if (size === 0) {
+            this.#tryWriteToHost(encodePacket({
+              type: "host.vfs.response",
+              id,
+              ok: true,
+              count: names.byteLength,
+            }));
+            return;
+          }
+          if (names.byteLength > size) {
+            throw new Error("xattr name list is larger than requested size");
+          }
+          this.#tryWriteToHost(encodePacket({
+            type: "host.vfs.response",
+            id,
+            ok: true,
+            names: new Binary(names),
+          }));
+          return;
+        }
+        case "host.vfs.removexattr": {
+          const path = assertString(document.path, "path");
+          const name = assertString(document.name, "name");
+          const posix = assertPosixFileSystem(fileSystem, mountPath);
+          await posix.removexattr(path, name);
+          this.#tryWriteToHost(encodePacket({
+            type: "host.vfs.response",
+            id,
+            ok: true,
+          }));
+          return;
+        }
       }
     } catch (error) {
       this.#tryWriteToHost(encodePacket({
@@ -509,7 +608,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
 
   async #waitForLaunch(): Promise<void> {
     await Promise.race([
-      this.#packetActivity.wait(),
+      this.#launchReady.wait(),
       once(this.#child, "exit").then(() => {
         throw this.#exitError ?? new Error("sandbox-host exited before VM launch completed");
       }),
@@ -517,6 +616,19 @@ export class HostProcessSandboxVm implements HostControlChannel {
         throw new Error("sandbox-host did not produce a launch acknowledgement");
       }),
     ]);
+  }
+}
+
+function encodeXattrNameList(names: readonly string[]): Uint8Array {
+  return new TextEncoder().encode(names.map((name) => `${name}\0`).join(""));
+}
+
+function isInitReadyPacket(packet: Uint8Array): boolean {
+  try {
+    const document = BSON.deserialize(packet.slice(4)) as Record<string, unknown>;
+    return document.type === "init.ready";
+  } catch {
+    return false;
   }
 }
 
@@ -632,8 +744,13 @@ function assertPosixFileSystem(
     || typeof candidate.unlink !== "function"
     || typeof candidate.rmdir !== "function"
     || typeof candidate.rename !== "function"
+    || typeof candidate.link !== "function"
     || typeof candidate.symlink !== "function"
     || typeof candidate.readlink !== "function"
+    || typeof candidate.setxattr !== "function"
+    || typeof candidate.getxattr !== "function"
+    || typeof candidate.listxattr !== "function"
+    || typeof candidate.removexattr !== "function"
   ) {
     throw new Error(`host filesystem mount does not support POSIX mutations: ${mountPath}`);
   }
@@ -718,9 +835,14 @@ class AsyncSignal {
     resolve(): void;
     reject(error: unknown): void;
   }> = [];
+  readonly #closedMessage: string;
   #signaled = false;
   #closed = false;
   #error: unknown;
+
+  constructor(closedMessage = "sandbox-host packet activity closed") {
+    this.#closedMessage = closedMessage;
+  }
 
   notify(): void {
     if (this.#closed) {
@@ -755,7 +877,7 @@ class AsyncSignal {
       if (this.#error !== undefined) {
         throw this.#error;
       }
-      throw new Error("sandbox-host packet activity closed");
+      throw new Error(this.#closedMessage);
     }
     return await new Promise<void>((resolve, reject) => {
       this.#waiters.push({ resolve, reject });

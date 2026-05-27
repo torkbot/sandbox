@@ -453,7 +453,7 @@ fn virtual_fs_devices(
     let mut devices = Vec::new();
     if spec.rootfs_overlay == Some(RootfsOverlaySpec::VirtualFs) {
         devices.push(VirtualFsDevice {
-            tag: "rootfs-overlay".to_string(),
+            tag: "rootfsoverlay".to_string(),
             path: "__root_overlay__".to_string(),
             readonly: false,
             backend: NodeVirtualFs::new("__root_overlay__".to_string(), bridge.clone()),

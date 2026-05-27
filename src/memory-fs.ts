@@ -9,16 +9,19 @@ type MemoryNode =
   | {
       readonly type: "directory";
       readonly entries: Map<string, MemoryNode>;
+      readonly xattrs: Map<string, Uint8Array>;
       readonly writable: boolean;
     }
   | {
       readonly type: "file";
       contents: Uint8Array;
+      readonly xattrs: Map<string, Uint8Array>;
       readonly writable: boolean;
     }
   | {
       readonly type: "symlink";
       readonly target: string;
+      readonly xattrs: Map<string, Uint8Array>;
       readonly writable: boolean;
     };
 
@@ -29,6 +32,7 @@ export function createMemoryFileSystem(options: MemoryFileSystemOptions = {}): S
   const root: MemoryDirectory = {
     type: "directory",
     entries: new Map(),
+    xattrs: new Map(),
     writable: true,
   };
   const encoder = new TextEncoder();
@@ -91,6 +95,7 @@ export function createMemoryFileSystem(options: MemoryFileSystemOptions = {}): S
         parent.entries.set(name, {
           type: "directory",
           entries: new Map(),
+          xattrs: new Map(),
           writable: true,
         });
       }
@@ -121,21 +126,45 @@ export function createMemoryFileSystem(options: MemoryFileSystemOptions = {}): S
       }
       parent.entries.delete(baseName(path));
     },
-    async rename(from, to) {
+    async rename(from, to, flags = 0) {
       const fromParent = ensureDirectory(parentPath(from));
       const node = fromParent.entries.get(baseName(from));
       if (node === undefined) {
         throw new Error(`not found: ${from}`);
       }
       const toParent = ensureDirectory(parentPath(to));
+      if ((flags & 1) !== 0 && toParent.entries.has(baseName(to))) {
+        throw new Error(`path exists: ${to}`);
+      }
       fromParent.entries.delete(baseName(from));
       toParent.entries.set(baseName(to), node);
+      if ((flags & 4) !== 0) {
+        fromParent.entries.set(baseName(from), {
+          type: "file",
+          contents: new Uint8Array(),
+          xattrs: new Map([["trusted.overlay.whiteout", new Uint8Array()]]),
+          writable: true,
+        });
+      }
+    },
+    async link(from, to) {
+      const node = lookup(from);
+      if (node.type === "directory") {
+        throw new Error(`cannot hard link directory: ${from}`);
+      }
+      const toParent = ensureDirectory(parentPath(to));
+      if (toParent.entries.has(baseName(to))) {
+        throw new Error(`path exists: ${to}`);
+      }
+      toParent.entries.set(baseName(to), node);
+      return nodeStat(node);
     },
     async symlink(target, path) {
       const parent = ensureDirectory(parentPath(path));
       const node: MemoryNode = {
         type: "symlink",
         target,
+        xattrs: new Map(),
         writable: true,
       };
       parent.entries.set(baseName(path), node);
@@ -148,6 +177,33 @@ export function createMemoryFileSystem(options: MemoryFileSystemOptions = {}): S
       }
       return node.target;
     },
+    async setxattr(path, name, value, flags = 0) {
+      const node = lookup(path);
+      const exists = node.xattrs.has(name);
+      if ((flags & 1) !== 0 && exists) {
+        throw new Error(`xattr already exists: ${name}`);
+      }
+      if ((flags & 2) !== 0 && !exists) {
+        throw new Error(`xattr does not exist: ${name}`);
+      }
+      node.xattrs.set(name, value.slice());
+    },
+    async getxattr(path, name) {
+      const value = lookup(path).xattrs.get(name);
+      if (value === undefined) {
+        throw new Error(`xattr not found: ${name}`);
+      }
+      return value.slice();
+    },
+    async listxattr(path) {
+      return Array.from(lookup(path).xattrs.keys());
+    },
+    async removexattr(path, name) {
+      const removed = lookup(path).xattrs.delete(name);
+      if (!removed) {
+        throw new Error(`xattr not found: ${name}`);
+      }
+    },
   };
 
   function writeFileNode(path: string, contents: Uint8Array): void {
@@ -155,6 +211,7 @@ export function createMemoryFileSystem(options: MemoryFileSystemOptions = {}): S
     parent.entries.set(baseName(path), {
       type: "file",
       contents,
+      xattrs: new Map(),
       writable: true,
     });
   }
@@ -184,6 +241,7 @@ export function createMemoryFileSystem(options: MemoryFileSystemOptions = {}): S
       const directory: MemoryNode = {
         type: "directory",
         entries: new Map(),
+        xattrs: new Map(),
         writable: true,
       };
       parent.entries.set(name, directory);

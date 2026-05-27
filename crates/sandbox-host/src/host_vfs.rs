@@ -8,8 +8,9 @@ use std::time::Duration;
 
 use bson::{Bson, Document, doc};
 use sandbox::vfs::{
-    VirtioFsDirEntry, VirtioFsEntry, VirtioVirtualFsBackend, VirtualFsAdapter, VirtualInode,
-    bindings, virtual_directory_entry, virtual_file_entry, virtual_symlink_entry,
+    GetxattrReply, ListxattrReply, VirtioFsDirEntry, VirtioFsEntry, VirtioVirtualFsBackend,
+    VirtualFsAdapter, VirtualInode, bindings, virtual_directory_entry, virtual_file_entry,
+    virtual_symlink_entry,
     virtual_writable_directory_entry, virtual_writable_file_entry,
 };
 
@@ -62,13 +63,11 @@ impl HostIoBridge {
         if response.get_bool("ok").unwrap_or(false) {
             Ok(response)
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                response
-                    .get_str("error")
-                    .unwrap_or("host virtual filesystem request failed")
-                    .to_string(),
-            ))
+            let message = response
+                .get_str("error")
+                .unwrap_or("host virtual filesystem request failed")
+                .to_string();
+            Err(host_vfs_error(message))
         }
     }
 
@@ -334,6 +333,28 @@ impl sandbox::vfs::HostVirtualFileSystem for NodeVirtualFs {
         Ok(())
     }
 
+    fn link(
+        &self,
+        inode: VirtualInode,
+        newparent: VirtualInode,
+        newname: &CStr,
+    ) -> io::Result<VirtioFsEntry> {
+        let from = self.path_for_inode(inode)?;
+        let newparent = self.path_for_inode(newparent)?;
+        let newname = newname.to_str().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "virtual path is not utf-8")
+        })?;
+        let to = join_guest_path(&newparent, newname);
+        let response = self.bridge.request(doc! {
+            "type": "host.vfs.link",
+            "mountPath": &self.mount_path,
+            "from": &from,
+            "to": &to,
+        })?;
+        let stat = response.get_document("stat").map_err(to_io_error)?;
+        entry_from_stat(self.inode_for_path(&to), stat)
+    }
+
     fn symlink(
         &self,
         linkname: &CStr,
@@ -370,6 +391,92 @@ impl sandbox::vfs::HostVirtualFileSystem for NodeVirtualFs {
             .map_err(to_io_error)?
             .as_bytes()
             .to_vec())
+    }
+
+    fn setxattr(
+        &self,
+        inode: VirtualInode,
+        name: &CStr,
+        value: &[u8],
+        flags: u32,
+    ) -> io::Result<()> {
+        let path = self.path_for_inode(inode)?;
+        let name = name.to_str().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "xattr name is not utf-8")
+        })?;
+        self.bridge.request(doc! {
+            "type": "host.vfs.setxattr",
+            "mountPath": &self.mount_path,
+            "path": &path,
+            "name": name,
+            "value": Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: value.to_vec(),
+            }),
+            "flags": flags as i64,
+        })?;
+        Ok(())
+    }
+
+    fn getxattr(
+        &self,
+        inode: VirtualInode,
+        name: &CStr,
+        size: u32,
+    ) -> io::Result<GetxattrReply> {
+        let path = self.path_for_inode(inode)?;
+        let name = name.to_str().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "xattr name is not utf-8")
+        })?;
+        let response = self.bridge.request(doc! {
+            "type": "host.vfs.getxattr",
+            "mountPath": &self.mount_path,
+            "path": &path,
+            "name": name,
+            "size": size as i64,
+        })?;
+        if size == 0 {
+            let count = response.get_i32("count").map_err(to_io_error)?;
+            return Ok(GetxattrReply::Count(count.max(0) as u32));
+        }
+        let value = response
+            .get_binary_generic("value")
+            .cloned()
+            .map_err(to_io_error)?;
+        Ok(GetxattrReply::Value(value))
+    }
+
+    fn listxattr(&self, inode: VirtualInode, size: u32) -> io::Result<ListxattrReply> {
+        let path = self.path_for_inode(inode)?;
+        let response = self.bridge.request(doc! {
+            "type": "host.vfs.listxattr",
+            "mountPath": &self.mount_path,
+            "path": &path,
+            "size": size as i64,
+        })?;
+        if size == 0 {
+            let count = response.get_i32("count").map_err(to_io_error)?;
+            return Ok(ListxattrReply::Count(count.max(0) as u32));
+        }
+        let names = response
+            .get_binary_generic("names")
+            .cloned()
+            .map_err(to_io_error)?;
+        Ok(ListxattrReply::Names(names))
+    }
+
+    fn removexattr(&self, inode: VirtualInode, name: &CStr) -> io::Result<()> {
+        let path = self.path_for_inode(inode)?;
+        let name = name.to_str().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "xattr name is not utf-8")
+        })?;
+        self.bridge.request(doc! {
+            "type": "host.vfs.removexattr",
+            "mountPath": &self.mount_path,
+            "path": &path,
+            "name": name,
+        })?;
+        Ok(())
     }
 }
 
@@ -516,7 +623,9 @@ fn join_guest_path(parent: &str, name: &str) -> String {
 }
 
 fn validate_rename_flags(flags: u32) -> io::Result<()> {
-    if flags == 0 {
+    let supported = (bindings::LINUX_RENAME_NOREPLACE
+        | bindings::LINUX_RENAME_WHITEOUT) as u32;
+    if flags & !supported == 0 {
         Ok(())
     } else {
         Err(io::Error::new(
@@ -540,6 +649,27 @@ fn encode_document_packet(document: &Document) -> io::Result<Vec<u8>> {
 
 fn to_io_error(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+
+fn host_vfs_error(message: String) -> io::Error {
+    let errno = if message.starts_with("not found:") {
+        Some(libc::ENOENT)
+    } else if message.starts_with("path exists:")
+        || message.starts_with("xattr already exists:")
+    {
+        Some(libc::EEXIST)
+    } else if message.starts_with("xattr not found:") {
+        Some(bindings::LINUX_ENODATA)
+    } else if message.contains("larger than requested size") {
+        Some(libc::ERANGE)
+    } else {
+        None
+    };
+
+    match errno {
+        Some(errno) => io::Error::from_raw_os_error(errno),
+        None => io::Error::new(io::ErrorKind::Other, message),
+    }
 }
 
 #[cfg(test)]
@@ -577,8 +707,9 @@ mod tests {
     #[test]
     fn rename_flags_fail_closed_until_explicitly_supported() {
         validate_rename_flags(0).unwrap();
+        validate_rename_flags(bindings::LINUX_RENAME_NOREPLACE as u32).unwrap();
 
-        let error = match validate_rename_flags(1) {
+        let error = match validate_rename_flags(bindings::LINUX_RENAME_EXCHANGE as u32) {
             Ok(_) => panic!("rename flags should be rejected"),
             Err(error) => error,
         };

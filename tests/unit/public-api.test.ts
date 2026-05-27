@@ -26,6 +26,36 @@ test("fs.virtual wraps user-space filesystems for mounts and overlays", () => {
   });
 });
 
+test("fs.memory supports POSIX hard links and extended attributes", async () => {
+  const fileSystem = fs.memory({
+    files: {
+      "/source.txt": "source",
+    },
+  });
+
+  await fileSystem.link("/source.txt", "/linked.txt");
+  await fileSystem.write({
+    path: "/linked.txt",
+    offset: 0,
+    contents: new TextEncoder().encode("linked"),
+  });
+
+  assert.equal(
+    new TextDecoder().decode(await fileSystem.read({
+      path: "/source.txt",
+      signal: AbortSignal.timeout(1_000),
+    })),
+    "linked",
+  );
+
+  await fileSystem.setxattr("/linked.txt", "trusted.overlay.whiteout", new Uint8Array([1, 2, 3]));
+  assert.deepEqual(await fileSystem.listxattr("/source.txt"), ["trusted.overlay.whiteout"]);
+  assert.deepEqual(
+    await fileSystem.getxattr("/source.txt", "trusted.overlay.whiteout"),
+    new Uint8Array([1, 2, 3]),
+  );
+});
+
 test("defineSandbox accepts resource limits", () => {
   const sandbox = defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.20"),

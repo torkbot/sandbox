@@ -269,7 +269,6 @@ fn mount_virtual_filesystems(
     args: impl Iterator<Item = String>,
     env_mounts: Option<String>,
 ) -> Result<(), InitError> {
-    use std::ffi::CString;
     use std::path::Path;
 
     let mounts = args

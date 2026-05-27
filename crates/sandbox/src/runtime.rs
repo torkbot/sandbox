@@ -261,13 +261,13 @@ impl KrunContext {
         let http_network_arg = CString::new("--http-network").unwrap();
         let rootfs_overlay_arg = CString::new("--rootfs-overlay=writable").unwrap();
         let rootfs_overlay_tag_arg =
-            CString::new("--rootfs-overlay-virtiofs=rootfs-overlay").unwrap();
+            CString::new("--rootfs-overlay-virtiofs=rootfsoverlay").unwrap();
         let network_enabled = spec.network.is_some();
         let mount_env = CString::new(format!("SANDBOX_VIRTIOFS_MOUNTS={encoded_mounts}")).unwrap();
         let http_network_env = CString::new("SANDBOX_HTTP_NETWORK=1").unwrap();
         let rootfs_overlay_env = CString::new("SANDBOX_ROOTFS_OVERLAY=writable").unwrap();
         let rootfs_overlay_tag_env =
-            CString::new("SANDBOX_ROOTFS_OVERLAY_VIRTIOFS=rootfs-overlay").unwrap();
+            CString::new("SANDBOX_ROOTFS_OVERLAY_VIRTIOFS=rootfsoverlay").unwrap();
         let ca_env = spec
             .network
             .as_ref()
@@ -315,8 +315,11 @@ pub struct VirtualFsDevice {
 
 fn encode_virtual_fs_mounts(virtual_fs: &[VirtualFsDevice]) -> String {
     let mut value = String::new();
-    for (index, device) in virtual_fs.iter().enumerate() {
-        if index > 0 {
+    for device in virtual_fs
+        .iter()
+        .filter(|device| device.path != "__root_overlay__")
+    {
+        if !value.is_empty() {
             value.push(';');
         }
         value.push_str(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&device.tag));

@@ -55,8 +55,13 @@ export interface SandboxPosixFileSystem extends SandboxWritableFileSystem {
   unlink(path: string): Promise<void>;
   rmdir(path: string): Promise<void>;
   rename(from: string, to: string, flags?: number): Promise<void>;
+  link(from: string, to: string): Promise<SandboxFileStat>;
   symlink(target: string, path: string): Promise<SandboxFileStat>;
   readlink(path: string): Promise<string>;
+  setxattr(path: string, name: string, value: Uint8Array, flags?: number): Promise<void>;
+  getxattr(path: string, name: string): Promise<Uint8Array>;
+  listxattr(path: string): Promise<readonly string[]>;
+  removexattr(path: string, name: string): Promise<void>;
 }
 
 export interface MemoryFileSystemOptions {
