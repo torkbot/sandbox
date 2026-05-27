@@ -503,6 +503,15 @@ impl NodeVirtualFs {
 
     fn rename_path(&self, from: &str, to: &str) {
         let mut state = self.state.lock().expect("vfs inode state lock poisoned");
+        if from == to
+            || state
+                .inodes_by_path
+                .get(from)
+                .zip(state.inodes_by_path.get(to))
+                .is_some_and(|(from_inode, to_inode)| from_inode == to_inode)
+        {
+            return;
+        }
         forget_path_tree(&mut state, to);
         let prefix = format!("{from}/");
         let path_replacements = state
@@ -814,6 +823,39 @@ mod tests {
         assert_eq!(state.inodes_by_path.get("/source"), Some(&2));
         assert_eq!(state.inodes_by_path.get("/renamed"), Some(&2));
         assert_eq!(state.inodes_by_path.get("/linked"), None);
+    }
+
+    #[test]
+    fn no_op_renames_preserve_inode_cache() {
+        let bridge = HostIoBridge::new();
+        let vfs = NodeVirtualFs {
+            mount_path: "/mnt".to_string(),
+            bridge,
+            state: Arc::new(Mutex::new(NodeVirtualFsState::default())),
+        };
+        {
+            let mut state = vfs.state.lock().unwrap();
+            state.paths_by_inode.insert(2, "/dir".to_string());
+            state.inodes_by_path.insert("/dir".to_string(), 2);
+            state.paths_by_inode.insert(3, "/dir/file".to_string());
+            state.inodes_by_path.insert("/dir/file".to_string(), 3);
+            state.inodes_by_path.insert("/linked".to_string(), 3);
+        }
+
+        vfs.rename_path("/dir", "/dir");
+        vfs.rename_path("/dir/file", "/linked");
+
+        let state = vfs.state.lock().unwrap();
+        assert_eq!(
+            state.paths_by_inode.get(&2).map(String::as_str),
+            Some("/dir")
+        );
+        assert_eq!(
+            state.paths_by_inode.get(&3).map(String::as_str),
+            Some("/dir/file")
+        );
+        assert_eq!(state.inodes_by_path.get("/dir/file"), Some(&3));
+        assert_eq!(state.inodes_by_path.get("/linked"), Some(&3));
     }
 
     #[test]

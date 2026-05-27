@@ -3,6 +3,7 @@ import { HostControlTransport } from "./control.ts";
 import { HostProcessSandboxVm } from "./host-process.ts";
 import { createMemoryFileSystem } from "./memory-fs.ts";
 import {
+  isSandboxPosixFileSystem,
   isSandboxWritableFileSystem,
 } from "./vfs.ts";
 import type { HostSpawnSandboxOptions } from "./spawn-options.ts";
@@ -349,11 +350,14 @@ class HostBackedSandboxVm implements SandboxVm {
     let syncError: unknown;
     if (this.#options.rootfs.storage !== undefined) {
       try {
-        await withTimeout(
+        const result = await withTimeout(
           this.#rootExec.exec("/bin/sync"),
           CLOSE_SYNC_TIMEOUT_MS,
           "sandbox close sync timed out",
         );
+        if (result.exitCode !== 0) {
+          throw new Error(`sandbox close sync failed with exit code ${result.exitCode}: ${result.stderr}`);
+        }
       } catch (error) {
         syncError = error;
       }
@@ -656,10 +660,16 @@ function validateBuiltInRootfsName(name: string): void {
 
 function validateSandboxBootOptions(options: SandboxBootOptions): void {
   const mountPaths = new Set<string>();
-  for (const path of Object.keys(options.mounts ?? {})) {
+  for (const [path, source] of Object.entries(options.mounts ?? {})) {
     validateGuestPath(path, "mount.path");
     if (mountPaths.has(path)) {
       throw new Error(`invalid sandbox boot options: duplicate mount path: ${path}`);
+    }
+    if (
+      isSandboxWritableFileSystem(source.fileSystem)
+      && !isSandboxPosixFileSystem(source.fileSystem)
+    ) {
+      throw new Error(`invalid sandbox boot options: writable mount must implement the POSIX filesystem interface: ${path}`);
     }
     mountPaths.add(path);
   }

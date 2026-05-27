@@ -129,6 +129,21 @@ test("boot rejects mount paths with NUL bytes before runtime launch", async () =
   );
 });
 
+test("boot rejects writable mounts without POSIX filesystem support", async () => {
+  const sandbox = defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.20"),
+  });
+
+  await assert.rejects(
+    sandbox.boot({
+      mounts: {
+        "/mnt": fs.virtual(writableFileSystem()),
+      },
+    }),
+    /invalid sandbox boot options: writable mount must implement the POSIX filesystem interface: \/mnt/,
+  );
+});
+
 function readOnlyFileSystem(): SandboxFileSystem {
   return {
     async stat() {

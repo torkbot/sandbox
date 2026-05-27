@@ -329,7 +329,14 @@ impl CowBlockStorageState {
                 block += 1;
             }
             let count = block - start;
+            let mut returned_blocks = HashSet::new();
             for (index, data) in self.store.read_blocks(start, count)? {
+                if index < start || index >= start + count {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "COW block store returned a block outside the requested range",
+                    ));
+                }
                 if data.len() > self.block_size as usize {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -339,9 +346,97 @@ impl CowBlockStorageState {
                 let mut block = vec![0; self.block_size as usize];
                 block[..data.len()].copy_from_slice(&data);
                 self.cached_blocks.insert(index, block);
+                returned_blocks.insert(index);
+            }
+            for expected in start..start + count {
+                if !returned_blocks.contains(&expected) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "COW block store omitted a listed block",
+                    ));
+                }
             }
             self.loaded_store_blocks.extend(start..start + count);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::fs;
+    use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Debug)]
+    struct TestBlockStore {
+        block_size: u64,
+        blocks: Mutex<HashMap<u64, Vec<u8>>>,
+    }
+
+    impl CowBlockStore for TestBlockStore {
+        fn block_size(&self) -> u64 {
+            self.block_size
+        }
+
+        fn list_blocks(&self) -> io::Result<HashSet<u64>> {
+            Ok(self.blocks.lock().unwrap().keys().copied().collect())
+        }
+
+        fn read_blocks(&self, start: u64, count: u64) -> io::Result<Vec<(u64, Vec<u8>)>> {
+            let blocks = self.blocks.lock().unwrap();
+            Ok((start..start + count)
+                .filter_map(|index| blocks.get(&index).map(|data| (index, data.clone())))
+                .collect())
+        }
+
+        fn write_blocks(&self, chunks: Vec<(u64, Vec<u8>)>) -> io::Result<()> {
+            let mut blocks = self.blocks.lock().unwrap();
+            for (index, data) in chunks {
+                blocks.insert(index, data);
+            }
+            Ok(())
+        }
+
+        fn flush(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn load_store_blocks_rejects_missing_listed_blocks() {
+        let path = temp_base_image_path();
+        fs::write(&path, [0_u8; 8192]).unwrap();
+        let base = File::open(&path).unwrap();
+        let store = Arc::new(TestBlockStore {
+            block_size: 4096,
+            blocks: Mutex::new(HashMap::new()),
+        });
+        let mut state = CowBlockStorageState {
+            base,
+            size: 8192,
+            block_size: 4096,
+            store,
+            store_blocks: HashSet::from([1]),
+            loaded_store_blocks: HashSet::new(),
+            cached_blocks: HashMap::new(),
+            modified_blocks: HashSet::new(),
+        };
+
+        let error = state.load_store_blocks(1, 1).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "COW block store omitted a listed block");
+        let _ = fs::remove_file(path);
+    }
+
+    fn temp_base_image_path() -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!("sandbox-cow-block-storage-test-{nanos}.img"))
     }
 }
