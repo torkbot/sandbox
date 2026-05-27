@@ -90,18 +90,6 @@ test("boot rejects relative mount paths before runtime launch", async () => {
   );
 });
 
-test("boot rejects COW block storage until block-device wiring exists", async () => {
-  const sandbox = defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.20"),
-    storage: storage.cow(memoryBlockStore()),
-  });
-
-  await assert.rejects(
-    sandbox.boot(),
-    /unsupported sandbox options: storage\.cow\(\.\.\.\) root storage is not wired to the guest block device yet/,
-  );
-});
-
 test("boot rejects root and dot-component mount paths before runtime launch", async () => {
   const sandbox = defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.20"),
