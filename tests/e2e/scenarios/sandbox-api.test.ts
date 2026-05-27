@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  createSandboxConfig,
+  defineSandbox,
   fs,
   rootfs,
   type SandboxFileStat,
@@ -14,11 +14,11 @@ test("new public API boots a built-in rootfs and runs a process", async (t) => {
     return;
   }
 
-  await using sandbox = await createSandboxConfig({
+  await using sandbox = await defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.20"),
   }).boot();
 
-  const result = await sandbox.process.exec("/bin/sh", ["-lc", "printf '%s' ready"]);
+  const result = await sandbox.exec("/bin/sh", ["-lc", "printf '%s' ready"]);
 
   assert.equal(result.exitCode, 0, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
   assert.equal(result.stdout, "ready");
@@ -33,7 +33,7 @@ test("boot options provide instance-specific virtual mounts", async (t) => {
   const laneFs = memoryWritableFileSystem({
     "/note.txt": new TextEncoder().encode("lane-private"),
   });
-  await using sandbox = await createSandboxConfig({
+  await using sandbox = await defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.20"),
   }).boot({
     mounts: {
@@ -41,7 +41,7 @@ test("boot options provide instance-specific virtual mounts", async (t) => {
     },
   });
 
-  const result = await sandbox.process.exec("/bin/cat", ["/mnt/note.txt"]);
+  const result = await sandbox.exec("/bin/cat", ["/mnt/note.txt"]);
 
   assert.equal(result.exitCode, 0, result.stderr);
   assert.equal(result.stdout, "lane-private");
@@ -52,13 +52,13 @@ test("boot cwd becomes the default process working directory", async (t) => {
     return;
   }
 
-  await using sandbox = await createSandboxConfig({
+  await using sandbox = await defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.20"),
   }).boot({
     cwd: "/tmp",
   });
 
-  const result = await sandbox.process.exec("/bin/pwd");
+  const result = await sandbox.exec("/bin/pwd");
 
   assert.equal(result.exitCode, 0);
   assert.equal(result.stdout.trim(), "/tmp");
@@ -70,12 +70,12 @@ test("overlay supplies writable copy-on-write rootfs storage", async (t) => {
   }
 
   const overlay = memoryWritableFileSystem();
-  await using sandbox = await createSandboxConfig({
+  await using sandbox = await defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.20"),
     overlay: fs.virtual(overlay),
   }).boot();
 
-  const result = await sandbox.process.exec("/bin/sh", [
+  const result = await sandbox.exec("/bin/sh", [
     "-lc",
     "printf '%s' installed > /usr/local/bin/example && cat /usr/local/bin/example",
   ]);

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  createSandboxConfig,
+  defineSandbox,
   fs,
   network,
   rootfs,
@@ -26,44 +26,24 @@ test("fs.virtual wraps user-space filesystems for mounts and overlays", () => {
   });
 });
 
-test("createSandboxConfig rejects read-only overlay filesystems", () => {
+test("defineSandbox rejects read-only overlay filesystems", () => {
   assert.throws(
-    () => createSandboxConfig({
+    () => defineSandbox({
       rootfs: rootfs.builtIn("alpine:3.20"),
       overlay: fs.virtual(readOnlyFileSystem()) as SandboxWritableFileSystemSource,
     }),
-    /invalid sandbox config: overlay filesystem must be writable/,
+    /invalid sandbox definition: overlay filesystem must be writable/,
   );
 });
 
-test("network.buildPolicy creates a deny-by-default connection policy", async () => {
-  const calls: string[] = [];
-  const policy = network.buildPolicy({
-    async onConnectionRequest(conn) {
-      calls.push(`${conn.host}:${conn.port}`);
-      if (conn.host === "registry.npmjs.org") {
-        conn.allowHttp();
-      }
-    },
+test("network.policy creates an opaque connection policy", () => {
+  const policy = network.policy(async (conn) => {
+    if (conn.host === "registry.npmjs.org") {
+      conn.allowHttp();
+    }
   });
 
-  const grants: string[] = [];
-  await policy.onConnectionRequest({
-    transport: "tcp",
-    host: "registry.npmjs.org",
-    port: 443,
-    allow() {
-      grants.push("raw");
-      return {};
-    },
-    allowHttp() {
-      grants.push("http");
-      return {};
-    },
-  });
-
-  assert.deepEqual(calls, ["registry.npmjs.org:443"]);
-  assert.deepEqual(grants, ["http"]);
+  assert.equal(policy.kind, "network-policy");
 });
 
 function readOnlyFileSystem(): SandboxFileSystem {

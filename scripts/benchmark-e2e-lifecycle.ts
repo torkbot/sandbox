@@ -6,7 +6,7 @@ import { platform } from "node:os";
 import { resolve } from "node:path";
 
 import {
-  createSandboxConfig,
+  defineSandbox,
   rootfs,
 } from "../src/index.ts";
 import { hostBinaryPath } from "../src/host-process.ts";
@@ -104,17 +104,17 @@ async function runLifecycleIteration(
 ): Promise<IterationTiming> {
   const totalStart = nowMs();
   const bootStart = totalStart;
-  const sandboxConfig = createSandboxConfig({
+  const sandboxDefinition = defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.20"),
   });
 
-  const sandbox = await sandboxConfig.boot();
+  const sandbox = await sandboxDefinition.boot();
   let closed = false;
   try {
     const bootMs = nowMs() - bootStart;
 
     const execStart = nowMs();
-    const result = await sandbox.process.exec("/bin/sh", ["-lc", input.command]);
+    const result = await sandbox.exec("/bin/sh", ["-lc", input.command]);
     const execMs = nowMs() - execStart;
     if (result.exitCode !== 0) {
       throw new Error(

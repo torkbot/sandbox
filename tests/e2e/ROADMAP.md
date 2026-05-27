@@ -9,7 +9,7 @@ configure a reusable sandbox, boot an instance, run work, and close it.
 Passing:
 
 - `new public API boots a built-in rootfs and runs a process`
-  - Covers `createSandboxConfig`, `rootfs.builtIn(...)`, `config.boot()`, and `sandbox.process.exec(...)`.
+  - Covers `defineSandbox`, `rootfs.builtIn(...)`, `sandbox.boot()`, and `lane.exec(...)`.
 - `boot options provide instance-specific virtual mounts`
   - Covers per-instance `mounts` and `fs.virtual(...)` without separate binding concepts.
 - `overlay supplies writable copy-on-write rootfs storage`
@@ -17,10 +17,10 @@ Passing:
 
 Next:
 
-- Add a deterministic local HTTP origin test for `network.buildPolicy(...)` once
+- Add a deterministic local HTTP origin test for `network.policy(...)` once
   the guest image and DNS path can exercise the interception layer without
   depending on public internet behavior.
-- Add a streaming process test when `sandbox.process.spawn(...)` lands.
+- Add a streaming process test when `lane.spawn(...)` lands.
 - Reintroduce hostile guest and POSIX-hardening coverage using only the public
   API above.
 

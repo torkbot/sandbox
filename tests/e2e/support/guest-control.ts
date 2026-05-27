@@ -1,29 +1,29 @@
-import type { SandboxProcessExecResult, SandboxRuntime } from "../../../src/index.ts";
+import type { SandboxExecResult, SandboxInstance } from "../../../src/index.ts";
 
 export async function execGuest(
-  vm: SandboxRuntime,
+  vm: SandboxInstance,
   input: {
     readonly id: string;
     readonly argv: readonly string[];
     readonly env?: Record<string, string>;
   },
-): Promise<SandboxProcessExecResult> {
+): Promise<SandboxExecResult> {
   const [command, ...args] = input.argv;
   if (command === undefined) {
     throw new Error("argv must contain a command");
   }
-  return await vm.process.exec(command, args, { env: input.env });
+  return await vm.exec(command, args, { env: input.env });
 }
 
 export async function execGuestShell(
-  vm: SandboxRuntime,
+  vm: SandboxInstance,
   input: {
     readonly id: string;
     readonly script: string;
     readonly env?: Record<string, string>;
   },
-): Promise<SandboxProcessExecResult> {
-  return await vm.process.exec("/bin/sh", ["-lc", input.script], { env: input.env });
+): Promise<SandboxExecResult> {
+  return await vm.exec("/bin/sh", ["-lc", input.script], { env: input.env });
 }
 
 export async function withTimeout<T>(

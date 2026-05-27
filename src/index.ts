@@ -58,9 +58,6 @@ export interface SandboxPosixFileSystem extends SandboxWritableFileSystem {
   readlink(path: string): Promise<string>;
 }
 
-export type SandboxVirtualFileSystem = SandboxFileSystem;
-export type SandboxMountedFileSystem = SandboxFileSystem;
-
 export interface SandboxHttpRequest {
   readonly protocol: "http/1.1" | "h2";
   readonly url: URL;
@@ -78,10 +75,6 @@ export interface SandboxHttpRequest {
   };
 }
 
-export type SandboxHttpRequestHook = (
-  request: SandboxHttpRequest,
-) => void | Promise<void>;
-
 export type BuiltInRootfsName = "alpine:3.20";
 
 export type BuiltInRootfsConfig = {
@@ -93,7 +86,7 @@ export type Rootfs = BuiltInRootfsConfig;
 
 export type SandboxFileSystemSource = {
   readonly kind: "virtual-fs";
-  readonly fileSystem: SandboxVirtualFileSystem;
+  readonly fileSystem: SandboxFileSystem;
 };
 
 export type SandboxWritableFileSystemSource = {
@@ -124,9 +117,11 @@ export type NetworkConnectionRequestHandler = (
   connection: NetworkConnectionRequest,
 ) => void | Promise<void>;
 
+const networkPolicyHandler: unique symbol = Symbol("networkPolicyHandler");
+
 export type NetworkPolicy = {
   readonly kind: "network-policy";
-  readonly onConnectionRequest: NetworkConnectionRequestHandler;
+  readonly [networkPolicyHandler]: NetworkConnectionRequestHandler;
 };
 
 type NetworkPolicyHookRegistration = {
@@ -134,7 +129,7 @@ type NetworkPolicyHookRegistration = {
   readonly network: InternalNetworkConfig;
 };
 
-export interface SandboxConfigOptions {
+export interface SandboxDefinitionOptions {
   readonly rootfs: Rootfs;
   readonly overlay?: SandboxWritableFileSystemSource;
   readonly network?: NetworkPolicy;
@@ -145,36 +140,32 @@ export interface SandboxBootOptions {
   readonly cwd?: string;
 }
 
-export interface SandboxConfig {
-  boot(options?: SandboxBootOptions): Promise<SandboxRuntime>;
+export interface SandboxDefinition {
+  boot(options?: SandboxBootOptions): Promise<SandboxInstance>;
 }
 
-export interface SandboxProcessExecOptions {
+export interface SandboxExecOptions {
   readonly cwd?: string;
   readonly env?: Record<string, string>;
 }
 
-export interface SandboxProcessExecResult {
+export interface SandboxExecResult {
   readonly exitCode: number;
   readonly stdout: string;
   readonly stderr: string;
 }
 
-export interface SandboxProcess {
+export interface SandboxInstance {
   exec(
     command: string,
     args?: readonly string[],
-    options?: SandboxProcessExecOptions,
-  ): Promise<SandboxProcessExecResult>;
-}
-
-export interface SandboxRuntime {
-  readonly process: SandboxProcess;
+    options?: SandboxExecOptions,
+  ): Promise<SandboxExecResult>;
   close(): Promise<void>;
   [Symbol.asyncDispose](): Promise<void>;
 }
 
-interface SandboxVm extends SandboxRuntime {
+interface SandboxVm extends SandboxInstance {
   readonly control: SandboxControl;
   readonly diagnostics?: SandboxDiagnostics;
 }
@@ -192,9 +183,9 @@ export const rootfs = {
   },
 };
 
-export function virtualFs(fileSystem: SandboxWritableFileSystem): SandboxWritableFileSystemSource;
-export function virtualFs(fileSystem: SandboxVirtualFileSystem): SandboxFileSystemSource;
-export function virtualFs(fileSystem: SandboxVirtualFileSystem): SandboxFileSystemSource {
+function virtualFs(fileSystem: SandboxWritableFileSystem): SandboxWritableFileSystemSource;
+function virtualFs(fileSystem: SandboxFileSystem): SandboxFileSystemSource;
+function virtualFs(fileSystem: SandboxFileSystem): SandboxFileSystemSource {
   return {
     kind: "virtual-fs",
     fileSystem,
@@ -206,19 +197,17 @@ export const fs = {
 };
 
 export const network = {
-  buildPolicy(input: {
-    readonly onConnectionRequest: NetworkConnectionRequestHandler;
-  }): NetworkPolicy {
+  policy(onConnectionRequest: NetworkConnectionRequestHandler): NetworkPolicy {
     return {
       kind: "network-policy",
-      onConnectionRequest: input.onConnectionRequest,
+      [networkPolicyHandler]: onConnectionRequest,
     };
   },
 };
 
-export function createSandboxConfig(options: SandboxConfigOptions): SandboxConfig {
-  validateSandboxConfigOptions(options);
-  return new ConfiguredSandboxConfig(options);
+export function defineSandbox(options: SandboxDefinitionOptions): SandboxDefinition {
+  validateSandboxDefinitionOptions(options);
+  return new DefinedSandbox(options);
 }
 
 type SpawnHttpRequestHeadersHook = {
@@ -226,14 +215,14 @@ type SpawnHttpRequestHeadersHook = {
   readonly selector: SandboxHttpRequestSelector;
 };
 
-class ConfiguredSandboxConfig implements SandboxConfig {
-  readonly #options: SandboxConfigOptions;
+class DefinedSandbox implements SandboxDefinition {
+  readonly #options: SandboxDefinitionOptions;
 
-  constructor(options: SandboxConfigOptions) {
+  constructor(options: SandboxDefinitionOptions) {
     this.#options = options;
   }
 
-  async boot(options: SandboxBootOptions = {}): Promise<SandboxRuntime> {
+  async boot(options: SandboxBootOptions = {}): Promise<SandboxInstance> {
     validateSandboxBootOptions(options);
     const networkPolicy = this.#options.network === undefined
       ? undefined
@@ -252,8 +241,8 @@ class ConfiguredSandboxConfig implements SandboxConfig {
 
 class HostBackedSandboxVm implements SandboxVm {
   readonly control: SandboxControl;
-  readonly process: SandboxProcess;
   readonly diagnostics?: SandboxDiagnostics;
+  readonly #exec: ControlBackedSandboxExec;
 
   readonly #hostVm: {
     readonly hasControlSocket: boolean;
@@ -279,7 +268,7 @@ class HostBackedSandboxVm implements SandboxVm {
       connected: hostVm.hasControlSocket,
       channel: hostVm,
     });
-    this.process = new ControlBackedSandboxProcess(this.control, _options.cwd);
+    this.#exec = new ControlBackedSandboxExec(this.control, _options.cwd);
     if (hostVm.terminateHostForTest !== undefined) {
       this.diagnostics = {
         terminateHostForTest: () => hostVm.terminateHostForTest?.() ?? Promise.resolve(),
@@ -300,9 +289,17 @@ class HostBackedSandboxVm implements SandboxVm {
   async [Symbol.asyncDispose](): Promise<void> {
     await this.close();
   }
+
+  async exec(
+    command: string,
+    args: readonly string[] = [],
+    options: SandboxExecOptions = {},
+  ): Promise<SandboxExecResult> {
+    return await this.#exec.exec(command, args, options);
+  }
 }
 
-class ControlBackedSandboxProcess implements SandboxProcess {
+class ControlBackedSandboxExec {
   readonly #control: SandboxControl;
   readonly #cwd: string | undefined;
 
@@ -314,8 +311,8 @@ class ControlBackedSandboxProcess implements SandboxProcess {
   async exec(
     command: string,
     args: readonly string[] = [],
-    options: SandboxProcessExecOptions = {},
-  ): Promise<SandboxProcessExecResult> {
+    options: SandboxExecOptions = {},
+  ): Promise<SandboxExecResult> {
     const cwd = options.cwd ?? this.#cwd;
     const env = cwd === undefined
       ? options.env
@@ -393,7 +390,7 @@ function toHostSpawnOptions(
 }
 
 function toInternalSandboxOptions(
-  config: SandboxConfigOptions,
+  config: SandboxDefinitionOptions,
   boot: SandboxBootOptions,
   network?: InternalNetworkConfig,
 ): InternalSandboxOptions {
@@ -413,7 +410,7 @@ function toInternalSandboxOptions(
 }
 
 function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPolicyHookRegistration {
-  const hook: SandboxHttpRequestHook = async (request) => {
+  const hook: HttpRequestMiddleware = async (request) => {
     const grants: Array<{
       readonly kind: "raw" | "http";
       readonly middleware?: HttpRequestMiddleware;
@@ -433,7 +430,7 @@ function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPoli
       },
     };
 
-    await policy.onConnectionRequest(connection);
+    await policy[networkPolicyHandler](connection);
 
     if (grants.length === 0) {
       throw new Error(`network connection denied: ${request.url.origin}`);
@@ -489,16 +486,16 @@ function builtInRootfsPath(name: BuiltInRootfsName): string {
   throw new Error(`unsupported built-in rootfs: ${name satisfies never}`);
 }
 
-function validateSandboxConfigOptions(options: SandboxConfigOptions): void {
+function validateSandboxDefinitionOptions(options: SandboxDefinitionOptions): void {
   if (options.rootfs.kind !== "built-in-rootfs") {
-    throw new Error("invalid sandbox config: rootfs must be selected with rootfs.builtIn(...)");
+    throw new Error("invalid sandbox definition: rootfs must be selected with rootfs.builtIn(...)");
   }
   builtInRootfsPath(options.rootfs.name);
   if (options.overlay !== undefined && !isSandboxWritableFileSystem(options.overlay.fileSystem)) {
-    throw new Error("invalid sandbox config: overlay filesystem must be writable");
+    throw new Error("invalid sandbox definition: overlay filesystem must be writable");
   }
   if (options.network !== undefined && options.network.kind !== "network-policy") {
-    throw new Error("invalid sandbox config: network must be created with network.buildPolicy(...)");
+    throw new Error("invalid sandbox definition: network must be created with network.policy(...)");
   }
 }
 

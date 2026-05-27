@@ -5,7 +5,7 @@ libkrun-backed microVMs with host-controlled filesystems and network policy.
 
 ```ts
 import {
-  createSandboxConfig,
+  defineSandbox,
   fs,
   rootfs,
   type SandboxWritableFileSystem,
@@ -13,18 +13,18 @@ import {
 
 declare const workspaceFs: SandboxWritableFileSystem;
 
-const config = createSandboxConfig({
+const sandbox = defineSandbox({
   rootfs: rootfs.builtIn("alpine:3.20"),
 });
 
-await using sandbox = await config.boot({
+await using lane = await sandbox.boot({
   mounts: {
     "/workspace": fs.virtual(workspaceFs),
   },
   cwd: "/workspace",
 });
 
-const result = await sandbox.process.exec("npm", ["test"]);
+const result = await lane.exec("npm", ["test"]);
 
 if (result.exitCode !== 0) {
   throw new Error(result.stderr);
@@ -38,7 +38,7 @@ the mounts each instance needs:
 
 ```ts
 import {
-  createSandboxConfig,
+  defineSandbox,
   fs,
   rootfs,
   type SandboxWritableFileSystem,
@@ -46,18 +46,18 @@ import {
 
 declare const workspaceFs: SandboxWritableFileSystem;
 
-const config = createSandboxConfig({
+const sandbox = defineSandbox({
   rootfs: rootfs.builtIn("alpine:3.20"),
 });
 
-await using sandbox = await config.boot({
+await using lane = await sandbox.boot({
   mounts: {
     "/workspace": fs.virtual(workspaceFs),
   },
   cwd: "/workspace",
 });
 
-const result = await sandbox.process.exec("npm", ["test"], {
+const result = await lane.exec("npm", ["test"], {
   env: { CI: "1" },
 });
 
@@ -68,9 +68,9 @@ if (result.exitCode !== 0) {
 
 The public API is split into three layers:
 
-- `createSandboxConfig(...)` describes reusable machine configuration.
-- `config.boot(...)` creates a runtime instance with per-instance mounts.
-- `sandbox.process.*` runs work inside the booted instance.
+- `defineSandbox(...)` describes reusable machine configuration.
+- `sandbox.boot(...)` creates a runtime instance with per-instance mounts.
+- `lane.exec(...)` runs buffered work inside the booted instance.
 
 Expensive artifact preparation is intentionally outside `boot()`.
 `rootfs.builtIn("alpine:3.20")` selects a built-in rootfs artifact that must
@@ -82,7 +82,7 @@ at runtime.
 ### Configuration
 
 ```ts
-type SandboxConfig = {
+type SandboxDefinition = {
   rootfs: Rootfs;
   overlay?: SandboxWritableFileSystemSource;
   network?: NetworkPolicy;
@@ -101,7 +101,7 @@ store copy-on-write data and deletion masks over the immutable rootfs. When
 absent, the guest root filesystem is read-only.
 
 ```ts
-createSandboxConfig({
+defineSandbox({
   rootfs: rootfs.builtIn("alpine:3.20"),
   overlay: fs.virtual(rootOverlayFs),
 });
@@ -111,12 +111,10 @@ createSandboxConfig({
 connection requests and grants only the traffic it explicitly allows:
 
 ```ts
-const policy = network.buildPolicy({
-  async onConnectionRequest(conn) {
-    if (conn.host === "registry.npmjs.org") {
-      conn.allowHttp();
-    }
-  },
+const policy = network.policy(async (conn) => {
+  if (conn.host === "registry.npmjs.org") {
+    conn.allowHttp();
+  }
 });
 ```
 
@@ -124,17 +122,15 @@ const policy = network.buildPolicy({
 HTTP(S)-classified traffic and can apply request middleware:
 
 ```ts
-const policy = network.buildPolicy({
-  async onConnectionRequest(conn) {
-    if (conn.host !== "api.example.com") return;
+const policy = network.policy(async (conn) => {
+  if (conn.host !== "api.example.com") return;
 
-    conn.allowHttp(async (request) => {
-      request.headers.set(
-        "authorization",
-        `Bearer ${await credentialBroker.authorizationFor(request)}`,
-      );
-    });
-  },
+  conn.allowHttp(async (request) => {
+    request.headers.set(
+      "authorization",
+      `Bearer ${await credentialBroker.authorizationFor(request)}`,
+    );
+  });
 });
 ```
 
@@ -153,7 +149,7 @@ Mounts are per-instance because different sandbox instances often need
 different filesystems over the same reusable machine configuration:
 
 ```ts
-await using sandbox = await config.boot({
+await using lane = await sandbox.boot({
   mounts: {
     "/workspace": fs.virtual(workspaceFs),
     "/private": fs.virtual(privateFs),
@@ -182,7 +178,7 @@ const rootOverlay = fs.virtual(rootOverlayFs);
 `exec` is the simple buffered process API:
 
 ```ts
-const result = await sandbox.process.exec("npm", ["test"], {
+const result = await lane.exec("npm", ["test"], {
   cwd: "/workspace",
   env: { CI: "1" },
 });
@@ -190,7 +186,7 @@ const result = await sandbox.process.exec("npm", ["test"], {
 
 `exec` is intentionally small: it buffers stdout and stderr and returns when the
 process exits. Streaming stdin/stdout/stderr belongs in the future
-`sandbox.process.spawn(...)` API.
+`lane.spawn(...)` API.
 
 ## Internal Architecture
 

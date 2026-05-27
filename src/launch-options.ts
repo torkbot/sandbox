@@ -1,6 +1,6 @@
 import type {
   SandboxFileSystem,
-  SandboxHttpRequestHook,
+  HttpRequestMiddleware,
   SandboxWritableFileSystemSource,
 } from "./index.ts";
 
@@ -57,6 +57,6 @@ export interface InternalSandboxOptions {
 export type RegisteredHttpRequestHeadersHook = {
   readonly id: string;
   readonly selector: SandboxHttpRequestSelector;
-  readonly hook: SandboxHttpRequestHook;
+  readonly hook: HttpRequestMiddleware;
   active: boolean;
 };

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  createSandboxConfig,
+  defineSandbox,
   fs,
   rootfs,
   type SandboxFileSystem,
@@ -9,41 +9,41 @@ import {
   type SandboxWritableFileSystemSource,
 } from "../../src/index.ts";
 
-test("createSandboxConfig rejects non-built-in rootfs objects", () => {
+test("defineSandbox rejects non-built-in rootfs objects", () => {
   assert.throws(
-    () => createSandboxConfig({
+    () => defineSandbox({
       rootfs: { kind: "prebuilt-rootfs", path: "rootfs.erofs", format: "erofs" } as never,
     }),
-    /invalid sandbox config: rootfs must be selected with rootfs\.builtIn\(\.\.\.\)/,
+    /invalid sandbox definition: rootfs must be selected with rootfs\.builtIn\(\.\.\.\)/,
   );
 });
 
-test("createSandboxConfig rejects unsupported built-in rootfs names", () => {
+test("defineSandbox rejects unsupported built-in rootfs names", () => {
   assert.throws(
-    () => createSandboxConfig({
+    () => defineSandbox({
       rootfs: { kind: "built-in-rootfs", name: "debian:13" } as never,
     }),
     /unsupported built-in rootfs: debian:13/,
   );
 });
 
-test("createSandboxConfig rejects read-only overlay filesystems", () => {
+test("defineSandbox rejects read-only overlay filesystems", () => {
   assert.throws(
-    () => createSandboxConfig({
+    () => defineSandbox({
       rootfs: rootfs.builtIn("alpine:3.20"),
       overlay: fs.virtual(readOnlyFileSystem()) as SandboxWritableFileSystemSource,
     }),
-    /invalid sandbox config: overlay filesystem must be writable/,
+    /invalid sandbox definition: overlay filesystem must be writable/,
   );
 });
 
 test("boot rejects relative mount paths before runtime launch", async () => {
-  const config = createSandboxConfig({
+  const sandbox = defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.20"),
   });
 
   await assert.rejects(
-    config.boot({
+    sandbox.boot({
       mounts: {
         workspace: fs.virtual(writableFileSystem()),
       },
@@ -53,12 +53,12 @@ test("boot rejects relative mount paths before runtime launch", async () => {
 });
 
 test("boot rejects root and dot-component mount paths before runtime launch", async () => {
-  const config = createSandboxConfig({
+  const sandbox = defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.20"),
   });
 
   await assert.rejects(
-    config.boot({
+    sandbox.boot({
       mounts: {
         "/": fs.virtual(writableFileSystem()),
       },
@@ -67,7 +67,7 @@ test("boot rejects root and dot-component mount paths before runtime launch", as
   );
 
   await assert.rejects(
-    config.boot({
+    sandbox.boot({
       mounts: {
         "/tmp/../proc": fs.virtual(writableFileSystem()),
       },
@@ -77,12 +77,12 @@ test("boot rejects root and dot-component mount paths before runtime launch", as
 });
 
 test("boot rejects mount paths with NUL bytes before runtime launch", async () => {
-  const config = createSandboxConfig({
+  const sandbox = defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.20"),
   });
 
   await assert.rejects(
-    config.boot({
+    sandbox.boot({
       mounts: {
         "/bad\0path": fs.virtual(writableFileSystem()),
       },
