@@ -96,6 +96,69 @@ test("COW rootfs round-trips rootfs mutations across instances", async (t) => {
   assert.equal(read.stdout, "persisted");
 });
 
+test("COW rootfs close sync ignores the instance cwd", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const blockStore = memoryBlockStore();
+  const sandboxDefinition = defineSandbox({
+    rootfs: rootfs.cow({
+      base: rootfs.builtIn("alpine:3.20"),
+      writable: blockStore,
+    }),
+  });
+
+  const first = await sandboxDefinition.boot({ cwd: "/tmp/close-cwd" });
+  try {
+    const prepare = await first.exec("/bin/mkdir", ["-p", "/tmp/close-cwd"], { cwd: "/" });
+    assert.equal(prepare.exitCode, 0, prepare.stderr);
+    const write = await first.exec("/bin/sh", [
+      "-lc",
+      "printf '%s' cwd-independent > /root/close-sync.txt",
+    ]);
+    assert.equal(write.exitCode, 0, write.stderr);
+    const removeCwd = await first.exec("/bin/rm", ["-rf", "/tmp/close-cwd"], { cwd: "/" });
+    assert.equal(removeCwd.exitCode, 0, removeCwd.stderr);
+  } finally {
+    await first.close();
+  }
+
+  await using second = await sandboxDefinition.boot();
+  const read = await second.exec("/bin/cat", ["/root/close-sync.txt"]);
+
+  assert.equal(read.exitCode, 0, read.stderr);
+  assert.equal(read.stdout, "cwd-independent");
+});
+
+test("COW rootfs rejects overlapping boots for the same writable store", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const blockStore = memoryBlockStore();
+  const sandboxDefinition = defineSandbox({
+    rootfs: rootfs.cow({
+      base: rootfs.builtIn("alpine:3.20"),
+      writable: blockStore,
+    }),
+  });
+
+  const first = await sandboxDefinition.boot();
+  try {
+    await assert.rejects(
+      sandboxDefinition.boot(),
+      /COW rootfs block store is already attached to a running sandbox/,
+    );
+  } finally {
+    await first.close();
+  }
+
+  await using second = await sandboxDefinition.boot();
+  const ready = await second.exec("/bin/true");
+  assert.equal(ready.exitCode, 0, ready.stderr);
+});
+
 function memoryBlockStore(): SandboxBlockStore {
   const blocks = new Map<bigint, Uint8Array>();
   return {
