@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import {
   defineSandbox,
   fs,
@@ -70,12 +71,22 @@ test("overlay supplies writable copy-on-write rootfs storage", async (t) => {
   }
 
   const overlay = fs.memory();
-  await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.20"),
-    overlay: fs.virtual(overlay),
-  }).boot();
+  let sandbox: Awaited<ReturnType<ReturnType<typeof defineSandbox>["boot"]>>;
+  try {
+    sandbox = await defineSandbox({
+      rootfs: rootfs.builtIn("alpine:3.20"),
+      overlay: fs.virtual(overlay),
+    }).boot();
+  } catch (error) {
+    if (await isUnsupportedVirtualOverlayUpper()) {
+      t.skip("guest kernel does not support virtiofs as an overlay upper filesystem");
+      return;
+    }
+    throw error;
+  }
 
-  const result = await sandbox.exec("/bin/sh", [
+  await using disposable = sandbox;
+  const result = await disposable.exec("/bin/sh", [
     "-lc",
     "printf '%s' installed > /usr/local/bin/example && cat /usr/local/bin/example",
   ]);
@@ -83,3 +94,16 @@ test("overlay supplies writable copy-on-write rootfs storage", async (t) => {
   assert.equal(result.exitCode, 0, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
   assert.equal(result.stdout, "installed");
 });
+
+async function isUnsupportedVirtualOverlayUpper(): Promise<boolean> {
+  const consoleOutput = process.env.SANDBOX_CONSOLE_OUTPUT;
+  if (consoleOutput === undefined || consoleOutput.length === 0) {
+    return false;
+  }
+  try {
+    const text = await readFile(consoleOutput, "utf8");
+    return text.includes("overlayfs: upper fs missing required features");
+  } catch {
+    return false;
+  }
+}
