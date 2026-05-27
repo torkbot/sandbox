@@ -284,14 +284,19 @@ class DefinedSandbox implements SandboxDefinition {
       ? undefined
       : createNetworkPolicyHookRegistration(this.#options.network);
     const launchOptions = await toInternalSandboxOptions(this.#options, options, networkPolicy?.network);
-    validateInternalSandboxOptions(launchOptions);
-    const hostOptions = toHostSpawnOptions(launchOptions, networkPolicy?.hooks ?? []);
-    const hostVm = await HostProcessSandboxVm.spawn(
-      launchOptions,
-      hostOptions,
-      new Map((networkPolicy?.hooks ?? []).map((hook) => [hook.id, hook])),
-    );
-    return new HostBackedSandboxVm(hostVm, launchOptions);
+    try {
+      validateInternalSandboxOptions(launchOptions);
+      const hostOptions = toHostSpawnOptions(launchOptions, networkPolicy?.hooks ?? []);
+      const hostVm = await HostProcessSandboxVm.spawn(
+        launchOptions,
+        hostOptions,
+        new Map((networkPolicy?.hooks ?? []).map((hook) => [hook.id, hook])),
+      );
+      return new HostBackedSandboxVm(hostVm, launchOptions);
+    } catch (error) {
+      await launchOptions.storageCleanup?.();
+      throw error;
+    }
   }
 }
 
@@ -340,11 +345,22 @@ class HostBackedSandboxVm implements SandboxVm {
     }
 
     this.#closed = true;
+    let syncError: unknown;
+    if (this.#options.storageCleanup !== undefined) {
+      try {
+        await this.#exec.exec("/bin/sync");
+      } catch (error) {
+        syncError = error;
+      }
+    }
     try {
       await this.control.close();
       await this.#hostVm.close();
     } finally {
       await this.#options.storageCleanup?.();
+    }
+    if (syncError !== undefined) {
+      throw syncError;
     }
   }
 

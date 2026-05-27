@@ -23,11 +23,8 @@ export async function materializeCowRootStorage(
   return {
     path: rootfsPath,
     cleanup: async () => {
-      try {
-        await checkpointBlocks(rootfsPath, storage);
-      } finally {
-        await rm(tempDir, { recursive: true, force: true });
-      }
+      await checkpointBlocks(rootfsPath, storage);
+      await rm(tempDir, { recursive: true, force: true });
     },
   };
 }
