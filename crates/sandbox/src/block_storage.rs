@@ -150,7 +150,7 @@ impl Storage for CowBlockStorage {
 
     async fn flush(&self) -> io::Result<()> {
         let (store, chunks) = {
-            let mut state = self.state.lock().expect("COW block storage lock poisoned");
+            let state = self.state.lock().expect("COW block storage lock poisoned");
             let chunks = state
                 .modified_blocks
                 .iter()
@@ -161,13 +161,23 @@ impl Storage for CowBlockStorage {
                         .map(|data| (*index, data.clone()))
                 })
                 .collect::<Vec<_>>();
-            state.modified_blocks.clear();
             (state.store.clone(), chunks)
         };
         if !chunks.is_empty() {
-            store.write_blocks(chunks)?;
+            store.write_blocks(chunks.clone())?;
         }
-        store.flush()
+        store.flush()?;
+        let mut state = self.state.lock().expect("COW block storage lock poisoned");
+        for (index, flushed) in chunks {
+            if state
+                .cached_blocks
+                .get(&index)
+                .is_some_and(|current| current == &flushed)
+            {
+                state.modified_blocks.remove(&index);
+            }
+        }
+        Ok(())
     }
 
     async fn sync(&self) -> io::Result<()> {
@@ -280,10 +290,10 @@ impl CowBlockStorageState {
             }
             if !self.cached_blocks.contains_key(&block_index) {
                 let mut block = vec![0; self.block_size as usize];
+                let readable = self.size.saturating_sub(block_start).min(self.block_size) as usize;
                 self.base.seek(SeekFrom::Start(block_start))?;
-                let bytes_read = self.base.read(&mut block)?;
-                if bytes_read < block.len() {
-                    block[bytes_read..].fill(0);
+                if readable > 0 {
+                    self.base.read_exact(&mut block[..readable])?;
                 }
                 self.cached_blocks.insert(block_index, block);
             }

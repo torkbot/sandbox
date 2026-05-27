@@ -152,6 +152,9 @@ export function createMemoryFileSystem(options: MemoryFileSystemOptions = {}): S
       const toParent = lookupDirectory(parentPath(to));
       const destinationName = baseName(to);
       const existing = toParent.entries.get(destinationName);
+      if (existing === node) {
+        return;
+      }
       if ((flags & 1) !== 0 && existing !== undefined) {
         throw new Error(`path exists: ${to}`);
       }

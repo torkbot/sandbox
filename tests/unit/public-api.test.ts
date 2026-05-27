@@ -147,6 +147,41 @@ test("fs.memory rejects invalid rename replacements", async () => {
   await assert.rejects(fileSystem.rename("/empty-dir", "/dir"), /directory not empty: \/dir/);
 });
 
+test("fs.memory treats same-node renames as no-ops", async () => {
+  const fileSystem = fs.memory({
+    files: {
+      "/dir/child.txt": "child",
+      "/file.txt": "file",
+    },
+  });
+  await fileSystem.link("/file.txt", "/linked.txt");
+
+  await fileSystem.rename("/dir", "/dir");
+  await fileSystem.rename("/file.txt", "/linked.txt");
+
+  assert.equal(
+    new TextDecoder().decode(await fileSystem.read({
+      path: "/dir/child.txt",
+      signal: AbortSignal.timeout(1_000),
+    })),
+    "child",
+  );
+  assert.equal(
+    new TextDecoder().decode(await fileSystem.read({
+      path: "/file.txt",
+      signal: AbortSignal.timeout(1_000),
+    })),
+    "file",
+  );
+  assert.equal(
+    new TextDecoder().decode(await fileSystem.read({
+      path: "/linked.txt",
+      signal: AbortSignal.timeout(1_000),
+    })),
+    "file",
+  );
+});
+
 test("fs.memory rejects directory renames into their own subtree", async () => {
   const fileSystem = fs.memory({
     files: {
