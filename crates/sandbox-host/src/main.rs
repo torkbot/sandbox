@@ -1,8 +1,8 @@
 use std::env;
 use std::io::{self, ErrorKind, Read};
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use bson::{Bson, Document, doc};
@@ -15,7 +15,7 @@ use sandbox::config::{
 use sandbox::http_flow::{
     HookBackedHttpInterceptRuntime, HttpHookExecutor, InterceptedHttpRequest,
 };
-use sandbox::runtime::{HostServices, VirtualFsDevice};
+use sandbox::runtime::{ControlSocket, HostServices, StartStatusObserver, VirtualFsDevice};
 
 mod host_vfs;
 
@@ -66,43 +66,23 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
 
     let spec = sandbox::MicroVmSpec::build(parse_spawn(spawn_document)?)?;
     let bridge = HostIoBridge::new();
-    let virtual_fs = virtual_fs_devices(&spec, bridge.clone());
-    let services = HostServices {
-        http: http_intercept_runtime(&spec, bridge.clone())?,
-        root_storage: spec.rootfs.storage.as_ref().map(|storage| {
-            Arc::new(NodeCowBlockStore::new(
-                bridge.clone(),
-                match storage {
-                    sandbox::config::RootfsStorageSpec::CowBlockStore { block_size } => *block_size,
-                },
-            )) as Arc<dyn CowBlockStore>
-        }),
-    };
-    let mut vm = sandbox::runtime::KrunVm::create_with_services(&spec, virtual_fs, services)?;
-    vm.start()?;
-
-    let mut guest_writer = vm.control_socket().try_clone()?;
-    let mut guest_reader = vm.control_socket().try_clone()?;
     let (bridge_tx, bridge_rx) = mpsc::channel::<Result<(), String>>();
-
-    let start_status = vm.start_status_observer();
-    let status_tx = bridge_tx.clone();
-    thread::spawn(move || {
-        if let Err(error) = start_status.wait() {
-            let _ = status_tx.send(Err(error.to_string()));
-        }
-    });
+    let guest_writer_slot: Arc<(Mutex<Option<ControlSocket>>, Condvar)> =
+        Arc::new((Mutex::new(None), Condvar::new()));
+    let start_status_slot: Arc<Mutex<Option<StartStatusObserver>>> = Arc::new(Mutex::new(None));
 
     let stdin_bridge = bridge.clone();
     let stdin_tx = bridge_tx.clone();
-    let stdin_start_status = vm.start_status_observer();
+    let stdin_guest_writer = guest_writer_slot.clone();
+    let stdin_start_status = start_status_slot.clone();
     thread::spawn(move || {
         let mut stdin = io::stdin().lock();
         loop {
             let (packet, document) = match read_packet(&mut stdin) {
                 Ok(value) => value,
                 Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
-                    let result = match stdin_start_status.get() {
+                    let start_status = stdin_start_status.lock().unwrap().clone();
+                    let result = match start_status.and_then(|status| status.get()) {
                         Some(Ok(())) => Ok(()),
                         Some(Err(error)) => {
                             Err(format!("VM exited after host stdin closed: {error}"))
@@ -120,10 +100,47 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
             if stdin_bridge.route_response(document) {
                 continue;
             }
-            if let Err(error) = guest_writer.write_packet(&packet) {
+
+            let (writer_lock, writer_ready) = &*stdin_guest_writer;
+            let mut writer = writer_lock.lock().unwrap();
+            while writer.is_none() {
+                writer = writer_ready.wait(writer).unwrap();
+            }
+            if let Err(error) = writer.as_mut().unwrap().write_packet(&packet) {
                 let _ = stdin_tx.send(Err(format!("write guest control packet: {error}")));
                 return;
             }
+        }
+    });
+
+    let virtual_fs = virtual_fs_devices(&spec, bridge.clone());
+    let services = HostServices {
+        http: http_intercept_runtime(&spec, bridge.clone())?,
+        root_storage: spec.rootfs.storage.as_ref().map(|storage| {
+            Arc::new(NodeCowBlockStore::new(
+                bridge.clone(),
+                match storage {
+                    sandbox::config::RootfsStorageSpec::CowBlockStore { block_size } => *block_size,
+                },
+            )) as Arc<dyn CowBlockStore>
+        }),
+    };
+    let mut vm = sandbox::runtime::KrunVm::create_with_services(&spec, virtual_fs, services)?;
+    vm.start()?;
+
+    {
+        let (writer_lock, writer_ready) = &*guest_writer_slot;
+        *writer_lock.lock().unwrap() = Some(vm.control_socket().try_clone()?);
+        writer_ready.notify_all();
+    }
+    let mut guest_reader = vm.control_socket().try_clone()?;
+
+    let start_status = vm.start_status_observer();
+    *start_status_slot.lock().unwrap() = Some(start_status.clone());
+    let status_tx = bridge_tx.clone();
+    thread::spawn(move || {
+        if let Err(error) = start_status.wait() {
+            let _ = status_tx.send(Err(error.to_string()));
         }
     });
 
