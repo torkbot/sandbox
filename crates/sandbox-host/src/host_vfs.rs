@@ -496,9 +496,7 @@ impl NodeVirtualFs {
 
     fn forget_path(&self, path: &str) {
         let mut state = self.state.lock().expect("vfs inode state lock poisoned");
-        if let Some(inode) = state.inodes_by_path.remove(path) {
-            state.paths_by_inode.remove(&inode);
-        }
+        remove_path_mapping(&mut state, path);
     }
 
     fn rename_path(&self, from: &str, to: &str) {
@@ -527,8 +525,32 @@ impl NodeVirtualFs {
 
     fn alias_path_to_inode(&self, path: &str, inode: u64) {
         let mut state = self.state.lock().expect("vfs inode state lock poisoned");
-        if let Some(previous_inode) = state.inodes_by_path.insert(path.to_string(), inode) {
-            state.paths_by_inode.remove(&previous_inode);
+        remove_path_mapping(&mut state, path);
+        state.inodes_by_path.insert(path.to_string(), inode);
+        state
+            .paths_by_inode
+            .entry(inode)
+            .or_insert_with(|| path.to_string());
+    }
+}
+
+fn remove_path_mapping(state: &mut NodeVirtualFsState, path: &str) {
+    let Some(inode) = state.inodes_by_path.remove(path) else {
+        return;
+    };
+    if state
+        .paths_by_inode
+        .get(&inode)
+        .is_some_and(|stored| stored == path)
+    {
+        if let Some((replacement_path, _)) = state
+            .inodes_by_path
+            .iter()
+            .find(|(_, candidate_inode)| **candidate_inode == inode)
+        {
+            state.paths_by_inode.insert(inode, replacement_path.clone());
+        } else {
+            state.paths_by_inode.remove(&inode);
         }
     }
 }
@@ -544,7 +566,7 @@ fn forget_path_tree(state: &mut NodeVirtualFsState, path: &str) {
         .collect::<Vec<_>>();
     for inode in forgotten {
         if let Some(path) = state.paths_by_inode.remove(&inode) {
-            state.inodes_by_path.remove(&path);
+            remove_path_mapping(state, &path);
         }
     }
 }
@@ -736,5 +758,22 @@ mod tests {
             host_vfs_error("not a directory: /target".to_string()).raw_os_error(),
             Some(libc::ENOTDIR)
         );
+    }
+
+    #[test]
+    fn removing_hard_link_canonical_path_preserves_remaining_alias() {
+        let mut state = NodeVirtualFsState::default();
+        state.paths_by_inode.insert(2, "/source".to_string());
+        state.inodes_by_path.insert("/source".to_string(), 2);
+        state.inodes_by_path.insert("/linked".to_string(), 2);
+
+        remove_path_mapping(&mut state, "/source");
+
+        assert_eq!(
+            state.paths_by_inode.get(&2).map(String::as_str),
+            Some("/linked")
+        );
+        assert_eq!(state.inodes_by_path.get("/linked"), Some(&2));
+        assert_eq!(state.inodes_by_path.get("/source"), None);
     }
 }

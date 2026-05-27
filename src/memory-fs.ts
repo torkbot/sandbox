@@ -142,6 +142,9 @@ export function createMemoryFileSystem(options: MemoryFileSystemOptions = {}): S
       if (node === undefined) {
         throw new Error(`not found: ${from}`);
       }
+      if (node.type === "directory" && isDescendantPath(from, to)) {
+        throw new Error(`invalid rename target: ${to}`);
+      }
       const toParent = lookupDirectory(parentPath(to));
       const destinationName = baseName(to);
       const existing = toParent.entries.get(destinationName);
@@ -306,6 +309,13 @@ function validateRenameReplacement(source: MemoryNode, destination: MemoryNode, 
   if (destination.type === "directory") {
     throw new Error(`is a directory: ${path}`);
   }
+}
+
+function isDescendantPath(parent: string, child: string): boolean {
+  if (parent === "/") {
+    return child !== "/";
+  }
+  return child.startsWith(`${parent}/`);
 }
 
 function nodeStat(node: MemoryNode): SandboxFileStat {

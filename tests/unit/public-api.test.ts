@@ -116,6 +116,24 @@ test("fs.memory rejects invalid rename replacements", async () => {
   await assert.rejects(fileSystem.rename("/empty-dir", "/dir"), /directory not empty: \/dir/);
 });
 
+test("fs.memory rejects directory renames into their own subtree", async () => {
+  const fileSystem = fs.memory({
+    files: {
+      "/a/b/file.txt": "file",
+    },
+  });
+
+  await assert.rejects(fileSystem.rename("/a", "/a/b/c"), /invalid rename target: \/a\/b\/c/);
+
+  assert.equal(
+    new TextDecoder().decode(await fileSystem.read({
+      path: "/a/b/file.txt",
+      signal: AbortSignal.timeout(1_000),
+    })),
+    "file",
+  );
+});
+
 test("defineSandbox accepts resource limits", () => {
   const sandbox = defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.20"),
