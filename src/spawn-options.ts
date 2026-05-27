@@ -1,4 +1,4 @@
-import type { OutboundNetworkRule } from "./index.ts";
+import type { InternalOutboundNetworkRule } from "./launch-options.ts";
 
 export type HostSpawnSandboxOptions = {
   readonly name?: string;
@@ -17,10 +17,11 @@ export type HostSpawnSandboxOptions = {
   readonly rootfs: {
     readonly path: string;
     readonly readonly?: boolean;
-    readonly format: "directory" | "erofs";
-  };
-  readonly rootfsOverlay?: {
-    readonly mode: "writable";
+    readonly format: "directory" | "erofs" | "ext4";
+    readonly storage?: {
+      readonly kind: "cow-block-store";
+      readonly blockSize: number;
+    };
   };
   readonly mounts?: readonly {
     readonly kind: "virtual-fs";
@@ -30,7 +31,7 @@ export type HostSpawnSandboxOptions = {
   readonly network?: {
     readonly outbound?: {
       readonly policy: "deny";
-      readonly rules: readonly OutboundNetworkRule[];
+      readonly rules: readonly InternalOutboundNetworkRule[];
     };
     readonly http?: {
       readonly caCertificatePem?: string;

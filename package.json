@@ -1,6 +1,6 @@
 {
   "name": "@torkbot/sandbox",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": false,
   "type": "module",
   "description": "A TypeScript-first Node.js library for spawning libkrun-backed microVMs.",
@@ -33,6 +33,7 @@
     "build:kernel": "node ./scripts/build-kernel.ts",
     "build:rootfs": "node ./scripts/build-rootfs.ts",
     "build:rootfs:erofs": "node ./scripts/build-rootfs-erofs.ts",
+    "build:rootfs:ext4": "node ./scripts/build-rootfs-ext4.ts",
     "build:ts": "rm -f dist/*.js dist/*.js.map dist/*.d.ts dist/*.d.ts.map && tsgo --project tsconfig.build.json --pretty",
     "artifacts:link-current": "node ./scripts/prepare-npm-packages.ts --platform --current --install",
     "benchmark:e2e:lifecycle": "node ./scripts/benchmark-e2e-lifecycle.ts",
@@ -43,8 +44,8 @@
     "test:rust": "cargo test --workspace",
     "test:unit": "node --test tests/unit/*.test.ts",
     "typecheck": "tsgo --noEmit --pretty",
-    "release:prepare": "node --run build && node ./scripts/prepare-npm-packages.ts",
-    "release:pack": "npm run build:ts && node ./scripts/prepare-npm-packages.ts --clean --root && node ./scripts/prepare-npm-packages.ts --platform --current && npm pack --dry-run ./dist/npm/sandbox && npm pack --dry-run ./dist/npm/sandbox-*",
+    "release:prepare": "node --run build && node --run build:init && node --run build:rootfs && node --run build:rootfs:erofs && node --run build:rootfs:ext4 && node ./scripts/prepare-npm-packages.ts --clean --root && node ./scripts/prepare-npm-packages.ts --platform --current",
+    "release:pack": "npm run build:ts && node --run build:init && node --run build:rootfs && node --run build:rootfs:erofs && node --run build:rootfs:ext4 && node ./scripts/prepare-npm-packages.ts --clean --root && node ./scripts/prepare-npm-packages.ts --platform --current && npm pack --dry-run ./dist/npm/sandbox && npm pack --dry-run ./dist/npm/sandbox-*",
     "prepublishOnly": "node --run release:prepare"
   },
   "devDependencies": {
@@ -60,7 +61,7 @@
     "just-bash": "^2.14.5"
   },
   "optionalDependencies": {
-    "@torkbot/sandbox-darwin-arm64": "0.1.0",
-    "@torkbot/sandbox-linux-x64-gnu": "0.1.0"
+    "@torkbot/sandbox-darwin-arm64": "0.2.0",
+    "@torkbot/sandbox-linux-x64-gnu": "0.2.0"
   }
 }

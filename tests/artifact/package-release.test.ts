@@ -7,23 +7,27 @@ test("root package declares public release metadata and platform optional depend
     await readFile(new URL("../../package.json", import.meta.url), "utf8"),
   ) as {
     private?: boolean;
-    version?: string;
     publishConfig?: { access?: string };
     bin?: Record<string, string>;
     optionalDependencies?: Record<string, string>;
     napi?: unknown;
+    version?: string;
   };
 
   assert.equal(packageJson.private, false);
-  assert.equal(packageJson.version, "0.1.0");
   assert.equal(packageJson.publishConfig?.access, "public");
   assert.deepEqual(packageJson.bin, {
     sandbox: "./dist/cli.js",
   });
-  assert.deepEqual(packageJson.optionalDependencies, {
-    "@torkbot/sandbox-darwin-arm64": "0.1.0",
-    "@torkbot/sandbox-linux-x64-gnu": "0.1.0",
-  });
+  assert.deepEqual(Object.keys(packageJson.optionalDependencies ?? {}).sort(), [
+    "@torkbot/sandbox-darwin-arm64",
+    "@torkbot/sandbox-linux-x64-gnu",
+  ]);
+  for (const [packageName, packageVersion] of Object.entries(
+    packageJson.optionalDependencies ?? {},
+  )) {
+    assert.equal(packageVersion, packageJson.version, packageName);
+  }
   assert.equal(packageJson.napi, undefined);
 });
 
@@ -36,8 +40,10 @@ test("release workflow builds platform packages before publishing the root packa
   assert.match(workflow, /npm run build:host/);
   assert.doesNotMatch(workflow, /build:native/);
   assert.match(workflow, /Build kernel artifact/);
+  assert.match(workflow, /Build rootfs artifact/);
   assert.match(workflow, /SANDBOX_KERNEL_ARCH/);
   assert.match(workflow, /Download kernel artifact/);
+  assert.match(workflow, /Download rootfs artifact/);
   assert.match(workflow, /prepare-npm-packages\.ts --platform --current/);
   assert.match(workflow, /Publish platform packages/);
   assert.match(workflow, /Publish root package/);
@@ -47,4 +53,32 @@ test("release workflow builds platform packages before publishing the root packa
 
   const publishJob = workflow.slice(workflow.indexOf("  publish:"));
   assert.match(publishJob, /uses: actions\/checkout@v4/);
+
+  const rootfsJob = workflow.slice(workflow.indexOf("  build-rootfs:"), workflow.lastIndexOf("  publish:"));
+  assert.match(rootfsJob, /submodules: recursive/);
+});
+
+test("local release scripts build current rootfs before packaging platform packages", async () => {
+  const packageJson = JSON.parse(
+    await readFile(new URL("../../package.json", import.meta.url), "utf8"),
+  ) as { scripts?: Record<string, string> };
+
+  for (const scriptName of ["release:prepare", "release:pack"]) {
+    const script = packageJson.scripts?.[scriptName] ?? "";
+    const buildRootfs = script.indexOf("node --run build:rootfs:erofs");
+    const buildWritableRootfs = script.indexOf("node --run build:rootfs:ext4");
+    const packageCurrentPlatform = script.indexOf("prepare-npm-packages.ts --platform --current");
+
+    assert.notEqual(buildRootfs, -1, `${scriptName} should build the rootfs image`);
+    assert.notEqual(buildWritableRootfs, -1, `${scriptName} should build the writable rootfs image`);
+    assert.notEqual(packageCurrentPlatform, -1, `${scriptName} should package the current platform`);
+    assert.ok(
+      buildRootfs < packageCurrentPlatform,
+      `${scriptName} should build the rootfs image before packaging the platform package`,
+    );
+    assert.ok(
+      buildWritableRootfs < packageCurrentPlatform,
+      `${scriptName} should build the writable rootfs image before packaging the platform package`,
+    );
+  }
 });

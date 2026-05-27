@@ -7,7 +7,7 @@ use std::time::Duration;
 
 pub use krun_devices::virtio::bindings;
 pub use krun_devices::virtio::fs::{
-    Entry as VirtioFsEntry, VirtualDirEntry as VirtioFsDirEntry,
+    Entry as VirtioFsEntry, GetxattrReply, ListxattrReply, VirtualDirEntry as VirtioFsDirEntry,
     VirtualFsBackend as VirtioVirtualFsBackend,
 };
 
@@ -96,6 +96,16 @@ pub trait HostVirtualFileSystem: Send + Sync + 'static {
         Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
     }
 
+    fn link(
+        &self,
+        inode: VirtualInode,
+        newparent: VirtualInode,
+        newname: &CStr,
+    ) -> io::Result<VirtioFsEntry> {
+        let _ = (inode, newparent, newname);
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
+
     fn symlink(
         &self,
         linkname: &CStr,
@@ -108,6 +118,32 @@ pub trait HostVirtualFileSystem: Send + Sync + 'static {
 
     fn readlink(&self, inode: VirtualInode) -> io::Result<Vec<u8>> {
         let _ = inode;
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
+
+    fn setxattr(
+        &self,
+        inode: VirtualInode,
+        name: &CStr,
+        value: &[u8],
+        flags: u32,
+    ) -> io::Result<()> {
+        let _ = (inode, name, value, flags);
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
+
+    fn getxattr(&self, inode: VirtualInode, name: &CStr, size: u32) -> io::Result<GetxattrReply> {
+        let _ = (inode, name, size);
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
+
+    fn listxattr(&self, inode: VirtualInode, size: u32) -> io::Result<ListxattrReply> {
+        let _ = (inode, size);
+        Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
+    }
+
+    fn removexattr(&self, inode: VirtualInode, name: &CStr) -> io::Result<()> {
+        let _ = (inode, name);
         Err(io::Error::from_raw_os_error(bindings::LINUX_ENOSYS))
     }
 }
@@ -222,6 +258,14 @@ impl VirtioVirtualFsBackend for VirtualFsAdapter {
         )
     }
 
+    fn link(&self, inode: u64, newparent: u64, newname: &CStr) -> io::Result<VirtioFsEntry> {
+        self.inner.link(
+            VirtualInode::from(inode),
+            VirtualInode::from(newparent),
+            newname,
+        )
+    }
+
     fn symlink(&self, linkname: &CStr, parent: u64, name: &CStr) -> io::Result<VirtioFsEntry> {
         self.inner
             .symlink(linkname, VirtualInode::from(parent), name)
@@ -229,6 +273,23 @@ impl VirtioVirtualFsBackend for VirtualFsAdapter {
 
     fn readlink(&self, inode: u64) -> io::Result<Vec<u8>> {
         self.inner.readlink(VirtualInode::from(inode))
+    }
+
+    fn setxattr(&self, inode: u64, name: &CStr, value: &[u8], flags: u32) -> io::Result<()> {
+        self.inner
+            .setxattr(VirtualInode::from(inode), name, value, flags)
+    }
+
+    fn getxattr(&self, inode: u64, name: &CStr, size: u32) -> io::Result<GetxattrReply> {
+        self.inner.getxattr(VirtualInode::from(inode), name, size)
+    }
+
+    fn listxattr(&self, inode: u64, size: u32) -> io::Result<ListxattrReply> {
+        self.inner.listxattr(VirtualInode::from(inode), size)
+    }
+
+    fn removexattr(&self, inode: u64, name: &CStr) -> io::Result<()> {
+        self.inner.removexattr(VirtualInode::from(inode), name)
     }
 }
 

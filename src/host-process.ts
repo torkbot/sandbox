@@ -6,28 +6,30 @@ import type { HostControlChannel } from "./control.ts";
 import type { HostSpawnSandboxOptions } from "./spawn-options.ts";
 import { isSandboxWritableFileSystem } from "./vfs.ts";
 import type {
-  SandboxOptions,
   SandboxFileSystem,
+  SandboxBlockStoreContext,
+  SandboxBlockStore,
   SandboxPosixFileSystem,
-  SandboxHttpRequestHook,
-  SandboxHttpRequestSelector,
 } from "./index.ts";
+import type {
+  InternalSandboxOptions,
+  RegisteredHttpRequestHeadersHook,
+} from "./launch-options.ts";
 
-type RegisteredHttpRequestHeadersHook = {
-  readonly selector: SandboxHttpRequestSelector;
-  readonly hook: SandboxHttpRequestHook;
-  active: boolean;
-};
+const DEFAULT_LAUNCH_TIMEOUT_MS = 60_000;
 
 export class HostProcessSandboxVm implements HostControlChannel {
   readonly hasControlSocket = true;
   readonly packets: AsyncIterable<Uint8Array>;
 
   readonly #child: ChildProcessWithoutNullStreams;
-  readonly #options: SandboxOptions;
+  readonly #options: InternalSandboxOptions;
   readonly #packets = new AsyncQueue<Uint8Array>();
   readonly #packetActivity = new AsyncSignal();
+  readonly #launchReady = new AsyncSignal("sandbox-host launch acknowledgement closed");
   readonly #hostFs = new Map<string, SandboxFileSystem>();
+  readonly #rootBlockStore?: SandboxBlockStore;
+  readonly #rootBlockStoreContext?: SandboxBlockStoreContext;
   readonly #requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook>;
   #buffer = new Uint8Array();
   #stderr = "";
@@ -37,17 +39,17 @@ export class HostProcessSandboxVm implements HostControlChannel {
 
   private constructor(
     child: ChildProcessWithoutNullStreams,
-    options: SandboxOptions,
+    options: InternalSandboxOptions,
     requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook>,
   ) {
     this.#child = child;
     this.#options = options;
     this.packets = this.#packets;
     this.#requestHeaderHooks = requestHeaderHooks;
+    this.#rootBlockStore = options.rootfs.storage?.blockStore;
+    this.#rootBlockStoreContext = options.rootfs.storage?.context;
     for (const mount of options.mounts ?? []) {
-      if (mount.kind === "virtual-fs") {
-        this.#hostFs.set(mount.path, mount.fileSystem);
-      }
+      this.#hostFs.set(mount.path, mount.fileSystem);
     }
     child.stdout.on("data", (chunk: Buffer) => {
       this.#receive(chunk);
@@ -78,11 +80,12 @@ export class HostProcessSandboxVm implements HostControlChannel {
       );
       this.#packets.close(this.#exitError);
       this.#packetActivity.close(this.#exitError);
+      this.#launchReady.close(this.#exitError);
     });
   }
 
   static async spawn(
-    options: SandboxOptions,
+    options: InternalSandboxOptions,
     hostOptions: HostSpawnSandboxOptions,
     requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook> = new Map(),
   ): Promise<HostProcessSandboxVm> {
@@ -227,6 +230,9 @@ export class HostProcessSandboxVm implements HostControlChannel {
       this.#buffer = this.#buffer.slice(packetLength);
       this.#packetActivity.notify();
       if (!this.#routeHostPacket(packet)) {
+        if (isInitReadyPacket(packet)) {
+          this.#launchReady.notify();
+        }
         this.#packets.push(packet);
       }
     }
@@ -252,10 +258,19 @@ export class HostProcessSandboxVm implements HostControlChannel {
       && type !== "host.vfs.unlink"
       && type !== "host.vfs.rmdir"
       && type !== "host.vfs.rename"
+      && type !== "host.vfs.link"
       && type !== "host.vfs.symlink"
       && type !== "host.vfs.readlink"
+      && type !== "host.vfs.setxattr"
+      && type !== "host.vfs.getxattr"
+      && type !== "host.vfs.listxattr"
+      && type !== "host.vfs.removexattr"
       && type !== "host.http.requestHeaders"
       && type !== "host.http.activeRequestHeaderHooks"
+      && type !== "host.block.list"
+      && type !== "host.block.read"
+      && type !== "host.block.write"
+      && type !== "host.block.flush"
     ) {
       return false;
     }
@@ -264,6 +279,13 @@ export class HostProcessSandboxVm implements HostControlChannel {
       void this.#handleHttpRequestHeaders(document);
     } else if (type === "host.http.activeRequestHeaderHooks") {
       void this.#handleActiveRequestHeaderHooks(document);
+    } else if (
+      type === "host.block.list"
+      || type === "host.block.read"
+      || type === "host.block.write"
+      || type === "host.block.flush"
+    ) {
+      void this.#handleBlockStoreRequest(document);
     } else {
       void this.#handleVirtualFsRequest(document);
     }
@@ -474,6 +496,18 @@ export class HostProcessSandboxVm implements HostControlChannel {
           }));
           return;
         }
+        case "host.vfs.link": {
+          const posix = assertPosixFileSystem(fileSystem, mountPath);
+          const from = assertString(document.from, "from");
+          const to = assertString(document.to, "to");
+          this.#tryWriteToHost(encodePacket({
+            type: "host.vfs.response",
+            id,
+            ok: true,
+            stat: await posix.link(from, to),
+          }));
+          return;
+        }
         case "host.vfs.symlink": {
           const path = assertString(document.path, "path");
           const posix = assertPosixFileSystem(fileSystem, mountPath);
@@ -498,6 +532,83 @@ export class HostProcessSandboxVm implements HostControlChannel {
           }));
           return;
         }
+        case "host.vfs.setxattr": {
+          const path = assertString(document.path, "path");
+          const name = assertString(document.name, "name");
+          const value = binaryField(document.value, "value");
+          const flags = assertNumber(document.flags, "flags");
+          const posix = assertPosixFileSystem(fileSystem, mountPath);
+          await posix.setxattr(path, name, value, flags);
+          this.#tryWriteToHost(encodePacket({
+            type: "host.vfs.response",
+            id,
+            ok: true,
+          }));
+          return;
+        }
+        case "host.vfs.getxattr": {
+          const path = assertString(document.path, "path");
+          const name = assertString(document.name, "name");
+          const size = assertNumber(document.size, "size");
+          const posix = assertPosixFileSystem(fileSystem, mountPath);
+          const value = await posix.getxattr(path, name);
+          if (size === 0) {
+            this.#tryWriteToHost(encodePacket({
+              type: "host.vfs.response",
+              id,
+              ok: true,
+              count: value.byteLength,
+            }));
+            return;
+          }
+          if (value.byteLength > size) {
+            throw new Error("xattr value is larger than requested size");
+          }
+          this.#tryWriteToHost(encodePacket({
+            type: "host.vfs.response",
+            id,
+            ok: true,
+            value: new Binary(value),
+          }));
+          return;
+        }
+        case "host.vfs.listxattr": {
+          const path = assertString(document.path, "path");
+          const size = assertNumber(document.size, "size");
+          const posix = assertPosixFileSystem(fileSystem, mountPath);
+          const names = encodeXattrNameList(await posix.listxattr(path));
+          if (size === 0) {
+            this.#tryWriteToHost(encodePacket({
+              type: "host.vfs.response",
+              id,
+              ok: true,
+              count: names.byteLength,
+            }));
+            return;
+          }
+          if (names.byteLength > size) {
+            throw new Error("xattr name list is larger than requested size");
+          }
+          this.#tryWriteToHost(encodePacket({
+            type: "host.vfs.response",
+            id,
+            ok: true,
+            names: new Binary(names),
+          }));
+          return;
+        }
+        case "host.vfs.removexattr": {
+          const path = assertString(document.path, "path");
+          const name = assertString(document.name, "name");
+          const posix = assertPosixFileSystem(fileSystem, mountPath);
+          await posix.removexattr(path, name);
+          this.#tryWriteToHost(encodePacket({
+            type: "host.vfs.response",
+            id,
+            ok: true,
+          }));
+          return;
+        }
       }
     } catch (error) {
       this.#tryWriteToHost(encodePacket({
@@ -509,16 +620,110 @@ export class HostProcessSandboxVm implements HostControlChannel {
     }
   }
 
+  async #handleBlockStoreRequest(document: Record<string, unknown>): Promise<void> {
+    const id = typeof document.id === "string" ? document.id : "";
+    try {
+      const blockStore = this.#rootBlockStore;
+      const blockStoreContext = this.#rootBlockStoreContext;
+      if (blockStore === undefined || blockStoreContext === undefined) {
+        throw new Error("root block store is not configured");
+      }
+
+      switch (document.type) {
+        case "host.block.list": {
+          this.#tryWriteToHost(encodePacket({
+            type: "host.block.response",
+            id,
+            ok: true,
+            blocks: (await blockStore.list(blockStoreContext)).map((block) => block.toString()),
+          }));
+          return;
+        }
+        case "host.block.read": {
+          const chunks = await blockStore.read({
+            start: BigInt(assertString(document.start, "start")),
+            count: assertNumber(document.count, "count"),
+          }, blockStoreContext);
+          this.#tryWriteToHost(encodePacket({
+            type: "host.block.response",
+            id,
+            ok: true,
+            chunks: chunks.map((chunk) => ({
+              start: chunk.start.toString(),
+              data: new Binary(chunk.data),
+            })),
+          }));
+          return;
+        }
+        case "host.block.write": {
+          const chunks = assertDocumentArray(document.chunks, "chunks").map((chunk) => ({
+            start: BigInt(assertString(chunk.start, "chunks.start")),
+            data: binaryField(chunk.data, "chunks.data"),
+          }));
+          await blockStore.write(chunks, blockStoreContext);
+          this.#tryWriteToHost(encodePacket({
+            type: "host.block.response",
+            id,
+            ok: true,
+          }));
+          return;
+        }
+        case "host.block.flush": {
+          await blockStore.flush?.(blockStoreContext);
+          this.#tryWriteToHost(encodePacket({
+            type: "host.block.response",
+            id,
+            ok: true,
+          }));
+          return;
+        }
+      }
+    } catch (error) {
+      this.#tryWriteToHost(encodePacket({
+        type: "host.block.response",
+        id,
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    }
+  }
+
   async #waitForLaunch(): Promise<void> {
+    const timeoutMs = launchTimeoutMs();
     await Promise.race([
-      this.#packetActivity.wait(),
+      this.#launchReady.wait(),
       once(this.#child, "exit").then(() => {
         throw this.#exitError ?? new Error("sandbox-host exited before VM launch completed");
       }),
-      delay(10_000).then(() => {
-        throw new Error("sandbox-host did not produce a launch acknowledgement");
+      unrefDelay(timeoutMs).then(() => {
+        throw new Error(`sandbox-host did not produce a launch acknowledgement within ${timeoutMs}ms`);
       }),
     ]);
+  }
+}
+
+function launchTimeoutMs(): number {
+  const value = process.env.SANDBOX_LAUNCH_TIMEOUT_MS;
+  if (value === undefined || value.length === 0) {
+    return DEFAULT_LAUNCH_TIMEOUT_MS;
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`SANDBOX_LAUNCH_TIMEOUT_MS must be a positive integer, got ${value}`);
+  }
+  return parsed;
+}
+
+function encodeXattrNameList(names: readonly string[]): Uint8Array {
+  return new TextEncoder().encode(names.map((name) => `${name}\0`).join(""));
+}
+
+function isInitReadyPacket(packet: Uint8Array): boolean {
+  try {
+    const document = BSON.deserialize(packet.slice(4)) as Record<string, unknown>;
+    return document.type === "init.ready";
+  } catch {
+    return false;
   }
 }
 
@@ -558,6 +763,13 @@ function assertHeaderPairs(value: unknown, field: string): [string, string][] {
     throw new Error(`host request ${field} must be header pairs`);
   }
   return value as [string, string][];
+}
+
+function assertDocumentArray(value: unknown, field: string): Record<string, unknown>[] {
+  if (!Array.isArray(value) || value.some((entry) => entry === null || typeof entry !== "object")) {
+    throw new Error(`host request ${field} must be documents`);
+  }
+  return value as Record<string, unknown>[];
 }
 
 function trackHeaderMutations(headers: Headers): () => boolean {
@@ -634,8 +846,13 @@ function assertPosixFileSystem(
     || typeof candidate.unlink !== "function"
     || typeof candidate.rmdir !== "function"
     || typeof candidate.rename !== "function"
+    || typeof candidate.link !== "function"
     || typeof candidate.symlink !== "function"
     || typeof candidate.readlink !== "function"
+    || typeof candidate.setxattr !== "function"
+    || typeof candidate.getxattr !== "function"
+    || typeof candidate.listxattr !== "function"
+    || typeof candidate.removexattr !== "function"
   ) {
     throw new Error(`host filesystem mount does not support POSIX mutations: ${mountPath}`);
   }
@@ -644,6 +861,13 @@ function assertPosixFileSystem(
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
+}
+
+function unrefDelay(milliseconds: number): Promise<void> {
+  return new Promise((resolvePromise) => {
+    const timeout = setTimeout(resolvePromise, milliseconds);
+    timeout.unref();
+  });
 }
 
 class AsyncQueue<T> implements AsyncIterable<T> {
@@ -720,9 +944,14 @@ class AsyncSignal {
     resolve(): void;
     reject(error: unknown): void;
   }> = [];
+  readonly #closedMessage: string;
   #signaled = false;
   #closed = false;
   #error: unknown;
+
+  constructor(closedMessage = "sandbox-host packet activity closed") {
+    this.#closedMessage = closedMessage;
+  }
 
   notify(): void {
     if (this.#closed) {
@@ -757,7 +986,7 @@ class AsyncSignal {
       if (this.#error !== undefined) {
         throw this.#error;
       }
-      throw new Error("sandbox-host packet activity closed");
+      throw new Error(this.#closedMessage);
     }
     return await new Promise<void>((resolve, reject) => {
       this.#waiters.push({ resolve, reject });
@@ -776,7 +1005,12 @@ function encodeHostSpawn(options: HostSpawnSandboxOptions): Uint8Array {
     rootfsPath: options.rootfs.path,
     rootfsReadonly: options.rootfs.readonly,
     rootfsFormat: options.rootfs.format,
-    rootfsOverlayMode: options.rootfsOverlay?.mode,
+    rootfsStorage: options.rootfs.storage === undefined
+      ? undefined
+      : {
+        kind: options.rootfs.storage.kind,
+        blockSize: options.rootfs.storage.blockSize,
+      },
     mounts: options.mounts ?? [],
     networkOutbound: options.network?.outbound,
     networkHttp: options.network?.http === undefined ? undefined : options.network.http,

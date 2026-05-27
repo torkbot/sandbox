@@ -8,9 +8,11 @@ use std::sync::{Arc, Condvar, Mutex, Once};
 use std::thread::{self, JoinHandle};
 
 use base64::Engine;
+use imago::{DynStorage, SyncFormatAccess, raw::Raw};
 
 use crate::MicroVmSpec;
-use crate::config::{KernelFormat, RootfsFormat};
+use crate::block_storage::{CowBlockStorage, CowBlockStore};
+use crate::config::{KernelFormat, RootfsFormat, RootfsStorageSpec};
 use crate::control::INIT_CONTROL_PORT;
 use crate::http_flow::HttpInterceptRuntime;
 use crate::network::OutboundRulePlan;
@@ -26,6 +28,7 @@ pub struct KrunContext {
 #[derive(Default, Clone)]
 pub struct HostServices {
     pub http: Option<Arc<dyn HttpInterceptRuntime>>,
+    pub root_storage: Option<Arc<dyn CowBlockStore>>,
 }
 
 #[derive(Debug)]
@@ -89,7 +92,7 @@ impl KrunContext {
         context.apply_vm_config(spec)?;
         context.apply_console_output()?;
         context.apply_kernel(spec)?;
-        context.apply_rootfs(spec)?;
+        context.apply_rootfs(spec, &services)?;
         context.apply_network(spec, &services)?;
         for device in virtual_fs {
             context.add_virtual_fs(device)?;
@@ -207,7 +210,7 @@ impl KrunContext {
         }
     }
 
-    fn apply_rootfs(&self, spec: &MicroVmSpec) -> Result<(), KrunError> {
+    fn apply_rootfs(&self, spec: &MicroVmSpec, services: &HostServices) -> Result<(), KrunError> {
         match spec.rootfs.format {
             RootfsFormat::Directory => {
                 let path = cstring_path("krun_set_root", &spec.rootfs.path)?;
@@ -219,27 +222,56 @@ impl KrunContext {
                     krun::krun_set_direct_init(self.id, "/sandbox-init".to_string()),
                 )
             }
-            RootfsFormat::Erofs => {
+            RootfsFormat::Erofs | RootfsFormat::Ext4 => {
                 let block_id = CString::new("root").unwrap();
-                let path = cstring_path("krun_add_disk3", &spec.rootfs.path)?;
-                check_krun("krun_add_disk3", unsafe {
-                    krun::krun_add_disk3(
-                        self.id,
-                        block_id.as_ptr(),
-                        path.as_ptr(),
-                        0,
-                        spec.rootfs.readonly,
-                        false,
-                        sync_mode(),
-                    )
-                })?;
+                if let Some(RootfsStorageSpec::CowBlockStore { .. }) = spec.rootfs.storage {
+                    let store = services.root_storage.clone().ok_or_else(|| {
+                        KrunError::new("root COW block store missing", -libc::EINVAL)
+                    })?;
+                    let storage = CowBlockStorage::open(&spec.rootfs.path, store)
+                        .map_err(|_| KrunError::new("CowBlockStorage::open", -libc::EIO))?;
+                    let raw = Raw::<Box<dyn DynStorage>>::open_image_sync(Box::new(storage), true)
+                        .map_err(|_| KrunError::new("Raw::open_image_sync", -libc::EIO))?;
+                    let disk = SyncFormatAccess::new(raw)
+                        .map_err(|_| KrunError::new("SyncFormatAccess::new", -libc::EIO))?;
+                    check_krun(
+                        "krun_add_storage_disk",
+                        krun::krun_add_storage_disk(
+                            self.id,
+                            "root".to_string(),
+                            Arc::new(Mutex::new(disk)),
+                            false,
+                            sync_mode(),
+                        ),
+                    )?;
+                } else {
+                    let path = cstring_path("krun_add_disk3", &spec.rootfs.path)?;
+                    check_krun("krun_add_disk3", unsafe {
+                        krun::krun_add_disk3(
+                            self.id,
+                            block_id.as_ptr(),
+                            path.as_ptr(),
+                            0,
+                            spec.rootfs.readonly,
+                            false,
+                            sync_mode(),
+                        )
+                    })?;
+                }
 
                 check_krun(
                     "krun_set_direct_block_root",
                     krun::krun_set_direct_block_root(
                         self.id,
                         "/dev/vda".to_string(),
-                        "erofs".to_string(),
+                        match spec.rootfs.format {
+                            RootfsFormat::Erofs => "erofs",
+                            RootfsFormat::Ext4 => "ext4",
+                            RootfsFormat::Directory => {
+                                unreachable!("directory rootfs handled above")
+                            }
+                        }
+                        .to_string(),
                         if spec.rootfs.readonly { "ro" } else { "rw" }.to_string(),
                         "/sandbox-init".to_string(),
                     ),
@@ -259,11 +291,9 @@ impl KrunContext {
         let encoded_mounts = encode_virtual_fs_mounts(virtual_fs);
         let mount_arg = CString::new(format!("--virtiofs-mounts={encoded_mounts}")).unwrap();
         let http_network_arg = CString::new("--http-network").unwrap();
-        let rootfs_overlay_arg = CString::new("--rootfs-overlay=writable").unwrap();
         let network_enabled = spec.network.is_some();
         let mount_env = CString::new(format!("SANDBOX_VIRTIOFS_MOUNTS={encoded_mounts}")).unwrap();
         let http_network_env = CString::new("SANDBOX_HTTP_NETWORK=1").unwrap();
-        let rootfs_overlay_env = CString::new("SANDBOX_ROOTFS_OVERLAY=writable").unwrap();
         let ca_env = spec
             .network
             .as_ref()
@@ -282,10 +312,6 @@ impl KrunContext {
         if network_enabled {
             argv.push(http_network_arg.as_ptr());
             envp.push(http_network_env.as_ptr());
-        }
-        if spec.rootfs_overlay.is_some() {
-            argv.push(rootfs_overlay_arg.as_ptr());
-            envp.push(rootfs_overlay_env.as_ptr());
         }
         if let Some(ca_env) = ca_env.as_ref() {
             envp.push(ca_env.as_ptr());
@@ -307,8 +333,8 @@ pub struct VirtualFsDevice {
 
 fn encode_virtual_fs_mounts(virtual_fs: &[VirtualFsDevice]) -> String {
     let mut value = String::new();
-    for (index, device) in virtual_fs.iter().enumerate() {
-        if index > 0 {
+    for device in virtual_fs {
+        if !value.is_empty() {
             value.push(';');
         }
         value.push_str(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&device.tag));
@@ -629,7 +655,7 @@ mod tests {
             rootfs_path: "rootfs.erofs".to_string(),
             rootfs_readonly: Some(true),
             rootfs_format: "erofs".to_string(),
-            rootfs_overlay_mode: None,
+            rootfs_storage: None,
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
@@ -651,7 +677,7 @@ mod tests {
             rootfs_path: "/tmp/sandbox-root".to_string(),
             rootfs_readonly: Some(true),
             rootfs_format: "directory".to_string(),
-            rootfs_overlay_mode: None,
+            rootfs_storage: None,
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
@@ -675,7 +701,7 @@ mod tests {
             rootfs_path: "rootfs.erofs".to_string(),
             rootfs_readonly: Some(true),
             rootfs_format: "erofs".to_string(),
-            rootfs_overlay_mode: None,
+            rootfs_storage: None,
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
@@ -711,7 +737,7 @@ mod tests {
             rootfs_path: "rootfs.erofs".to_string(),
             rootfs_readonly: Some(true),
             rootfs_format: "erofs".to_string(),
-            rootfs_overlay_mode: None,
+            rootfs_storage: None,
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
@@ -917,7 +943,7 @@ mod tests {
             rootfs_path: "bad\0root".to_string(),
             rootfs_readonly: Some(true),
             rootfs_format: "erofs".to_string(),
-            rootfs_overlay_mode: None,
+            rootfs_storage: None,
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,

@@ -1,5 +1,27 @@
 import { Binary, BSON } from "bson";
-import type { SandboxControlCommand, SandboxControlEvent } from "./index.ts";
+
+export type SandboxControlEvent =
+  | {
+      readonly type: "init.ready";
+      readonly guest: {
+        readonly root: { readonly readonly: boolean };
+        readonly init: { readonly name: string };
+      };
+    }
+  | {
+      readonly type: "guest.exec.complete";
+      readonly id: string;
+      readonly exitCode: number;
+      readonly stdout: string;
+      readonly stderr: string;
+    };
+
+export type SandboxControlCommand = {
+  readonly type: "guest.exec";
+  readonly id: string;
+  readonly argv: readonly string[];
+  readonly env?: Record<string, string>;
+};
 
 export function encodeControlCommand(command: SandboxControlCommand): Uint8Array {
   switch (command.type) {

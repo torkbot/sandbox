@@ -9,7 +9,6 @@ pub struct MicroVmSpec {
     pub kernel: KernelSpec,
     pub init: InitSpec,
     pub rootfs: RootfsSpec,
-    pub rootfs_overlay: Option<RootfsOverlaySpec>,
     pub mounts: Vec<MountSpec>,
     pub network: Option<NetworkSpec>,
 }
@@ -39,17 +38,19 @@ pub struct RootfsSpec {
     pub path: PathBuf,
     pub readonly: bool,
     pub format: RootfsFormat,
+    pub storage: Option<RootfsStorageSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootfsStorageSpec {
+    CowBlockStore { block_size: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootfsFormat {
     Directory,
     Erofs,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RootfsOverlaySpec {
-    Writable,
+    Ext4,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,17 +191,16 @@ impl MicroVmSpec {
             path: PathBuf::from(input.rootfs_path),
             readonly: input.rootfs_readonly.unwrap_or(true),
             format: RootfsFormat::parse(&input.rootfs_format)?,
+            storage: input
+                .rootfs_storage
+                .map(RootfsStorageSpec::parse)
+                .transpose()?,
         };
         if rootfs.format == RootfsFormat::Directory {
             return Err(SpecError::new(
                 "directory rootfs is not supported for sandboxed VM launch; use an EROFS rootfs",
             ));
         }
-
-        let rootfs_overlay = input
-            .rootfs_overlay_mode
-            .map(|mode| RootfsOverlaySpec::parse(&mode))
-            .transpose()?;
 
         let mounts = input
             .mounts
@@ -232,7 +232,6 @@ impl MicroVmSpec {
             kernel,
             init,
             rootfs,
-            rootfs_overlay,
             mounts,
             network,
         })
@@ -260,19 +259,9 @@ impl RootfsFormat {
         match value {
             "directory" => Ok(Self::Directory),
             "erofs" => Ok(Self::Erofs),
+            "ext4" => Ok(Self::Ext4),
             other => Err(SpecError::new(format!(
                 "unsupported rootfs.format: {other}"
-            ))),
-        }
-    }
-}
-
-impl RootfsOverlaySpec {
-    fn parse(value: &str) -> Result<Self, SpecError> {
-        match value {
-            "writable" => Ok(Self::Writable),
-            other => Err(SpecError::new(format!(
-                "unsupported rootfsOverlay.mode: {other}"
             ))),
         }
     }
@@ -319,10 +308,36 @@ pub struct MicroVmSpecInput {
     pub rootfs_path: String,
     pub rootfs_readonly: Option<bool>,
     pub rootfs_format: String,
-    pub rootfs_overlay_mode: Option<String>,
+    pub rootfs_storage: Option<RootfsStorageSpecInput>,
     pub mounts: Vec<MountSpecInput>,
     pub network_outbound: Option<OutboundSpec>,
     pub network_http: Option<HttpSpecInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootfsStorageSpecInput {
+    pub kind: String,
+    pub block_size: u64,
+}
+
+impl RootfsStorageSpec {
+    fn parse(input: RootfsStorageSpecInput) -> Result<Self, SpecError> {
+        match input.kind.as_str() {
+            "cow-block-store" => {
+                if input.block_size == 0 || input.block_size % 512 != 0 {
+                    return Err(SpecError::new(
+                        "rootfs.storage.blockSize must be a positive multiple of 512",
+                    ));
+                }
+                Ok(Self::CowBlockStore {
+                    block_size: input.block_size,
+                })
+            }
+            other => Err(SpecError::new(format!(
+                "unsupported rootfs.storage.kind: {other}"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -354,7 +369,7 @@ mod tests {
             rootfs_path: "rootfs.erofs".to_string(),
             rootfs_readonly: None,
             rootfs_format: "erofs".to_string(),
-            rootfs_overlay_mode: None,
+            rootfs_storage: None,
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
@@ -376,7 +391,6 @@ mod tests {
     #[test]
     fn keeps_requested_mount_and_network_shape() {
         let mut input = valid_input();
-        input.rootfs_overlay_mode = Some("writable".to_string());
         input.mounts = vec![MountSpecInput {
             kind: "virtual-fs".to_string(),
             path: "/sandbox".to_string(),
@@ -408,7 +422,6 @@ mod tests {
 
         let spec = MicroVmSpec::build(input).unwrap();
 
-        assert_eq!(spec.rootfs_overlay, Some(RootfsOverlaySpec::Writable));
         assert_eq!(
             spec.mounts,
             vec![MountSpec::VirtualFs {

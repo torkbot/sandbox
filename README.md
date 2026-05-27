@@ -1,108 +1,70 @@
 # Sandbox
 
-Sandbox is a TypeScript-first Node.js library for spawning libkrun-backed microVMs.
-
-The target shape is:
-
-- boot a guest from a prebuilt read-only rootfs artifact, likely EROFS,
-- mount host-implemented virtual filesystems,
-- intercept guest HTTP request headers through host TypeScript hooks,
-- communicate with guest init over a bidirectional transport,
-- ship as a statically linked host artifact.
+Sandbox is a TypeScript-first Node.js library for running work inside
+libkrun-backed microVMs with host-controlled filesystems and network policy.
 
 ```ts
 import {
-  acceptPublicInternet,
-  acceptTcp,
-  binding,
-  linuxOverlayFs,
-  mount,
-  prebuiltRootfs,
-  projectInit,
-  projectKernel,
-  scratchFs,
-  createSandbox,
-  type SandboxWritableFileSystem,
+  defineSandbox,
+  fs,
+  rootfs,
 } from "@torkbot/sandbox";
 
-declare const workspaceFs: SandboxWritableFileSystem;
-
-await using sandbox = createSandbox({
-  kernel: projectKernel(),
-  init: projectInit(),
-  rootfs: linuxOverlayFs({
-    lower: prebuiltRootfs("dist/rootfs/sandbox.erofs", { format: "erofs" }),
-    upper: scratchFs(),
-  }),
-
-  mounts: [
-    mount("/sandbox", {
-      async stat(path) {
-        if (path === "/") {
-          return {
-            type: "directory",
-            sizeBytes: null,
-            mediaType: null,
-            modifiedAtMs: null,
-          };
-        }
-
-        if (path === "/status.json") {
-          const body = JSON.stringify({ ready: true });
-          return {
-            type: "file",
-            sizeBytes: Buffer.byteLength(body),
-            mediaType: "application/json",
-            modifiedAtMs: null,
-          };
-        }
-
-        throw new Error(`missing path ${path}`);
-      },
-
-      async list(path) {
-        if (path !== "/") throw new Error(`missing directory ${path}`);
-        return [{ name: "status.json", type: "file" }];
-      },
-
-      async read(input) {
-        if (input.path !== "/status.json") {
-          throw new Error(`unknown virtual file: ${input.path}`);
-        }
-
-        return Buffer.from(JSON.stringify({ ready: true }));
-      },
-    }),
-  ],
-
-  bindings: [
-    binding("/workspace", workspaceFs),
-  ],
-
-  network: {
-    outbound: {
-      policy: "deny",
-      rules: [
-        acceptTcp({ cidr: "127.0.0.1/32", ports: [8080] }),
-        acceptPublicInternet({ ports: [443] }),
-      ],
-    },
+const workspaceFs = fs.memory({
+  files: {
+    "/hello.txt": "hello from the host filesystem\n",
   },
 });
 
-sandbox.http.onRequest({ origin: "https://api.github.com" }, (request) => {
-  request.headers.set("authorization", `Bearer ${process.env.GITHUB_TOKEN}`);
+const sandbox = defineSandbox({
+  rootfs: rootfs.builtIn("alpine:3.20"),
+  resources: {
+    cpus: 2,
+    memoryMiB: 2048,
+  },
 });
 
-await using vm = await sandbox.run();
+await using lane = await sandbox.boot({
+  mounts: {
+    "/workspace": fs.virtual(workspaceFs),
+  },
+  cwd: "/workspace",
+});
+
+const result = await lane.exec("cat", ["hello.txt"]);
+
+if (result.exitCode !== 0) {
+  throw new Error(result.stderr);
+}
 ```
 
-Incremental guest operations are explicit:
+## Quick Start
+
+Create reusable machine configuration once, then boot one or more instances with
+the mounts each instance needs:
 
 ```ts
-const result = await vm.control.exec({
-  id: "tests",
-  argv: ["node", "--test", "test/**/*.test.ts"],
+import {
+  defineSandbox,
+  fs,
+  rootfs,
+} from "@torkbot/sandbox";
+
+const workspaceFs = fs.memory();
+
+const sandbox = defineSandbox({
+  rootfs: rootfs.builtIn("alpine:3.20"),
+});
+
+await using lane = await sandbox.boot({
+  mounts: {
+    "/workspace": fs.virtual(workspaceFs),
+  },
+  cwd: "/workspace",
+});
+
+const result = await lane.exec("sh", ["-lc", "printf 'ok\\n'"], {
+  env: { CI: "1" },
 });
 
 if (result.exitCode !== 0) {
@@ -110,70 +72,212 @@ if (result.exitCode !== 0) {
 }
 ```
 
-Mounted filesystems expose both the raw callback shape and a host-side tool surface for agent workflows:
+The public API is split into three layers:
+
+- `defineSandbox(...)` describes reusable machine configuration.
+- `sandbox.boot(...)` creates a runtime instance with per-instance mounts.
+- `lane.exec(...)` runs buffered work inside the booted instance.
+
+Expensive artifact preparation is intentionally outside `boot()`.
+`rootfs.builtIn("alpine:3.20")` selects a built-in rootfs artifact that must
+already be installed with Sandbox. It does not pull an image or build a rootfs
+at runtime.
+
+## API Overview
+
+### Configuration
 
 ```ts
-const sandboxProc = vm.mounts.virtualFs("/sandbox");
-const statusBytes = await sandboxProc.read({
-  path: "/status.json",
-  signal: AbortSignal.timeout(1_000),
-});
+type SandboxDefinition = {
+  rootfs: Rootfs;
+  resources?: {
+    cpus?: number;
+    memoryMiB?: number;
+  };
+  network?: NetworkPolicy;
+};
+```
 
-console.log(JSON.parse(Buffer.from(statusBytes).toString("utf8")));
+`rootfs` selects the guest root filesystem. The first public rootfs source is
+the read-only built-in catalog:
 
-const workspace = vm.mounts.host("/workspace");
+```ts
+rootfs.builtIn("alpine:3.20");
+```
 
-const notes = await workspace.read({
-  path: "notes.md",
-  offset: 1,
-  limit: 80,
-});
+`resources` controls the VM shape used by every instance booted from the
+definition. Omitted values use Sandbox defaults.
 
-await workspace.write({
-  path: "plan.md",
-  content: "# Plan\n\nStart here.\n",
-});
-
-await workspace.patch({
-  path: "plan.md",
-  edits: [{ oldText: "Start here.", newText: "Ship the narrow slice." }],
-});
-
-const grep = await workspace.bash({
-  command: "grep \"Ship\" plan.md",
-  timeoutMs: 1_000,
+```ts
+defineSandbox({
+  rootfs: rootfs.builtIn("alpine:3.20"),
+  resources: {
+    cpus: 4,
+    memoryMiB: 4096,
+  },
 });
 ```
 
-Root filesystems are immutable by default. A writable root is expressed as an explicit Linux overlayfs composition:
+Use `rootfs.cow(...)` when rootfs mutations should persist. The sandbox library
+owns the COW block-device contract; user-space owns the block store's
+durability, compression, migration, and checkpoint policy. Built-in rootfs
+packages include a read-only EROFS image for normal boots and a writable ext4
+image used as the COW base.
 
 ```ts
-await using sandbox = createSandbox({
-  kernel: projectKernel(),
-  init: projectInit(),
-  rootfs: linuxOverlayFs({
-    lower: prebuiltRootfs("dist/rootfs/base.erofs", { format: "erofs" }),
-    upper: scratchFs(),
+defineSandbox({
+  rootfs: rootfs.cow({
+    base: rootfs.builtIn("alpine:3.20"),
+    writable: laneBlockStore,
   }),
 });
+```
 
-await using vm = await sandbox.run();
+The block store interface is intentionally storage-agnostic:
 
-await vm.control.exec({
-  id: "install-toolchain",
-  argv: ["/bin/sh", "-lc", "apk add --no-cache git nodejs"],
+```ts
+interface SandboxBlockStore {
+  readonly blockSize: number;
+  list(context: SandboxBlockStoreContext): Promise<readonly bigint[]>;
+  read(
+    range: SandboxBlockRange,
+    context: SandboxBlockStoreContext,
+  ): Promise<readonly SandboxBlockChunk[]>;
+  write(
+    chunks: readonly SandboxBlockChunk[],
+    context: SandboxBlockStoreContext,
+  ): Promise<void>;
+  flush?(context: SandboxBlockStoreContext): Promise<void>;
+}
+```
+
+The `context.base` value identifies the exact built-in base image for this boot.
+The sandbox library passes it through to every block-store operation; user-space
+storage can use it to namespace blocks, reject mismatched snapshots, or migrate
+state. `list()` returns the block IDs currently present in the COW store. The
+Rust block backend reads that manifest once at boot, so clean base-image blocks
+are served without asking JavaScript. Dirty blocks are read lazily and writes are
+batched back through `write(...)` on flush.
+
+A writable COW block store must be attached to at most one running sandbox
+instance at a time. Concurrent sandboxes sharing the same writable store are
+undefined behavior; create one store per lane or enforce exclusivity in the
+storage driver.
+
+`network` is optional. When omitted, egress is denied. A network policy receives
+connection requests and grants only the traffic it explicitly allows:
+
+```ts
+const policy = network.policy(async (conn) => {
+  if (conn.host === "registry.npmjs.org") {
+    conn.allowHttp();
+  }
 });
 ```
 
-`mount(...)` means a guest-visible mount boundary. `binding(...)` means a host-side attachment point into the same filesystem abstraction and does not create a guest mount.
+`conn.allow()` grants HTTP(S)-classified traffic without request middleware.
+`conn.allowHttp(...)` grants HTTP(S)-classified traffic and can apply request
+middleware:
 
-The guest contract is intentionally narrow:
+```ts
+const policy = network.policy(async (conn) => {
+  if (conn.host !== "api.example.com") return;
 
-- `/` is read-only unless the rootfs is a `linuxOverlayFs(...)` composition.
-- `/sandbox` is implemented by the host.
-- HTTP request-header hooks are registered in TypeScript and enforced by the Rust host data plane.
-- Network egress starts from deny; outbound rules opt in the exact protocols, ranges, and ports the guest can reach.
-- The HTTP interception CA is generated and injected by Sandbox. Callers provide request-header hooks, not certificate plumbing.
+  conn.allowHttp(async (request) => {
+    request.headers.set(
+      "authorization",
+      `Bearer ${await credentialBroker.authorizationFor(request)}`,
+    );
+  });
+});
+```
+
+Deny remains the default. If the policy callback does not create a grant, the
+connection is blocked. The `NetworkGrant` returned by `allow()` and
+`allowHttp()` is reserved as the future extension point for instance-local
+state, such as remembering a grant for a time window.
+
+The runtime uses this policy shape to keep the JavaScript boundary explicit.
+Native rules can be added under the same model later without changing the
+caller-facing API.
+
+### Boot Options
+
+Mounts are per-instance because different sandbox instances often need
+different filesystems over the same reusable machine configuration:
+
+```ts
+await using lane = await sandbox.boot({
+  mounts: {
+    "/workspace": fs.virtual(workspaceFs),
+    "/tmp": fs.virtual(privateFs),
+    "/mnt": fs.virtual(sharedFs),
+  },
+  cwd: "/workspace",
+});
+```
+
+Sandbox does not special-case `/workspace`. Mount paths are just guest-visible
+paths backed by user-supplied filesystems. The target path must already exist
+in the selected rootfs; the built-in Alpine rootfs includes `/workspace`,
+`/tmp`, and `/mnt`.
+
+### Filesystems
+
+`fs.memory(...)` creates a real in-memory POSIX filesystem that can be mounted:
+
+```ts
+const workspaceFs = fs.memory({
+  files: {
+    "/README.md": "# Example\n",
+  },
+});
+```
+
+`fs.virtual(...)` adapts any compatible user-space JavaScript filesystem to
+Sandbox mounts:
+
+```ts
+const workspace = fs.virtual(workspaceFs);
+```
+
+### Processes
+
+`exec` is the simple buffered process API:
+
+```ts
+const result = await lane.exec("npm", ["test"], {
+  cwd: "/workspace",
+  env: { CI: "1" },
+});
+```
+
+`exec` is intentionally small: it buffers stdout and stderr and returns when the
+process exits. Streaming stdin/stdout/stderr belongs in the future
+`lane.spawn(...)` API.
+
+## Internal Architecture
+
+Sandbox hides the kernel, init, transport, and host helper behind a small
+TypeScript API:
+
+- The runtime boots a libkrun-backed guest from a prebuilt rootfs artifact:
+  read-only EROFS by default, or writable ext4 when a COW rootfs is used.
+- Kernel and init artifacts are implementation details owned by Sandbox.
+- A signed `sandbox-host` helper owns the Node/Rust/libkrun boundary.
+- Guest control traffic uses an implicit fd-backed transport between the host
+  and Sandbox init.
+- Host-implemented virtual filesystems are mounted into the guest.
+- Rootfs mutation persistence is modeled as block-level copy-on-write rootfs,
+  not as a guest-visible POSIX filesystem.
+- Network egress is default-deny. Native code should enforce fast-path policy
+  decisions and delegate to JavaScript only when a policy callback is required.
+- HTTP request middleware is caller-provided JavaScript, but Sandbox owns the
+  interception machinery and certificate plumbing.
+
+The intended boundary is that Sandbox knows how to launch, isolate, mount,
+intercept, and enforce. User-space owns artifact selection, filesystem
+durability, network policy state, confirmation flows, and credential brokering.
 
 ## Design Targets
 
@@ -182,12 +286,12 @@ The guest contract is intentionally narrow:
 - custom guest init owned by this repo,
 - implicit fd-backed host control sockets owned by Sandbox,
 - avoid host filesystem coordination unless it is intrinsic to the artifact; prefer file descriptors, database handles, bytes, and async iterables over paths,
-- build-time rootfs shaping, with prebuilt rootfs artifacts supplied at VM instantiation,
-- root filesystem composition through small explicit primitives such as `linuxOverlayFs(...)` and `scratchFs()`, with lower and upper expressed as filesystem values,
-- `mount(...)` only for guest-visible mounts; `binding(...)` only for host-side attachment points,
+- build-time rootfs shaping, with built-in rootfs artifacts selected by typed logical names at VM instantiation,
+- immutable rootfs by default, with copy-on-write rootfs supplied by a user-space block store when requested,
+- generic guest-visible mounts backed by the same user-space filesystem abstraction,
 - programmable virtual filesystems backed by TypeScript callbacks,
 - transparent HTTP interception with TypeScript request-header hooks,
-- default-deny outbound networking with explicit accept rules for protocols, CIDR ranges, public internet reachability, and ports,
+- default-deny outbound networking with JavaScript policy callbacks only where native rules cannot decide,
 - Rust-native or statically linkable networking components; sidecar network daemons are references, not default runtime dependencies,
 - macOS HVF entitlement signing verified as part of the integration test flow.
 
@@ -211,7 +315,7 @@ The npm package is published as `@torkbot/sandbox`. It does not use post-install
 - `@torkbot/sandbox-darwin-arm64`
 - `@torkbot/sandbox-linux-x64-gnu`
 
-Each platform package contains the N-API binding and the `sandbox-host` helper for that target. Runtime artifact resolution only loads the installed optional dependency for the current platform. Local development uses the same layout by materializing the current platform package under `node_modules`.
+Each platform package contains the `sandbox-host` helper and built-in rootfs artifacts for that target. Runtime artifact resolution only loads the installed optional dependency for the current platform. Local development uses the same layout by materializing the current platform package under `node_modules`.
 
 ### macOS signing setup
 

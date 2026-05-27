@@ -1,54 +1,23 @@
+import {
+  builtInRootfsIdentity,
+  builtInRootfsPath,
+} from "./artifacts.ts";
 import { HostControlTransport } from "./control.ts";
 import { HostProcessSandboxVm } from "./host-process.ts";
-import { createSandboxHostFileSystemTools } from "./host-filesystem-tools.ts";
-import { isSandboxWritableFileSystem } from "./vfs.ts";
+import { createMemoryFileSystem } from "./memory-fs.ts";
+import {
+  isSandboxPosixFileSystem,
+  isSandboxWritableFileSystem,
+} from "./vfs.ts";
 import type { HostSpawnSandboxOptions } from "./spawn-options.ts";
-export { HostControlTransport } from "./control.ts";
-
-export interface Transport<TIncoming = unknown, TOutgoing = unknown> {
-  readonly incoming: AsyncIterable<TIncoming>;
-  send(message: TOutgoing): Promise<void>;
-  close(): Promise<void>;
-}
-
-export interface SandboxCpuOptions {
-  readonly vcpus?: number;
-}
-
-export interface SandboxMemoryOptions {
-  readonly mib?: number;
-}
-
-export type KernelConfig = {
-  readonly kind: "project-kernel";
-  readonly format?: "auto" | "raw" | "elf" | "pe-gz" | "image-gz" | "image-zstd";
-};
-
-export type InitConfig = {
-  readonly kind: "project-init";
-  readonly crate: "sandbox-init";
-};
-
-export type SandboxFsConfig = PrebuiltRootfsConfig | LinuxOverlayRootfsConfig | ScratchFsConfig;
-
-export type RootfsConfig = PrebuiltRootfsConfig | LinuxOverlayRootfsConfig;
-
-export type PrebuiltRootfsConfig = {
-  readonly kind: "prebuilt-rootfs";
-  readonly path: string;
-  readonly readonly?: boolean;
-  readonly format: "directory" | "erofs";
-};
-
-export type LinuxOverlayRootfsConfig = {
-  readonly kind: "linux-overlay-fs";
-  readonly lower: SandboxFsConfig;
-  readonly upper: SandboxFsConfig;
-};
-
-export type ScratchFsConfig = {
-  readonly kind: "scratch-fs";
-};
+import type { SandboxControl } from "./control.ts";
+import type { SandboxControlEvent } from "./control-codec.ts";
+import type {
+  InternalNetworkConfig,
+  InternalSandboxOptions,
+  RegisteredHttpRequestHeadersHook,
+  SandboxHttpRequestSelector,
+} from "./launch-options.ts";
 
 export type SandboxFileType = "file" | "directory" | "symlink";
 
@@ -93,68 +62,18 @@ export interface SandboxPosixFileSystem extends SandboxWritableFileSystem {
   unlink(path: string): Promise<void>;
   rmdir(path: string): Promise<void>;
   rename(from: string, to: string, flags?: number): Promise<void>;
+  link(from: string, to: string): Promise<SandboxFileStat>;
   symlink(target: string, path: string): Promise<SandboxFileStat>;
   readlink(path: string): Promise<string>;
+  setxattr(path: string, name: string, value: Uint8Array, flags?: number): Promise<void>;
+  getxattr(path: string, name: string): Promise<Uint8Array>;
+  listxattr(path: string): Promise<readonly string[]>;
+  removexattr(path: string, name: string): Promise<void>;
 }
 
-export type SandboxVirtualFileSystem = SandboxFileSystem;
-export type SandboxMountedFileSystem = SandboxFileSystem;
-
-export type SandboxHostReadResult = {
-  readonly path: string;
-  readonly content: string;
-  readonly totalLines: number;
-  readonly truncated: boolean;
-};
-
-export type SandboxHostPatchEdit = {
-  readonly oldText: string;
-  readonly newText: string;
-};
-
-export type SandboxHostBashResult = {
-  readonly stdout: string;
-  readonly stderr: string;
-  readonly exitCode: number;
-};
-
-export interface SandboxHostFileSystemTools {
-  read(input: {
-    readonly path: string;
-    readonly offset?: number;
-    readonly limit?: number;
-    readonly signal?: AbortSignal;
-  }): Promise<SandboxHostReadResult>;
-  write(input: {
-    readonly path: string;
-    readonly content: string;
-    readonly signal?: AbortSignal;
-  }): Promise<void>;
-  patch(input: {
-    readonly path: string;
-    readonly edits: readonly SandboxHostPatchEdit[];
-    readonly signal?: AbortSignal;
-  }): Promise<void>;
-  bash(input: {
-    readonly command: string;
-    readonly timeoutMs?: number;
-    readonly signal?: AbortSignal;
-  }): Promise<SandboxHostBashResult>;
+export interface MemoryFileSystemOptions {
+  readonly files?: Readonly<Record<string, string | Uint8Array>>;
 }
-
-export type VirtualFsMountConfig = {
-  readonly kind: "virtual-fs";
-  readonly path: string;
-  readonly fileSystem: SandboxVirtualFileSystem;
-};
-
-export type FileSystemBindingConfig = {
-  readonly kind: "filesystem-binding";
-  readonly path: string;
-  readonly fileSystem: SandboxVirtualFileSystem;
-};
-
-export type MountConfig = VirtualFsMountConfig;
 
 export interface SandboxHttpRequest {
   readonly protocol: "http/1.1" | "h2";
@@ -173,338 +92,225 @@ export interface SandboxHttpRequest {
   };
 }
 
-export type SandboxHttpRequestHook = (
+export type BuiltInRootfsName = "alpine:3.20";
+
+export type BuiltInRootfsConfig = {
+  readonly kind: "built-in-rootfs";
+  readonly name: BuiltInRootfsName;
+};
+
+export type CowRootfsConfig = {
+  readonly kind: "cow-rootfs";
+  readonly base: BuiltInRootfsConfig;
+  readonly writable: SandboxBlockStore;
+};
+
+export type Rootfs = BuiltInRootfsConfig | CowRootfsConfig;
+
+export type SandboxFileSystemSource = {
+  readonly kind: "virtual-fs";
+  readonly fileSystem: SandboxFileSystem;
+};
+
+export type SandboxWritableFileSystemSource = {
+  readonly kind: "virtual-fs";
+  readonly fileSystem: SandboxPosixFileSystem;
+};
+
+export type SandboxBlockRange = {
+  readonly start: bigint;
+  readonly count: number;
+};
+
+export type SandboxBlockChunk = {
+  readonly start: bigint;
+  readonly data: Uint8Array;
+};
+
+export type SandboxBlockStoreContext = {
+  readonly base: string;
+};
+
+export interface SandboxBlockStore {
+  readonly blockSize: number;
+  list(context: SandboxBlockStoreContext): Promise<readonly bigint[]>;
+  read(range: SandboxBlockRange, context: SandboxBlockStoreContext): Promise<readonly SandboxBlockChunk[]>;
+  write(chunks: readonly SandboxBlockChunk[], context: SandboxBlockStoreContext): Promise<void>;
+  flush?(context: SandboxBlockStoreContext): Promise<void>;
+}
+
+export type HttpRequestMiddleware = (
   request: SandboxHttpRequest,
 ) => void | Promise<void>;
 
-export interface SandboxHttpRequestSelector {
-  readonly origin: string;
+export interface NetworkGrant {
 }
 
-export interface SandboxHttpHook extends AsyncDisposable {
-  [Symbol.asyncDispose](): Promise<void>;
+export interface HttpNetworkGrant extends NetworkGrant {
 }
 
-export interface SandboxHttpHooks {
-  onRequest(
-    selector: SandboxHttpRequestSelector,
-    hook: SandboxHttpRequestHook,
-  ): SandboxHttpHook;
+export interface NetworkConnectionRequest {
+  readonly transport: "tcp" | "udp";
+  readonly host?: string;
+  readonly ip?: string;
+  readonly port: number;
+  /**
+   * Allows HTTP(S)-classified traffic for this connection without request middleware.
+   * Raw non-HTTP egress is not exposed by the first public policy API.
+   */
+  allow(): NetworkGrant;
+  allowHttp(middleware?: HttpRequestMiddleware): HttpNetworkGrant;
 }
 
-export interface SandboxBuilder extends AsyncDisposable {
-  readonly http: SandboxHttpHooks;
-  run(): Promise<SandboxVm>;
-  [Symbol.asyncDispose](): Promise<void>;
-}
+export type NetworkConnectionRequestHandler = (
+  connection: NetworkConnectionRequest,
+) => void | Promise<void>;
 
-export type OutboundNetworkRule =
-  | {
-      readonly action: "accept";
-      readonly protocol: "tcp";
-      readonly cidr: string;
-      readonly ports?: readonly number[];
-    }
-  | {
-      readonly action: "accept";
-      readonly protocol: "udp";
-      readonly cidr: string;
-      readonly ports?: readonly number[];
-    }
-  | {
-      readonly action: "accept";
-      readonly scope: "public-internet";
-      readonly ports?: readonly number[];
-    };
+const networkPolicyHandler: unique symbol = Symbol("networkPolicyHandler");
 
-export interface OutboundNetworkPolicy {
-  readonly policy: "deny";
-  readonly rules: readonly OutboundNetworkRule[];
-}
-
-export interface NetworkConfig {
-  readonly outbound?: OutboundNetworkPolicy;
-  readonly http?: {
-    readonly certificateAuthority?: {
-      readonly certificatePem: string;
-      readonly privateKeyPem: string;
-    };
-  };
-}
-
-export interface SandboxOptions {
-  readonly name?: string;
-  readonly cpu?: SandboxCpuOptions;
-  readonly memory?: SandboxMemoryOptions;
-  readonly kernel: KernelConfig;
-  readonly init: InitConfig;
-  readonly rootfs: RootfsConfig;
-  readonly mounts?: readonly MountConfig[];
-  readonly bindings?: readonly FileSystemBindingConfig[];
-  readonly network?: NetworkConfig;
-}
-
-export interface SandboxMounts {
-  get(path: string): SandboxMountedFileSystem;
-  virtualFs(path: string): SandboxVirtualFileSystem;
-  host(path: string): SandboxHostFileSystemTools;
-}
-
-export type SandboxControlEvent =
-  | {
-      readonly type: "init.ready";
-      readonly guest: {
-        readonly root: { readonly readonly: boolean };
-        readonly init: { readonly name: string };
-      };
-    }
-  | {
-      readonly type: "guest.exec.complete";
-      readonly id: string;
-      readonly exitCode: number;
-      readonly stdout: string;
-      readonly stderr: string;
-    };
-
-export type SandboxControlCommand = {
-  readonly type: "guest.exec";
-  readonly id: string;
-  readonly argv: readonly string[];
-  readonly env?: Record<string, string>;
+export type NetworkPolicy = {
+  readonly kind: "network-policy";
+  readonly [networkPolicyHandler]: NetworkConnectionRequestHandler;
 };
 
-export interface SandboxControl extends Transport<SandboxControlEvent, SandboxControlCommand> {
-  exec(input: {
-    readonly id?: string;
-    readonly argv: readonly string[];
-    readonly env?: Record<string, string>;
-  }): Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>>;
+type NetworkPolicyHookRegistration = {
+  readonly hooks: readonly RegisteredHttpRequestHeadersHook[];
+  readonly network: InternalNetworkConfig;
+};
+
+export interface SandboxDefinitionOptions {
+  readonly rootfs: Rootfs;
+  readonly resources?: SandboxResourceLimits;
+  readonly network?: NetworkPolicy;
 }
 
-export interface SandboxVm {
-  readonly control: SandboxControl;
-  readonly mounts: SandboxMounts;
-  readonly diagnostics?: SandboxDiagnostics;
+export interface SandboxResourceLimits {
+  readonly cpus?: number;
+  readonly memoryMiB?: number;
+}
+
+export interface SandboxBootOptions {
+  readonly mounts?: Readonly<Record<string, SandboxFileSystemSource>>;
+  readonly cwd?: string;
+}
+
+export interface SandboxDefinition {
+  boot(options?: SandboxBootOptions): Promise<SandboxInstance>;
+}
+
+export interface SandboxExecOptions {
+  readonly cwd?: string;
+  readonly env?: Record<string, string>;
+}
+
+export interface SandboxExecResult {
+  readonly exitCode: number;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+export interface SandboxInstance {
+  exec(
+    command: string,
+    args?: readonly string[],
+    options?: SandboxExecOptions,
+  ): Promise<SandboxExecResult>;
   close(): Promise<void>;
   [Symbol.asyncDispose](): Promise<void>;
 }
 
-export interface SandboxDiagnostics {
+interface SandboxVm extends SandboxInstance {
+  readonly control: SandboxControl;
+  readonly diagnostics?: SandboxDiagnostics;
+}
+
+interface SandboxDiagnostics {
   terminateHostForTest(): Promise<void>;
 }
 
-export function projectKernel(options: Omit<KernelConfig, "kind"> = {}): KernelConfig {
-  return {
-    kind: "project-kernel",
-    ...options,
-  };
-}
+export const rootfs = {
+  builtIn(name: BuiltInRootfsName): BuiltInRootfsConfig {
+    return {
+      kind: "built-in-rootfs",
+      name,
+    };
+  },
+  cow(options: { readonly base: BuiltInRootfsConfig; readonly writable: SandboxBlockStore }): Rootfs {
+    return {
+      kind: "cow-rootfs",
+      base: options.base,
+      writable: options.writable,
+    };
+  },
+};
 
-export function projectInit(): InitConfig {
-  return {
-    kind: "project-init",
-    crate: "sandbox-init",
-  };
-}
-
-export function prebuiltRootfs(path: string, options: Omit<PrebuiltRootfsConfig, "kind" | "path">): PrebuiltRootfsConfig {
-  return {
-    kind: "prebuilt-rootfs",
-    path,
-    readonly: options.readonly ?? true,
-    format: options.format,
-  };
-}
-
-export function scratchFs(): ScratchFsConfig {
-  return {
-    kind: "scratch-fs",
-  };
-}
-
-export function linuxOverlayFs(input: {
-  readonly lower: SandboxFsConfig;
-  readonly upper: SandboxFsConfig;
-}): LinuxOverlayRootfsConfig {
-  return {
-    kind: "linux-overlay-fs",
-    lower: input.lower,
-    upper: input.upper,
-  };
-}
-
-export function virtualFsMount(path: string, fileSystem: SandboxVirtualFileSystem): VirtualFsMountConfig {
+function virtualFs(fileSystem: SandboxPosixFileSystem): SandboxWritableFileSystemSource;
+function virtualFs(fileSystem: SandboxFileSystem): SandboxFileSystemSource;
+function virtualFs(fileSystem: SandboxFileSystem): SandboxFileSystemSource {
   return {
     kind: "virtual-fs",
-    path,
     fileSystem,
   };
 }
 
-export function mount(path: string, fileSystem: SandboxVirtualFileSystem): VirtualFsMountConfig {
-  return virtualFsMount(path, fileSystem);
-}
-
-export function binding(path: string, fileSystem: SandboxVirtualFileSystem): FileSystemBindingConfig {
-  return {
-    kind: "filesystem-binding",
-    path,
-    fileSystem,
-  };
-}
-
-export function acceptTcp(input: {
-  readonly cidr: string;
-  readonly ports?: readonly number[];
-}): OutboundNetworkRule {
-  return {
-    action: "accept",
-    protocol: "tcp",
-    cidr: input.cidr,
-    ports: input.ports,
-  };
-}
-
-export function acceptUdp(input: {
-  readonly cidr: string;
-  readonly ports?: readonly number[];
-}): OutboundNetworkRule {
-  return {
-    action: "accept",
-    protocol: "udp",
-    cidr: input.cidr,
-    ports: input.ports,
-  };
-}
-
-export function acceptPublicInternet(input: {
-  readonly ports?: readonly number[];
-} = {}): OutboundNetworkRule {
-  return {
-    action: "accept",
-    scope: "public-internet",
-    ports: input.ports,
-  };
-}
-
-export async function spawnSandbox(options: SandboxOptions): Promise<SandboxVm> {
-  validateSandboxOptions(options);
-  const hostOptions = toHostSpawnOptions(options, []);
-  const hostVm = await HostProcessSandboxVm.spawn(options, hostOptions, new Map());
-  return new HostBackedSandboxVm(hostVm, options);
-}
-
-export function createSandbox(options: SandboxOptions): SandboxBuilder {
-  validateSandboxOptions(options);
-  return new ConfiguredSandboxBuilder(options);
-}
-
-type RegisteredHttpRequestHeadersHook = {
-  readonly id: string;
-  readonly selector: SandboxHttpRequestSelector;
-  readonly hook: SandboxHttpRequestHook;
-  active: boolean;
+export const fs = {
+  memory: createMemoryFileSystem,
+  virtual: virtualFs,
 };
+
+export const network = {
+  policy(onConnectionRequest: NetworkConnectionRequestHandler): NetworkPolicy {
+    return {
+      kind: "network-policy",
+      [networkPolicyHandler]: onConnectionRequest,
+    };
+  },
+};
+
+export function defineSandbox(options: SandboxDefinitionOptions): SandboxDefinition {
+  validateSandboxDefinitionOptions(options);
+  return new DefinedSandbox(options);
+}
 
 type SpawnHttpRequestHeadersHook = {
   readonly id: string;
   readonly selector: SandboxHttpRequestSelector;
 };
 
-class ConfiguredSandboxBuilder implements SandboxBuilder {
-  readonly http: SandboxHttpHooks;
+class DefinedSandbox implements SandboxDefinition {
+  readonly #options: SandboxDefinitionOptions;
 
-  readonly #options: SandboxOptions;
-  readonly #requestHeaderHooks = new Set<RegisteredHttpRequestHeadersHook>();
-  #nextRequestHeaderHookId = 1;
-  #runStarted = false;
-  #vm: SandboxVm | null = null;
-  #closed = false;
-
-  constructor(options: SandboxOptions) {
+  constructor(options: SandboxDefinitionOptions) {
     this.#options = options;
-    this.http = {
-      onRequest: (selector, hook) => {
-        this.#assertOpen();
-        if (this.#runStarted) {
-          throw new Error("sandbox has already been run");
-        }
-        const registration: RegisteredHttpRequestHeadersHook = {
-          id: `http-request-headers-${this.#nextRequestHeaderHookId++}`,
-          selector,
-          hook,
-          active: true,
-        };
-        this.#requestHeaderHooks.add(registration);
-        return new ConfiguredSandboxHttpHook(this, registration);
-      },
-    };
   }
 
-  async run(): Promise<SandboxVm> {
-    this.#assertOpen();
-    if (this.#runStarted) {
-      throw new Error("sandbox has already been run");
+  async boot(options: SandboxBootOptions = {}): Promise<SandboxInstance> {
+    validateSandboxBootOptions(options);
+    const networkPolicy = this.#options.network === undefined
+      ? undefined
+      : createNetworkPolicyHookRegistration(this.#options.network);
+    const launchOptions = await toInternalSandboxOptions(this.#options, options, networkPolicy?.network);
+    try {
+      validateInternalSandboxOptions(launchOptions);
+      const hostOptions = toHostSpawnOptions(launchOptions, networkPolicy?.hooks ?? []);
+      const hostVm = await HostProcessSandboxVm.spawn(
+        launchOptions,
+        hostOptions,
+        new Map((networkPolicy?.hooks ?? []).map((hook) => [hook.id, hook])),
+      );
+      return new HostBackedSandboxVm(hostVm, launchOptions);
+    } catch (error) {
+      throw error;
     }
-    this.#runStarted = true;
-    const registrations = Array.from(this.#requestHeaderHooks);
-    const hostOptions = toHostSpawnOptions(this.#options, registrations);
-    const hostVm = await HostProcessSandboxVm.spawn(
-      this.#options,
-      hostOptions,
-      new Map(registrations.map((registration) => [registration.id, registration])),
-    );
-    this.#vm = new HostBackedSandboxVm(hostVm, this.#options);
-    return this.#vm;
-  }
-
-  async [Symbol.asyncDispose](): Promise<void> {
-    if (this.#closed) {
-      return;
-    }
-    this.#closed = true;
-    await this.#vm?.close();
-    this.#requestHeaderHooks.clear();
-  }
-
-  async removeHook(registration: RegisteredHttpRequestHeadersHook): Promise<void> {
-    registration.active = false;
-    this.#requestHeaderHooks.delete(registration);
-  }
-
-  #assertOpen(): void {
-    if (this.#closed) {
-      throw new Error("sandbox is closed");
-    }
-  }
-}
-
-class ConfiguredSandboxHttpHook implements SandboxHttpHook {
-  readonly #sandbox: ConfiguredSandboxBuilder;
-  readonly #registration: RegisteredHttpRequestHeadersHook;
-  #disposed = false;
-
-  constructor(
-    sandbox: ConfiguredSandboxBuilder,
-    registration: RegisteredHttpRequestHeadersHook,
-  ) {
-    this.#sandbox = sandbox;
-    this.#registration = registration;
-  }
-
-  async [Symbol.asyncDispose](): Promise<void> {
-    if (this.#disposed) {
-      return;
-    }
-    this.#disposed = true;
-    await this.#sandbox.removeHook(this.#registration);
   }
 }
 
 class HostBackedSandboxVm implements SandboxVm {
-  readonly mounts: SandboxMounts;
   readonly control: SandboxControl;
   readonly diagnostics?: SandboxDiagnostics;
+  readonly #exec: ControlBackedSandboxExec;
+  readonly #rootExec: ControlBackedSandboxExec;
+  readonly #options: InternalSandboxOptions;
 
   readonly #hostVm: {
     readonly hasControlSocket: boolean;
@@ -523,14 +329,16 @@ class HostBackedSandboxVm implements SandboxVm {
       close(): Promise<void> | void;
       terminateHostForTest?(): Promise<void>;
     },
-    options: SandboxOptions,
+    options: InternalSandboxOptions,
   ) {
     this.#hostVm = hostVm;
-    this.mounts = new ConfiguredSandboxMounts(options.mounts ?? [], options.bindings ?? []);
+    this.#options = options;
     this.control = new HostControlTransport({
       connected: hostVm.hasControlSocket,
       channel: hostVm,
     });
+    this.#exec = new ControlBackedSandboxExec(this.control, options.cwd);
+    this.#rootExec = new ControlBackedSandboxExec(this.control, "/");
     if (hostVm.terminateHostForTest !== undefined) {
       this.diagnostics = {
         terminateHostForTest: () => hostVm.terminateHostForTest?.() ?? Promise.resolve(),
@@ -544,80 +352,98 @@ class HostBackedSandboxVm implements SandboxVm {
     }
 
     this.#closed = true;
-    await this.control.close();
-    await this.#hostVm.close();
+    let syncError: unknown;
+    if (this.#options.rootfs.storage !== undefined) {
+      try {
+        const result = await this.#rootExec.exec("/bin/sync");
+        if (result.exitCode !== 0) {
+          throw new Error(`sandbox close sync failed with exit code ${result.exitCode}: ${result.stderr}`);
+        }
+      } catch (error) {
+        syncError = error;
+      }
+    }
+    try {
+      await this.control.close();
+      await this.#hostVm.close();
+    } finally {
+    }
+    if (syncError !== undefined) {
+      throw syncError;
+    }
   }
 
   async [Symbol.asyncDispose](): Promise<void> {
     await this.close();
   }
+
+  async exec(
+    command: string,
+    args: readonly string[] = [],
+    options: SandboxExecOptions = {},
+  ): Promise<SandboxExecResult> {
+    return await this.#exec.exec(command, args, options);
+  }
 }
 
-class ConfiguredSandboxMounts implements SandboxMounts {
-  readonly #mounts = new Map<string, SandboxMountedFileSystem>();
-  readonly #virtualMounts = new Map<string, SandboxVirtualFileSystem>();
-  readonly #hostTools = new Map<string, SandboxHostFileSystemTools>();
+class ControlBackedSandboxExec {
+  readonly #control: SandboxControl;
+  readonly #cwd: string | undefined;
 
-  constructor(
-    mounts: readonly MountConfig[],
-    bindings: readonly FileSystemBindingConfig[],
-  ) {
-    for (const mount of mounts) {
-      this.#mounts.set(mount.path, mount.fileSystem);
-      this.#virtualMounts.set(mount.path, mount.fileSystem);
-      this.#hostTools.set(mount.path, createSandboxHostFileSystemTools(mount.fileSystem));
-    }
-    for (const binding of bindings) {
-      this.#hostTools.set(binding.path, createSandboxHostFileSystemTools(binding.fileSystem));
-    }
+  constructor(control: SandboxControl, cwd: string | undefined) {
+    this.#control = control;
+    this.#cwd = cwd;
   }
 
-  get(path: string): SandboxMountedFileSystem {
-    const mount = this.#mounts.get(path);
-    if (mount === undefined) {
-      throw new Error(`sandbox mount not found: ${path}`);
-    }
-    return mount;
+  async exec(
+    command: string,
+    args: readonly string[] = [],
+    options: SandboxExecOptions = {},
+  ): Promise<SandboxExecResult> {
+    const cwd = options.cwd ?? this.#cwd;
+    const env = cwd === undefined
+      ? options.env
+      : {
+          ...options.env,
+          SANDBOX_EXEC_CWD: cwd,
+          PWD: cwd,
+        };
+    const argv = cwd === undefined
+      ? [command, ...args]
+      : ["/bin/sh", "-lc", "cd \"$SANDBOX_EXEC_CWD\" && exec \"$@\"", "sandbox-exec", command, ...args];
+    const result = await this.#control.exec({
+      argv,
+      env,
+    });
+    return {
+      exitCode: result.exitCode,
+      stdout: result.stdout,
+      stderr: result.stderr,
+    };
   }
 
-  virtualFs(path: string): SandboxVirtualFileSystem {
-    const mount = this.#virtualMounts.get(path);
-    if (mount === undefined) {
-      throw new Error(`virtualFs mount not found: ${path}`);
-    }
-    return mount;
-  }
-
-  host(path: string): SandboxHostFileSystemTools {
-    const tools = this.#hostTools.get(path);
-    if (tools === undefined) {
-      throw new Error(`host filesystem tools not found: ${path}`);
-    }
-    return tools;
-  }
 }
 
 function toHostSpawnOptions(
-  options: SandboxOptions,
+  options: InternalSandboxOptions,
   requestHeaderHooks: readonly SpawnHttpRequestHeadersHook[],
 ): HostSpawnSandboxOptions {
-  const rootfs = lowerNativeRootfs(options.rootfs);
   if (
     (requestHeaderHooks.length > 0 || options.network?.http !== undefined)
     && options.network?.outbound === undefined
   ) {
-    throw new Error("invalid spawnSandbox options: network.outbound is required when HTTP interception is configured");
+    throw new Error("invalid sandbox options: network.outbound is required when HTTP interception is configured");
   }
   const network = options.network === undefined && requestHeaderHooks.length === 0
     ? undefined
     : {
       outbound: options.network?.outbound,
       http: requestHeaderHooks.length === 0
-        && options.network?.http?.certificateAuthority === undefined
+        && options.network?.http?.caCertificatePem === undefined
         ? undefined
         : {
-          caCertificatePem: options.network?.http?.certificateAuthority?.certificatePem,
-          caPrivateKeyPem: options.network?.http?.certificateAuthority?.privateKeyPem,
+          caCertificatePem: options.network?.http?.caCertificatePem,
+          caPrivateKeyPem: options.network?.http?.caPrivateKeyPem,
           requestHeaderHooks: requestHeaderHooks.map((hook) => ({
             id: hook.id,
             origin: hook.selector.origin,
@@ -626,26 +452,22 @@ function toHostSpawnOptions(
     };
 
   return {
-    name: options.name,
-    cpu: options.cpu,
-    memory: options.memory,
     kernel: {
-      format: options.kernel.format,
+      format: undefined,
+    },
+    cpu: {
+      vcpus: options.resources?.cpus,
+    },
+    memory: {
+      mib: options.resources?.memoryMiB,
     },
     init: {
-      crateName: options.init.crate,
+      crateName: "sandbox-init",
     },
-    rootfs: {
-      path: rootfs.path,
-      readonly: rootfs.readonly,
-      format: rootfs.format,
-    },
-    rootfsOverlay: options.rootfs.kind === "linux-overlay-fs"
-      ? { mode: "writable" }
-      : undefined,
+    rootfs: options.rootfs,
     mounts: options.mounts?.map((mount) => {
       return {
-        kind: mount.kind,
+        kind: "virtual-fs",
         path: mount.path,
         writable: isSandboxWritableFileSystem(mount.fileSystem),
       };
@@ -654,61 +476,215 @@ function toHostSpawnOptions(
   };
 }
 
-function lowerNativeRootfs(rootfs: RootfsConfig): PrebuiltRootfsConfig {
-  if (rootfs.kind === "prebuilt-rootfs") {
-    return rootfs;
-  }
-
-  if (rootfs.lower.kind !== "prebuilt-rootfs") {
-    throw new Error(`rootfs ${rootfs.kind} lower ${rootfs.lower.kind} is not implemented yet`);
-  }
-  if (rootfs.upper.kind !== "scratch-fs") {
-    throw new Error(`rootfs ${rootfs.kind} upper ${rootfs.upper.kind} is not implemented yet`);
-  }
+async function toInternalSandboxOptions(
+  config: SandboxDefinitionOptions,
+  boot: SandboxBootOptions,
+  network?: InternalNetworkConfig,
+): Promise<InternalSandboxOptions> {
+  const rootfs = await lowerRootfs(config.rootfs);
   return {
-    ...rootfs.lower,
-    readonly: true,
+    resources: config.resources,
+    rootfs,
+    cwd: boot.cwd,
+    mounts: Object.entries(boot.mounts ?? {}).map(([path, source]) => {
+      return {
+        path,
+        fileSystem: source.fileSystem,
+      };
+    }),
+    network,
   };
 }
 
-function validateSandboxOptions(options: SandboxOptions): void {
-  if (options.cpu?.vcpus !== undefined && (!Number.isInteger(options.cpu.vcpus) || options.cpu.vcpus <= 0)) {
-    throw new Error("invalid spawnSandbox options: cpu.vcpus must be greater than zero");
+function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPolicyHookRegistration {
+  const hook: HttpRequestMiddleware = async (request) => {
+    const grants: Array<{
+      readonly kind: "http";
+      readonly middleware?: HttpRequestMiddleware;
+    }> = [];
+    const connection: NetworkConnectionRequest = {
+      transport: "tcp",
+      host: request.url.hostname,
+      ip: request.destination.upstreamIp,
+      port: request.destination.upstreamPort,
+      allow() {
+        grants.push({ kind: "http" });
+        return {};
+      },
+      allowHttp(middleware?: HttpRequestMiddleware) {
+        grants.push({ kind: "http", middleware });
+        return {};
+      },
+    };
+
+    await policy[networkPolicyHandler](connection);
+
+    if (grants.length === 0) {
+      throw new Error(`network connection denied: ${request.url.origin}`);
+    }
+
+    for (const grant of grants) {
+      if (grant.kind === "http") {
+        await grant.middleware?.(request);
+      }
+    }
+  };
+  const hooks: RegisteredHttpRequestHeadersHook[] = [
+    {
+      id: "network-policy-http",
+      selector: { origin: "http://*" },
+      hook,
+      active: true,
+    },
+    {
+      id: "network-policy-https",
+      selector: { origin: "https://*" },
+      hook,
+      active: true,
+    },
+  ];
+  return {
+    hooks,
+    network: {
+      outbound: {
+        policy: "deny",
+        rules: [
+          { action: "accept", scope: "public-internet", ports: [] },
+          { action: "accept", protocol: "udp", cidr: "10.0.2.1/32", ports: [53] },
+        ],
+      },
+    },
+  };
+}
+
+async function lowerRootfs(
+  rootfs: Rootfs,
+): Promise<InternalSandboxOptions["rootfs"]> {
+  switch (rootfs.kind) {
+    case "built-in-rootfs":
+      return {
+        path: builtInRootfsPath(rootfs.name),
+        readonly: true,
+        format: "erofs",
+      };
+    case "cow-rootfs":
+      return {
+        path: builtInRootfsPath(rootfs.base.name, "ext4"),
+        readonly: false,
+        format: "ext4",
+        storage: {
+          kind: "cow-block-store",
+          blockSize: rootfs.writable.blockSize,
+          blockStore: rootfs.writable,
+          context: {
+            base: builtInRootfsIdentity(rootfs.base.name, "ext4"),
+          },
+        },
+      };
   }
-  if (options.cpu?.vcpus !== undefined && options.cpu.vcpus > 255) {
-    throw new Error("invalid spawnSandbox options: cpu.vcpus must be less than or equal to 255");
+}
+
+function validateRootfs(rootfs: Rootfs): void {
+  switch (rootfs.kind) {
+    case "built-in-rootfs":
+      validateBuiltInRootfsName(rootfs.name);
+      return;
+    case "cow-rootfs":
+      if (rootfs.base.kind !== "built-in-rootfs") {
+        throw new Error("invalid sandbox definition: rootfs.cow base must be created with rootfs.builtIn(...)");
+      }
+      validateBuiltInRootfsName(rootfs.base.name);
+      validateBlockStore(rootfs.writable);
+      return;
+    default:
+      throw new Error(
+        "invalid sandbox definition: rootfs must be created with rootfs.builtIn(...) or rootfs.cow(...)",
+      );
   }
-  if (options.memory?.mib !== undefined && (!Number.isInteger(options.memory.mib) || options.memory.mib <= 0)) {
-    throw new Error("invalid spawnSandbox options: memory.mib must be greater than zero");
+}
+
+function validateBlockStore(blockStore: SandboxBlockStore): void {
+  if (!Number.isInteger(blockStore.blockSize) || blockStore.blockSize <= 0) {
+    throw new Error("invalid sandbox definition: rootfs COW block size must be a positive integer");
   }
-  if (options.init.crate !== "sandbox-init") {
-    throw new Error(`invalid spawnSandbox options: unsupported init crate: ${options.init.crate}`);
+  if (blockStore.blockSize % 512 !== 0) {
+    throw new Error("invalid sandbox definition: rootfs COW block size must be a multiple of 512 bytes");
   }
-  validateRootfsConfig(options.rootfs, "rootfs");
+  if (typeof blockStore.list !== "function") {
+    throw new Error("invalid sandbox definition: rootfs COW block store must provide list()");
+  }
+  if (typeof blockStore.read !== "function") {
+    throw new Error("invalid sandbox definition: rootfs COW block store must provide read()");
+  }
+  if (typeof blockStore.write !== "function") {
+    throw new Error("invalid sandbox definition: rootfs COW block store must provide write()");
+  }
+}
+
+function validateSandboxDefinitionOptions(options: SandboxDefinitionOptions): void {
+  validateRootfs(options.rootfs);
+  if (options.resources?.cpus !== undefined && (!Number.isInteger(options.resources.cpus) || options.resources.cpus <= 0)) {
+    throw new Error("invalid sandbox definition: resources.cpus must be a positive integer");
+  }
+  if (options.resources?.cpus !== undefined && options.resources.cpus > 255) {
+    throw new Error("invalid sandbox definition: resources.cpus must be less than or equal to 255");
+  }
+  if (
+    options.resources?.memoryMiB !== undefined
+    && (!Number.isInteger(options.resources.memoryMiB) || options.resources.memoryMiB <= 0)
+  ) {
+    throw new Error("invalid sandbox definition: resources.memoryMiB must be a positive integer");
+  }
+  if (options.network !== undefined && options.network.kind !== "network-policy") {
+    throw new Error("invalid sandbox definition: network must be created with network.policy(...)");
+  }
+}
+
+function validateBuiltInRootfsName(name: string): void {
+  if (name !== "alpine:3.20") {
+    throw new Error(`unsupported built-in rootfs: ${name}`);
+  }
+}
+
+function validateSandboxBootOptions(options: SandboxBootOptions): void {
+  const mountPaths = new Set<string>();
+  for (const [path, source] of Object.entries(options.mounts ?? {})) {
+    validateGuestPath(path, "mount.path");
+    if (mountPaths.has(path)) {
+      throw new Error(`invalid sandbox boot options: duplicate mount path: ${path}`);
+    }
+    if (
+      isSandboxWritableFileSystem(source.fileSystem)
+      && !isSandboxPosixFileSystem(source.fileSystem)
+    ) {
+      throw new Error(`invalid sandbox boot options: writable mount must implement the POSIX filesystem interface: ${path}`);
+    }
+    mountPaths.add(path);
+  }
+  if (options.cwd !== undefined && !options.cwd.startsWith("/")) {
+    throw new Error("invalid sandbox boot options: cwd must be absolute");
+  }
+}
+
+function validateInternalSandboxOptions(options: InternalSandboxOptions): void {
+  if (options.rootfs.path.length === 0) {
+    throw new Error("invalid sandbox options: rootfs.path must not be empty");
+  }
+  if (options.rootfs.format !== "erofs" && options.rootfs.format !== "ext4") {
+    throw new Error("invalid sandbox options: rootfs.format must be erofs or ext4");
+  }
 
   const mountPaths = new Set<string>();
   for (const mount of options.mounts ?? []) {
     validateGuestPath(mount.path, "mount.path");
     if (mountPaths.has(mount.path)) {
-      throw new Error(`invalid spawnSandbox options: duplicate mount path: ${mount.path}`);
+      throw new Error(`invalid sandbox options: duplicate mount path: ${mount.path}`);
     }
     mountPaths.add(mount.path);
   }
 
-  const bindingPaths = new Set<string>();
-  for (const binding of options.bindings ?? []) {
-    validateGuestPath(binding.path, "binding.path");
-    if (mountPaths.has(binding.path)) {
-      throw new Error(`invalid spawnSandbox options: binding path conflicts with mount path: ${binding.path}`);
-    }
-    if (bindingPaths.has(binding.path)) {
-      throw new Error(`invalid spawnSandbox options: duplicate binding path: ${binding.path}`);
-    }
-    bindingPaths.add(binding.path);
-  }
-
   if (options.network?.outbound?.policy !== undefined && options.network.outbound.policy !== "deny") {
-    throw new Error("invalid spawnSandbox options: network.outbound.policy must be deny");
+    throw new Error("invalid sandbox options: network.outbound.policy must be deny");
   }
   for (const rule of options.network?.outbound?.rules ?? []) {
     if ("cidr" in rule) {
@@ -718,50 +694,25 @@ function validateSandboxOptions(options: SandboxOptions): void {
   }
 }
 
-function validateRootfsConfig(rootfs: SandboxFsConfig, field: string): void {
-  if (rootfs.kind === "prebuilt-rootfs") {
-    if (rootfs.path.length === 0) {
-      throw new Error(`invalid spawnSandbox options: ${field}.path must not be empty`);
-    }
-    if (rootfs.format === "directory") {
-      const prefix = field === "rootfs" ? "" : `${field} `;
-      throw new Error(`invalid spawnSandbox options: ${prefix}directory rootfs is not supported for sandboxed VM launch; use an EROFS rootfs`);
-    }
-    return;
-  }
-
-  if (rootfs.kind === "linux-overlay-fs") {
-    validateRootfsConfig(rootfs.lower, `${field}.lower`);
-    validateRootfsConfig(rootfs.upper, `${field}.upper`);
-    return;
-  }
-
-  if (rootfs.kind === "scratch-fs") {
-    return;
-  }
-
-  throw new Error(`invalid spawnSandbox options: unsupported ${field} kind`);
-}
-
-function validateGuestPath(path: string, field: "mount.path" | "binding.path"): void {
+function validateGuestPath(path: string, field: "mount.path"): void {
   if (!path.startsWith("/")) {
-    throw new Error(`invalid spawnSandbox options: ${field} must be absolute`);
+    throw new Error(`invalid sandbox options: ${field} must be absolute`);
   }
   if (path === "/") {
-    throw new Error(`invalid spawnSandbox options: ${field} must not be root`);
+    throw new Error(`invalid sandbox options: ${field} must not be root`);
   }
   if (path.includes("\0")) {
-    throw new Error(`invalid spawnSandbox options: ${field} must not contain NUL bytes`);
+    throw new Error(`invalid sandbox options: ${field} must not contain NUL bytes`);
   }
   if (path.split("/").some((component) => component === "." || component === "..")) {
-    throw new Error(`invalid spawnSandbox options: ${field} must not contain '.' or '..' components`);
+    throw new Error(`invalid sandbox options: ${field} must not contain '.' or '..' components`);
   }
 }
 
 function validateOutboundPorts(ports: readonly number[] | undefined): void {
   for (const port of ports ?? []) {
     if (!Number.isInteger(port) || port < 1 || port > 65_535) {
-      throw new Error(`invalid spawnSandbox options: invalid outbound network port: ${port}`);
+      throw new Error(`invalid sandbox options: invalid outbound network port: ${port}`);
     }
   }
 }
@@ -769,29 +720,29 @@ function validateOutboundPorts(ports: readonly number[] | undefined): void {
 function validateCidr(range: string): void {
   const [address, prefixText, extra] = range.split("/");
   if (address === undefined || prefixText === undefined || extra !== undefined) {
-    throw new Error(`invalid spawnSandbox options: invalid CIDR range: ${range}`);
+    throw new Error(`invalid sandbox options: invalid CIDR range: ${range}`);
   }
 
   const prefix = Number(prefixText);
   if (!Number.isInteger(prefix)) {
-    throw new Error(`invalid spawnSandbox options: invalid CIDR prefix: ${range}`);
+    throw new Error(`invalid sandbox options: invalid CIDR prefix: ${range}`);
   }
 
   if (address.includes(":")) {
     if (prefix < 0 || prefix > 128) {
-      throw new Error(`invalid spawnSandbox options: invalid CIDR prefix: ${range}`);
+      throw new Error(`invalid sandbox options: invalid CIDR prefix: ${range}`);
     }
     if (parseIpv6Address(address) === null) {
-      throw new Error(`invalid spawnSandbox options: invalid CIDR address: ${range}`);
+      throw new Error(`invalid sandbox options: invalid CIDR address: ${range}`);
     }
-    throw new Error(`invalid spawnSandbox options: IPv6 outbound CIDR ranges are not supported yet: ${range}`);
+    throw new Error(`invalid sandbox options: IPv6 outbound CIDR ranges are not supported yet: ${range}`);
   }
 
   if (prefix < 0 || prefix > 32) {
-    throw new Error(`invalid spawnSandbox options: invalid CIDR prefix: ${range}`);
+    throw new Error(`invalid sandbox options: invalid CIDR prefix: ${range}`);
   }
   if (parseIpv4Address(address) === null) {
-    throw new Error(`invalid spawnSandbox options: invalid CIDR address: ${range}`);
+    throw new Error(`invalid sandbox options: invalid CIDR address: ${range}`);
   }
 }
 

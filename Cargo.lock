@@ -1221,6 +1221,7 @@ dependencies = [
  "bzip2",
  "crossbeam-channel",
  "flate2",
+ "imago",
  "krun-arch",
  "krun-arch-gen",
  "krun-cpuid",
@@ -1285,6 +1286,7 @@ version = "1.18.0"
 dependencies = [
  "crossbeam-channel",
  "env_logger",
+ "imago",
  "krun-devices",
  "krun-hvf",
  "krun-polly",
@@ -2121,6 +2123,7 @@ dependencies = [
  "base64",
  "cc",
  "httparse",
+ "imago",
  "ipnet",
  "krun-devices",
  "libc",

@@ -120,6 +120,7 @@ jobs:
     needs:
       - verify
       - build-kernel
+      - build-rootfs
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -142,6 +143,12 @@ jobs:
         with:
           name: kernel-${{ matrix.kernel_arch }}
           path: dist/kernel
+
+      - name: Download rootfs artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rootfs-${{ matrix.kernel_arch }}
+          path: dist/rootfs
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -180,6 +187,56 @@ jobs:
         with:
           name: npm-platform-${{ runner.os }}-${{ runner.arch }}
           path: dist/npm/*.tgz
+          if-no-files-found: error
+
+  build-rootfs:
+    name: Build rootfs artifact (${{ matrix.guest_arch }})
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - guest_arch: arm64
+            runner: ubuntu-24.04-arm
+          - guest_arch: x86_64
+            runner: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+          submodules: recursive
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build init binary for built-in rootfs
+        run: npm run build:init
+
+      - name: Build built-in rootfs
+        run: npm run build:rootfs
+
+      - name: Build built-in rootfs EROFS image
+        run: npm run build:rootfs:erofs
+
+      - name: Build built-in rootfs ext4 image
+        run: npm run build:rootfs:ext4
+
+      - name: Upload rootfs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rootfs-${{ matrix.guest_arch }}
+          path: |
+            dist/rootfs/alpine-3.20.erofs
+            dist/rootfs/alpine-3.20.ext4
           if-no-files-found: error
 
   build-root:

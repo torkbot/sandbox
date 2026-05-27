@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use bson::{Bson, Document, doc};
 use sandbox::vfs::{
-    VirtioFsDirEntry, VirtioFsEntry, VirtioVirtualFsBackend, VirtualFsAdapter, VirtualInode,
-    bindings, virtual_directory_entry, virtual_file_entry, virtual_symlink_entry,
-    virtual_writable_directory_entry, virtual_writable_file_entry,
+    GetxattrReply, ListxattrReply, VirtioFsDirEntry, VirtioFsEntry, VirtioVirtualFsBackend,
+    VirtualFsAdapter, VirtualInode, bindings, virtual_directory_entry, virtual_file_entry,
+    virtual_symlink_entry, virtual_writable_directory_entry, virtual_writable_file_entry,
 };
 
 #[derive(Debug)]
@@ -62,19 +62,19 @@ impl HostIoBridge {
         if response.get_bool("ok").unwrap_or(false) {
             Ok(response)
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                response
-                    .get_str("error")
-                    .unwrap_or("host virtual filesystem request failed")
-                    .to_string(),
-            ))
+            let message = response
+                .get_str("error")
+                .unwrap_or("host virtual filesystem request failed")
+                .to_string();
+            Err(host_vfs_error(message))
         }
     }
 
     pub fn route_response(&self, document: Document) -> bool {
         let response_type = document.get_str("type").ok();
-        if response_type != Some("host.vfs.response") && response_type != Some("host.http.response")
+        if response_type != Some("host.vfs.response")
+            && response_type != Some("host.http.response")
+            && response_type != Some("host.block.response")
         {
             return false;
         }
@@ -334,6 +334,29 @@ impl sandbox::vfs::HostVirtualFileSystem for NodeVirtualFs {
         Ok(())
     }
 
+    fn link(
+        &self,
+        inode: VirtualInode,
+        newparent: VirtualInode,
+        newname: &CStr,
+    ) -> io::Result<VirtioFsEntry> {
+        let from = self.path_for_inode(inode)?;
+        let newparent = self.path_for_inode(newparent)?;
+        let newname = newname.to_str().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "virtual path is not utf-8")
+        })?;
+        let to = join_guest_path(&newparent, newname);
+        let response = self.bridge.request(doc! {
+            "type": "host.vfs.link",
+            "mountPath": &self.mount_path,
+            "from": &from,
+            "to": &to,
+        })?;
+        let stat = response.get_document("stat").map_err(to_io_error)?;
+        self.alias_path_to_inode(&to, u64::from(inode));
+        entry_from_stat(u64::from(inode), stat)
+    }
+
     fn symlink(
         &self,
         linkname: &CStr,
@@ -371,6 +394,87 @@ impl sandbox::vfs::HostVirtualFileSystem for NodeVirtualFs {
             .as_bytes()
             .to_vec())
     }
+
+    fn setxattr(
+        &self,
+        inode: VirtualInode,
+        name: &CStr,
+        value: &[u8],
+        flags: u32,
+    ) -> io::Result<()> {
+        let path = self.path_for_inode(inode)?;
+        let name = name
+            .to_str()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "xattr name is not utf-8"))?;
+        self.bridge.request(doc! {
+            "type": "host.vfs.setxattr",
+            "mountPath": &self.mount_path,
+            "path": &path,
+            "name": name,
+            "value": Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: value.to_vec(),
+            }),
+            "flags": flags as i64,
+        })?;
+        Ok(())
+    }
+
+    fn getxattr(&self, inode: VirtualInode, name: &CStr, size: u32) -> io::Result<GetxattrReply> {
+        let path = self.path_for_inode(inode)?;
+        let name = name
+            .to_str()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "xattr name is not utf-8"))?;
+        let response = self.bridge.request(doc! {
+            "type": "host.vfs.getxattr",
+            "mountPath": &self.mount_path,
+            "path": &path,
+            "name": name,
+            "size": size as i64,
+        })?;
+        if size == 0 {
+            let count = response.get_i32("count").map_err(to_io_error)?;
+            return Ok(GetxattrReply::Count(count.max(0) as u32));
+        }
+        let value = response
+            .get_binary_generic("value")
+            .cloned()
+            .map_err(to_io_error)?;
+        Ok(GetxattrReply::Value(value))
+    }
+
+    fn listxattr(&self, inode: VirtualInode, size: u32) -> io::Result<ListxattrReply> {
+        let path = self.path_for_inode(inode)?;
+        let response = self.bridge.request(doc! {
+            "type": "host.vfs.listxattr",
+            "mountPath": &self.mount_path,
+            "path": &path,
+            "size": size as i64,
+        })?;
+        if size == 0 {
+            let count = response.get_i32("count").map_err(to_io_error)?;
+            return Ok(ListxattrReply::Count(count.max(0) as u32));
+        }
+        let names = response
+            .get_binary_generic("names")
+            .cloned()
+            .map_err(to_io_error)?;
+        Ok(ListxattrReply::Names(names))
+    }
+
+    fn removexattr(&self, inode: VirtualInode, name: &CStr) -> io::Result<()> {
+        let path = self.path_for_inode(inode)?;
+        let name = name
+            .to_str()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "xattr name is not utf-8"))?;
+        self.bridge.request(doc! {
+            "type": "host.vfs.removexattr",
+            "mountPath": &self.mount_path,
+            "path": &path,
+            "name": name,
+        })?;
+        Ok(())
+    }
 }
 
 impl NodeVirtualFs {
@@ -394,49 +498,90 @@ impl NodeVirtualFs {
 
     fn forget_path(&self, path: &str) {
         let mut state = self.state.lock().expect("vfs inode state lock poisoned");
-        if let Some(inode) = state.inodes_by_path.remove(path) {
-            state.paths_by_inode.remove(&inode);
-        }
+        remove_path_mapping(&mut state, path);
     }
 
     fn rename_path(&self, from: &str, to: &str) {
         let mut state = self.state.lock().expect("vfs inode state lock poisoned");
+        if from == to
+            || state
+                .inodes_by_path
+                .get(from)
+                .zip(state.inodes_by_path.get(to))
+                .is_some_and(|(from_inode, to_inode)| from_inode == to_inode)
+        {
+            return;
+        }
         forget_path_tree(&mut state, to);
         let prefix = format!("{from}/");
-        let replacements = state
-            .paths_by_inode
+        let path_replacements = state
+            .inodes_by_path
             .iter()
-            .filter_map(|(inode, path)| {
+            .filter_map(|(path, inode)| {
                 if path == from {
-                    Some((*inode, to.to_string()))
+                    Some((path.clone(), to.to_string(), *inode))
                 } else {
                     path.strip_prefix(&prefix)
-                        .map(|suffix| (*inode, format!("{to}/{suffix}")))
+                        .map(|suffix| (path.clone(), format!("{to}/{suffix}"), *inode))
                 }
             })
             .collect::<Vec<_>>();
-        for (inode, next_path) in replacements {
-            if let Some(previous_path) = state.paths_by_inode.insert(inode, next_path.clone()) {
-                state.inodes_by_path.remove(&previous_path);
+        for (previous_path, next_path, inode) in path_replacements {
+            state.inodes_by_path.remove(&previous_path);
+            state.inodes_by_path.insert(next_path.clone(), inode);
+            if state
+                .paths_by_inode
+                .get(&inode)
+                .is_some_and(|stored| stored == &previous_path)
+            {
+                state.paths_by_inode.insert(inode, next_path);
             }
-            state.inodes_by_path.insert(next_path, inode);
+        }
+    }
+
+    fn alias_path_to_inode(&self, path: &str, inode: u64) {
+        let mut state = self.state.lock().expect("vfs inode state lock poisoned");
+        remove_path_mapping(&mut state, path);
+        state.inodes_by_path.insert(path.to_string(), inode);
+        state
+            .paths_by_inode
+            .entry(inode)
+            .or_insert_with(|| path.to_string());
+    }
+}
+
+fn remove_path_mapping(state: &mut NodeVirtualFsState, path: &str) {
+    let Some(inode) = state.inodes_by_path.remove(path) else {
+        return;
+    };
+    if state
+        .paths_by_inode
+        .get(&inode)
+        .is_some_and(|stored| stored == path)
+    {
+        if let Some((replacement_path, _)) = state
+            .inodes_by_path
+            .iter()
+            .find(|(_, candidate_inode)| **candidate_inode == inode)
+        {
+            state.paths_by_inode.insert(inode, replacement_path.clone());
+        } else {
+            state.paths_by_inode.remove(&inode);
         }
     }
 }
 
 fn forget_path_tree(state: &mut NodeVirtualFsState, path: &str) {
     let prefix = format!("{path}/");
-    let forgotten = state
-        .paths_by_inode
+    let forgotten_paths = state
+        .inodes_by_path
         .iter()
-        .filter_map(|(inode, candidate)| {
-            (candidate == path || candidate.starts_with(&prefix)).then_some(*inode)
+        .filter_map(|(candidate, _)| {
+            (candidate == path || candidate.starts_with(&prefix)).then_some(candidate.clone())
         })
         .collect::<Vec<_>>();
-    for inode in forgotten {
-        if let Some(path) = state.paths_by_inode.remove(&inode) {
-            state.inodes_by_path.remove(&path);
-        }
+    for path in forgotten_paths {
+        remove_path_mapping(state, &path);
     }
 }
 
@@ -516,7 +661,8 @@ fn join_guest_path(parent: &str, name: &str) -> String {
 }
 
 fn validate_rename_flags(flags: u32) -> io::Result<()> {
-    if flags == 0 {
+    let supported = bindings::LINUX_RENAME_NOREPLACE as u32;
+    if flags & !supported == 0 {
         Ok(())
     } else {
         Err(io::Error::new(
@@ -540,6 +686,33 @@ fn encode_document_packet(document: &Document) -> io::Result<Vec<u8>> {
 
 fn to_io_error(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+
+fn host_vfs_error(message: String) -> io::Error {
+    let errno = if message.starts_with("not found:") {
+        Some(libc::ENOENT)
+    } else if message.starts_with("path exists") || message.starts_with("xattr already exists:") {
+        Some(libc::EEXIST)
+    } else if message.starts_with("directory not empty:") {
+        Some(libc::ENOTEMPTY)
+    } else if message.starts_with("is a directory:") {
+        Some(libc::EISDIR)
+    } else if message.starts_with("not a directory:") {
+        Some(libc::ENOTDIR)
+    } else if message.starts_with("xattr not found:")
+        || message.starts_with("xattr does not exist:")
+    {
+        Some(bindings::LINUX_ENODATA)
+    } else if message.contains("larger than requested size") {
+        Some(libc::ERANGE)
+    } else {
+        None
+    };
+
+    match errno {
+        Some(errno) => io::Error::from_raw_os_error(errno),
+        None => io::Error::new(io::ErrorKind::Other, message),
+    }
 }
 
 #[cfg(test)]
@@ -577,12 +750,132 @@ mod tests {
     #[test]
     fn rename_flags_fail_closed_until_explicitly_supported() {
         validate_rename_flags(0).unwrap();
+        validate_rename_flags(bindings::LINUX_RENAME_NOREPLACE as u32).unwrap();
 
-        let error = match validate_rename_flags(1) {
-            Ok(_) => panic!("rename flags should be rejected"),
-            Err(error) => error,
+        for flag in [
+            bindings::LINUX_RENAME_EXCHANGE as u32,
+            bindings::LINUX_RENAME_WHITEOUT as u32,
+        ] {
+            let error = match validate_rename_flags(flag) {
+                Ok(_) => panic!("rename flags should be rejected"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            assert!(error.to_string().contains("rename flags"));
+        }
+    }
+
+    #[test]
+    fn host_vfs_errors_preserve_posix_directory_failures() {
+        assert_eq!(
+            host_vfs_error("directory not empty: /target".to_string()).raw_os_error(),
+            Some(libc::ENOTEMPTY)
+        );
+        assert_eq!(
+            host_vfs_error("is a directory: /target".to_string()).raw_os_error(),
+            Some(libc::EISDIR)
+        );
+        assert_eq!(
+            host_vfs_error("not a directory: /target".to_string()).raw_os_error(),
+            Some(libc::ENOTDIR)
+        );
+    }
+
+    #[test]
+    fn removing_hard_link_canonical_path_preserves_remaining_alias() {
+        let mut state = NodeVirtualFsState::default();
+        state.paths_by_inode.insert(2, "/source".to_string());
+        state.inodes_by_path.insert("/source".to_string(), 2);
+        state.inodes_by_path.insert("/linked".to_string(), 2);
+
+        remove_path_mapping(&mut state, "/source");
+
+        assert_eq!(
+            state.paths_by_inode.get(&2).map(String::as_str),
+            Some("/linked")
+        );
+        assert_eq!(state.inodes_by_path.get("/linked"), Some(&2));
+        assert_eq!(state.inodes_by_path.get("/source"), None);
+    }
+
+    #[test]
+    fn renaming_hard_link_alias_preserves_inode_identity() {
+        let bridge = HostIoBridge::new();
+        let vfs = NodeVirtualFs {
+            mount_path: "/mnt".to_string(),
+            bridge,
+            state: Arc::new(Mutex::new(NodeVirtualFsState::default())),
         };
-        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert!(error.to_string().contains("rename flags"));
+        {
+            let mut state = vfs.state.lock().unwrap();
+            state.paths_by_inode.insert(2, "/source".to_string());
+            state.inodes_by_path.insert("/source".to_string(), 2);
+            state.inodes_by_path.insert("/linked".to_string(), 2);
+        }
+
+        vfs.rename_path("/linked", "/renamed");
+
+        let state = vfs.state.lock().unwrap();
+        assert_eq!(
+            state.paths_by_inode.get(&2).map(String::as_str),
+            Some("/source")
+        );
+        assert_eq!(state.inodes_by_path.get("/source"), Some(&2));
+        assert_eq!(state.inodes_by_path.get("/renamed"), Some(&2));
+        assert_eq!(state.inodes_by_path.get("/linked"), None);
+    }
+
+    #[test]
+    fn no_op_renames_preserve_inode_cache() {
+        let bridge = HostIoBridge::new();
+        let vfs = NodeVirtualFs {
+            mount_path: "/mnt".to_string(),
+            bridge,
+            state: Arc::new(Mutex::new(NodeVirtualFsState::default())),
+        };
+        {
+            let mut state = vfs.state.lock().unwrap();
+            state.paths_by_inode.insert(2, "/dir".to_string());
+            state.inodes_by_path.insert("/dir".to_string(), 2);
+            state.paths_by_inode.insert(3, "/dir/file".to_string());
+            state.inodes_by_path.insert("/dir/file".to_string(), 3);
+            state.inodes_by_path.insert("/linked".to_string(), 3);
+        }
+
+        vfs.rename_path("/dir", "/dir");
+        vfs.rename_path("/dir/file", "/linked");
+
+        let state = vfs.state.lock().unwrap();
+        assert_eq!(
+            state.paths_by_inode.get(&2).map(String::as_str),
+            Some("/dir")
+        );
+        assert_eq!(
+            state.paths_by_inode.get(&3).map(String::as_str),
+            Some("/dir/file")
+        );
+        assert_eq!(state.inodes_by_path.get("/dir/file"), Some(&3));
+        assert_eq!(state.inodes_by_path.get("/linked"), Some(&3));
+    }
+
+    #[test]
+    fn forgetting_tree_removes_hard_link_aliases_inside_tree() {
+        let mut state = NodeVirtualFsState::default();
+        state.paths_by_inode.insert(2, "/outside".to_string());
+        state.inodes_by_path.insert("/outside".to_string(), 2);
+        state.inodes_by_path.insert("/dst/link".to_string(), 2);
+        state.paths_by_inode.insert(3, "/dst/file".to_string());
+        state.inodes_by_path.insert("/dst/file".to_string(), 3);
+
+        forget_path_tree(&mut state, "/dst");
+
+        assert_eq!(state.inodes_by_path.get("/dst/link"), None);
+        assert_eq!(state.inodes_by_path.get("/dst/file"), None);
+        assert_eq!(state.paths_by_inode.get(&3), None);
+        assert_eq!(state.inodes_by_path.get("/outside"), Some(&2));
+        assert_eq!(
+            state.paths_by_inode.get(&2).map(String::as_str),
+            Some("/outside")
+        );
     }
 }

@@ -1,389 +1,150 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  acceptTcp,
-  binding,
-  createSandbox,
-  linuxOverlayFs,
-  prebuiltRootfs,
-  projectInit,
-  projectKernel,
-  scratchFs,
-  spawnSandbox,
-  virtualFsMount,
+  defineSandbox,
+  fs,
+  rootfs,
+  type SandboxBlockStore,
+  type SandboxFileSystem,
+  type SandboxWritableFileSystem,
 } from "../../src/index.ts";
 
-test("spawnSandbox rejects invalid CPU config before runtime launch", async () => {
-  await assert.rejects(
-    spawnSandbox({
-      kernel: projectKernel(),
-      init: projectInit(),
-      cpu: { vcpus: 0 },
-      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
-        format: "erofs",
-      }),
+test("defineSandbox rejects non-built-in rootfs objects", () => {
+  assert.throws(
+    () => defineSandbox({
+      rootfs: { kind: "prebuilt-rootfs", path: "rootfs.erofs", format: "erofs" } as never,
     }),
-    /invalid spawnSandbox options: cpu\.vcpus must be greater than zero/,
+    /invalid sandbox definition: rootfs must be created with rootfs\.builtIn\(\.\.\.\) or rootfs\.cow\(\.\.\.\)/,
   );
 });
 
-test("spawnSandbox rejects CPU counts the native spec cannot represent before runtime launch", async () => {
-  await assert.rejects(
-    spawnSandbox({
-      kernel: projectKernel(),
-      init: projectInit(),
-      cpu: { vcpus: 256 },
-      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
-        format: "erofs",
-      }),
+test("defineSandbox rejects unsupported built-in rootfs names", () => {
+  assert.throws(
+    () => defineSandbox({
+      rootfs: { kind: "built-in-rootfs", name: "debian:13" } as never,
     }),
-    /invalid spawnSandbox options: cpu\.vcpus must be less than or equal to 255/,
+    /unsupported built-in rootfs: debian:13/,
   );
 });
 
-test("spawnSandbox rejects fractional resource config before runtime launch", async () => {
-  await assert.rejects(
-    spawnSandbox({
-      kernel: projectKernel(),
-      init: projectInit(),
-      cpu: { vcpus: 1.5 },
-      memory: { mib: 128.5 },
-      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
-        format: "erofs",
-      }),
+test("defineSandbox rejects invalid COW rootfs", () => {
+  assert.throws(
+    () => defineSandbox({
+      rootfs: { kind: "cow-rootfs", base: { kind: "other-rootfs" }, writable: memoryBlockStore() } as never,
     }),
-    /invalid spawnSandbox options: cpu\.vcpus must be greater than zero/,
-  );
-});
-
-test("spawnSandbox rejects directory rootfs before runtime launch", async () => {
-  await assert.rejects(
-    spawnSandbox({
-      kernel: projectKernel(),
-      init: projectInit(),
-      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20", {
-        format: "directory",
-      }),
-    }),
-    /invalid spawnSandbox options: directory rootfs is not supported for sandboxed VM launch; use an EROFS rootfs/,
-  );
-});
-
-test("spawnSandbox rejects invalid overlay lower rootfs before runtime launch", async () => {
-  await assert.rejects(
-    spawnSandbox({
-      kernel: projectKernel(),
-      init: projectInit(),
-      rootfs: linuxOverlayFs({
-        lower: prebuiltRootfs("", { format: "erofs" }),
-        upper: scratchFs(),
-      }),
-    }),
-    /invalid spawnSandbox options: rootfs\.lower\.path must not be empty/,
+    /invalid sandbox definition: rootfs.cow base must be created with rootfs\.builtIn\(\.\.\.\)/,
   );
 
-  await assert.rejects(
-    spawnSandbox({
-      kernel: projectKernel(),
-      init: projectInit(),
-      rootfs: linuxOverlayFs({
-        lower: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20", {
-          format: "directory",
-        }),
-        upper: scratchFs(),
-      }),
-    }),
-    /invalid spawnSandbox options: rootfs\.lower directory rootfs is not supported for sandboxed VM launch; use an EROFS rootfs/,
-  );
-});
-
-test("spawnSandbox rejects relative mount paths before runtime launch", async () => {
-  await assert.rejects(
-    spawnSandbox({
-      kernel: projectKernel(),
-      init: projectInit(),
-      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
-        format: "erofs",
-      }),
-      mounts: [
-        {
-          kind: "virtual-fs",
-          path: "sandbox",
-          fileSystem: {
-            async stat() {
-              throw new Error("not reached");
-            },
-            async list() {
-              throw new Error("not reached");
-            },
-            async read() {
-              throw new Error("not reached");
-            },
-          },
+  assert.throws(
+    () => defineSandbox({
+      rootfs: rootfs.cow({
+        base: rootfs.builtIn("alpine:3.20"),
+        writable: {
+          ...memoryBlockStore(),
+          blockSize: 0,
         },
-      ],
+      }),
     }),
-    /invalid spawnSandbox options: mount\.path must be absolute/,
+    /invalid sandbox definition: rootfs COW block size must be a positive integer/,
   );
 });
 
-test("spawnSandbox rejects duplicate mount paths before runtime launch", async () => {
-  const fileSystem = {
-    async stat() {
-      throw new Error("not reached");
-    },
-    async list() {
-      throw new Error("not reached");
-    },
-    async read() {
-      throw new Error("not reached");
-    },
-  };
-
-  await assert.rejects(
-    spawnSandbox({
-      kernel: projectKernel(),
-      init: projectInit(),
-      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
-        format: "erofs",
-      }),
-      mounts: [
-        { kind: "virtual-fs", path: "/sandbox", fileSystem },
-        { kind: "virtual-fs", path: "/sandbox", fileSystem },
-      ],
+test("defineSandbox rejects invalid resource limits", () => {
+  assert.throws(
+    () => defineSandbox({
+      rootfs: rootfs.builtIn("alpine:3.20"),
+      resources: { cpus: 0 },
     }),
-    /invalid spawnSandbox options: duplicate mount path: \/sandbox/,
+    /invalid sandbox definition: resources\.cpus must be a positive integer/,
+  );
+
+  assert.throws(
+    () => defineSandbox({
+      rootfs: rootfs.builtIn("alpine:3.20"),
+      resources: { cpus: 256 },
+    }),
+    /invalid sandbox definition: resources\.cpus must be less than or equal to 255/,
+  );
+
+  assert.throws(
+    () => defineSandbox({
+      rootfs: rootfs.builtIn("alpine:3.20"),
+      resources: { memoryMiB: 0 },
+    }),
+    /invalid sandbox definition: resources\.memoryMiB must be a positive integer/,
   );
 });
 
-test("spawnSandbox rejects root and dot-component mount paths before runtime launch", async () => {
-  const fileSystem = unreachableFileSystem();
-
-  await assert.rejects(
-    spawnSandbox({
-      kernel: projectKernel(),
-      init: projectInit(),
-      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
-        format: "erofs",
-      }),
-      mounts: [
-        virtualFsMount("/", fileSystem),
-      ],
-    }),
-    /invalid spawnSandbox options: mount\.path must not be root/,
-  );
-
-  await assert.rejects(
-    spawnSandbox({
-      kernel: projectKernel(),
-      init: projectInit(),
-      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
-        format: "erofs",
-      }),
-      mounts: [
-        virtualFsMount("/tmp/../proc", fileSystem),
-      ],
-    }),
-    /invalid spawnSandbox options: mount\.path must not contain '\.' or '\.\.' components/,
-  );
-});
-
-test("spawnSandbox rejects mount paths with NUL bytes before runtime launch", async () => {
-  await assert.rejects(
-    spawnSandbox({
-      kernel: projectKernel(),
-      init: projectInit(),
-      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
-        format: "erofs",
-      }),
-      mounts: [
-        virtualFsMount("/bad\0path", unreachableFileSystem()),
-      ],
-    }),
-    /invalid spawnSandbox options: mount\.path must not contain NUL bytes/,
-  );
-});
-
-test("spawnSandbox rejects relative binding paths before runtime launch", async () => {
-  await assert.rejects(
-    spawnSandbox({
-      kernel: projectKernel(),
-      init: projectInit(),
-      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
-        format: "erofs",
-      }),
-      bindings: [
-        binding("workspace", unreachableFileSystem()),
-      ],
-    }),
-    /invalid spawnSandbox options: binding\.path must be absolute/,
-  );
-});
-
-test("spawnSandbox rejects duplicate binding paths before runtime launch", async () => {
-  const fileSystem = unreachableFileSystem();
-
-  await assert.rejects(
-    spawnSandbox({
-      kernel: projectKernel(),
-      init: projectInit(),
-      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
-        format: "erofs",
-      }),
-      bindings: [
-        binding("/workspace", fileSystem),
-        binding("/workspace", fileSystem),
-      ],
-    }),
-    /invalid spawnSandbox options: duplicate binding path: \/workspace/,
-  );
-});
-
-test("spawnSandbox rejects binding paths that conflict with guest mounts", async () => {
-  const fileSystem = unreachableFileSystem();
-
-  await assert.rejects(
-    spawnSandbox({
-      kernel: projectKernel(),
-      init: projectInit(),
-      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
-        format: "erofs",
-      }),
-      mounts: [
-        virtualFsMount("/workspace", fileSystem),
-      ],
-      bindings: [
-        binding("/workspace", fileSystem),
-      ],
-    }),
-    /invalid spawnSandbox options: binding path conflicts with mount path: \/workspace/,
-  );
-});
-
-test("spawnSandbox rejects unsupported init crates before runtime launch", async () => {
-  await assert.rejects(
-    spawnSandbox({
-      kernel: projectKernel(),
-      init: {
-        kind: "project-init",
-        crate: "other-init" as "sandbox-init",
-      },
-      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
-        format: "erofs",
-      }),
-    }),
-    /invalid spawnSandbox options: unsupported init crate: other-init/,
-  );
-});
-
-test("spawnSandbox rejects invalid outbound CIDR ranges before runtime launch", async () => {
-  await assert.rejects(
-    spawnSandbox({
-      kernel: projectKernel(),
-      init: projectInit(),
-      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
-        format: "erofs",
-      }),
-      network: {
-        outbound: {
-          policy: "deny",
-          rules: [acceptTcp({ cidr: "127.0.0.0/33" })],
-        },
-      },
-    }),
-    /invalid spawnSandbox options: invalid CIDR prefix: 127\.0\.0\.0\/33/,
-  );
-});
-
-test("spawnSandbox rejects invalid outbound CIDR addresses before runtime launch", async () => {
-  await assert.rejects(
-    spawnSandbox({
-      kernel: projectKernel(),
-      init: projectInit(),
-      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
-        format: "erofs",
-      }),
-      network: {
-        outbound: {
-          policy: "deny",
-          rules: [acceptTcp({ cidr: "999.0.0.0/8" })],
-        },
-      },
-    }),
-    /invalid spawnSandbox options: invalid CIDR address: 999\.0\.0\.0\/8/,
-  );
-});
-
-test("spawnSandbox rejects IPv6 outbound CIDR ranges until IPv6 egress is supported", async () => {
-  await assert.rejects(
-    spawnSandbox({
-      kernel: projectKernel(),
-      init: projectInit(),
-      rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
-        format: "erofs",
-      }),
-      network: {
-        outbound: {
-          policy: "deny",
-          rules: [acceptTcp({ cidr: "2001:db8::/32" })],
-        },
-      },
-    }),
-    /invalid spawnSandbox options: IPv6 outbound CIDR ranges are not supported yet: 2001:db8::\/32/,
-  );
-});
-
-test("createSandbox requires outbound policy when request-header hooks are configured", async () => {
-  const sandbox = createSandbox({
-    kernel: projectKernel(),
-    init: projectInit(),
-    rootfs: prebuiltRootfs("test-fixtures/rootfs/alpine-3.20.erofs", {
-      format: "erofs",
-    }),
+test("boot rejects relative mount paths before runtime launch", async () => {
+  const sandbox = defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.20"),
   });
-  sandbox.http.onRequest({ origin: "https://api.github.com" }, () => {});
 
   await assert.rejects(
-    sandbox.run(),
-    /invalid spawnSandbox options: network\.outbound is required when HTTP interception is configured/,
+    sandbox.boot({
+      mounts: {
+        workspace: fs.virtual(writableFileSystem()),
+      },
+    }),
+    /invalid sandbox options: mount\.path must be absolute/,
   );
 });
 
-test("virtualFsMount preserves the host filesystem object", () => {
-  const virtualFs = {
-    async stat() {
-      return {
-        type: "directory" as const,
-        sizeBytes: null,
-        mediaType: null,
-        modifiedAtMs: null,
-      };
-    },
-    async list() {
-      return [];
-    },
-    async read() {
-      return new Uint8Array();
-    },
-  };
+test("boot rejects root and dot-component mount paths before runtime launch", async () => {
+  const sandbox = defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.20"),
+  });
 
-  const mount = virtualFsMount("/sandbox", virtualFs);
+  await assert.rejects(
+    sandbox.boot({
+      mounts: {
+        "/": fs.virtual(writableFileSystem()),
+      },
+    }),
+    /invalid sandbox options: mount\.path must not be root/,
+  );
 
-  assert.equal(mount.kind, "virtual-fs");
-  assert.equal(mount.path, "/sandbox");
-  assert.equal(mount.fileSystem, virtualFs);
+  await assert.rejects(
+    sandbox.boot({
+      mounts: {
+        "/tmp/../proc": fs.virtual(writableFileSystem()),
+      },
+    }),
+    /invalid sandbox options: mount\.path must not contain '\.' or '\.\.' components/,
+  );
 });
 
-test("binding preserves the host filesystem object without creating a mount", () => {
-  const virtualFs = unreachableFileSystem();
-  const config = binding("/workspace", virtualFs);
+test("boot rejects mount paths with NUL bytes before runtime launch", async () => {
+  const sandbox = defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.20"),
+  });
 
-  assert.equal(config.kind, "filesystem-binding");
-  assert.equal(config.path, "/workspace");
-  assert.equal(config.fileSystem, virtualFs);
+  await assert.rejects(
+    sandbox.boot({
+      mounts: {
+        "/bad\0path": fs.virtual(writableFileSystem()),
+      },
+    }),
+    /invalid sandbox options: mount\.path must not contain NUL bytes/,
+  );
 });
 
-function unreachableFileSystem() {
+test("boot rejects writable mounts without POSIX filesystem support", async () => {
+  const sandbox = defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.20"),
+  });
+
+  await assert.rejects(
+    sandbox.boot({
+      mounts: {
+        "/mnt": fs.virtual(writableFileSystem()),
+      },
+    }),
+    /invalid sandbox boot options: writable mount must implement the POSIX filesystem interface: \/mnt/,
+  );
+});
+
+function readOnlyFileSystem(): SandboxFileSystem {
   return {
     async stat() {
       throw new Error("not reached");
@@ -393,6 +154,35 @@ function unreachableFileSystem() {
     },
     async read() {
       throw new Error("not reached");
+    },
+  };
+}
+
+function writableFileSystem(): SandboxWritableFileSystem {
+  return {
+    ...readOnlyFileSystem(),
+    async createFile() {
+      throw new Error("not reached");
+    },
+    async write() {
+      throw new Error("not reached");
+    },
+    async truncate() {
+      throw new Error("not reached");
+    },
+  };
+}
+
+function memoryBlockStore(): SandboxBlockStore {
+  return {
+    blockSize: 4096,
+    async list() {
+      return [];
+    },
+    async read() {
+      return [];
+    },
+    async write() {
     },
   };
 }
