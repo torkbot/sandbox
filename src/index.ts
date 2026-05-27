@@ -1,5 +1,6 @@
 import { HostControlTransport } from "./control.ts";
 import { HostProcessSandboxVm } from "./host-process.ts";
+import { createMemoryFileSystem } from "./memory-fs.ts";
 import { isSandboxWritableFileSystem } from "./vfs.ts";
 import type { HostSpawnSandboxOptions } from "./spawn-options.ts";
 import type { SandboxControl } from "./control.ts";
@@ -56,6 +57,10 @@ export interface SandboxPosixFileSystem extends SandboxWritableFileSystem {
   rename(from: string, to: string, flags?: number): Promise<void>;
   symlink(target: string, path: string): Promise<SandboxFileStat>;
   readlink(path: string): Promise<string>;
+}
+
+export interface MemoryFileSystemOptions {
+  readonly files?: Readonly<Record<string, string | Uint8Array>>;
 }
 
 export interface SandboxHttpRequest {
@@ -199,6 +204,7 @@ function virtualFs(fileSystem: SandboxFileSystem): SandboxFileSystemSource {
 }
 
 export const fs = {
+  memory: createMemoryFileSystem,
   virtual: virtualFs,
 };
 

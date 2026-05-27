@@ -8,10 +8,17 @@ import {
   defineSandbox,
   fs,
   rootfs,
-  type SandboxWritableFileSystem,
 } from "@torkbot/sandbox";
 
-declare const workspaceFs: SandboxWritableFileSystem;
+const workspaceFs = fs.memory({
+  files: {
+    "/package.json": JSON.stringify({
+      scripts: {
+        test: "node --test",
+      },
+    }),
+  },
+});
 
 const sandbox = defineSandbox({
   rootfs: rootfs.builtIn("alpine:3.20"),
@@ -45,10 +52,9 @@ import {
   defineSandbox,
   fs,
   rootfs,
-  type SandboxWritableFileSystem,
 } from "@torkbot/sandbox";
 
-declare const workspaceFs: SandboxWritableFileSystem;
+const workspaceFs = fs.memory();
 
 const sandbox = defineSandbox({
   rootfs: rootfs.builtIn("alpine:3.20"),
@@ -185,9 +191,20 @@ paths backed by user-supplied filesystems.
 
 ### Filesystems
 
-The first public filesystem source is `fs.virtual(...)`, which adapts a
-user-space JavaScript filesystem to Sandbox. The same filesystem abstraction can
-be used for mounts and for the root overlay:
+`fs.memory(...)` creates a real in-memory POSIX filesystem that can be mounted
+or used as root overlay storage:
+
+```ts
+const workspaceFs = fs.memory({
+  files: {
+    "/README.md": "# Example\n",
+  },
+});
+```
+
+`fs.virtual(...)` adapts any compatible user-space JavaScript filesystem to
+Sandbox. The same filesystem abstraction can be used for mounts and for the root
+overlay:
 
 ```ts
 const workspace = fs.virtual(workspaceFs);
