@@ -562,17 +562,15 @@ fn remove_path_mapping(state: &mut NodeVirtualFsState, path: &str) {
 
 fn forget_path_tree(state: &mut NodeVirtualFsState, path: &str) {
     let prefix = format!("{path}/");
-    let forgotten = state
-        .paths_by_inode
+    let forgotten_paths = state
+        .inodes_by_path
         .iter()
-        .filter_map(|(inode, candidate)| {
-            (candidate == path || candidate.starts_with(&prefix)).then_some(*inode)
+        .filter_map(|(candidate, _)| {
+            (candidate == path || candidate.starts_with(&prefix)).then_some(candidate.clone())
         })
         .collect::<Vec<_>>();
-    for inode in forgotten {
-        if let Some(path) = state.paths_by_inode.remove(&inode) {
-            remove_path_mapping(state, &path);
-        }
+    for path in forgotten_paths {
+        remove_path_mapping(state, &path);
     }
 }
 
@@ -814,5 +812,26 @@ mod tests {
         assert_eq!(state.inodes_by_path.get("/source"), Some(&2));
         assert_eq!(state.inodes_by_path.get("/renamed"), Some(&2));
         assert_eq!(state.inodes_by_path.get("/linked"), None);
+    }
+
+    #[test]
+    fn forgetting_tree_removes_hard_link_aliases_inside_tree() {
+        let mut state = NodeVirtualFsState::default();
+        state.paths_by_inode.insert(2, "/outside".to_string());
+        state.inodes_by_path.insert("/outside".to_string(), 2);
+        state.inodes_by_path.insert("/dst/link".to_string(), 2);
+        state.paths_by_inode.insert(3, "/dst/file".to_string());
+        state.inodes_by_path.insert("/dst/file".to_string(), 3);
+
+        forget_path_tree(&mut state, "/dst");
+
+        assert_eq!(state.inodes_by_path.get("/dst/link"), None);
+        assert_eq!(state.inodes_by_path.get("/dst/file"), None);
+        assert_eq!(state.paths_by_inode.get(&3), None);
+        assert_eq!(state.inodes_by_path.get("/outside"), Some(&2));
+        assert_eq!(
+            state.paths_by_inode.get(&2).map(String::as_str),
+            Some("/outside")
+        );
     }
 }

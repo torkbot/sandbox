@@ -16,6 +16,8 @@ import type {
   SandboxHttpRequestSelector,
 } from "./launch-options.ts";
 
+const CLOSE_SYNC_TIMEOUT_MS = 1_000;
+
 export type SandboxFileType = "file" | "directory" | "symlink";
 
 export type SandboxFileStat = {
@@ -348,7 +350,11 @@ class HostBackedSandboxVm implements SandboxVm {
     let syncError: unknown;
     if (this.#options.storageCleanup !== undefined) {
       try {
-        await this.#exec.exec("/bin/sync");
+        await withTimeout(
+          this.#exec.exec("/bin/sync"),
+          CLOSE_SYNC_TIMEOUT_MS,
+          "sandbox close sync timed out",
+        );
       } catch (error) {
         syncError = error;
       }
@@ -374,6 +380,22 @@ class HostBackedSandboxVm implements SandboxVm {
     options: SandboxExecOptions = {},
   ): Promise<SandboxExecResult> {
     return await this.#exec.exec(command, args, options);
+  }
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) {
+      clearTimeout(timeout);
+    }
   }
 }
 

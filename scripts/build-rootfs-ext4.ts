@@ -25,6 +25,7 @@ await run("docker", [
     "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends e2fsprogs ca-certificates",
     "mkdir -p /work/rootfs",
     "tar -C /rootfs -cf - . | tar -C /work/rootfs -xf -",
+    "chown -R 0:0 /work/rootfs",
     "size_kb=$(du -sk /work/rootfs | cut -f1)",
     "image_kb=$((size_kb + 131072))",
     `truncate -s "\${image_kb}K" /out/${shellArg(basename(outPath))}`,
