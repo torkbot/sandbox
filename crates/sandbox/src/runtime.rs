@@ -219,7 +219,7 @@ impl KrunContext {
                     krun::krun_set_direct_init(self.id, "/sandbox-init".to_string()),
                 )
             }
-            RootfsFormat::Erofs => {
+            RootfsFormat::Erofs | RootfsFormat::Ext4 => {
                 let block_id = CString::new("root").unwrap();
                 let path = cstring_path("krun_add_disk3", &spec.rootfs.path)?;
                 check_krun("krun_add_disk3", unsafe {
@@ -239,7 +239,14 @@ impl KrunContext {
                     krun::krun_set_direct_block_root(
                         self.id,
                         "/dev/vda".to_string(),
-                        "erofs".to_string(),
+                        match spec.rootfs.format {
+                            RootfsFormat::Erofs => "erofs",
+                            RootfsFormat::Ext4 => "ext4",
+                            RootfsFormat::Directory => {
+                                unreachable!("directory rootfs handled above")
+                            }
+                        }
+                        .to_string(),
                         if spec.rootfs.readonly { "ro" } else { "rw" }.to_string(),
                         "/sandbox-init".to_string(),
                     ),

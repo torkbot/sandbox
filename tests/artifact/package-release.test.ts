@@ -60,13 +60,19 @@ test("local release scripts build current rootfs before packaging platform packa
   for (const scriptName of ["release:prepare", "release:pack"]) {
     const script = packageJson.scripts?.[scriptName] ?? "";
     const buildRootfs = script.indexOf("node --run build:rootfs:erofs");
+    const buildWritableRootfs = script.indexOf("node --run build:rootfs:ext4");
     const packageCurrentPlatform = script.indexOf("prepare-npm-packages.ts --platform --current");
 
     assert.notEqual(buildRootfs, -1, `${scriptName} should build the rootfs image`);
+    assert.notEqual(buildWritableRootfs, -1, `${scriptName} should build the writable rootfs image`);
     assert.notEqual(packageCurrentPlatform, -1, `${scriptName} should package the current platform`);
     assert.ok(
       buildRootfs < packageCurrentPlatform,
       `${scriptName} should build the rootfs image before packaging the platform package`,
+    );
+    assert.ok(
+      buildWritableRootfs < packageCurrentPlatform,
+      `${scriptName} should build the writable rootfs image before packaging the platform package`,
     );
   }
 });

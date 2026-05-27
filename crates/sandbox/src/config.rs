@@ -44,6 +44,7 @@ pub struct RootfsSpec {
 pub enum RootfsFormat {
     Directory,
     Erofs,
+    Ext4,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,6 +249,7 @@ impl RootfsFormat {
         match value {
             "directory" => Ok(Self::Directory),
             "erofs" => Ok(Self::Erofs),
+            "ext4" => Ok(Self::Ext4),
             other => Err(SpecError::new(format!(
                 "unsupported rootfs.format: {other}"
             ))),

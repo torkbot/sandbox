@@ -2,6 +2,7 @@ import { builtInRootfsPath } from "./artifacts.ts";
 import { HostControlTransport } from "./control.ts";
 import { HostProcessSandboxVm } from "./host-process.ts";
 import { createMemoryFileSystem } from "./memory-fs.ts";
+import { materializeCowRootStorage } from "./root-storage.ts";
 import {
   isSandboxWritableFileSystem,
 } from "./vfs.ts";
@@ -279,13 +280,10 @@ class DefinedSandbox implements SandboxDefinition {
 
   async boot(options: SandboxBootOptions = {}): Promise<SandboxInstance> {
     validateSandboxBootOptions(options);
-    if (this.#options.storage !== undefined) {
-      throw new Error("unsupported sandbox options: storage.cow(...) root storage is not wired to the guest block device yet");
-    }
     const networkPolicy = this.#options.network === undefined
       ? undefined
       : createNetworkPolicyHookRegistration(this.#options.network);
-    const launchOptions = toInternalSandboxOptions(this.#options, options, networkPolicy?.network);
+    const launchOptions = await toInternalSandboxOptions(this.#options, options, networkPolicy?.network);
     validateInternalSandboxOptions(launchOptions);
     const hostOptions = toHostSpawnOptions(launchOptions, networkPolicy?.hooks ?? []);
     const hostVm = await HostProcessSandboxVm.spawn(
@@ -301,6 +299,7 @@ class HostBackedSandboxVm implements SandboxVm {
   readonly control: SandboxControl;
   readonly diagnostics?: SandboxDiagnostics;
   readonly #exec: ControlBackedSandboxExec;
+  readonly #options: InternalSandboxOptions;
 
   readonly #hostVm: {
     readonly hasControlSocket: boolean;
@@ -319,14 +318,15 @@ class HostBackedSandboxVm implements SandboxVm {
       close(): Promise<void> | void;
       terminateHostForTest?(): Promise<void>;
     },
-    _options: InternalSandboxOptions,
+    options: InternalSandboxOptions,
   ) {
     this.#hostVm = hostVm;
+    this.#options = options;
     this.control = new HostControlTransport({
       connected: hostVm.hasControlSocket,
       channel: hostVm,
     });
-    this.#exec = new ControlBackedSandboxExec(this.control, _options.cwd);
+    this.#exec = new ControlBackedSandboxExec(this.control, options.cwd);
     if (hostVm.terminateHostForTest !== undefined) {
       this.diagnostics = {
         terminateHostForTest: () => hostVm.terminateHostForTest?.() ?? Promise.resolve(),
@@ -340,8 +340,12 @@ class HostBackedSandboxVm implements SandboxVm {
     }
 
     this.#closed = true;
-    await this.control.close();
-    await this.#hostVm.close();
+    try {
+      await this.control.close();
+      await this.#hostVm.close();
+    } finally {
+      await this.#options.storageCleanup?.();
+    }
   }
 
   async [Symbol.asyncDispose](): Promise<void> {
@@ -447,16 +451,17 @@ function toHostSpawnOptions(
   };
 }
 
-function toInternalSandboxOptions(
+async function toInternalSandboxOptions(
   config: SandboxDefinitionOptions,
   boot: SandboxBootOptions,
   network?: InternalNetworkConfig,
-): InternalSandboxOptions {
-  const baseRootfs = lowerBuiltInRootfs(config.rootfs);
+): Promise<InternalSandboxOptions> {
+  const baseRootfs = await lowerBuiltInRootfs(config.rootfs, config.storage);
   return {
     resources: config.resources,
-    rootfs: baseRootfs,
+    rootfs: baseRootfs.rootfs,
     storage: config.storage,
+    storageCleanup: baseRootfs.cleanup,
     cwd: boot.cwd,
     mounts: Object.entries(boot.mounts ?? {}).map(([path, source]) => {
       return {
@@ -529,12 +534,34 @@ function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPoli
   };
 }
 
-function lowerBuiltInRootfs(rootfs: Rootfs): InternalSandboxOptions["rootfs"] {
+async function lowerBuiltInRootfs(
+  rootfs: Rootfs,
+  storage: SandboxRootStorage | undefined,
+): Promise<{
+  readonly rootfs: InternalSandboxOptions["rootfs"];
+  readonly cleanup?: () => Promise<void>;
+}> {
+  if (storage !== undefined) {
+    const materialized = await materializeCowRootStorage(
+      builtInRootfsPath(rootfs.name, "ext4"),
+      storage,
+    );
+    return {
+      rootfs: {
+        path: materialized.path,
+        readonly: false,
+        format: "ext4",
+      },
+      cleanup: materialized.cleanup,
+    };
+  }
   const path = builtInRootfsPath(rootfs.name);
   return {
-    path,
-    readonly: true,
-    format: "erofs",
+    rootfs: {
+      path,
+      readonly: true,
+      format: "erofs",
+    },
   };
 }
 
@@ -599,8 +626,8 @@ function validateInternalSandboxOptions(options: InternalSandboxOptions): void {
   if (options.rootfs.path.length === 0) {
     throw new Error("invalid sandbox options: rootfs.path must not be empty");
   }
-  if (options.rootfs.format !== "erofs") {
-    throw new Error("invalid sandbox options: rootfs.format must be erofs");
+  if (options.rootfs.format !== "erofs" && options.rootfs.format !== "ext4") {
+    throw new Error("invalid sandbox options: rootfs.format must be erofs or ext4");
   }
 
   const mountPaths = new Set<string>();

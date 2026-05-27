@@ -122,7 +122,9 @@ defineSandbox({
 `storage` is optional. When present, it describes copy-on-write block storage for
 rootfs mutations. The sandbox library owns the COW block-device contract;
 user-space owns the block store's durability, compression, migration, and
-checkpoint policy. When absent, the guest root filesystem is read-only.
+checkpoint policy. When absent, the guest root filesystem is read-only. Built-in
+rootfs packages include a read-only EROFS image for normal boots and a writable
+ext4 image used as the COW base when `storage` is configured.
 
 ```ts
 import { storage } from "@torkbot/sandbox";
@@ -243,8 +245,8 @@ process exits. Streaming stdin/stdout/stderr belongs in the future
 Sandbox hides the kernel, init, transport, and host helper behind a small
 TypeScript API:
 
-- The runtime boots a libkrun-backed guest from a prebuilt read-only rootfs
-  artifact, likely EROFS.
+- The runtime boots a libkrun-backed guest from a prebuilt rootfs artifact:
+  read-only EROFS by default, or writable ext4 when COW block storage is used.
 - Kernel and init artifacts are implementation details owned by Sandbox.
 - A signed `sandbox-host` helper owns the Node/Rust/libkrun boundary.
 - Guest control traffic uses an implicit fd-backed transport between the host

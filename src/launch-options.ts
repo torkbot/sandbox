@@ -50,9 +50,10 @@ export interface InternalSandboxOptions {
   readonly rootfs: {
     readonly path: string;
     readonly readonly?: boolean;
-    readonly format: "erofs";
+    readonly format: "erofs" | "ext4";
   };
   readonly storage?: SandboxRootStorage;
+  readonly storageCleanup?: () => Promise<void>;
   readonly mounts?: readonly InternalMount[];
   readonly network?: InternalNetworkConfig;
   readonly cwd?: string;

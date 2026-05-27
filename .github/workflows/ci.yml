@@ -112,6 +112,7 @@ jobs:
             git ls-files -z \
               scripts/build-rootfs.ts \
               scripts/build-rootfs-erofs.ts \
+              scripts/build-rootfs-ext4.ts \
               | xargs -0 shasum -a 256
           } > rootfs-cache-inputs.txt
           rootfs_key_hash="$(shasum -a 256 rootfs-cache-inputs.txt | cut -d ' ' -f1)"
@@ -160,6 +161,7 @@ jobs:
         run: |
           npm run build:rootfs
           npm run build:rootfs:erofs
+          npm run build:rootfs:ext4
 
   e2e-fixtures-arm64:
     name: Build e2e fixtures (ubuntu-24.04-arm)
@@ -210,6 +212,7 @@ jobs:
             git ls-files -z \
               scripts/build-rootfs.ts \
               scripts/build-rootfs-erofs.ts \
+              scripts/build-rootfs-ext4.ts \
               | xargs -0 shasum -a 256
           } > rootfs-cache-inputs.txt
           rootfs_key_hash="$(shasum -a 256 rootfs-cache-inputs.txt | cut -d ' ' -f1)"
@@ -258,6 +261,7 @@ jobs:
         run: |
           npm run build:rootfs
           npm run build:rootfs:erofs
+          npm run build:rootfs:ext4
 
   e2e:
     name: Run e2e (ubuntu-24.04)
@@ -339,6 +343,7 @@ jobs:
             git ls-files -z \
               scripts/build-rootfs.ts \
               scripts/build-rootfs-erofs.ts \
+              scripts/build-rootfs-ext4.ts \
               | xargs -0 shasum -a 256
           } > rootfs-cache-inputs.txt
           rootfs_key_hash="$(shasum -a 256 rootfs-cache-inputs.txt | cut -d ' ' -f1)"
