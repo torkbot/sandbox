@@ -65,8 +65,19 @@ export function createMemoryFileSystem(options: MemoryFileSystemOptions = {}): S
       return node.contents.slice(offset, end);
     },
     async createFile(path) {
-      writeFileNode(path, new Uint8Array());
-      return nodeStat(lookup(path));
+      const parent = lookupDirectory(parentPath(path));
+      const name = baseName(path);
+      if (parent.entries.has(name)) {
+        throw new Error(`path exists: ${path}`);
+      }
+      const node: MemoryNode = {
+        type: "file",
+        contents: new Uint8Array(),
+        xattrs: new Map(),
+        writable: true,
+      };
+      parent.entries.set(name, node);
+      return nodeStat(node);
     },
     async write(input) {
       const node = ensureFile(input.path);
@@ -85,24 +96,23 @@ export function createMemoryFileSystem(options: MemoryFileSystemOptions = {}): S
       return nodeStat(node);
     },
     async mkdir(path) {
-      const parent = ensureDirectory(parentPath(path));
+      const parent = lookupDirectory(parentPath(path));
       const name = baseName(path);
       const existing = parent.entries.get(name);
-      if (existing !== undefined && existing.type !== "directory") {
-        throw new Error(`path exists and is not a directory: ${path}`);
+      if (existing !== undefined) {
+        throw new Error(`path exists: ${path}`);
       }
-      if (existing === undefined) {
-        parent.entries.set(name, {
-          type: "directory",
-          entries: new Map(),
-          xattrs: new Map(),
-          writable: true,
-        });
-      }
-      return nodeStat(parent.entries.get(name) ?? parent);
+      const node: MemoryNode = {
+        type: "directory",
+        entries: new Map(),
+        xattrs: new Map(),
+        writable: true,
+      };
+      parent.entries.set(name, node);
+      return nodeStat(node);
     },
     async unlink(path) {
-      const parent = ensureDirectory(parentPath(path));
+      const parent = lookupDirectory(parentPath(path));
       const node = parent.entries.get(baseName(path));
       if (node === undefined) {
         throw new Error(`not found: ${path}`);
@@ -113,7 +123,7 @@ export function createMemoryFileSystem(options: MemoryFileSystemOptions = {}): S
       parent.entries.delete(baseName(path));
     },
     async rmdir(path) {
-      const parent = ensureDirectory(parentPath(path));
+      const parent = lookupDirectory(parentPath(path));
       const node = parent.entries.get(baseName(path));
       if (node === undefined) {
         throw new Error(`not found: ${path}`);
@@ -127,17 +137,22 @@ export function createMemoryFileSystem(options: MemoryFileSystemOptions = {}): S
       parent.entries.delete(baseName(path));
     },
     async rename(from, to, flags = 0) {
-      const fromParent = ensureDirectory(parentPath(from));
+      const fromParent = lookupDirectory(parentPath(from));
       const node = fromParent.entries.get(baseName(from));
       if (node === undefined) {
         throw new Error(`not found: ${from}`);
       }
-      const toParent = ensureDirectory(parentPath(to));
-      if ((flags & 1) !== 0 && toParent.entries.has(baseName(to))) {
+      const toParent = lookupDirectory(parentPath(to));
+      const destinationName = baseName(to);
+      const existing = toParent.entries.get(destinationName);
+      if ((flags & 1) !== 0 && existing !== undefined) {
         throw new Error(`path exists: ${to}`);
       }
+      if (existing !== undefined) {
+        validateRenameReplacement(node, existing, to);
+      }
       fromParent.entries.delete(baseName(from));
-      toParent.entries.set(baseName(to), node);
+      toParent.entries.set(destinationName, node);
       if ((flags & 4) !== 0) {
         fromParent.entries.set(baseName(from), {
           type: "file",
@@ -152,7 +167,7 @@ export function createMemoryFileSystem(options: MemoryFileSystemOptions = {}): S
       if (node.type === "directory") {
         throw new Error(`cannot hard link directory: ${from}`);
       }
-      const toParent = ensureDirectory(parentPath(to));
+      const toParent = lookupDirectory(parentPath(to));
       if (toParent.entries.has(baseName(to))) {
         throw new Error(`path exists: ${to}`);
       }
@@ -160,7 +175,7 @@ export function createMemoryFileSystem(options: MemoryFileSystemOptions = {}): S
       return nodeStat(node);
     },
     async symlink(target, path) {
-      const parent = ensureDirectory(parentPath(path));
+      const parent = lookupDirectory(parentPath(path));
       if (parent.entries.has(baseName(path))) {
         throw new Error(`path exists: ${path}`);
       }
@@ -220,13 +235,7 @@ export function createMemoryFileSystem(options: MemoryFileSystemOptions = {}): S
   }
 
   function ensureFile(path: string): MemoryFile {
-    let node: MemoryNode;
-    try {
-      node = lookup(path);
-    } catch {
-      writeFileNode(path, new Uint8Array());
-      node = lookup(path);
-    }
+    const node = lookup(path);
     if (node.type !== "file") {
       throw new Error(`not a file: ${path}`);
     }
@@ -256,6 +265,14 @@ export function createMemoryFileSystem(options: MemoryFileSystemOptions = {}): S
     return existing;
   }
 
+  function lookupDirectory(path: string): MemoryDirectory {
+    const node = lookup(path);
+    if (node.type !== "directory") {
+      throw new Error(`not a directory: ${path}`);
+    }
+    return node;
+  }
+
   function lookup(path: string): MemoryNode {
     if (path === "/") {
       return root;
@@ -272,6 +289,22 @@ export function createMemoryFileSystem(options: MemoryFileSystemOptions = {}): S
       node = child;
     }
     return node;
+  }
+}
+
+function validateRenameReplacement(source: MemoryNode, destination: MemoryNode, path: string): void {
+  if (source.type === "directory") {
+    if (destination.type !== "directory") {
+      throw new Error(`not a directory: ${path}`);
+    }
+    if (destination.entries.size > 0) {
+      throw new Error(`directory not empty: ${path}`);
+    }
+    return;
+  }
+
+  if (destination.type === "directory") {
+    throw new Error(`is a directory: ${path}`);
   }
 }
 

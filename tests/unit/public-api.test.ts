@@ -86,6 +86,36 @@ test("fs.memory reports symlink target size and refuses replacement", async () =
   );
 });
 
+test("fs.memory refuses missing parent directories for POSIX mutations", async () => {
+  const fileSystem = fs.memory({
+    files: {
+      "/source.txt": "source",
+    },
+  });
+
+  await assert.rejects(fileSystem.createFile("/missing/file.txt"), /not found: \/missing/);
+  await assert.rejects(fileSystem.mkdir("/missing/dir"), /not found: \/missing/);
+  await assert.rejects(fileSystem.rename("/source.txt", "/missing/source.txt"), /not found: \/missing/);
+  await assert.rejects(fileSystem.link("/source.txt", "/missing/source.txt"), /not found: \/missing/);
+  await assert.rejects(fileSystem.symlink("source.txt", "/missing/link.txt"), /not found: \/missing/);
+});
+
+test("fs.memory rejects invalid rename replacements", async () => {
+  const fileSystem = fs.memory({
+    files: {
+      "/file.txt": "file",
+      "/target.txt": "target",
+      "/dir/child.txt": "child",
+      "/empty/.keep": "",
+    },
+  });
+  await fileSystem.mkdir("/empty-dir");
+
+  await assert.rejects(fileSystem.rename("/file.txt", "/dir"), /is a directory: \/dir/);
+  await assert.rejects(fileSystem.rename("/dir", "/target.txt"), /not a directory: \/target\.txt/);
+  await assert.rejects(fileSystem.rename("/empty-dir", "/dir"), /directory not empty: \/dir/);
+});
+
 test("defineSandbox accepts resource limits", () => {
   const sandbox = defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.20"),

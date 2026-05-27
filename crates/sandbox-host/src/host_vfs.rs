@@ -351,7 +351,8 @@ impl sandbox::vfs::HostVirtualFileSystem for NodeVirtualFs {
             "to": &to,
         })?;
         let stat = response.get_document("stat").map_err(to_io_error)?;
-        entry_from_stat(self.inode_for_path(&to), stat)
+        self.alias_path_to_inode(&to, u64::from(inode));
+        entry_from_stat(u64::from(inode), stat)
     }
 
     fn symlink(
@@ -523,6 +524,13 @@ impl NodeVirtualFs {
             state.inodes_by_path.insert(next_path, inode);
         }
     }
+
+    fn alias_path_to_inode(&self, path: &str, inode: u64) {
+        let mut state = self.state.lock().expect("vfs inode state lock poisoned");
+        if let Some(previous_inode) = state.inodes_by_path.insert(path.to_string(), inode) {
+            state.paths_by_inode.remove(&previous_inode);
+        }
+    }
 }
 
 fn forget_path_tree(state: &mut NodeVirtualFsState, path: &str) {
@@ -647,8 +655,14 @@ fn to_io_error(error: impl std::fmt::Display) -> io::Error {
 fn host_vfs_error(message: String) -> io::Error {
     let errno = if message.starts_with("not found:") {
         Some(libc::ENOENT)
-    } else if message.starts_with("path exists:") || message.starts_with("xattr already exists:") {
+    } else if message.starts_with("path exists") || message.starts_with("xattr already exists:") {
         Some(libc::EEXIST)
+    } else if message.starts_with("directory not empty:") {
+        Some(libc::ENOTEMPTY)
+    } else if message.starts_with("is a directory:") {
+        Some(libc::EISDIR)
+    } else if message.starts_with("not a directory:") {
+        Some(libc::ENOTDIR)
     } else if message.starts_with("xattr not found:") {
         Some(bindings::LINUX_ENODATA)
     } else if message.contains("larger than requested size") {
@@ -706,5 +720,21 @@ mod tests {
         };
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
         assert!(error.to_string().contains("rename flags"));
+    }
+
+    #[test]
+    fn host_vfs_errors_preserve_posix_directory_failures() {
+        assert_eq!(
+            host_vfs_error("directory not empty: /target".to_string()).raw_os_error(),
+            Some(libc::ENOTEMPTY)
+        );
+        assert_eq!(
+            host_vfs_error("is a directory: /target".to_string()).raw_os_error(),
+            Some(libc::EISDIR)
+        );
+        assert_eq!(
+            host_vfs_error("not a directory: /target".to_string()).raw_os_error(),
+            Some(libc::ENOTDIR)
+        );
     }
 }

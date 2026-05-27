@@ -176,15 +176,17 @@ different filesystems over the same reusable machine configuration:
 await using lane = await sandbox.boot({
   mounts: {
     "/workspace": fs.virtual(workspaceFs),
-    "/private": fs.virtual(privateFs),
-    "/shared": fs.virtual(sharedFs),
+    "/tmp": fs.virtual(privateFs),
+    "/mnt": fs.virtual(sharedFs),
   },
   cwd: "/workspace",
 });
 ```
 
 Sandbox does not special-case `/workspace`. Mount paths are just guest-visible
-paths backed by user-supplied filesystems.
+paths backed by user-supplied filesystems. The target path must already exist
+in the selected rootfs; the built-in Alpine rootfs includes `/workspace`,
+`/tmp`, and `/mnt`.
 
 ### Filesystems
 
