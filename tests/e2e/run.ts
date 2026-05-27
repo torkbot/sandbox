@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { platform } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 const runId = new Date().toISOString().replaceAll(":", "-").replaceAll(".", "-");
 const resultDir = join(repoRoot, "test-results", "e2e", runId);
+const consoleOutputPath = process.env.SANDBOX_CONSOLE_OUTPUT ?? join(resultDir, "console.log");
 
 await mkdir(resultDir, { recursive: true });
 
@@ -31,7 +32,7 @@ const child = spawn(
     cwd: repoRoot,
     env: {
       ...process.env,
-      SANDBOX_CONSOLE_OUTPUT: process.env.SANDBOX_CONSOLE_OUTPUT ?? join(resultDir, "console.log"),
+      SANDBOX_CONSOLE_OUTPUT: consoleOutputPath,
       SANDBOX_E2E_RESULT_DIR: resultDir,
       SANDBOX_E2E_RUN_ID: runId,
     },
@@ -52,4 +53,15 @@ const exitCode = await new Promise<number>((resolve) => {
 
 manifest.status = exitCode === 0 ? "passed" : "failed";
 await writeFile(join(resultDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+if (exitCode !== 0) {
+  try {
+    const consoleOutput = await readFile(consoleOutputPath, "utf8");
+    if (consoleOutput.trim().length > 0) {
+      console.error("Guest console output:");
+      console.error(consoleOutput.trimEnd());
+    }
+  } catch {
+    // The console output is best-effort diagnostic context for failing e2e runs.
+  }
+}
 process.exitCode = exitCode;

@@ -51,6 +51,7 @@ fn prepare_rootfs_overlay(
         return Ok(false);
     }
 
+    raise_console_log_level();
     mount_fs("tmpfs", "/run", "tmpfs", 0)?;
     let (upperdir, workdir) = if let Some(tag) = overlay_virtiofs {
         std::fs::create_dir_all("/run/sandbox-rootfs-overlay")
@@ -84,6 +85,11 @@ fn prepare_rootfs_overlay(
     std::env::set_current_dir("/")
         .map_err(|error| InitError(format!("chdir / after overlay chroot: {error}")))?;
     Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn raise_console_log_level() {
+    let _ = std::fs::write("/proc/sys/kernel/printk", "8 4 1 7\n");
 }
 
 #[cfg(not(target_os = "linux"))]
