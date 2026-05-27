@@ -2,7 +2,6 @@ import { builtInRootfsPath } from "./artifacts.ts";
 import { HostControlTransport } from "./control.ts";
 import { HostProcessSandboxVm } from "./host-process.ts";
 import { createMemoryFileSystem } from "./memory-fs.ts";
-import { materializeCowRootStorage } from "./root-storage.ts";
 import {
   isSandboxWritableFileSystem,
 } from "./vfs.ts";
@@ -123,6 +122,7 @@ export type SandboxBlockChunk = {
 
 export interface SandboxBlockStore {
   readonly blockSize: number;
+  list(): Promise<readonly bigint[]>;
   read(range: SandboxBlockRange): Promise<readonly SandboxBlockChunk[]>;
   write(chunks: readonly SandboxBlockChunk[]): Promise<void>;
   flush?(): Promise<void>;
@@ -297,7 +297,6 @@ class DefinedSandbox implements SandboxDefinition {
       );
       return new HostBackedSandboxVm(hostVm, launchOptions);
     } catch (error) {
-      await launchOptions.storageCleanup?.();
       throw error;
     }
   }
@@ -349,7 +348,7 @@ class HostBackedSandboxVm implements SandboxVm {
 
     this.#closed = true;
     let syncError: unknown;
-    if (this.#options.storageCleanup !== undefined) {
+    if (this.#options.storage !== undefined) {
       try {
         await withTimeout(
           this.#exec.exec("/bin/sync"),
@@ -364,7 +363,6 @@ class HostBackedSandboxVm implements SandboxVm {
       await this.control.close();
       await this.#hostVm.close();
     } finally {
-      await this.#options.storageCleanup?.();
     }
     if (syncError !== undefined) {
       throw syncError;
@@ -495,12 +493,11 @@ async function toInternalSandboxOptions(
   boot: SandboxBootOptions,
   network?: InternalNetworkConfig,
 ): Promise<InternalSandboxOptions> {
-  const baseRootfs = await lowerBuiltInRootfs(config.rootfs, config.storage);
+  const baseRootfs = lowerBuiltInRootfs(config.rootfs, config.storage);
   return {
     resources: config.resources,
     rootfs: baseRootfs.rootfs,
     storage: config.storage,
-    storageCleanup: baseRootfs.cleanup,
     cwd: boot.cwd,
     mounts: Object.entries(boot.mounts ?? {}).map(([path, source]) => {
       return {
@@ -573,25 +570,23 @@ function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPoli
   };
 }
 
-async function lowerBuiltInRootfs(
+function lowerBuiltInRootfs(
   rootfs: Rootfs,
   storage: SandboxRootStorage | undefined,
-): Promise<{
+): {
   readonly rootfs: InternalSandboxOptions["rootfs"];
-  readonly cleanup?: () => Promise<void>;
-}> {
+} {
   if (storage !== undefined) {
-    const materialized = await materializeCowRootStorage(
-      builtInRootfsPath(rootfs.name, "ext4"),
-      storage,
-    );
     return {
       rootfs: {
-        path: materialized.path,
+        path: builtInRootfsPath(rootfs.name, "ext4"),
         readonly: false,
         format: "ext4",
+        storage: {
+          kind: storage.kind,
+          blockSize: storage.blockStore.blockSize,
+        },
       },
-      cleanup: materialized.cleanup,
     };
   }
   const path = builtInRootfsPath(rootfs.name);
@@ -638,6 +633,15 @@ function validateRootStorage(storage: SandboxRootStorage): void {
   }
   if (storage.blockStore.blockSize % 512 !== 0) {
     throw new Error("invalid sandbox definition: storage block size must be a multiple of 512 bytes");
+  }
+  if (typeof storage.blockStore.list !== "function") {
+    throw new Error("invalid sandbox definition: storage block store must provide list()");
+  }
+  if (typeof storage.blockStore.read !== "function") {
+    throw new Error("invalid sandbox definition: storage block store must provide read()");
+  }
+  if (typeof storage.blockStore.write !== "function") {
+    throw new Error("invalid sandbox definition: storage block store must provide write()");
   }
 }
 

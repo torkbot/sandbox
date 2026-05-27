@@ -38,6 +38,12 @@ pub struct RootfsSpec {
     pub path: PathBuf,
     pub readonly: bool,
     pub format: RootfsFormat,
+    pub storage: Option<RootfsStorageSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootfsStorageSpec {
+    CowBlockStore { block_size: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +191,10 @@ impl MicroVmSpec {
             path: PathBuf::from(input.rootfs_path),
             readonly: input.rootfs_readonly.unwrap_or(true),
             format: RootfsFormat::parse(&input.rootfs_format)?,
+            storage: input
+                .rootfs_storage
+                .map(RootfsStorageSpec::parse)
+                .transpose()?,
         };
         if rootfs.format == RootfsFormat::Directory {
             return Err(SpecError::new(
@@ -298,9 +308,36 @@ pub struct MicroVmSpecInput {
     pub rootfs_path: String,
     pub rootfs_readonly: Option<bool>,
     pub rootfs_format: String,
+    pub rootfs_storage: Option<RootfsStorageSpecInput>,
     pub mounts: Vec<MountSpecInput>,
     pub network_outbound: Option<OutboundSpec>,
     pub network_http: Option<HttpSpecInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootfsStorageSpecInput {
+    pub kind: String,
+    pub block_size: u64,
+}
+
+impl RootfsStorageSpec {
+    fn parse(input: RootfsStorageSpecInput) -> Result<Self, SpecError> {
+        match input.kind.as_str() {
+            "cow-block-store" => {
+                if input.block_size == 0 || input.block_size % 512 != 0 {
+                    return Err(SpecError::new(
+                        "rootfs.storage.blockSize must be a positive multiple of 512",
+                    ));
+                }
+                Ok(Self::CowBlockStore {
+                    block_size: input.block_size,
+                })
+            }
+            other => Err(SpecError::new(format!(
+                "unsupported rootfs.storage.kind: {other}"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,6 +369,7 @@ mod tests {
             rootfs_path: "rootfs.erofs".to_string(),
             rootfs_readonly: None,
             rootfs_format: "erofs".to_string(),
+            rootfs_storage: None,
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,

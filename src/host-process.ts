@@ -7,6 +7,7 @@ import type { HostSpawnSandboxOptions } from "./spawn-options.ts";
 import { isSandboxWritableFileSystem } from "./vfs.ts";
 import type {
   SandboxFileSystem,
+  SandboxBlockStore,
   SandboxPosixFileSystem,
 } from "./index.ts";
 import type {
@@ -26,6 +27,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
   readonly #packetActivity = new AsyncSignal();
   readonly #launchReady = new AsyncSignal("sandbox-host launch acknowledgement closed");
   readonly #hostFs = new Map<string, SandboxFileSystem>();
+  readonly #rootBlockStore?: SandboxBlockStore;
   readonly #requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook>;
   #buffer = new Uint8Array();
   #stderr = "";
@@ -42,6 +44,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
     this.#options = options;
     this.packets = this.#packets;
     this.#requestHeaderHooks = requestHeaderHooks;
+    this.#rootBlockStore = options.storage?.blockStore;
     for (const mount of options.mounts ?? []) {
       this.#hostFs.set(mount.path, mount.fileSystem);
     }
@@ -261,6 +264,10 @@ export class HostProcessSandboxVm implements HostControlChannel {
       && type !== "host.vfs.removexattr"
       && type !== "host.http.requestHeaders"
       && type !== "host.http.activeRequestHeaderHooks"
+      && type !== "host.block.list"
+      && type !== "host.block.read"
+      && type !== "host.block.write"
+      && type !== "host.block.flush"
     ) {
       return false;
     }
@@ -269,6 +276,13 @@ export class HostProcessSandboxVm implements HostControlChannel {
       void this.#handleHttpRequestHeaders(document);
     } else if (type === "host.http.activeRequestHeaderHooks") {
       void this.#handleActiveRequestHeaderHooks(document);
+    } else if (
+      type === "host.block.list"
+      || type === "host.block.read"
+      || type === "host.block.write"
+      || type === "host.block.flush"
+    ) {
+      void this.#handleBlockStoreRequest(document);
     } else {
       void this.#handleVirtualFsRequest(document);
     }
@@ -603,6 +617,73 @@ export class HostProcessSandboxVm implements HostControlChannel {
     }
   }
 
+  async #handleBlockStoreRequest(document: Record<string, unknown>): Promise<void> {
+    const id = typeof document.id === "string" ? document.id : "";
+    try {
+      const blockStore = this.#rootBlockStore;
+      if (blockStore === undefined) {
+        throw new Error("root block store is not configured");
+      }
+
+      switch (document.type) {
+        case "host.block.list": {
+          this.#tryWriteToHost(encodePacket({
+            type: "host.block.response",
+            id,
+            ok: true,
+            blocks: (await blockStore.list()).map((block) => block.toString()),
+          }));
+          return;
+        }
+        case "host.block.read": {
+          const chunks = await blockStore.read({
+            start: BigInt(assertString(document.start, "start")),
+            count: assertNumber(document.count, "count"),
+          });
+          this.#tryWriteToHost(encodePacket({
+            type: "host.block.response",
+            id,
+            ok: true,
+            chunks: chunks.map((chunk) => ({
+              start: chunk.start.toString(),
+              data: new Binary(chunk.data),
+            })),
+          }));
+          return;
+        }
+        case "host.block.write": {
+          const chunks = assertDocumentArray(document.chunks, "chunks").map((chunk) => ({
+            start: BigInt(assertString(chunk.start, "chunks.start")),
+            data: binaryField(chunk.data, "chunks.data"),
+          }));
+          await blockStore.write(chunks);
+          this.#tryWriteToHost(encodePacket({
+            type: "host.block.response",
+            id,
+            ok: true,
+          }));
+          return;
+        }
+        case "host.block.flush": {
+          await blockStore.flush?.();
+          this.#tryWriteToHost(encodePacket({
+            type: "host.block.response",
+            id,
+            ok: true,
+          }));
+          return;
+        }
+      }
+    } catch (error) {
+      this.#tryWriteToHost(encodePacket({
+        type: "host.block.response",
+        id,
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    }
+  }
+
   async #waitForLaunch(): Promise<void> {
     const timeoutMs = launchTimeoutMs();
     await Promise.race([
@@ -678,6 +759,13 @@ function assertHeaderPairs(value: unknown, field: string): [string, string][] {
     throw new Error(`host request ${field} must be header pairs`);
   }
   return value as [string, string][];
+}
+
+function assertDocumentArray(value: unknown, field: string): Record<string, unknown>[] {
+  if (!Array.isArray(value) || value.some((entry) => entry === null || typeof entry !== "object")) {
+    throw new Error(`host request ${field} must be documents`);
+  }
+  return value as Record<string, unknown>[];
 }
 
 function trackHeaderMutations(headers: Headers): () => boolean {
@@ -913,6 +1001,7 @@ function encodeHostSpawn(options: HostSpawnSandboxOptions): Uint8Array {
     rootfsPath: options.rootfs.path,
     rootfsReadonly: options.rootfs.readonly,
     rootfsFormat: options.rootfs.format,
+    rootfsStorage: options.rootfs.storage,
     mounts: options.mounts ?? [],
     networkOutbound: options.network?.outbound,
     networkHttp: options.network?.http === undefined ? undefined : options.network.http,

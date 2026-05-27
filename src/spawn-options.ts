@@ -18,6 +18,10 @@ export type HostSpawnSandboxOptions = {
     readonly path: string;
     readonly readonly?: boolean;
     readonly format: "directory" | "erofs" | "ext4";
+    readonly storage?: {
+      readonly kind: "cow-block-store";
+      readonly blockSize: number;
+    };
   };
   readonly mounts?: readonly {
     readonly kind: "virtual-fs";

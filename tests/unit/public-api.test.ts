@@ -236,6 +236,9 @@ function memoryBlockStore(): SandboxBlockStore {
   const blocks = new Map<bigint, Uint8Array>();
   return {
     blockSize: 4096,
+    async list() {
+      return Array.from(blocks.keys());
+    },
     async read(range) {
       const chunks = [];
       for (let offset = 0; offset < range.count; offset += 1) {

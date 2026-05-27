@@ -6,10 +6,11 @@ use std::sync::mpsc;
 use std::thread;
 
 use bson::{Bson, Document, doc};
+use sandbox::block_storage::CowBlockStore;
 use sandbox::config::MountSpec;
 use sandbox::config::{
     HttpRequestHeaderHookSpec, HttpSpecInput, MicroVmSpecInput, MountSpecInput, OutboundPolicy,
-    OutboundRuleSpec, OutboundSpec,
+    OutboundRuleSpec, OutboundSpec, RootfsStorageSpecInput,
 };
 use sandbox::http_flow::{
     HookBackedHttpInterceptRuntime, HttpHookExecutor, InterceptedHttpRequest,
@@ -68,6 +69,14 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
     let virtual_fs = virtual_fs_devices(&spec, bridge.clone());
     let services = HostServices {
         http: http_intercept_runtime(&spec, bridge.clone())?,
+        root_storage: spec.rootfs.storage.as_ref().map(|storage| {
+            Arc::new(NodeCowBlockStore::new(
+                bridge.clone(),
+                match storage {
+                    sandbox::config::RootfsStorageSpec::CowBlockStore { block_size } => *block_size,
+                },
+            )) as Arc<dyn CowBlockStore>
+        }),
     };
     let mut vm = sandbox::runtime::KrunVm::create_with_services(&spec, virtual_fs, services)?;
     vm.start()?;
@@ -229,6 +238,101 @@ impl RequestHookSelector {
 struct NodeHttpHookExecutor {
     bridge: Arc<HostIoBridge>,
     hooks: Vec<NodeRequestHeaderHook>,
+}
+
+#[derive(Debug)]
+struct NodeCowBlockStore {
+    bridge: Arc<HostIoBridge>,
+    block_size: u64,
+}
+
+impl NodeCowBlockStore {
+    fn new(bridge: Arc<HostIoBridge>, block_size: u64) -> Self {
+        Self { bridge, block_size }
+    }
+}
+
+impl CowBlockStore for NodeCowBlockStore {
+    fn block_size(&self) -> u64 {
+        self.block_size
+    }
+
+    fn list_blocks(&self) -> io::Result<std::collections::HashSet<u64>> {
+        let response = self.bridge.request(doc! {
+            "type": "host.block.list",
+        })?;
+        let blocks = response
+            .get_array("blocks")
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        blocks
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "block id must be a string")
+                    })?
+                    .parse::<u64>()
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+            })
+            .collect()
+    }
+
+    fn read_blocks(&self, start: u64, count: u64) -> io::Result<Vec<(u64, Vec<u8>)>> {
+        let response = self.bridge.request(doc! {
+            "type": "host.block.read",
+            "start": start.to_string(),
+            "count": i64::try_from(count).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "block count exceeds i64"))?,
+        })?;
+        let chunks = response
+            .get_array("chunks")
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        chunks
+            .iter()
+            .map(|value| {
+                let document = value.as_document().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "block chunk must be a document")
+                })?;
+                let index = document
+                    .get_str("start")
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+                    .parse::<u64>()
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                let data = document
+                    .get_binary_generic("data")
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+                    .to_vec();
+                Ok((index, data))
+            })
+            .collect()
+    }
+
+    fn write_blocks(&self, chunks: Vec<(u64, Vec<u8>)>) -> io::Result<()> {
+        let chunks = chunks
+            .into_iter()
+            .map(|(index, data)| {
+                Bson::Document(doc! {
+                    "start": index.to_string(),
+                    "data": Bson::Binary(bson::Binary {
+                        subtype: bson::spec::BinarySubtype::Generic,
+                        bytes: data,
+                    }),
+                })
+            })
+            .collect::<Vec<_>>();
+        self.bridge.request(doc! {
+            "type": "host.block.write",
+            "chunks": chunks,
+        })?;
+        Ok(())
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        self.bridge.request(doc! {
+            "type": "host.block.flush",
+        })?;
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -510,10 +614,23 @@ fn parse_spawn(document: Document) -> Result<MicroVmSpecInput, Box<dyn std::erro
         rootfs_path: document.get_str("rootfsPath")?.to_string(),
         rootfs_readonly: optional_bool(&document, "rootfsReadonly"),
         rootfs_format: document.get_str("rootfsFormat")?.to_string(),
+        rootfs_storage: parse_rootfs_storage(document.get_document("rootfsStorage").ok())?,
         mounts: parse_mounts(document.get_array("mounts")?)?,
         network_outbound: parse_network_outbound(document.get_document("networkOutbound").ok())?,
         network_http: parse_network_http(document.get_document("networkHttp").ok())?,
     })
+}
+
+fn parse_rootfs_storage(
+    document: Option<&Document>,
+) -> Result<Option<RootfsStorageSpecInput>, Box<dyn std::error::Error>> {
+    let Some(document) = document else {
+        return Ok(None);
+    };
+    Ok(Some(RootfsStorageSpecInput {
+        kind: document.get_str("kind")?.to_string(),
+        block_size: u64::try_from(document.get_i32("blockSize")?)?,
+    }))
 }
 
 fn parse_mounts(values: &[bson::Bson]) -> Result<Vec<MountSpecInput>, Box<dyn std::error::Error>> {

@@ -142,11 +142,17 @@ The block store interface is intentionally storage-agnostic:
 ```ts
 interface SandboxBlockStore {
   readonly blockSize: number;
+  list(): Promise<readonly bigint[]>;
   read(range: SandboxBlockRange): Promise<readonly SandboxBlockChunk[]>;
   write(chunks: readonly SandboxBlockChunk[]): Promise<void>;
   flush?(): Promise<void>;
 }
 ```
+
+`list()` returns the block IDs currently present in the COW store. The Rust
+block backend reads that manifest once at boot, so clean base-image blocks are
+served without asking JavaScript. Dirty blocks are read lazily and writes are
+batched back through `write(...)` on flush.
 
 `network` is optional. When omitted, egress is denied. A network policy receives
 connection requests and grants only the traffic it explicitly allows:

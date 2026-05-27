@@ -161,6 +161,9 @@ function writableFileSystem(): SandboxWritableFileSystem {
 function memoryBlockStore(): SandboxBlockStore {
   return {
     blockSize: 4096,
+    async list() {
+      return [];
+    },
     async read() {
       return [];
     },
