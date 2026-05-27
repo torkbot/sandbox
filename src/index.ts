@@ -208,7 +208,7 @@ export const rootfs = {
   },
 };
 
-function virtualFs(fileSystem: SandboxWritableFileSystem): SandboxWritableFileSystemSource;
+function virtualFs(fileSystem: SandboxPosixFileSystem): SandboxWritableFileSystemSource;
 function virtualFs(fileSystem: SandboxFileSystem): SandboxFileSystemSource;
 function virtualFs(fileSystem: SandboxFileSystem): SandboxFileSystemSource {
   return {
@@ -452,7 +452,7 @@ function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPoli
       transport: "tcp",
       host: request.url.hostname,
       ip: request.destination.upstreamIp,
-      port: request.destination.originalPort,
+      port: request.destination.upstreamPort,
       allow() {
         grants.push({ kind: "http" });
         return {};

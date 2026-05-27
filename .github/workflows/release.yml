@@ -205,6 +205,15 @@ jobs:
       - name: Build TypeScript package
         run: npm run build:ts
 
+      - name: Build init binary for built-in rootfs
+        run: npm run build:init
+
+      - name: Build built-in rootfs
+        run: npm run build:rootfs
+
+      - name: Build built-in rootfs EROFS image
+        run: npm run build:rootfs:erofs
+
       - name: Prepare root package
         run: node ./scripts/prepare-npm-packages.ts --root
 

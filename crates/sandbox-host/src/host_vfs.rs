@@ -503,23 +503,28 @@ impl NodeVirtualFs {
         let mut state = self.state.lock().expect("vfs inode state lock poisoned");
         forget_path_tree(&mut state, to);
         let prefix = format!("{from}/");
-        let replacements = state
-            .paths_by_inode
+        let path_replacements = state
+            .inodes_by_path
             .iter()
-            .filter_map(|(inode, path)| {
+            .filter_map(|(path, inode)| {
                 if path == from {
-                    Some((*inode, to.to_string()))
+                    Some((path.clone(), to.to_string(), *inode))
                 } else {
                     path.strip_prefix(&prefix)
-                        .map(|suffix| (*inode, format!("{to}/{suffix}")))
+                        .map(|suffix| (path.clone(), format!("{to}/{suffix}"), *inode))
                 }
             })
             .collect::<Vec<_>>();
-        for (inode, next_path) in replacements {
-            if let Some(previous_path) = state.paths_by_inode.insert(inode, next_path.clone()) {
-                state.inodes_by_path.remove(&previous_path);
+        for (previous_path, next_path, inode) in path_replacements {
+            state.inodes_by_path.remove(&previous_path);
+            state.inodes_by_path.insert(next_path.clone(), inode);
+            if state
+                .paths_by_inode
+                .get(&inode)
+                .is_some_and(|stored| stored == &previous_path)
+            {
+                state.paths_by_inode.insert(inode, next_path);
             }
-            state.inodes_by_path.insert(next_path, inode);
         }
     }
 
@@ -685,7 +690,9 @@ fn host_vfs_error(message: String) -> io::Error {
         Some(libc::EISDIR)
     } else if message.starts_with("not a directory:") {
         Some(libc::ENOTDIR)
-    } else if message.starts_with("xattr not found:") {
+    } else if message.starts_with("xattr not found:")
+        || message.starts_with("xattr does not exist:")
+    {
         Some(bindings::LINUX_ENODATA)
     } else if message.contains("larger than requested size") {
         Some(libc::ERANGE)
@@ -775,5 +782,32 @@ mod tests {
         );
         assert_eq!(state.inodes_by_path.get("/linked"), Some(&2));
         assert_eq!(state.inodes_by_path.get("/source"), None);
+    }
+
+    #[test]
+    fn renaming_hard_link_alias_preserves_inode_identity() {
+        let bridge = HostIoBridge::new();
+        let vfs = NodeVirtualFs {
+            mount_path: "/mnt".to_string(),
+            bridge,
+            state: Arc::new(Mutex::new(NodeVirtualFsState::default())),
+        };
+        {
+            let mut state = vfs.state.lock().unwrap();
+            state.paths_by_inode.insert(2, "/source".to_string());
+            state.inodes_by_path.insert("/source".to_string(), 2);
+            state.inodes_by_path.insert("/linked".to_string(), 2);
+        }
+
+        vfs.rename_path("/linked", "/renamed");
+
+        let state = vfs.state.lock().unwrap();
+        assert_eq!(
+            state.paths_by_inode.get(&2).map(String::as_str),
+            Some("/source")
+        );
+        assert_eq!(state.inodes_by_path.get("/source"), Some(&2));
+        assert_eq!(state.inodes_by_path.get("/renamed"), Some(&2));
+        assert_eq!(state.inodes_by_path.get("/linked"), None);
     }
 }
