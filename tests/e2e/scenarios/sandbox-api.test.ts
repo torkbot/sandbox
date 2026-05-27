@@ -131,34 +131,6 @@ test("COW rootfs close sync ignores the instance cwd", async (t) => {
   assert.equal(read.stdout, "cwd-independent");
 });
 
-test("COW rootfs rejects overlapping boots for the same writable store", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
-    return;
-  }
-
-  const blockStore = memoryBlockStore();
-  const sandboxDefinition = defineSandbox({
-    rootfs: rootfs.cow({
-      base: rootfs.builtIn("alpine:3.20"),
-      writable: blockStore,
-    }),
-  });
-
-  const first = await sandboxDefinition.boot();
-  try {
-    await assert.rejects(
-      sandboxDefinition.boot(),
-      /COW rootfs block store is already attached to a running sandbox/,
-    );
-  } finally {
-    await first.close();
-  }
-
-  await using second = await sandboxDefinition.boot();
-  const ready = await second.exec("/bin/true");
-  assert.equal(ready.exitCode, 0, ready.stderr);
-});
-
 function memoryBlockStore(): SandboxBlockStore {
   const blocks = new Map<bigint, Uint8Array>();
   return {

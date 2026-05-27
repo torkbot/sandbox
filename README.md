@@ -150,6 +150,11 @@ block backend reads that manifest once at boot, so clean base-image blocks are
 served without asking JavaScript. Dirty blocks are read lazily and writes are
 batched back through `write(...)` on flush.
 
+A writable COW block store must be attached to at most one running sandbox
+instance at a time. Concurrent sandboxes sharing the same writable store are
+undefined behavior; create one store per lane or enforce exclusivity in the
+storage driver.
+
 `network` is optional. When omitted, egress is denied. A network policy receives
 connection requests and grants only the traffic it explicitly allows:
 

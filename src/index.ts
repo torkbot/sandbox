@@ -16,7 +16,6 @@ import type {
 } from "./launch-options.ts";
 
 const CLOSE_SYNC_TIMEOUT_MS = 1_000;
-const activeCowBlockStores = new WeakSet<SandboxBlockStore>();
 
 export type SandboxFileType = "file" | "directory" | "symlink";
 
@@ -285,7 +284,6 @@ class DefinedSandbox implements SandboxDefinition {
       ? undefined
       : createNetworkPolicyHookRegistration(this.#options.network);
     const launchOptions = await toInternalSandboxOptions(this.#options, options, networkPolicy?.network);
-    const releaseRootfsLease = acquireRootfsLease(launchOptions);
     try {
       validateInternalSandboxOptions(launchOptions);
       const hostOptions = toHostSpawnOptions(launchOptions, networkPolicy?.hooks ?? []);
@@ -294,9 +292,8 @@ class DefinedSandbox implements SandboxDefinition {
         hostOptions,
         new Map((networkPolicy?.hooks ?? []).map((hook) => [hook.id, hook])),
       );
-      return new HostBackedSandboxVm(hostVm, launchOptions, releaseRootfsLease);
+      return new HostBackedSandboxVm(hostVm, launchOptions);
     } catch (error) {
-      releaseRootfsLease();
       throw error;
     }
   }
@@ -308,7 +305,6 @@ class HostBackedSandboxVm implements SandboxVm {
   readonly #exec: ControlBackedSandboxExec;
   readonly #rootExec: ControlBackedSandboxExec;
   readonly #options: InternalSandboxOptions;
-  readonly #releaseRootfsLease: () => void;
 
   readonly #hostVm: {
     readonly hasControlSocket: boolean;
@@ -328,11 +324,9 @@ class HostBackedSandboxVm implements SandboxVm {
       terminateHostForTest?(): Promise<void>;
     },
     options: InternalSandboxOptions,
-    releaseRootfsLease: () => void,
   ) {
     this.#hostVm = hostVm;
     this.#options = options;
-    this.#releaseRootfsLease = releaseRootfsLease;
     this.control = new HostControlTransport({
       connected: hostVm.hasControlSocket,
       channel: hostVm,
@@ -368,7 +362,6 @@ class HostBackedSandboxVm implements SandboxVm {
       await this.control.close();
       await this.#hostVm.close();
     } finally {
-      this.#releaseRootfsLease();
     }
     if (syncError !== undefined) {
       throw syncError;
@@ -597,25 +590,6 @@ function lowerRootfs(
         },
       };
   }
-}
-
-function acquireRootfsLease(options: InternalSandboxOptions): () => void {
-  const blockStore = options.rootfs.storage?.blockStore;
-  if (blockStore === undefined) {
-    return () => {};
-  }
-  if (activeCowBlockStores.has(blockStore)) {
-    throw new Error("invalid sandbox boot: COW rootfs block store is already attached to a running sandbox");
-  }
-  activeCowBlockStores.add(blockStore);
-  let released = false;
-  return () => {
-    if (released) {
-      return;
-    }
-    released = true;
-    activeCowBlockStores.delete(blockStore);
-  };
 }
 
 function validateRootfs(rootfs: Rootfs): void {
