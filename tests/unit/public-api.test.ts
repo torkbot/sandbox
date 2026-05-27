@@ -56,6 +56,19 @@ test("fs.memory supports POSIX hard links and extended attributes", async () => 
   );
 });
 
+test("fs.memory creates user overlay whiteouts for rename whiteout", async () => {
+  const fileSystem = fs.memory({
+    files: {
+      "/source.txt": "source",
+    },
+  });
+
+  await fileSystem.rename("/source.txt", "/renamed.txt", 4);
+
+  assert.deepEqual(await fileSystem.listxattr("/source.txt"), ["user.overlay.whiteout"]);
+  assert.deepEqual(await fileSystem.getxattr("/source.txt", "user.overlay.whiteout"), new Uint8Array());
+});
+
 test("defineSandbox accepts resource limits", () => {
   const sandbox = defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.20"),

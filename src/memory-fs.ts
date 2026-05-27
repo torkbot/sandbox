@@ -142,7 +142,7 @@ export function createMemoryFileSystem(options: MemoryFileSystemOptions = {}): S
         fromParent.entries.set(baseName(from), {
           type: "file",
           contents: new Uint8Array(),
-          xattrs: new Map([["trusted.overlay.whiteout", new Uint8Array()]]),
+          xattrs: new Map([["user.overlay.whiteout", new Uint8Array()]]),
           writable: true,
         });
       }
