@@ -37,7 +37,6 @@ type BenchmarkConfig = {
   readonly iterations: number;
   readonly warmups: number;
   readonly command: string;
-  readonly rootfs: string;
   readonly output: string;
 };
 
@@ -45,7 +44,7 @@ const repoRoot = resolve(import.meta.dirname, "..");
 const runId = new Date().toISOString().replaceAll(":", "-").replaceAll(".", "-");
 const config = parseArgs(process.argv.slice(2));
 
-const artifacts = await assertVmLaunchSupport(config.rootfs);
+const artifacts = await assertVmLaunchSupport();
 await mkdir(resolve(repoRoot, config.output), { recursive: true });
 
 const timings: IterationTiming[] = [];
@@ -74,7 +73,7 @@ const report = {
   platform: platform(),
   arch: process.arch,
   command: config.command,
-  rootfs: config.rootfs,
+  rootfs: "alpine:3.20",
   git: gitMetadata(),
   node: {
     execPath: process.execPath,
@@ -143,7 +142,7 @@ async function runLifecycleIteration(
   }
 }
 
-async function assertVmLaunchSupport(rootfs: string): Promise<{
+async function assertVmLaunchSupport(): Promise<{
   readonly hostBinary: ArtifactMetadata;
   readonly rootfs: ArtifactMetadata;
 }> {
@@ -154,7 +153,7 @@ async function assertVmLaunchSupport(rootfs: string): Promise<{
   if (process.platform !== "darwin" && process.platform !== "linux") {
     throw new Error(`unsupported VM launch host platform: ${process.platform}`);
   }
-  const rootfsPath = resolve(repoRoot, rootfs);
+  const rootfsPath = resolve(repoRoot, "dist/rootfs/alpine-3.20.erofs");
   await access(rootfsPath);
   return {
     hostBinary: await artifactMetadata(hostBinary),
@@ -205,7 +204,6 @@ function parseArgs(args: readonly string[]): BenchmarkConfig {
   let iterations = 10;
   let warmups = 1;
   let command = "true";
-  let rootfs = "dist/rootfs/alpine-3.20.erofs";
   let output = `test-results/benchmarks/e2e-lifecycle/${runId}`;
 
   for (let index = 0; index < args.length; index += 1) {
@@ -232,11 +230,6 @@ function parseArgs(args: readonly string[]): BenchmarkConfig {
       index += 1;
       continue;
     }
-    if (arg === "--rootfs") {
-      rootfs = readValue(args, index);
-      index += 1;
-      continue;
-    }
     if (arg === "--output") {
       output = readValue(args, index);
       index += 1;
@@ -245,7 +238,7 @@ function parseArgs(args: readonly string[]): BenchmarkConfig {
     throw new Error(`unknown argument: ${arg}`);
   }
 
-  return { iterations, warmups, command, rootfs, output };
+  return { iterations, warmups, command, output };
 }
 
 function readValue(args: readonly string[], index: number): string {
@@ -340,7 +333,6 @@ Options:
   -n, --iterations <count>  measured iterations to run (default: 10)
       --warmups <count>     warmup iterations excluded from stats (default: 1)
   -c, --command <script>    guest shell command to run (default: true)
-      --rootfs <path>       EROFS rootfs path (default: dist/rootfs/alpine-3.20.erofs)
       --output <dir>        output directory for summary.json
 `);
 }

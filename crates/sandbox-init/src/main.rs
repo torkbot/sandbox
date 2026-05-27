@@ -135,7 +135,8 @@ fn diagnose_overlay_xattr(workdir: &str) -> String {
         Err(error) => return format!("err:{error}"),
     };
     let name = CString::new("user.overlay.opaque").unwrap();
-    let result = unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), b"0".as_ptr().cast(), 1, 0) };
+    let result =
+        unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), b"0".as_ptr().cast(), 1, 0) };
     let status = if result == 0 {
         "ok".to_string()
     } else {

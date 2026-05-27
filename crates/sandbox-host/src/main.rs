@@ -212,10 +212,16 @@ impl RequestHookSelector {
     }
 
     fn matches_rebound_authority(&self, scheme: &str, authority: &str) -> bool {
-        self.scheme == scheme
-            && canonical_authority(scheme, authority)
-                .is_ok_and(|authority| authority == self.authority)
-            && is_hostname(&self.authority)
+        if self.scheme != scheme {
+            return false;
+        }
+        let Ok(authority) = canonical_authority(scheme, authority) else {
+            return false;
+        };
+        if self.authority == "*" {
+            return is_hostname(&authority);
+        }
+        authority == self.authority && is_hostname(&self.authority)
     }
 }
 
@@ -653,4 +659,28 @@ fn optional_i32(document: &Document, key: &str) -> Option<i32> {
 
 fn optional_bool(document: &Document, key: &str) -> Option<bool> {
     document.get_bool(key).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RequestHookSelector;
+
+    #[test]
+    fn wildcard_hook_selector_participates_in_rebind_checks_for_hostnames() {
+        let selector = RequestHookSelector::parse("https://*").unwrap();
+
+        assert!(selector.matches_rebound_authority("https", "registry.npmjs.org"));
+        assert!(selector.matches_rebound_authority("https", "registry.npmjs.org:443"));
+        assert!(!selector.matches_rebound_authority("https", "10.0.0.1"));
+        assert!(!selector.matches_rebound_authority("http", "registry.npmjs.org"));
+    }
+
+    #[test]
+    fn exact_hook_selector_still_checks_only_matching_hostname_authorities() {
+        let selector = RequestHookSelector::parse("https://registry.npmjs.org").unwrap();
+
+        assert!(selector.matches_rebound_authority("https", "registry.npmjs.org:443"));
+        assert!(!selector.matches_rebound_authority("https", "example.com"));
+        assert!(!selector.matches_rebound_authority("https", "104.16.0.1"));
+    }
 }

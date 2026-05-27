@@ -153,7 +153,7 @@ for (const platformPackage of preparePlatforms ? selectedPlatformPackages : []) 
 async function copyDist(source: string, destination: string): Promise<void> {
   await mkdir(destination, { recursive: true });
   for (const entry of await readdir(source, { withFileTypes: true })) {
-    if (entry.name === "npm" || entry.name === "init" || entry.name === "kernel" || entry.name === "rootfs") {
+    if (entry.name === "npm" || entry.name === "init" || entry.name === "kernel") {
       continue;
     }
 

@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 import { HostControlTransport } from "./control.ts";
 import { HostProcessSandboxVm } from "./host-process.ts";
 import { createMemoryFileSystem } from "./memory-fs.ts";
@@ -119,6 +121,10 @@ export interface NetworkConnectionRequest {
   readonly host?: string;
   readonly ip?: string;
   readonly port: number;
+  /**
+   * Allows HTTP(S)-classified traffic for this connection without request middleware.
+   * Raw non-HTTP egress is not exposed by the first public policy API.
+   */
   allow(): NetworkGrant;
   allowHttp(middleware?: HttpRequestMiddleware): HttpNetworkGrant;
 }
@@ -436,7 +442,7 @@ function toInternalSandboxOptions(
 function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPolicyHookRegistration {
   const hook: HttpRequestMiddleware = async (request) => {
     const grants: Array<{
-      readonly kind: "raw" | "http";
+      readonly kind: "http";
       readonly middleware?: HttpRequestMiddleware;
     }> = [];
     const connection: NetworkConnectionRequest = {
@@ -445,7 +451,7 @@ function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPoli
       ip: request.destination.upstreamIp,
       port: request.destination.originalPort,
       allow() {
-        grants.push({ kind: "raw" });
+        grants.push({ kind: "http" });
         return {};
       },
       allowHttp(middleware?: HttpRequestMiddleware) {
@@ -505,7 +511,11 @@ function lowerBuiltInRootfs(rootfs: Rootfs): InternalSandboxOptions["rootfs"] {
 
 function builtInRootfsPath(name: BuiltInRootfsName): string {
   if (name === "alpine:3.20") {
-    return "dist/rootfs/alpine-3.20.erofs";
+    const packagedPath = resolve(import.meta.dirname, "rootfs/alpine-3.20.erofs");
+    if (existsSync(packagedPath)) {
+      return packagedPath;
+    }
+    return resolve(import.meta.dirname, "../dist/rootfs/alpine-3.20.erofs");
   }
   throw new Error(`unsupported built-in rootfs: ${name satisfies never}`);
 }

@@ -12,11 +12,7 @@ import {
 
 const workspaceFs = fs.memory({
   files: {
-    "/package.json": JSON.stringify({
-      scripts: {
-        test: "node --test",
-      },
-    }),
+    "/hello.txt": "hello from the host filesystem\n",
   },
 });
 
@@ -35,7 +31,7 @@ await using lane = await sandbox.boot({
   cwd: "/workspace",
 });
 
-const result = await lane.exec("npm", ["test"]);
+const result = await lane.exec("cat", ["hello.txt"]);
 
 if (result.exitCode !== 0) {
   throw new Error(result.stderr);
@@ -67,7 +63,7 @@ await using lane = await sandbox.boot({
   cwd: "/workspace",
 });
 
-const result = await lane.exec("npm", ["test"], {
+const result = await lane.exec("sh", ["-lc", "printf 'ok\\n'"], {
   env: { CI: "1" },
 });
 
@@ -145,8 +141,9 @@ const policy = network.policy(async (conn) => {
 });
 ```
 
-`conn.allow()` grants the raw connection. `conn.allowHttp(...)` grants
-HTTP(S)-classified traffic and can apply request middleware:
+`conn.allow()` grants HTTP(S)-classified traffic without request middleware.
+`conn.allowHttp(...)` grants HTTP(S)-classified traffic and can apply request
+middleware:
 
 ```ts
 const policy = network.policy(async (conn) => {
