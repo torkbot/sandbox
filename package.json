@@ -1,6 +1,6 @@
 {
   "name": "@torkbot/sandbox",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": false,
   "type": "module",
   "description": "A TypeScript-first Node.js library for spawning libkrun-backed microVMs.",
@@ -61,7 +61,7 @@
     "just-bash": "^2.14.5"
   },
   "optionalDependencies": {
-    "@torkbot/sandbox-darwin-arm64": "0.3.0",
-    "@torkbot/sandbox-linux-x64-gnu": "0.3.0"
+    "@torkbot/sandbox-darwin-arm64": "0.3.1",
+    "@torkbot/sandbox-linux-x64-gnu": "0.3.1"
   }
 }
