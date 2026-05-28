@@ -3,7 +3,6 @@ use rama_http::HeaderMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpRequestProtocol {
     Http1,
-    Http2,
 }
 
 pub fn header_map_from_pairs<'a>(

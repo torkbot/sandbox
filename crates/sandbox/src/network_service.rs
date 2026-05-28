@@ -863,6 +863,9 @@ fn should_use_raw_tcp_relay(bytes: &[u8]) -> bool {
 }
 
 fn bytes_could_be_http_request(bytes: &[u8]) -> bool {
+    if bytes.starts_with(H2_PREFACE) {
+        return false;
+    }
     if H2_PREFACE.starts_with(bytes) {
         return true;
     }
@@ -1033,14 +1036,10 @@ fn rewrite_intercepted_head(
     runtime: Option<&dyn HttpInterceptRuntime>,
 ) -> io::Result<Option<RewrittenHead>> {
     if guest_head.starts_with(H2_PREFACE) {
-        return rewrite_h2_head(
-            guest_head,
-            destination,
-            scheme,
-            tls,
-            outbound_rules,
-            runtime,
-        );
+        return Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "HTTP/2 interception requires the Rama HTTP proxy pipeline",
+        ));
     }
     rewrite_h1_head(
         guest_head,
@@ -1161,322 +1160,6 @@ fn rewrite_h1_head(
     }))
 }
 
-fn rewrite_h2_head(
-    guest_head: &[u8],
-    destination: &HttpDestination,
-    scheme_override: &str,
-    tls: Option<HostTlsMetadata>,
-    outbound_rules: Option<&[OutboundRulePlan]>,
-    runtime: Option<&dyn HttpInterceptRuntime>,
-) -> io::Result<Option<RewrittenHead>> {
-    let mut cursor = H2_PREFACE.len();
-    while guest_head.len() >= cursor + 9 {
-        let length = ((guest_head[cursor] as usize) << 16)
-            | ((guest_head[cursor + 1] as usize) << 8)
-            | (guest_head[cursor + 2] as usize);
-        let frame_type = guest_head[cursor + 3];
-        let flags = guest_head[cursor + 4];
-        let frame_end = cursor + 9 + length;
-        if guest_head.len() < frame_end {
-            return Ok(None);
-        }
-        if frame_type != 0x1 {
-            cursor = frame_end;
-            continue;
-        }
-
-        let payload = &guest_head[cursor + 9..frame_end];
-        let (header_prefix, header_block, header_padding) =
-            split_h2_headers_payload(payload, flags)?;
-        let stream_id = h2_stream_id(&guest_head[cursor + 5..cursor + 9]);
-        let mut header_block = header_block.to_vec();
-        let mut header_sequence_end = frame_end;
-        if flags & 0x4 == 0 {
-            let continuation = collect_h2_continuations(guest_head, frame_end, stream_id)?;
-            let Some(continuation) = continuation else {
-                return Ok(None);
-            };
-            header_block.extend_from_slice(&continuation.header_block);
-            header_sequence_end = continuation.end;
-        }
-        let mut block = rama_core::bytes::BytesMut::from(header_block.as_slice());
-        let mut decoder = rama_http::proto::h2::hpack::Decoder::new(4096);
-        let mut decoded = Vec::new();
-        decoder
-            .decode(&mut std::io::Cursor::new(&mut block), |header| {
-                decoded.push(header)
-            })
-            .map_err(|error| io::Error::new(ErrorKind::InvalidData, format!("{error:?}")))?;
-
-        let mut method = "GET".to_string();
-        let mut authority = None;
-        let mut path = "/".to_string();
-        let mut scheme = "http".to_string();
-        let mut pairs = Vec::new();
-        for header in &decoded {
-            match header {
-                rama_http::proto::h2::hpack::Header::Method(value) => {
-                    method = value.as_str().to_string();
-                }
-                rama_http::proto::h2::hpack::Header::Authority(value) => {
-                    authority = Some(value.to_string());
-                }
-                rama_http::proto::h2::hpack::Header::Path(value) => {
-                    path = value.to_string();
-                }
-                rama_http::proto::h2::hpack::Header::Scheme(value) => {
-                    scheme = value.to_string();
-                }
-                rama_http::proto::h2::hpack::Header::Field { name, value } => {
-                    pairs.push((
-                        name.as_str().to_string(),
-                        value
-                            .to_str()
-                            .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?
-                            .to_string(),
-                    ));
-                }
-                _ => {}
-            }
-        }
-        let authority = authority.ok_or_else(|| {
-            io::Error::new(ErrorKind::InvalidData, "HTTP/2 request missing :authority")
-        })?;
-        if scheme == "http" && scheme_override == "https" {
-            scheme = "https".to_string();
-        }
-        let (upstream_server_name, _) =
-            split_authority(&authority, default_port_for_scheme(&scheme))?;
-        let upstream = UpstreamEndpoint {
-            ip: destination.ip.clone(),
-            port: destination.port,
-        };
-        validate_upstream_allowed(&upstream, outbound_rules)?;
-        let request = InterceptedHttpRequest {
-            protocol: HttpRequestProtocol::Http2,
-            method,
-            url: format!("{scheme}://{authority}{path}"),
-            source: InterceptedDestination {
-                ip: destination.source_ip.clone(),
-                port: destination.source_port,
-            },
-            original_destination: InterceptedDestination {
-                ip: destination.ip.clone(),
-                port: destination.port,
-            },
-            upstream_dial: InterceptedDestination {
-                ip: upstream.ip.clone(),
-                port: upstream.port,
-            },
-            headers: pairs,
-            tls,
-        };
-        let request = match runtime {
-            Some(runtime) => {
-                if runtime.rejects_rebound_authority(
-                    &scheme,
-                    &authority,
-                    &request.original_destination,
-                    &request.upstream_dial,
-                ) {
-                    return Err(io::Error::new(
-                        ErrorKind::PermissionDenied,
-                        "request authority resolved to a rebound destination",
-                    ));
-                }
-                runtime.handle_request_head(request)?
-            }
-            None => request,
-        };
-        let mut encoded = rama_core::bytes::BytesMut::new();
-        let mut encoder = rama_http::proto::h2::hpack::Encoder::new(4096, 4096);
-        let mut hpack_headers = Vec::new();
-        hpack_headers.push(rama_http::proto::h2::hpack::Header::Method(
-            request.method.parse().map_err(|error| {
-                io::Error::new(
-                    ErrorKind::InvalidData,
-                    format!("invalid HTTP/2 method: {error}"),
-                )
-            })?,
-        ));
-        hpack_headers.push(rama_http::proto::h2::hpack::Header::Scheme(
-            rama_http::proto::h2::hpack::BytesStr::try_from(
-                rama_core::bytes::Bytes::copy_from_slice(scheme.as_bytes()),
-            )
-            .map_err(|error| io::Error::new(ErrorKind::InvalidData, format!("{error:?}")))?,
-        ));
-        hpack_headers.push(rama_http::proto::h2::hpack::Header::Authority(
-            rama_http::proto::h2::hpack::BytesStr::try_from(
-                rama_core::bytes::Bytes::copy_from_slice(authority.as_bytes()),
-            )
-            .map_err(|error| io::Error::new(ErrorKind::InvalidData, format!("{error:?}")))?,
-        ));
-        hpack_headers.push(rama_http::proto::h2::hpack::Header::Path(
-            rama_http::proto::h2::hpack::BytesStr::try_from(
-                rama_core::bytes::Bytes::copy_from_slice(path.as_bytes()),
-            )
-            .map_err(|error| io::Error::new(ErrorKind::InvalidData, format!("{error:?}")))?,
-        ));
-        for (name, value) in request.headers {
-            hpack_headers.push(rama_http::proto::h2::hpack::Header::Field {
-                name: name.parse().map_err(|error| {
-                    io::Error::new(
-                        ErrorKind::InvalidData,
-                        format!("invalid header name: {error}"),
-                    )
-                })?,
-                value: value.parse().map_err(|error| {
-                    io::Error::new(
-                        ErrorKind::InvalidData,
-                        format!("invalid header value: {error}"),
-                    )
-                })?,
-            });
-        }
-        encoder.encode(
-            hpack_headers
-                .into_iter()
-                .map(HpackHeaderExt::with_optional_name),
-            &mut encoded,
-        );
-        let mut rewritten = Vec::new();
-        rewritten.extend_from_slice(&guest_head[..cursor]);
-        let rewritten_payload_len = header_prefix.len() + encoded.len() + header_padding.len();
-        let rewritten_flags = flags | 0x4;
-        rewritten.extend_from_slice(&[
-            ((rewritten_payload_len >> 16) & 0xff) as u8,
-            ((rewritten_payload_len >> 8) & 0xff) as u8,
-            (rewritten_payload_len & 0xff) as u8,
-            frame_type,
-            rewritten_flags,
-        ]);
-        rewritten.extend_from_slice(&guest_head[cursor + 5..cursor + 9]);
-        rewritten.extend_from_slice(header_prefix);
-        rewritten.extend_from_slice(&encoded);
-        rewritten.extend_from_slice(header_padding);
-        rewritten.extend_from_slice(&guest_head[header_sequence_end..]);
-        return Ok(Some(RewrittenHead {
-            bytes: rewritten,
-            upstream_ip: upstream.ip,
-            upstream_port: upstream.port,
-            upstream_server_name,
-        }));
-    }
-    Ok(None)
-}
-
-fn split_h2_headers_payload(payload: &[u8], flags: u8) -> io::Result<(&[u8], &[u8], &[u8])> {
-    let mut block_start = 0;
-    if flags & 0x8 != 0 {
-        if payload.is_empty() {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
-                "HTTP/2 padded HEADERS frame is missing pad length",
-            ));
-        }
-        block_start = 1;
-    }
-    if flags & 0x20 != 0 {
-        if payload.len() < block_start + 5 {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
-                "HTTP/2 priority HEADERS frame is missing priority fields",
-            ));
-        }
-        block_start += 5;
-    }
-    let padding_len = if flags & 0x8 != 0 {
-        payload[0] as usize
-    } else {
-        0
-    };
-    if payload.len() < block_start + padding_len {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "HTTP/2 HEADERS frame padding exceeds payload length",
-        ));
-    }
-    let block_end = payload.len() - padding_len;
-    Ok((
-        &payload[..block_start],
-        &payload[block_start..block_end],
-        &payload[block_end..],
-    ))
-}
-
-struct H2ContinuationBlock {
-    header_block: Vec<u8>,
-    end: usize,
-}
-
-fn collect_h2_continuations(
-    bytes: &[u8],
-    mut cursor: usize,
-    stream_id: u32,
-) -> io::Result<Option<H2ContinuationBlock>> {
-    let mut header_block = Vec::new();
-    loop {
-        if bytes.len() < cursor + 9 {
-            return Ok(None);
-        }
-        let length = ((bytes[cursor] as usize) << 16)
-            | ((bytes[cursor + 1] as usize) << 8)
-            | (bytes[cursor + 2] as usize);
-        let frame_type = bytes[cursor + 3];
-        let flags = bytes[cursor + 4];
-        let frame_end = cursor + 9 + length;
-        if bytes.len() < frame_end {
-            return Ok(None);
-        }
-        if frame_type != 0x9 || h2_stream_id(&bytes[cursor + 5..cursor + 9]) != stream_id {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
-                "HTTP/2 HEADERS frame was not followed by matching CONTINUATION frames",
-            ));
-        }
-        header_block.extend_from_slice(&bytes[cursor + 9..frame_end]);
-        if flags & 0x4 != 0 {
-            return Ok(Some(H2ContinuationBlock {
-                header_block,
-                end: frame_end,
-            }));
-        }
-        cursor = frame_end;
-    }
-}
-
-fn h2_stream_id(bytes: &[u8]) -> u32 {
-    u32::from_be_bytes([bytes[0] & 0x7f, bytes[1], bytes[2], bytes[3]])
-}
-
-trait HpackHeaderExt {
-    fn with_optional_name(
-        self,
-    ) -> rama_http::proto::h2::hpack::Header<Option<rama_http::HeaderName>>;
-}
-
-impl HpackHeaderExt for rama_http::proto::h2::hpack::Header {
-    fn with_optional_name(
-        self,
-    ) -> rama_http::proto::h2::hpack::Header<Option<rama_http::HeaderName>> {
-        match self {
-            Self::Field {
-                name: field_name,
-                value,
-            } => rama_http::proto::h2::hpack::Header::Field {
-                name: Some(field_name),
-                value,
-            },
-            Self::Authority(value) => rama_http::proto::h2::hpack::Header::Authority(value),
-            Self::Method(value) => rama_http::proto::h2::hpack::Header::Method(value),
-            Self::Scheme(value) => rama_http::proto::h2::hpack::Header::Scheme(value),
-            Self::Path(value) => rama_http::proto::h2::hpack::Header::Path(value),
-            Self::Protocol(value) => rama_http::proto::h2::hpack::Header::Protocol(value),
-            Self::Status(value) => rama_http::proto::h2::hpack::Header::Status(value),
-        }
-    }
-}
-
 fn find_header_end(bytes: &[u8]) -> Option<usize> {
     bytes
         .windows(4)
@@ -1531,7 +1214,7 @@ fn tls_client_hello_offers_http(bytes: &[u8]) -> bool {
     tls_client_hello_extension(bytes, 16).is_some_and(|extension| {
         tls_alpn_protocols(extension)
             .iter()
-            .any(|protocol| protocol == "h2" || protocol == "http/1.1")
+            .any(|protocol| protocol == "http/1.1")
     })
 }
 
@@ -3382,32 +3065,10 @@ mod tests {
     }
 
     #[test]
-    fn h2_headers_payload_splits_padded_and_priority_fields() {
-        let payload = [
-            2, // pad length
-            0x80, 0, 0, 1, 7, // priority fields
-            0x82, 0x87, // HPACK block
-            0, 0, // padding
-        ];
-
-        let (prefix, block, padding) = split_h2_headers_payload(&payload, 0x8 | 0x20).unwrap();
-
-        assert_eq!(prefix, &payload[..6]);
-        assert_eq!(block, &payload[6..8]);
-        assert_eq!(padding, &payload[8..]);
-    }
-
-    #[test]
-    fn h2_headers_payload_rejects_invalid_padding() {
-        let error = split_h2_headers_payload(&[4, 0x82], 0x8).unwrap_err();
-
-        assert_eq!(error.kind(), ErrorKind::InvalidData);
-    }
-
-    #[test]
     fn raw_tcp_classifier_keeps_extension_http_methods_interceptable() {
         assert!(bytes_could_be_http_request(b"PROPFIND /dav HTTP/1.1\r\n"));
         assert!(bytes_could_be_http_request(b"CUSTOM-METHOD "));
+        assert!(!bytes_could_be_http_request(H2_PREFACE));
         assert!(!bytes_could_be_http_request(b"hello sandbox\n"));
         assert!(!bytes_could_be_http_request(b"PING\r\n"));
     }
@@ -3428,68 +3089,6 @@ mod tests {
         };
 
         assert_eq!(error.kind(), ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn h2_rewrite_accepts_headers_split_across_continuations() {
-        let mut encoded = rama_core::bytes::BytesMut::new();
-        let mut encoder = rama_http::proto::h2::hpack::Encoder::new(4096, 4096);
-        encoder.encode(
-            [
-                rama_http::proto::h2::hpack::Header::Method("GET".parse().unwrap()),
-                rama_http::proto::h2::hpack::Header::Scheme(
-                    rama_http::proto::h2::hpack::BytesStr::try_from(
-                        rama_core::bytes::Bytes::from_static(b"https"),
-                    )
-                    .unwrap(),
-                ),
-                rama_http::proto::h2::hpack::Header::Authority(
-                    rama_http::proto::h2::hpack::BytesStr::try_from(
-                        rama_core::bytes::Bytes::from_static(b"93.184.216.34"),
-                    )
-                    .unwrap(),
-                ),
-                rama_http::proto::h2::hpack::Header::Path(
-                    rama_http::proto::h2::hpack::BytesStr::try_from(
-                        rama_core::bytes::Bytes::from_static(b"/"),
-                    )
-                    .unwrap(),
-                ),
-            ]
-            .into_iter()
-            .map(HpackHeaderExt::with_optional_name),
-            &mut encoded,
-        );
-        let split = encoded.len() / 2;
-        let mut request = Vec::new();
-        request.extend_from_slice(H2_PREFACE);
-        request.extend_from_slice(&h2_frame(0x1, 0, 1, &encoded[..split]));
-        request.extend_from_slice(&h2_frame(0x9, 0x4, 1, &encoded[split..]));
-
-        let rewritten = rewrite_h2_head(
-            &request,
-            &HttpDestination {
-                source_ip: "10.0.2.15".to_string(),
-                source_port: 50_000,
-                ip: "93.184.216.34".to_string(),
-                port: 443,
-            },
-            "https",
-            None,
-            Some(&[OutboundRulePlan::AcceptPublicInternet { ports: vec![443] }]),
-            None,
-        )
-        .unwrap()
-        .unwrap();
-
-        assert!(rewritten.bytes.starts_with(H2_PREFACE));
-        let cursor = H2_PREFACE.len();
-        let length = ((rewritten.bytes[cursor] as usize) << 16)
-            | ((rewritten.bytes[cursor + 1] as usize) << 8)
-            | rewritten.bytes[cursor + 2] as usize;
-        assert_eq!(rewritten.bytes[cursor + 3], 0x1);
-        assert_eq!(rewritten.bytes[cursor + 4] & 0x4, 0x4);
-        assert_eq!(rewritten.bytes.len(), cursor + 9 + length);
     }
 
     #[test]
@@ -3733,20 +3332,6 @@ mod tests {
         frame[udp_start..udp_start + 2].copy_from_slice(&source_port.to_be_bytes());
         frame[udp_start + 2..udp_start + 4].copy_from_slice(&destination_port.to_be_bytes());
         frame[udp_start + 4..udp_start + 6].copy_from_slice(&8u16.to_be_bytes());
-        frame
-    }
-
-    fn h2_frame(frame_type: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&[
-            ((payload.len() >> 16) & 0xff) as u8,
-            ((payload.len() >> 8) & 0xff) as u8,
-            (payload.len() & 0xff) as u8,
-            frame_type,
-            flags,
-        ]);
-        frame.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
-        frame.extend_from_slice(payload);
         frame
     }
 }

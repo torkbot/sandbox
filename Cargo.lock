@@ -2128,7 +2128,6 @@ dependencies = [
  "krun-devices",
  "libc",
  "libkrun",
- "rama-core",
  "rama-http",
  "rcgen",
  "rustls",

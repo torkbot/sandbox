@@ -482,7 +482,6 @@ impl HttpHookExecutor for NodeHttpHookExecutor {
             "hookIds": hook_ids,
             "protocol": match request.protocol {
                 sandbox::http_interception::HttpRequestProtocol::Http1 => "http/1.1",
-                sandbox::http_interception::HttpRequestProtocol::Http2 => "h2",
             },
             "method": request.method,
             "url": request.url,
