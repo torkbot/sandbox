@@ -295,6 +295,10 @@ export interface TcpNetworkConnectionRequest extends NetworkConnectionRequestBas
   readonly dst: TcpNetworkEndpoint;
   /** Optional application-layer metadata observed for this TCP flow. */
   readonly application?: NetworkApplicationClassification;
+  /** HTTP-specific grants are only available on `protocol: "http"` events. */
+  readonly allowHttp?: never;
+  /** DNS-specific grants are only available on `protocol: "dns"` events. */
+  readonly allowDns?: never;
 }
 
 /**
@@ -308,6 +312,10 @@ export interface UdpNetworkConnectionRequest extends NetworkConnectionRequestBas
   readonly protocol: "udp";
   readonly src: UdpNetworkEndpoint;
   readonly dst: UdpNetworkEndpoint;
+  /** HTTP-specific grants are only available on `protocol: "http"` events. */
+  readonly allowHttp?: never;
+  /** DNS-specific grants are only available on `protocol: "dns"` events. */
+  readonly allowDns?: never;
 }
 
 /** DNS record type name exposed by DNS policy hooks. */
@@ -437,6 +445,8 @@ export interface DnsNetworkConnectionRequest<TTransport extends NetworkTransport
    * NXDOMAIN, or selective delegation to the runtime's default resolver.
    */
   allowDns(resolver?: DnsResolver): DnsNetworkGrant;
+  /** HTTP-specific grants are only available on `protocol: "http"` events. */
+  readonly allowHttp?: never;
 }
 
 /**
@@ -446,7 +456,7 @@ export interface DnsNetworkConnectionRequest<TTransport extends NetworkTransport
  * runtime has classified the flow as HTTP or HTTPS and can apply HTTP-specific
  * semantics such as request middleware.
  */
-export interface HttpNetworkConnectionRequest extends Omit<TcpNetworkConnectionRequest, "protocol" | "application"> {
+export interface HttpNetworkConnectionRequest extends Omit<TcpNetworkConnectionRequest, "protocol" | "application" | "allowHttp"> {
   /** Current classification for HTTP or HTTPS request policy. */
   readonly protocol: "http";
   /** Application metadata for the classified HTTP flow. */
@@ -466,6 +476,8 @@ export interface HttpNetworkConnectionRequest extends Omit<TcpNetworkConnectionR
    * `allow()` when the policy wants the default grant for the classified event.
    */
   allowHttp(middleware?: HttpRequestMiddleware): HttpNetworkGrant;
+  /** DNS-specific grants are only available on `protocol: "dns"` events. */
+  readonly allowDns?: never;
 }
 
 /**

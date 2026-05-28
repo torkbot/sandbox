@@ -240,8 +240,22 @@ test("defineSandbox rejects invalid COW rootfs block store", () => {
 
 test("network.policy creates an opaque connection policy", () => {
   const policy = network.policy(async (conn) => {
+    conn.allowHttp?.();
+    conn.allowDns?.();
+
     if (conn.protocol === "http" && conn.host === "registry.npmjs.org") {
       conn.allowHttp();
+    }
+    if (conn.protocol === "dns") {
+      conn.allowDns();
+      // @ts-expect-error HTTP grants are not exposed on DNS events.
+      conn.allowHttp();
+    }
+    if (conn.protocol === "udp") {
+      // @ts-expect-error HTTP grants are not exposed on generic UDP events.
+      conn.allowHttp();
+      // @ts-expect-error DNS grants are not exposed on generic UDP events.
+      conn.allowDns();
     }
   });
 
