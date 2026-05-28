@@ -4,22 +4,26 @@ use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs, UdpSocket};
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant as StdInstant};
 
+use rama_core::error::BoxError;
 use rama_core::extensions::Extensions;
 use rama_core::io::BridgeIo;
+use rama_core::layer::Layer;
 use rama_core::rt::Executor;
 use rama_core::service::Service;
+use rama_http::header::HOST;
+use rama_http::{Body, Request as RamaRequest, Response as RamaResponse, Version as RamaVersion};
 use rama_http_backend::proxy::mitm::HttpMitmRelay;
 use rama_tcp::stream::TcpStream as RamaTcpStream;
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::UnixTime;
 use rustls::DigitallySignedStruct;
 use rustls::SignatureScheme;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::UnixTime;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::{tcp, udp};
@@ -709,19 +713,23 @@ fn poll_tcp_dns_socket(
         }
         connection.from_guest.extend_from_slice(&buffer[..received]);
     }
-    if connection.to_guest.is_empty() && connection.from_guest.len() >= 2 {
+    while connection.from_guest.len() >= 2 {
         let request_len =
             u16::from_be_bytes([connection.from_guest[0], connection.from_guest[1]]) as usize;
-        if connection.from_guest.len() >= 2 + request_len {
-            let request = connection.from_guest[2..2 + request_len].to_vec();
-            let response = handle_tcp_dns_request(socket, outbound_rules, policy, &request);
-            if let Some(response) = response {
-                connection
-                    .to_guest
-                    .extend_from_slice(&(response.len() as u16).to_be_bytes());
-                connection.to_guest.extend_from_slice(&response);
-            }
+        if connection.from_guest.len() < 2 + request_len {
+            break;
+        }
+        let request = connection.from_guest[2..2 + request_len].to_vec();
+        connection.from_guest.drain(..2 + request_len);
+        let response = handle_tcp_dns_request(socket, outbound_rules, policy, &request);
+        if let Some(response) = response {
+            connection
+                .to_guest
+                .extend_from_slice(&(response.len() as u16).to_be_bytes());
+            connection.to_guest.extend_from_slice(&response);
+        } else {
             connection.close_after_flush = true;
+            break;
         }
     }
     while socket.can_send() && !connection.to_guest.is_empty() {
@@ -1207,11 +1215,7 @@ fn validate_upstream_allowed(
 }
 
 fn default_port_for_scheme(scheme: &str) -> u16 {
-    if scheme == "https" {
-        443
-    } else {
-        80
-    }
+    if scheme == "https" { 443 } else { 80 }
 }
 
 fn tls_client_hello_sni(bytes: &[u8]) -> Option<String> {
@@ -1936,8 +1940,175 @@ struct RamaHttpConnection {
     close_after_flush: bool,
 }
 
+#[derive(Clone)]
+struct RamaHttpPolicyLayer {
+    destination: HttpDestination,
+    runtime: Option<Arc<dyn HttpInterceptRuntime>>,
+    outbound_rules: Option<Vec<OutboundRulePlan>>,
+}
+
+#[derive(Clone)]
+struct RamaHttpPolicyService<S> {
+    inner: S,
+    destination: HttpDestination,
+    runtime: Option<Arc<dyn HttpInterceptRuntime>>,
+    outbound_rules: Option<Vec<OutboundRulePlan>>,
+}
+
+impl<S> Layer<S> for RamaHttpPolicyLayer {
+    type Service = Arc<RamaHttpPolicyService<S>>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        Arc::new(RamaHttpPolicyService {
+            inner,
+            destination: self.destination.clone(),
+            runtime: self.runtime.clone(),
+            outbound_rules: self.outbound_rules.clone(),
+        })
+    }
+}
+
+impl<S> Service<RamaRequest<Body>> for RamaHttpPolicyService<S>
+where
+    S: Service<RamaRequest<Body>, Output = RamaResponse, Error: Into<BoxError>>,
+{
+    type Output = RamaResponse;
+    type Error = BoxError;
+
+    async fn serve(&self, request: RamaRequest<Body>) -> Result<Self::Output, Self::Error> {
+        let request = apply_rama_http_policy(
+            request,
+            &self.destination,
+            self.outbound_rules.as_deref(),
+            self.runtime.as_deref(),
+        )?;
+        self.inner.serve(request).await.map_err(Into::into)
+    }
+}
+
+fn apply_rama_http_policy(
+    mut request: RamaRequest<Body>,
+    destination: &HttpDestination,
+    outbound_rules: Option<&[OutboundRulePlan]>,
+    runtime: Option<&dyn HttpInterceptRuntime>,
+) -> Result<RamaRequest<Body>, BoxError> {
+    let authority = request_authority(&request, default_port_for_scheme("http"))?;
+    let _ = split_authority(&authority, default_port_for_scheme("http"))?;
+    let upstream = UpstreamEndpoint {
+        ip: destination.ip.clone(),
+        port: destination.port,
+    };
+    validate_upstream_allowed(&upstream, outbound_rules)?;
+    let mut intercepted = InterceptedHttpRequest {
+        protocol: match request.version() {
+            RamaVersion::HTTP_2 => HttpRequestProtocol::Http2,
+            _ => HttpRequestProtocol::Http1,
+        },
+        method: request.method().as_str().to_string(),
+        url: format!("http://{}{}", authority, request_path(&request)),
+        original_destination: InterceptedDestination {
+            ip: destination.ip.clone(),
+            port: destination.port,
+        },
+        source: InterceptedDestination {
+            ip: destination.source_ip.clone(),
+            port: destination.source_port,
+        },
+        upstream_dial: InterceptedDestination {
+            ip: upstream.ip.clone(),
+            port: upstream.port,
+        },
+        headers: request
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                Some((
+                    name.as_str().to_ascii_lowercase(),
+                    value.to_str().ok()?.to_string(),
+                ))
+            })
+            .collect(),
+        tls: None,
+    };
+    if !intercepted
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("host"))
+    {
+        intercepted
+            .headers
+            .push(("host".to_string(), authority.clone()));
+    }
+    let intercepted = match runtime {
+        Some(runtime) => {
+            if runtime.rejects_rebound_authority(
+                "http",
+                &authority,
+                &intercepted.original_destination,
+                &intercepted.upstream_dial,
+            ) {
+                return Err(io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "request authority resolved to a rebound destination",
+                )
+                .into());
+            }
+            runtime.handle_request_head(intercepted)?
+        }
+        None => intercepted,
+    };
+    let is_h2 = request.version() == RamaVersion::HTTP_2;
+    let headers = request.headers_mut();
+    headers.clear();
+    for (name, value) in intercepted.headers {
+        if is_h2 && name.eq_ignore_ascii_case("connection") {
+            continue;
+        }
+        headers.insert(
+            name.parse::<rama_http::HeaderName>()
+                .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?,
+            value
+                .parse::<rama_http::HeaderValue>()
+                .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?,
+        );
+    }
+    Ok(request)
+}
+
+fn request_authority(request: &RamaRequest<Body>, default_port: u16) -> io::Result<String> {
+    if let Some(authority) = request.uri().authority() {
+        return Ok(authority.as_str().to_string());
+    }
+    if let Some(host) = request.headers().get(HOST) {
+        return host
+            .to_str()
+            .map(str::to_string)
+            .map_err(|error| io::Error::new(ErrorKind::InvalidData, error));
+    }
+    if let Some(host) = request.uri().host() {
+        return Ok(format!("{}:{}", host, default_port));
+    }
+    Err(io::Error::new(
+        ErrorKind::InvalidData,
+        "HTTP request is missing authority",
+    ))
+}
+
+fn request_path(request: &RamaRequest<Body>) -> &str {
+    request
+        .uri()
+        .path_and_query()
+        .map(|path| path.as_str())
+        .unwrap_or("/")
+}
+
 impl RamaHttpConnection {
-    fn start(destination: &HttpDestination, initial_guest_bytes: Vec<u8>) -> io::Result<Self> {
+    fn start(
+        destination: HttpDestination,
+        initial_guest_bytes: Vec<u8>,
+        runtime: Option<Arc<dyn HttpInterceptRuntime>>,
+        outbound_rules: Option<Vec<OutboundRulePlan>>,
+    ) -> io::Result<Self> {
         let upstream = TcpStream::connect(upstream_socket_addr(&destination.ip, destination.port))?;
         upstream.set_nonblocking(true)?;
         let (bridge, async_io) = SyncAsyncBridge::new(HTTP_BRIDGE_BUFFER_BYTES);
@@ -1945,16 +2116,22 @@ impl RamaHttpConnection {
             bridge.push_from_sync(&initial_guest_bytes);
         }
         thread::spawn(move || {
-            let Ok(runtime) = tokio::runtime::Runtime::new() else {
+            let Ok(tokio_runtime) = tokio::runtime::Runtime::new() else {
                 return;
             };
-            runtime.block_on(async move {
+            tokio_runtime.block_on(async move {
                 let Ok(upstream) =
                     RamaTcpStream::try_from_std_tcp_stream(upstream, Extensions::new())
                 else {
                     return;
                 };
-                let relay = HttpMitmRelay::new(Executor::default());
+                let relay = HttpMitmRelay::new(Executor::default()).with_http_middleware(
+                    RamaHttpPolicyLayer {
+                        destination,
+                        runtime,
+                        outbound_rules,
+                    },
+                );
                 let _ = relay.serve(BridgeIo(async_io, upstream)).await;
             });
         });
@@ -2385,7 +2562,12 @@ impl InterceptConnection {
             }
             if guest_head.starts_with(H2_PREFACE) {
                 let initial_bytes = std::mem::take(guest_head);
-                match RamaHttpConnection::start(&self.destination, initial_bytes) {
+                match RamaHttpConnection::start(
+                    self.destination.clone(),
+                    initial_bytes,
+                    self.runtime.clone(),
+                    self.outbound_rules.clone(),
+                ) {
                     Ok(relay) => {
                         self.state = InterceptState::RamaHttp(relay);
                     }
@@ -2612,12 +2794,14 @@ impl TransparentNat {
         let guest_port = packet.source_port(frame);
         let destination_ip = packet.destination_ip(frame);
         let destination_port = packet.destination_port(frame);
-        let host_port = self.udp_host_port_for_destination(
+        let Some(host_port) = self.udp_host_port_for_destination(
             guest_ip,
             guest_port,
             destination_ip,
             destination_port,
-        );
+        ) else {
+            return false;
+        };
         let flow = UdpNatFlow {
             guest_ip,
             guest_port,
@@ -2755,17 +2939,17 @@ impl TransparentNat {
         guest_port: u16,
         destination_ip: [u8; 4],
         destination_port: u16,
-    ) -> u16 {
+    ) -> Option<u16> {
         if let Some((flow, _)) = self.udp_flows.iter().find(|(flow, nat_flow)| {
             flow.guest_ip == guest_ip
                 && flow.guest_port == guest_port
                 && nat_flow.destination_ip == destination_ip
                 && nat_flow.destination_port == destination_port
         }) {
-            return flow.host_port;
+            return Some(flow.host_port);
         }
 
-        loop {
+        for _ in UDP_NAT_PORT_START..=UDP_NAT_PORT_END {
             let candidate = self.next_udp_host_port;
             self.next_udp_host_port = if self.next_udp_host_port == UDP_NAT_PORT_END {
                 UDP_NAT_PORT_START
@@ -2780,8 +2964,9 @@ impl TransparentNat {
             {
                 continue;
             }
-            return candidate;
+            return Some(candidate);
         }
+        None
     }
 }
 
@@ -3007,11 +3192,7 @@ fn udp_ipv4_checksum(source: [u8; 4], destination: [u8; 4], udp: &[u8]) -> u16 {
     pseudo_header.extend_from_slice(&(udp.len() as u16).to_be_bytes());
     pseudo_header.extend_from_slice(udp);
     let checksum = internet_checksum(&pseudo_header);
-    if checksum == 0 {
-        0xffff
-    } else {
-        checksum
-    }
+    if checksum == 0 { 0xffff } else { checksum }
 }
 
 fn internet_checksum(bytes: &[u8]) -> u16 {
@@ -3273,6 +3454,31 @@ mod tests {
         let response_packet = Ipv4UdpPacket::parse(&response).unwrap();
         assert_eq!(response_packet.source_ip(&response), [1, 1, 1, 1]);
         assert_eq!(response_packet.source_port(&response), 53);
+    }
+
+    #[test]
+    fn transparent_nat_reports_udp_port_exhaustion() {
+        let mut nat = TransparentNat::new(Ipv4Address::new(10, 0, 2, 1));
+        for host_port in UDP_NAT_PORT_START..=UDP_NAT_PORT_END {
+            nat.udp_flows.insert(
+                UdpNatFlow {
+                    guest_ip: [10, 0, 2, 15],
+                    guest_port: host_port,
+                    host_port,
+                },
+                NatFlow {
+                    destination_ip: [192, 0, 2, 1],
+                    destination_port: 53,
+                    last_seen: StdInstant::now(),
+                    closing: false,
+                },
+            );
+        }
+
+        assert_eq!(
+            nat.udp_host_port_for_destination([10, 0, 2, 16], 50_000, [192, 0, 2, 2], 53),
+            None,
+        );
     }
 
     #[test]
