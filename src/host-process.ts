@@ -17,6 +17,8 @@ import type {
   RegisteredNetworkConnectionHook,
 } from "./launch-options.ts";
 import type {
+  DnsResolver,
+  DnsResponse,
   NetworkConnectionRequest,
   NetworkEndpoint,
   NetworkTransport,
@@ -318,21 +320,56 @@ export class HostProcessSandboxVm implements HostControlChannel {
       const dstIp = assertString(document.dstIp, "dstIp");
       const dstPort = assertNumber(document.dstPort, "dstPort");
       let allowed = false;
-      const connection: NetworkConnectionRequest = {
-        protocol,
-        transport,
-        src: createNetworkEndpoint(srcIp, srcPort),
-        dst: createNetworkEndpoint(dstIp, dstPort),
-        ip: dstIp,
-        port: dstPort,
-        allow() {
-          allowed = true;
-          return {};
-        },
-      } as NetworkConnectionRequest;
+      let dnsResponse: DnsResponse | undefined;
+      let dnsResponsePromise: Promise<DnsResponse | undefined> | undefined;
+      const src = createNetworkEndpoint(srcIp, srcPort);
+      const dst = createNetworkEndpoint(dstIp, dstPort);
+      const allow = () => {
+        allowed = true;
+        return {};
+      };
+      const connection: NetworkConnectionRequest = protocol === "dns"
+        ? {
+            protocol: "dns",
+            transport,
+            src,
+            dst,
+            application: { protocol: "dns" },
+            questions: assertDnsQuestions(document.questions),
+            allow,
+            allowDns(resolver?: DnsResolver) {
+              allowed = true;
+              if (resolver !== undefined) {
+                dnsResponse = undefined;
+                const request = {
+                  transport,
+                  src,
+                  dst,
+                  questions: assertDnsQuestions(document.questions),
+                };
+                const resolved = resolver(request);
+                if (resolved instanceof Promise) {
+                  dnsResponsePromise = resolved;
+                } else {
+                  dnsResponse = resolved;
+                }
+              }
+              return {};
+            },
+          } as NetworkConnectionRequest
+        : {
+            protocol,
+            transport,
+            src,
+            dst,
+            allow,
+          } as NetworkConnectionRequest;
 
       if (this.#networkConnectionHook?.active === true) {
         await this.#networkConnectionHook.hook(connection);
+      }
+      if (dnsResponsePromise !== undefined) {
+        dnsResponse = await dnsResponsePromise;
       }
 
       this.#tryWriteToHost(encodePacket({
@@ -340,6 +377,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
         id,
         ok: true,
         allowed,
+        dnsResponse,
       }));
     } catch (error) {
       this.#tryWriteToHost(encodePacket({
@@ -833,6 +871,39 @@ function assertDocumentArray(value: unknown, field: string): Record<string, unkn
   return value as Record<string, unknown>[];
 }
 
+function assertDnsQuestions(value: unknown): Array<{
+  readonly name: string;
+  readonly type: "A" | "AAAA" | "CAA" | "CNAME" | "HTTPS" | "MX" | "NS" | "PTR" | "SOA" | "SRV" | "SVCB" | "TXT" | "UNKNOWN";
+  readonly class: "IN" | "UNKNOWN";
+}> {
+  return assertDocumentArray(value, "questions").map((question) => {
+    const type = assertString(question.type, "question.type");
+    const recordType = isDnsRecordType(type) ? type : "UNKNOWN";
+    const klass = assertString(question.class, "question.class");
+    return {
+      name: assertString(question.name, "question.name"),
+      type: recordType,
+      class: klass === "IN" ? "IN" : "UNKNOWN",
+    };
+  });
+}
+
+function isDnsRecordType(value: string): value is ReturnType<typeof assertDnsQuestions>[number]["type"] {
+  return value === "A"
+    || value === "AAAA"
+    || value === "CAA"
+    || value === "CNAME"
+    || value === "HTTPS"
+    || value === "MX"
+    || value === "NS"
+    || value === "PTR"
+    || value === "SOA"
+    || value === "SRV"
+    || value === "SVCB"
+    || value === "TXT"
+    || value === "UNKNOWN";
+}
+
 function trackHeaderMutations(headers: Headers): () => boolean {
   let mutated = false;
   const set = headers.set.bind(headers);
@@ -868,11 +939,11 @@ function assertProtocol(value: unknown): "http/1.1" | "h2" {
   throw new Error("host request protocol must be http/1.1 or h2");
 }
 
-function assertNetworkProtocol(value: unknown): "tcp" | "udp" {
-  if (value === "tcp" || value === "udp") {
+function assertNetworkProtocol(value: unknown): "tcp" | "udp" | "dns" {
+  if (value === "tcp" || value === "udp" || value === "dns") {
     return value;
   }
-  throw new Error("host network request protocol must be tcp or udp");
+  throw new Error("host network request protocol must be tcp, udp, or dns");
 }
 
 function assertNetworkTransport(value: unknown): NetworkTransport {

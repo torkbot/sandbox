@@ -116,6 +116,11 @@ const sandbox = defineSandbox({
     memoryMiB: 4096,
   },
   network: network.policy(async (conn) => {
+    if (conn.protocol !== "http") {
+      conn.allow();
+      return;
+    }
+
     if (conn.host === "api.github.com") {
       conn.allowHttp(async (request) => {
         request.headers.set(
@@ -225,10 +230,10 @@ connection requests and grants only the traffic it explicitly allows:
 
 ```ts
 const policy = network.policy(async (conn) => {
-  if (conn.protocol === "udp" && conn.dst.port === 53) {
-    conn.allow();
+  if (conn.protocol === "dns") {
+    conn.allowDns();
   }
-  if (conn.protocol === "tcp" && conn.dst.isPublicInternet() && conn.dst.port === 443) {
+  if (conn.transport === "tcp" && conn.dst.isPublicInternet() && conn.dst.port === 443) {
     conn.allow();
   }
   if (conn.protocol === "http" && conn.host === "registry.npmjs.org") {
@@ -239,16 +244,22 @@ const policy = network.policy(async (conn) => {
 
 `conn.allow()` grants the observed connection, request, or flow using the
 default semantics for its protocol. Protocol-specific grant helpers add
-protocol-specific behavior. `conn.allowHttp(...)` grants HTTP(S)-classified
-traffic and can apply request middleware:
+protocol-specific behavior. `conn.allowDns(...)` grants DNS over UDP or TCP and
+can provide programmable DNS responses. `conn.allowHttp(...)` grants
+HTTP(S)-classified traffic and can apply request middleware:
 
 ```ts
 const policy = network.policy(async (conn) => {
-  if (conn.protocol === "udp" && conn.dst.port === 53) {
-    conn.allow();
+  if (conn.protocol === "dns") {
+    conn.allowDns(async (request) => {
+      if (request.questions.some((question) => question.name === "metadata.internal")) {
+        return { code: "NXDOMAIN" };
+      }
+      return undefined;
+    });
     return;
   }
-  if (conn.protocol === "tcp" && conn.dst.isPublicInternet() && conn.dst.port === 443) {
+  if (conn.transport === "tcp" && conn.dst.isPublicInternet() && conn.dst.port === 443) {
     conn.allow();
     return;
   }
@@ -281,15 +292,24 @@ Endpoint helpers classify logical address ranges without relying on hostnames:
 available only when the runtime can derive it from higher-level protocol
 classification.
 
+`transport` is the TCP/UDP discriminator. `protocol` is the current policy
+classification: transport callbacks use `"tcp"` or `"udp"`, while DNS and HTTP
+callbacks use `"dns"` or `"http"` and expose protocol-specific helpers such as
+`allowDns(...)` and `allowHttp(...)`. DNS is normalized across UDP and TCP, so a
+DNS policy can usually branch on `conn.protocol === "dns"` and only inspect
+`conn.transport` when transport-specific behavior matters. TCP callbacks may
+also include `conn.application` metadata such as TLS SNI or ALPN when the
+runtime has observed it.
+
 The callback may run more than once for a higher-level request: first for the
 transport flow, then again when HTTP metadata is available. Transport callbacks
 should grant the IP-layer reachability they intend to permit; HTTP callbacks can
 then apply request-specific policy or header middleware.
 
 Deny remains the default. If the policy callback does not create a grant, the
-connection is blocked. The `NetworkGrant` returned by `allow()` and
-`allowHttp()` is reserved as the future extension point for instance-local
-state, such as remembering a grant for a time window.
+connection is blocked. The grants returned by `allow()`, `allowDns()`, and
+`allowHttp()` are reserved as future extension points for instance-local state,
+such as remembering a grant for a time window.
 
 The runtime uses this policy shape to keep the JavaScript boundary explicit.
 Native rules can be added under the same model later without changing the

@@ -76,21 +76,41 @@ export interface MemoryFileSystemOptions {
   readonly files?: Readonly<Record<string, string | Uint8Array>>;
 }
 
+/**
+ * HTTP request metadata exposed to HTTP network policy middleware.
+ *
+ * The request is already classified as HTTP or HTTPS and can be inspected or
+ * mutated before it is forwarded upstream.
+ */
 export interface SandboxHttpRequest {
+  /** HTTP version used by the intercepted request. */
   readonly protocol: "http/1.1" | "h2";
+  /** Absolute URL reconstructed from the request target and destination metadata. */
   readonly url: URL;
+  /** HTTP method exactly as received from the guest. */
   readonly method: string;
+  /** Mutable request headers. Changes are applied before forwarding upstream. */
   readonly headers: Headers;
+  /** IP-layer addressing observed for this request and the selected upstream. */
   readonly destination: {
+    /** Guest source IP address for the connection carrying this request. */
     readonly sourceIp: string;
+    /** Guest source port for the connection carrying this request. */
     readonly sourcePort: number;
+    /** Original destination IP address before host-side routing or proxying. */
     readonly originalIp: string;
+    /** Original destination port before host-side routing or proxying. */
     readonly originalPort: number;
+    /** Upstream IP address selected by the host proxy. */
     readonly upstreamIp: string;
+    /** Upstream port selected by the host proxy. */
     readonly upstreamPort: number;
   };
+  /** TLS metadata when the request was carried over HTTPS. */
   readonly tls?: {
+    /** Server Name Indication sent by the guest, when present. */
     readonly sni?: string;
+    /** Negotiated ALPN protocol, when present. */
     readonly alpn?: string;
   };
 }
@@ -142,38 +162,118 @@ export interface SandboxBlockStore {
   flush?(context: SandboxBlockStoreContext): Promise<void>;
 }
 
+/**
+ * Middleware invoked for an HTTP request allowed by a network policy.
+ *
+ * Middleware may mutate `request.headers` to add, replace, or remove outbound
+ * request headers before the request leaves the sandbox boundary.
+ */
 export type HttpRequestMiddleware = (
   request: SandboxHttpRequest,
 ) => void | Promise<void>;
 
+/**
+ * Opaque grant returned by `conn.allow()`.
+ *
+ * Grants intentionally carry no public fields today. They reserve a stable
+ * extension point for future instance-local grant state.
+ */
 export interface NetworkGrant {
 }
 
+/**
+ * Opaque grant returned by `conn.allowHttp(...)`.
+ *
+ * HTTP grants are distinct from generic network grants so future HTTP-specific
+ * policy state can remain type-safe.
+ */
 export interface HttpNetworkGrant extends NetworkGrant {
 }
 
+/**
+ * Opaque grant returned by `conn.allowDns(...)`.
+ *
+ * DNS grants are distinct from generic network grants so DNS-specific response
+ * behavior can remain type-safe across UDP and TCP transports.
+ */
+export interface DnsNetworkGrant extends NetworkGrant {
+}
+
+/** IP transport observed by the network policy hook. */
 export type NetworkTransport = "tcp" | "udp";
 
+/**
+ * Source or destination endpoint for a network policy event.
+ *
+ * Endpoint helpers classify the IP address only. They do not use DNS names,
+ * HTTP host headers, TLS SNI, or any other application-layer metadata.
+ */
 export interface NetworkEndpoint {
+  /** Numeric IP address observed at the sandbox network boundary. */
   readonly ip: string;
+  /** Transport-layer port observed at the sandbox network boundary. */
   readonly port: number;
+  /** True for IPv4 and IPv6 loopback addresses. */
   isLoopback(): boolean;
+  /** True for private-use address ranges such as RFC 1918 and IPv6 ULA. */
   isPrivate(): boolean;
+  /** True for link-local address ranges. */
   isLinkLocal(): boolean;
+  /** True for multicast address ranges. */
   isMulticast(): boolean;
+  /** True for the IPv4 limited broadcast address. */
   isBroadcast(): boolean;
+  /** True for documentation and example address ranges. */
   isDocumentation(): boolean;
+  /** True for reserved or otherwise non-public address ranges. */
   isReserved(): boolean;
+  /** True when the address is not classified as local, private, reserved, or documentation. */
   isPublicInternet(): boolean;
 }
 
-export interface NetworkConnectionRequestBase {
-  readonly transport: NetworkTransport;
-  readonly src: NetworkEndpoint;
-  readonly dst: NetworkEndpoint;
-  readonly host?: string;
-  readonly ip?: string;
+/** Application-layer protocol classification currently known for a policy event. */
+export type NetworkApplicationProtocol = "http" | "dns" | "tls" | "unknown";
+
+/**
+ * Best-effort application-layer metadata associated with a TCP policy event.
+ *
+ * Classification is intentionally partial: early TCP decisions may have no
+ * application metadata, TLS flows may expose SNI or ALPN before the runtime can
+ * classify HTTP, and non-HTTP protocols may remain `unknown`.
+ */
+export interface NetworkApplicationClassification {
+  /** Current application-layer classification. */
+  readonly protocol: NetworkApplicationProtocol;
+  /** ALPN protocol names offered or negotiated for the flow, when observed. */
+  readonly alpn?: readonly string[];
+  /** TLS Server Name Indication, when observed. */
+  readonly sni?: string;
+}
+
+/** TCP endpoint for a TCP network policy event. */
+export interface TcpNetworkEndpoint extends NetworkEndpoint {
   readonly port: number;
+}
+
+/** UDP endpoint for a UDP network policy event. */
+export interface UdpNetworkEndpoint extends NetworkEndpoint {
+  readonly port: number;
+}
+
+/**
+ * Common fields shared by all network policy events.
+ *
+ * `transport` is the discriminant to use when code needs to branch between TCP
+ * and UDP semantics. Higher-level classifications are represented by
+ * `protocol`.
+ */
+export interface NetworkConnectionRequestBase<TTransport extends NetworkTransport> {
+  /** IP transport that carried this event. Narrows TCP vs UDP request shapes. */
+  readonly transport: TTransport;
+  /** Source endpoint observed at the sandbox network boundary. */
+  readonly src: NetworkEndpoint;
+  /** Destination endpoint observed at the sandbox network boundary. */
+  readonly dst: NetworkEndpoint;
   /**
    * Allows this observed connection, request, or flow using the default semantics
    * for its protocol.
@@ -181,27 +281,207 @@ export interface NetworkConnectionRequestBase {
   allow(): NetworkGrant;
 }
 
-export interface HttpNetworkConnectionRequest extends NetworkConnectionRequestBase {
+/**
+ * TCP transport policy event.
+ *
+ * This event grants or denies TCP reachability for the observed flow. It may
+ * include partial application metadata when the runtime has already observed
+ * enough bytes to classify the flow.
+ */
+export interface TcpNetworkConnectionRequest extends NetworkConnectionRequestBase<"tcp"> {
+  /** Current classification for an unrefined TCP transport event. */
+  readonly protocol: "tcp";
+  readonly src: TcpNetworkEndpoint;
+  readonly dst: TcpNetworkEndpoint;
+  /** Optional application-layer metadata observed for this TCP flow. */
+  readonly application?: NetworkApplicationClassification;
+}
+
+/**
+ * UDP transport policy event.
+ *
+ * UDP is connectionless, so `allow()` permits the observed UDP flow according
+ * to the runtime's flow-tracking semantics rather than establishing a stream.
+ */
+export interface UdpNetworkConnectionRequest extends NetworkConnectionRequestBase<"udp"> {
+  /** Current classification for a UDP transport event. */
+  readonly protocol: "udp";
+  readonly src: UdpNetworkEndpoint;
+  readonly dst: UdpNetworkEndpoint;
+}
+
+/** DNS record type name exposed by DNS policy hooks. */
+export type DnsRecordType =
+  | "A"
+  | "AAAA"
+  | "CAA"
+  | "CNAME"
+  | "HTTPS"
+  | "MX"
+  | "NS"
+  | "PTR"
+  | "SOA"
+  | "SRV"
+  | "SVCB"
+  | "TXT"
+  | "UNKNOWN";
+
+/** DNS question class name exposed by DNS policy hooks. */
+export type DnsRecordClass = "IN" | "UNKNOWN";
+
+/** A single DNS question from a DNS policy event. */
+export interface DnsQuestion {
+  /** Fully qualified DNS name as sent by the guest, without a trailing dot. */
+  readonly name: string;
+  /** DNS record type requested by the guest. */
+  readonly type: DnsRecordType;
+  /** DNS class requested by the guest. */
+  readonly class: DnsRecordClass;
+}
+
+/** DNS response code for programmable DNS policy. */
+export type DnsResponseCode = "NOERROR" | "NXDOMAIN" | "SERVFAIL" | "REFUSED";
+
+/** DNS answer returned by programmable DNS policy. */
+export type DnsAnswer =
+  | {
+      /** IPv4 address answer. */
+      readonly type: "A";
+      /** Name this answer applies to. Defaults to the matching question name. */
+      readonly name?: string;
+      /** IPv4 address string. */
+      readonly address: string;
+      /** Answer TTL in seconds. */
+      readonly ttl?: number;
+    }
+  | {
+      /** IPv6 address answer. */
+      readonly type: "AAAA";
+      /** Name this answer applies to. Defaults to the matching question name. */
+      readonly name?: string;
+      /** IPv6 address string. */
+      readonly address: string;
+      /** Answer TTL in seconds. */
+      readonly ttl?: number;
+    }
+  | {
+      /** Canonical name answer. */
+      readonly type: "CNAME";
+      /** Name this answer applies to. Defaults to the matching question name. */
+      readonly name?: string;
+      /** Canonical target name. */
+      readonly target: string;
+      /** Answer TTL in seconds. */
+      readonly ttl?: number;
+    }
+  | {
+      /** Text answer. */
+      readonly type: "TXT";
+      /** Name this answer applies to. Defaults to the matching question name. */
+      readonly name?: string;
+      /** TXT strings for this answer. */
+      readonly values: readonly string[];
+      /** Answer TTL in seconds. */
+      readonly ttl?: number;
+    };
+
+/** Programmable DNS policy response. */
+export interface DnsResponse {
+  /** DNS response code. Defaults to `NOERROR` when answers are provided. */
+  readonly code?: DnsResponseCode;
+  /** DNS answers to return to the guest. */
+  readonly answers?: readonly DnsAnswer[];
+}
+
+/** DNS request metadata exposed to programmable DNS policy. */
+export interface SandboxDnsRequest {
+  /** Transport carrying the DNS message. */
+  readonly transport: NetworkTransport;
+  /** Source endpoint observed at the sandbox network boundary. */
+  readonly src: NetworkEndpoint;
+  /** Destination endpoint observed at the sandbox network boundary. */
+  readonly dst: NetworkEndpoint;
+  /** DNS questions from the request. */
+  readonly questions: readonly DnsQuestion[];
+}
+
+/**
+ * Resolver invoked by `conn.allowDns(...)`.
+ *
+ * Returning `undefined` delegates to the runtime's default DNS behavior.
+ */
+export type DnsResolver = (
+  request: SandboxDnsRequest,
+) => DnsResponse | undefined | Promise<DnsResponse | undefined>;
+
+/**
+ * DNS policy event refined from either UDP DNS or TCP DNS.
+ *
+ * DNS is modeled as an application protocol rather than a UDP-only feature so
+ * policy can use one ergonomic API for both DNS transports.
+ */
+export interface DnsNetworkConnectionRequest<TTransport extends NetworkTransport = NetworkTransport>
+  extends NetworkConnectionRequestBase<TTransport> {
+  /** Current classification for DNS request policy. */
+  readonly protocol: "dns";
+  /** DNS application metadata. */
+  readonly application: NetworkApplicationClassification & {
+    readonly protocol: "dns";
+  };
+  /** DNS questions from the request. */
+  readonly questions: readonly DnsQuestion[];
+  /**
+   * Allows the DNS request and optionally supplies programmable DNS behavior.
+   *
+   * Use this when policy needs DNS semantics such as synthetic answers,
+   * NXDOMAIN, or selective delegation to the runtime's default resolver.
+   */
+  allowDns(resolver?: DnsResolver): DnsNetworkGrant;
+}
+
+/**
+ * HTTP policy event refined from a TCP flow.
+ *
+ * HTTP events expose hostname-oriented fields and `allowHttp(...)` because the
+ * runtime has classified the flow as HTTP or HTTPS and can apply HTTP-specific
+ * semantics such as request middleware.
+ */
+export interface HttpNetworkConnectionRequest extends Omit<TcpNetworkConnectionRequest, "protocol" | "application"> {
+  /** Current classification for HTTP or HTTPS request policy. */
   readonly protocol: "http";
-  readonly transport: "tcp";
+  /** Application metadata for the classified HTTP flow. */
+  readonly application: NetworkApplicationClassification & {
+    readonly protocol: "http";
+  };
+  /** Hostname associated with the HTTP request. */
+  readonly host: string;
+  /** Upstream IP address selected for this HTTP request. */
+  readonly ip: string;
+  /** Upstream port selected for this HTTP request. */
+  readonly port: number;
+  /**
+   * Allows the HTTP request and optionally applies request middleware.
+   *
+   * Use this when policy needs HTTP semantics such as header injection. Use
+   * `allow()` when the policy wants the default grant for the classified event.
+   */
   allowHttp(middleware?: HttpRequestMiddleware): HttpNetworkGrant;
 }
 
-export interface TcpNetworkConnectionRequest extends NetworkConnectionRequestBase {
-  readonly protocol: "tcp";
-  readonly transport: "tcp";
-}
-
-export interface UdpNetworkConnectionRequest extends NetworkConnectionRequestBase {
-  readonly protocol: "udp";
-  readonly transport: "udp";
-}
-
+/**
+ * Network policy event passed to `network.policy(...)`.
+ *
+ * Use `transport` to branch on TCP vs UDP. Use `protocol` to branch on the
+ * current classification (`"tcp"`, `"udp"`, or the HTTP refinement `"http"`).
+ */
 export type NetworkConnectionRequest =
   | HttpNetworkConnectionRequest
+  | DnsNetworkConnectionRequest<"tcp">
+  | DnsNetworkConnectionRequest<"udp">
   | TcpNetworkConnectionRequest
   | UdpNetworkConnectionRequest;
 
+/** Callback invoked whenever the sandbox asks user policy to allow network egress. */
 export type NetworkConnectionRequestHandler = (
   connection: NetworkConnectionRequest,
 ) => void | Promise<void>;
@@ -209,6 +489,7 @@ export type NetworkConnectionRequestHandler = (
 const networkPolicyHandler: unique symbol = Symbol("networkPolicyHandler");
 
 export type NetworkPolicy = {
+  /** Identifies this value as a network policy definition. */
   readonly kind: "network-policy";
   readonly [networkPolicyHandler]: NetworkConnectionRequestHandler;
 };
@@ -615,6 +896,11 @@ function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPoli
         request.destination.upstreamIp,
         request.destination.upstreamPort,
       ),
+      application: {
+        protocol: "http",
+        alpn: request.tls?.alpn === undefined ? undefined : [request.tls.alpn],
+        sni: request.tls?.sni,
+      },
       host: request.url.hostname,
       ip: request.destination.upstreamIp,
       port: request.destination.upstreamPort,
@@ -668,6 +954,7 @@ function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPoli
         policy: "deny",
         rules: [
           { action: "accept", scope: "public-internet", ports: [] },
+          { action: "accept", protocol: "tcp", cidr: "10.0.2.1/32", ports: [53] },
           { action: "accept", protocol: "udp", cidr: "10.0.2.1/32", ports: [53] },
         ],
       },

@@ -48,11 +48,11 @@ test("network.policy allows HTTPS HTTP middleware", async (t) => {
   await using sandbox = await defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.23"),
     network: network.policy(async (conn) => {
-      if (conn.protocol === "tcp") {
+      if (conn.transport === "tcp" && conn.protocol !== "http") {
         conn.allow();
         return;
       }
-      if (conn.protocol === "udp" && conn.dst.port === 53) {
+      if (conn.transport === "udp" && conn.dst.port === 53) {
         conn.allow();
         return;
       }
@@ -237,6 +237,58 @@ test("network.policy allows generic UDP echo traffic", async (t) => {
   assert.equal(udp.messages.length, 1);
 });
 
+test("network.policy allows default DNS over UDP with the DNS hook", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+
+  await using sandbox = await bootAllowingDns();
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "dns-udp-default",
+    script: pythonDnsQuery({ transport: "udp", name: "public.sandbox.test" }),
+  }), 8_000, "default UDP DNS query");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "93.184.216.34");
+});
+
+test("network.policy supports a custom DNS resolver over UDP", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+
+  await using sandbox = await bootWithCustomDns("203.0.113.10");
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "dns-udp-custom",
+    script: pythonDnsQuery({ transport: "udp", name: "custom.sandbox.test" }),
+  }), 8_000, "custom UDP DNS query");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "203.0.113.10");
+});
+
+test("network.policy allows default DNS over TCP with the DNS hook", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+
+  await using sandbox = await bootAllowingDns();
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "dns-tcp-default",
+    script: pythonDnsQuery({ transport: "tcp", name: "public.sandbox.test" }),
+  }), 8_000, "default TCP DNS query");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "93.184.216.34");
+});
+
+test("network.policy supports a custom DNS resolver over TCP", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+
+  await using sandbox = await bootWithCustomDns("203.0.113.20");
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "dns-tcp-custom",
+    script: pythonDnsQuery({ transport: "tcp", name: "custom.sandbox.test" }),
+  }), 8_000, "custom TCP DNS query");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "203.0.113.20");
+});
+
 test("network.policy denies generic UDP before upstream receives datagrams", async (t) => {
   if (!requireVmLaunchSupport(t)) return;
   const udp = await startUdpEchoServer();
@@ -255,6 +307,7 @@ test("network.policy denies generic UDP before upstream receives datagrams", asy
 test("network.policy exposes source and destination endpoint helpers for transport callbacks", async (t) => {
   if (!requireVmLaunchSupport(t)) return;
   const observations: Array<{
+    readonly transport: string;
     readonly protocol: string;
     readonly srcIp: string;
     readonly srcPort: number;
@@ -268,7 +321,7 @@ test("network.policy exposes source and destination endpoint helpers for transpo
     rootfs: rootfs.builtIn("alpine:3.23"),
     network: network.policy((conn) => {
       observations.push(observation(conn));
-      if (conn.protocol === "udp" && conn.dst.port === 53) {
+      if (conn.transport === "udp" && conn.dst.port === 53) {
         conn.allow();
       }
     }),
@@ -281,7 +334,8 @@ test("network.policy exposes source and destination endpoint helpers for transpo
   assert.equal(result.exitCode, 0, commandOutput(result));
   assert.match(result.stdout, /93\.184\.216\.34/);
   assert.ok(observations.some((entry) => {
-    return entry.protocol === "udp"
+    return entry.transport === "udp"
+      && entry.protocol === "dns"
       && entry.dstIp === "10.0.2.1"
       && entry.dstPort === 53
       && entry.dstPrivate === true;
@@ -304,8 +358,43 @@ async function bootDenyingNetwork() {
   }).boot();
 }
 
+async function bootAllowingDns() {
+  return await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      if (conn.protocol === "dns") {
+        assert.equal(conn.questions[0]?.name, "public.sandbox.test");
+        conn.allowDns();
+      }
+    }),
+  }).boot();
+}
+
+async function bootWithCustomDns(address: string) {
+  return await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      if (conn.protocol === "dns") {
+        conn.allowDns((request) => {
+          assert.equal(request.questions[0]?.name, "custom.sandbox.test");
+          return {
+            answers: [
+              {
+                type: "A",
+                address,
+                ttl: 60,
+              },
+            ],
+          };
+        });
+      }
+    }),
+  }).boot();
+}
+
 function observation(conn: NetworkConnectionRequest) {
   return {
+    transport: conn.transport,
     protocol: conn.protocol,
     srcIp: conn.src.ip,
     srcPort: conn.src.port,
@@ -326,6 +415,10 @@ function pythonTlsExchange(port: number, message: string): string {
 
 function pythonUdpExchange(port: number, message: string): string {
   return `python3 - <<'PY'\nimport socket\ns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\ns.settimeout(3)\ns.sendto(${JSON.stringify(message)}.encode(), ("public.sandbox.test", ${port}))\nprint(s.recvfrom(4096)[0].decode(), end="")\ns.close()\nPY`;
+}
+
+function pythonDnsQuery(input: { readonly transport: "tcp" | "udp"; readonly name: string }): string {
+  return `python3 - <<'PY'\nimport socket, struct\n\ndef query(name):\n    packet = bytearray()\n    packet += b"\\x12\\x34\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00"\n    for label in name.split("."):\n        packet.append(len(label))\n        packet += label.encode()\n    packet += b"\\x00\\x00\\x01\\x00\\x01"\n    return bytes(packet)\n\ndef read_name(packet, offset):\n    labels = []\n    jumped = False\n    original = offset\n    while True:\n        length = packet[offset]\n        if length & 0xc0 == 0xc0:\n            pointer = ((length & 0x3f) << 8) | packet[offset + 1]\n            if not jumped:\n                original = offset + 2\n            offset = pointer\n            jumped = True\n            continue\n        offset += 1\n        if length == 0:\n            return ".".join(labels), (original if jumped else offset)\n        labels.append(packet[offset:offset + length].decode())\n        offset += length\n\ndef answer_address(packet):\n    question_count = struct.unpack("!H", packet[4:6])[0]\n    answer_count = struct.unpack("!H", packet[6:8])[0]\n    offset = 12\n    for _ in range(question_count):\n        _, offset = read_name(packet, offset)\n        offset += 4\n    for _ in range(answer_count):\n        _, offset = read_name(packet, offset)\n        rtype, rclass, ttl, rdlen = struct.unpack("!HHIH", packet[offset:offset + 10])\n        offset += 10\n        data = packet[offset:offset + rdlen]\n        offset += rdlen\n        if rtype == 1 and rclass == 1 and rdlen == 4:\n            return ".".join(str(byte) for byte in data)\n    raise RuntimeError("missing A answer")\n\nrequest = query(${JSON.stringify(input.name)})\nif ${JSON.stringify(input.transport)} == "udp":\n    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n    s.settimeout(3)\n    s.sendto(request, ("10.0.2.1", 53))\n    response = s.recvfrom(4096)[0]\nelse:\n    s = socket.create_connection(("10.0.2.1", 53), timeout=3)\n    s.settimeout(3)\n    s.sendall(struct.pack("!H", len(request)) + request)\n    size = struct.unpack("!H", s.recv(2))[0]\n    response = b""\n    while len(response) < size:\n        response += s.recv(size - len(response))\nprint(answer_address(response), end="")\ns.close()\nPY`;
 }
 
 async function startTcpServer(onConnection: (socket: net.Socket) => void): Promise<{

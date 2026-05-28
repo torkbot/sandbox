@@ -10,6 +10,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant as StdInstant};
 
+use rustls::DigitallySignedStruct;
+use rustls::SignatureScheme;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::UnixTime;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::{tcp, udp};
@@ -89,45 +93,68 @@ pub struct NetworkEndpoint {
 pub enum NetworkProtocol {
     Tcp,
     Udp,
+    Dns,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkConnectionAttempt {
     pub protocol: NetworkProtocol,
+    pub transport: NetworkProtocol,
     pub src: NetworkEndpoint,
     pub dst: NetworkEndpoint,
+    pub questions: Vec<DnsQuestion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsQuestion {
+    pub name: String,
+    pub type_name: String,
+    pub class_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsPolicyAnswer {
+    pub answer_type: String,
+    pub name: Option<String>,
+    pub address: Option<String>,
+    pub target: Option<String>,
+    pub values: Vec<String>,
+    pub ttl: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsPolicyResponse {
+    pub code: String,
+    pub answers: Vec<DnsPolicyAnswer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkPolicyDecision {
+    pub allowed: bool,
+    pub dns_response: Option<DnsPolicyResponse>,
 }
 
 pub trait NetworkPolicyRuntime: Send + Sync + std::fmt::Debug {
-    fn allow_connection(&self, connection: NetworkConnectionAttempt) -> io::Result<bool>;
+    fn decide_connection(
+        &self,
+        connection: NetworkConnectionAttempt,
+    ) -> io::Result<NetworkPolicyDecision>;
 }
 
 #[derive(Debug)]
 struct MitmTlsAuthority {
     ca_certificate_pem: String,
     ca_private_key_pem: String,
-    client_roots: rustls::RootCertStore,
 }
 
 impl MitmTlsAuthority {
     fn new(config: MitmTlsConfig) -> io::Result<Self> {
-        let ca_certificate =
+        let _ca_certificate =
             rustls::pki_types::CertificateDer::from_pem_slice(config.ca_certificate_pem.as_bytes())
                 .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
-        let mut client_roots = rustls::RootCertStore::empty();
-        let native_certs = rustls_native_certs::load_native_certs();
-        for cert in native_certs.certs {
-            client_roots
-                .add(cert)
-                .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
-        }
-        client_roots
-            .add(ca_certificate)
-            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
         Ok(Self {
             ca_certificate_pem: config.ca_certificate_pem,
             ca_private_key_pem: config.ca_private_key_pem,
-            client_roots,
         })
     }
 
@@ -152,7 +179,7 @@ impl MitmTlsAuthority {
             .with_no_client_auth()
             .with_single_cert(vec![certificate.der().clone()], private_key)
             .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
         rustls::ServerConnection::new(Arc::new(config))
             .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))
     }
@@ -163,7 +190,8 @@ impl MitmTlsAuthority {
         alpn_protocol: Option<&str>,
     ) -> io::Result<rustls::ClientConnection> {
         let mut config = rustls::ClientConfig::builder()
-            .with_root_certificates(self.client_roots.clone())
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(TransparentUpstreamVerifier))
             .with_no_client_auth();
         if let Some(alpn_protocol) = alpn_protocol {
             config.alpn_protocols = vec![alpn_protocol.as_bytes().to_vec()];
@@ -172,6 +200,54 @@ impl MitmTlsAuthority {
             .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
         rustls::ClientConnection::new(Arc::new(config), server_name)
             .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))
+    }
+}
+
+#[derive(Debug)]
+struct TransparentUpstreamVerifier;
+
+impl ServerCertVerifier for TransparentUpstreamVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ED25519,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+        ]
     }
 }
 
@@ -252,6 +328,8 @@ fn run_network_service(
     });
     let mut sockets = SocketSet::new(Vec::new());
     let dns_handle = add_dns_socket(&mut sockets);
+    let tcp_dns_handles = add_tcp_dns_listeners(&mut sockets);
+    let mut tcp_dns_connections = HashMap::new();
     let mut http_sockets = HashMap::new();
     let mut http_connections = HashMap::new();
     add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTP_PORT);
@@ -270,6 +348,15 @@ fn run_network_service(
             outbound_rules.as_deref(),
             policy.as_deref(),
         );
+        for handle in &tcp_dns_handles {
+            poll_tcp_dns_socket(
+                &mut sockets,
+                *handle,
+                outbound_rules.as_deref(),
+                policy.as_deref(),
+                &mut tcp_dns_connections,
+            );
+        }
         device.nat.prune_expired_flows();
         let active_nat_ports = device.nat.host_ports().collect::<HashSet<_>>();
         for port in &active_nat_ports {
@@ -351,6 +438,19 @@ fn add_dns_socket(sockets: &mut SocketSet<'_>) -> SocketHandle {
     sockets.add(socket)
 }
 
+fn add_tcp_dns_listeners(sockets: &mut SocketSet<'_>) -> Vec<SocketHandle> {
+    (0..HTTP_LISTENERS_PER_PORT)
+        .map(|_| {
+            let mut socket = tcp::Socket::new(
+                tcp::SocketBuffer::new(vec![0; HTTP_SOCKET_BUFFER_BYTES]),
+                tcp::SocketBuffer::new(vec![0; HTTP_SOCKET_BUFFER_BYTES]),
+            );
+            let _ = socket.listen(HOST_DNS_PORT);
+            sockets.add(socket)
+        })
+        .collect()
+}
+
 fn poll_dns_socket(
     sockets: &mut SocketSet<'_>,
     handle: SocketHandle,
@@ -367,23 +467,20 @@ fn poll_dns_socket(
         {
             continue;
         }
-        if policy.is_some_and(|policy| {
-            !policy_allows_connection(
-                policy,
-                NetworkProtocol::Udp,
-                NetworkEndpoint {
-                    ip: remote.endpoint.addr.to_string(),
-                    port: remote.endpoint.port,
-                },
-                NetworkEndpoint {
-                    ip: "10.0.2.1".to_string(),
-                    port: HOST_DNS_PORT,
-                },
-            )
-        }) {
-            continue;
-        }
-        let Some(response) = dns_response(request) else {
+        let src = NetworkEndpoint {
+            ip: remote.endpoint.addr.to_string(),
+            port: remote.endpoint.port,
+        };
+        let dst = NetworkEndpoint {
+            ip: "10.0.2.1".to_string(),
+            port: HOST_DNS_PORT,
+        };
+        let decision = match decide_dns(policy, NetworkProtocol::Udp, src, dst, request) {
+            Ok(decision) if decision.allowed => decision,
+            _ => continue,
+        };
+        let Some(response) = dns_response_with_decision(request, decision.dns_response.as_ref())
+        else {
             continue;
         };
         let _ = socket.send_slice(
@@ -391,6 +488,91 @@ fn poll_dns_socket(
             IpEndpoint::new(remote.endpoint.addr, remote.endpoint.port),
         );
     }
+}
+
+fn poll_tcp_dns_socket(
+    sockets: &mut SocketSet<'_>,
+    handle: SocketHandle,
+    outbound_rules: Option<&[OutboundRulePlan]>,
+    policy: Option<&dyn NetworkPolicyRuntime>,
+    connections: &mut HashMap<SocketHandle, TcpDnsConnection>,
+) {
+    let socket = sockets.get_mut::<tcp::Socket>(handle);
+    if !socket.is_active() {
+        connections.remove(&handle);
+        let _ = socket.listen(HOST_DNS_PORT);
+        return;
+    }
+
+    let connection = connections.entry(handle).or_default();
+    while socket.can_recv() {
+        let mut buffer = [0; 4096];
+        let received = socket.recv_slice(&mut buffer).unwrap_or(0);
+        if received == 0 {
+            break;
+        }
+        connection.from_guest.extend_from_slice(&buffer[..received]);
+    }
+    if connection.to_guest.is_empty() && connection.from_guest.len() >= 2 {
+        let request_len =
+            u16::from_be_bytes([connection.from_guest[0], connection.from_guest[1]]) as usize;
+        if connection.from_guest.len() >= 2 + request_len {
+            let request = connection.from_guest[2..2 + request_len].to_vec();
+            let response = handle_tcp_dns_request(socket, outbound_rules, policy, &request);
+            if let Some(response) = response {
+                connection
+                    .to_guest
+                    .extend_from_slice(&(response.len() as u16).to_be_bytes());
+                connection.to_guest.extend_from_slice(&response);
+            }
+            connection.close_after_flush = true;
+        }
+    }
+    while socket.can_send() && !connection.to_guest.is_empty() {
+        let sent = socket.send_slice(&connection.to_guest).unwrap_or(0);
+        if sent == 0 {
+            break;
+        }
+        connection.to_guest.drain(..sent);
+    }
+    if connection.close_after_flush && connection.to_guest.is_empty() {
+        connections.remove(&handle);
+        socket.close();
+    }
+}
+
+fn handle_tcp_dns_request(
+    socket: &tcp::Socket<'_>,
+    outbound_rules: Option<&[OutboundRulePlan]>,
+    policy: Option<&dyn NetworkPolicyRuntime>,
+    request: &[u8],
+) -> Option<Vec<u8>> {
+    if outbound_rules
+        .is_some_and(|rules| !is_allowed_outbound_tcp("10.0.2.1", HOST_DNS_PORT, rules))
+    {
+        return None;
+    }
+    let remote = socket.remote_endpoint()?;
+    let src = NetworkEndpoint {
+        ip: remote.addr.to_string(),
+        port: remote.port,
+    };
+    let dst = NetworkEndpoint {
+        ip: "10.0.2.1".to_string(),
+        port: HOST_DNS_PORT,
+    };
+    let decision = match decide_dns(policy, NetworkProtocol::Tcp, src, dst, request) {
+        Ok(decision) if decision.allowed => decision,
+        _ => return None,
+    };
+    dns_response_with_decision(request, decision.dns_response.as_ref())
+}
+
+#[derive(Default)]
+struct TcpDnsConnection {
+    from_guest: Vec<u8>,
+    to_guest: Vec<u8>,
+    close_after_flush: bool,
 }
 
 fn add_http_listener(
@@ -488,6 +670,30 @@ fn looks_like_tls(bytes: &[u8]) -> bool {
     matches!(bytes.first(), Some(0x16))
 }
 
+fn should_use_raw_tcp_relay(bytes: &[u8]) -> bool {
+    !bytes_could_be_http_request(bytes)
+}
+
+fn bytes_could_be_http_request(bytes: &[u8]) -> bool {
+    if H2_PREFACE.starts_with(bytes) {
+        return true;
+    }
+    const METHODS: [&[u8]; 9] = [
+        b"GET ",
+        b"HEAD ",
+        b"POST ",
+        b"PUT ",
+        b"PATCH ",
+        b"DELETE ",
+        b"OPTIONS ",
+        b"TRACE ",
+        b"CONNECT ",
+    ];
+    METHODS
+        .iter()
+        .any(|method| method.starts_with(bytes) || bytes.starts_with(method))
+}
+
 #[derive(Clone)]
 struct HttpDestination {
     source_ip: String,
@@ -561,8 +767,6 @@ fn poll_plain_http_socket(
 
     let connection = if port_is_probe(destination.port) {
         HttpConnection::response(HOST_HTTP_PROBE_RESPONSE)
-    } else if uses_raw_tcp_relay(destination.port) {
-        HttpConnection::tcp_relay(destination)
     } else {
         HttpConnection::intercept(
             destination,
@@ -577,10 +781,6 @@ fn poll_plain_http_socket(
 
 fn port_is_probe(port: u16) -> bool {
     port == HOST_HTTP_PROBE_PORT
-}
-
-fn uses_raw_tcp_relay(port: u16) -> bool {
-    !matches!(port, HOST_HTTP_PORT | HOST_HTTPS_PORT | HOST_ALT_HTTPS_PORT)
 }
 
 fn poll_http_connection(socket: &mut tcp::Socket<'_>, connection: &mut HttpConnection) {
@@ -680,7 +880,10 @@ fn rewrite_h1_head(
         .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?
         .to_string();
     let (upstream_server_name, _) = split_authority(&authority, default_port_for_scheme(scheme))?;
-    let upstream = resolve_upstream_authority(&authority, default_port_for_scheme(scheme))?;
+    let upstream = UpstreamEndpoint {
+        ip: destination.ip.clone(),
+        port: destination.port,
+    };
     validate_upstream_allowed(&upstream, outbound_rules)?;
     let mut pairs = request
         .headers
@@ -836,7 +1039,10 @@ fn rewrite_h2_head(
         }
         let (upstream_server_name, _) =
             split_authority(&authority, default_port_for_scheme(&scheme))?;
-        let upstream = resolve_upstream_authority(&authority, default_port_for_scheme(&scheme))?;
+        let upstream = UpstreamEndpoint {
+            ip: destination.ip.clone(),
+            port: destination.port,
+        };
         validate_upstream_allowed(&upstream, outbound_rules)?;
         let request = InterceptedHttpRequest {
             protocol: HttpRequestProtocol::Http2,
@@ -1086,23 +1292,6 @@ fn split_authority(authority: &str, default_port: u16) -> io::Result<(String, u1
     Ok((authority.to_string(), default_port))
 }
 
-fn resolve_upstream_authority(authority: &str, default_port: u16) -> io::Result<UpstreamEndpoint> {
-    let (host, port) = split_authority(authority, default_port)?;
-    let address = (host.as_str(), port)
-        .to_socket_addrs()?
-        .find(|address| address.is_ipv4())
-        .ok_or_else(|| {
-            io::Error::new(
-                ErrorKind::AddrNotAvailable,
-                format!("no IPv4 address resolved for {authority}"),
-            )
-        })?;
-    Ok(UpstreamEndpoint {
-        ip: address.ip().to_string(),
-        port,
-    })
-}
-
 fn validate_upstream_allowed(
     upstream: &UpstreamEndpoint,
     outbound_rules: Option<&[OutboundRulePlan]>,
@@ -1123,6 +1312,18 @@ fn default_port_for_scheme(scheme: &str) -> u16 {
 }
 
 fn tls_client_hello_sni(bytes: &[u8]) -> Option<String> {
+    tls_client_hello_extension(bytes, 0).and_then(tls_sni_from_extension)
+}
+
+fn tls_client_hello_offers_http(bytes: &[u8]) -> bool {
+    tls_client_hello_extension(bytes, 16).is_some_and(|extension| {
+        tls_alpn_protocols(extension)
+            .iter()
+            .any(|protocol| protocol == "h2" || protocol == "http/1.1")
+    })
+}
+
+fn tls_client_hello_extension(bytes: &[u8], requested_type: u16) -> Option<&[u8]> {
     if bytes.len() < 5 || bytes[0] != 0x16 {
         return None;
     }
@@ -1167,12 +1368,39 @@ fn tls_client_hello_sni(bytes: &[u8]) -> Option<String> {
         if offset + extension_len > extensions_end {
             return None;
         }
-        if extension_type == 0 {
-            return tls_sni_from_extension(&bytes[offset..offset + extension_len]);
+        if extension_type == requested_type {
+            return Some(&bytes[offset..offset + extension_len]);
         }
         offset += extension_len;
     }
     None
+}
+
+fn tls_alpn_protocols(extension: &[u8]) -> Vec<String> {
+    if extension.len() < 2 {
+        return Vec::new();
+    }
+    let list_len = u16::from_be_bytes([extension[0], extension[1]]) as usize;
+    let mut offset = 2;
+    let end = offset + list_len;
+    if extension.len() < end {
+        return Vec::new();
+    }
+    let mut protocols = Vec::new();
+    while offset < end {
+        let Some(len) = extension.get(offset).copied().map(usize::from) else {
+            return Vec::new();
+        };
+        offset += 1;
+        if offset + len > end {
+            return Vec::new();
+        }
+        if let Ok(protocol) = std::str::from_utf8(&extension[offset..offset + len]) {
+            protocols.push(protocol.to_string());
+        }
+        offset += len;
+    }
+    protocols
 }
 
 fn tls_record_complete(bytes: &[u8]) -> bool {
@@ -1247,8 +1475,37 @@ fn policy_allows_connection(
     dst: NetworkEndpoint,
 ) -> bool {
     policy
-        .allow_connection(NetworkConnectionAttempt { protocol, src, dst })
+        .decide_connection(NetworkConnectionAttempt {
+            protocol,
+            transport: protocol,
+            src,
+            dst,
+            questions: Vec::new(),
+        })
+        .map(|decision| decision.allowed)
         .unwrap_or(false)
+}
+
+fn decide_dns(
+    policy: Option<&dyn NetworkPolicyRuntime>,
+    transport: NetworkProtocol,
+    src: NetworkEndpoint,
+    dst: NetworkEndpoint,
+    request: &[u8],
+) -> io::Result<NetworkPolicyDecision> {
+    let Some(policy) = policy else {
+        return Ok(NetworkPolicyDecision {
+            allowed: true,
+            dns_response: None,
+        });
+    };
+    policy.decide_connection(NetworkConnectionAttempt {
+        protocol: NetworkProtocol::Dns,
+        transport,
+        src,
+        dst,
+        questions: dns_questions(request).unwrap_or_default(),
+    })
 }
 
 fn port_matches(ports: &[u16], destination_port: u16) -> bool {
@@ -1287,7 +1544,15 @@ fn upstream_socket_addr(destination_ip: &str, destination_port: u16) -> (String,
     (upstream_ip, destination_port)
 }
 
+#[cfg(test)]
 fn dns_response(request: &[u8]) -> Option<Vec<u8>> {
+    dns_response_with_decision(request, None)
+}
+
+fn dns_response_with_decision(
+    request: &[u8],
+    policy_response: Option<&DnsPolicyResponse>,
+) -> Option<Vec<u8>> {
     if request.len() < 12 {
         return None;
     }
@@ -1303,6 +1568,10 @@ fn dns_response(request: &[u8]) -> Option<Vec<u8>> {
     }
     let qtype = u16::from_be_bytes([request[question_end], request[question_end + 1]]);
     let qclass = u16::from_be_bytes([request[question_end + 2], request[question_end + 3]]);
+
+    if let Some(policy_response) = policy_response {
+        return dns_policy_response(request, question_end, &name, policy_response);
+    }
 
     let supported_question = qclass == 1 && qtype == 1;
     let answer = if supported_question {
@@ -1338,6 +1607,96 @@ fn dns_response(request: &[u8]) -> Option<Vec<u8>> {
     }
 
     Some(response)
+}
+
+fn dns_policy_response(
+    request: &[u8],
+    question_end: usize,
+    question_name: &str,
+    policy_response: &DnsPolicyResponse,
+) -> Option<Vec<u8>> {
+    let mut answers = Vec::new();
+    for answer in &policy_response.answers {
+        if answer.answer_type != "A" {
+            continue;
+        }
+        let Some(address) = answer
+            .address
+            .as_deref()
+            .and_then(|address| address.parse::<std::net::Ipv4Addr>().ok())
+        else {
+            continue;
+        };
+        answers.push((
+            answer.name.as_deref().unwrap_or(question_name),
+            answer.ttl,
+            address,
+        ));
+    }
+    let rcode = match policy_response.code.as_str() {
+        "NXDOMAIN" => 3,
+        "SERVFAIL" => 2,
+        "REFUSED" => 5,
+        _ => 0,
+    };
+    let mut response = Vec::new();
+    response.extend_from_slice(&request[0..2]);
+    response.extend_from_slice(&[0x81, 0x80 | rcode]);
+    response.extend_from_slice(&request[4..6]);
+    response.extend_from_slice(&(answers.len() as u16).to_be_bytes());
+    response.extend_from_slice(&[0, 0, 0, 0]);
+    response.extend_from_slice(&request[12..question_end + 4]);
+    for (_name, ttl, address) in answers {
+        response.extend_from_slice(&[0xc0, 0x0c]);
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&ttl.to_be_bytes());
+        response.extend_from_slice(&4u16.to_be_bytes());
+        response.extend_from_slice(&address.octets());
+    }
+    Some(response)
+}
+
+fn dns_questions(request: &[u8]) -> Option<Vec<DnsQuestion>> {
+    if request.len() < 12 {
+        return None;
+    }
+    let query_count = u16::from_be_bytes([request[4], request[5]]);
+    let mut questions = Vec::new();
+    let mut offset = 12;
+    for _ in 0..query_count {
+        let (name, question_end) = parse_dns_name(request, offset)?;
+        if request.len() < question_end + 4 {
+            return None;
+        }
+        let qtype = u16::from_be_bytes([request[question_end], request[question_end + 1]]);
+        let qclass = u16::from_be_bytes([request[question_end + 2], request[question_end + 3]]);
+        questions.push(DnsQuestion {
+            name,
+            type_name: dns_type_name(qtype).to_string(),
+            class_name: if qclass == 1 { "IN" } else { "UNKNOWN" }.to_string(),
+        });
+        offset = question_end + 4;
+    }
+    Some(questions)
+}
+
+fn dns_type_name(qtype: u16) -> &'static str {
+    match qtype {
+        1 => "A",
+        2 => "NS",
+        5 => "CNAME",
+        6 => "SOA",
+        12 => "PTR",
+        15 => "MX",
+        16 => "TXT",
+        28 => "AAAA",
+        33 => "SRV",
+        64 => "SVCB",
+        65 => "HTTPS",
+        257 => "CAA",
+        _ => "UNKNOWN",
+    }
 }
 
 fn parse_dns_name(packet: &[u8], mut offset: usize) -> Option<(String, usize)> {
@@ -1567,27 +1926,6 @@ impl HttpConnection {
             to_upstream: Vec::new(),
             close_after_flush: false,
         })
-    }
-
-    fn tcp_relay(destination: HttpDestination) -> Self {
-        let upstream = TcpStream::connect(upstream_socket_addr(&destination.ip, destination.port));
-        match upstream {
-            Ok(upstream) => {
-                let _ = upstream.set_nonblocking(true);
-                Self::Intercept(InterceptConnection {
-                    destination,
-                    runtime: None,
-                    tls_authority: None,
-                    outbound_rules: None,
-                    state: InterceptState::Relaying,
-                    upstream: Some(upstream),
-                    to_guest: Vec::new(),
-                    to_upstream: Vec::new(),
-                    close_after_flush: false,
-                })
-            }
-            Err(_) => Self::response(OUTBOUND_DENIED_RESPONSE),
-        }
     }
 
     fn is_finished(&self) -> bool {
@@ -1964,10 +2302,11 @@ impl InterceptConnection {
     }
 
     fn read_guest_head(&mut self, socket: &mut tcp::Socket<'_>) {
-        let InterceptState::ReadingHead { guest_head } = &mut self.state else {
-            return;
-        };
+        let mut raw_relay = None;
         while socket.can_recv() {
+            let InterceptState::ReadingHead { guest_head } = &mut self.state else {
+                return;
+            };
             let mut buffer = [0; TLS_READ_BUFFER_BYTES];
             let received = socket.recv_slice(&mut buffer).unwrap_or(0);
             if received == 0 {
@@ -1985,10 +2324,13 @@ impl InterceptConnection {
                 if !tls_record_complete(guest_head) {
                     continue;
                 }
+                if !tls_client_hello_offers_http(guest_head) {
+                    raw_relay = Some(std::mem::take(guest_head));
+                    break;
+                }
                 let Some(authority) = self.tls_authority.as_ref() else {
-                    self.close_after_flush = true;
-                    self.state = InterceptState::Closing;
-                    return;
+                    raw_relay = Some(std::mem::take(guest_head));
+                    break;
                 };
                 let sni = maybe_server_name;
                 let server_name = tls_intercept_server_name(&self.destination, sni.as_deref());
@@ -2003,6 +2345,10 @@ impl InterceptConnection {
                     }
                 }
                 return;
+            }
+            if should_use_raw_tcp_relay(guest_head) {
+                raw_relay = Some(std::mem::take(guest_head));
+                break;
             }
             match rewrite_intercepted_head(
                 guest_head,
@@ -2038,6 +2384,28 @@ impl InterceptConnection {
                     self.state = InterceptState::Closing;
                     return;
                 }
+            }
+        }
+        if let Some(initial_bytes) = raw_relay {
+            self.start_raw_relay(initial_bytes);
+        }
+    }
+
+    fn start_raw_relay(&mut self, initial_bytes: Vec<u8>) {
+        match TcpStream::connect(upstream_socket_addr(
+            &self.destination.ip,
+            self.destination.port,
+        )) {
+            Ok(upstream) => {
+                let _ = upstream.set_nonblocking(true);
+                self.to_upstream.extend_from_slice(&initial_bytes);
+                self.upstream = Some(upstream);
+                self.state = InterceptState::Relaying;
+            }
+            Err(_) => {
+                self.to_guest.extend_from_slice(OUTBOUND_DENIED_RESPONSE);
+                self.close_after_flush = true;
+                self.state = InterceptState::Closing;
             }
         }
     }

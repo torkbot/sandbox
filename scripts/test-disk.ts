@@ -211,10 +211,13 @@ function createNetworkStats(): {
   return {
     observe(connection) {
       policyCalls += 1;
+      const destinationHost = connection.protocol === "http"
+        ? connection.host
+        : connection.dst.ip;
       const destination = [
         connection.transport,
-        connection.host ?? connection.ip ?? "unknown",
-        connection.port,
+        destinationHost,
+        connection.dst.port,
       ].join(":");
       byDestination.set(destination, (byDestination.get(destination) ?? 0) + 1);
     },
