@@ -28,6 +28,38 @@ test("new public API boots a built-in rootfs and runs a process", async (t) => {
   assert.equal(result.stderr, "");
 });
 
+test("built-in agent rootfs includes common agent runtimes and CLIs", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot();
+
+  const result = await sandbox.exec("/bin/sh", [
+    "-lc",
+    [
+      "gh --version | head -n1",
+      "node --version",
+      "npm --version",
+      "python3 --version",
+      "python3 -m pip --version",
+    ].join(" && "),
+  ]);
+
+  assert.equal(
+    result.exitCode,
+    0,
+    `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+  );
+  assert.match(result.stdout, /^gh version /m);
+  assert.match(result.stdout, /^v24\./m);
+  assert.match(result.stdout, /^11\./m);
+  assert.match(result.stdout, /^Python 3\./m);
+  assert.match(result.stdout, /^pip /m);
+});
+
 test("boot options provide instance-specific virtual mounts", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
