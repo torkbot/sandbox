@@ -5,7 +5,8 @@ import { spawn } from "node:child_process";
 const repoRoot = resolve(import.meta.dirname, "..");
 const sourceDir = resolve(repoRoot, process.env.SANDBOX_ROOTFS_SOURCE_DIR ?? "dist/rootfs/alpine-3.23");
 const outPath = resolve(repoRoot, process.env.SANDBOX_ROOTFS_QCOW2_OUT ?? "dist/rootfs/alpine-3.23.qcow2");
-const clusterSize = process.env.SANDBOX_QCOW2_CLUSTER_SIZE ?? "65536";
+const clusterSize = decimalEnv("SANDBOX_QCOW2_CLUSTER_SIZE", "32768");
+const freeSpaceKiB = decimalEnv("SANDBOX_ROOTFS_FREE_SPACE_KIB", "131072");
 const filesystemUuid = "00000000-0000-0000-0000-000000000000";
 
 await assertDirectory(sourceDir);
@@ -29,7 +30,7 @@ await run("docker", [
     "tar -C /rootfs -cf - . | tar -C /work/rootfs -xf -",
     "chown -R 0:0 /work/rootfs",
     "size_kb=$(du -sk /work/rootfs | cut -f1)",
-    "image_kb=$((size_kb + 131072))",
+    `image_kb=$((size_kb + ${freeSpaceKiB}))`,
     "truncate -s \"${image_kb}K\" /work/rootfs.ext4",
     "export E2FSPROGS_FAKE_TIME=0",
     [
@@ -74,6 +75,14 @@ async function assertDirectory(path: string): Promise<void> {
 
 function shellArg(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function decimalEnv(name: string, fallback: string): string {
+  const value = process.env[name] ?? fallback;
+  if (!/^[1-9][0-9]*$/.test(value)) {
+    throw new Error(`${name} must be a positive decimal integer`);
+  }
+  return value;
 }
 
 async function run(command: string, args: readonly string[]): Promise<void> {

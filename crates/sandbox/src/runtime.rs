@@ -6,6 +6,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, Once};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use base64::Engine;
 use imago::{
@@ -215,6 +216,14 @@ impl KrunContext {
     fn apply_rootfs(&self, spec: &MicroVmSpec, services: &HostServices) -> Result<(), KrunError> {
         match spec.rootfs.format {
             RootfsFormat::Qcow2 => {
+                let rootfs_trace = RootfsTrace::start(
+                    if spec.rootfs.storage.is_some() {
+                        "qcow2+cow"
+                    } else {
+                        "qcow2"
+                    },
+                    spec.rootfs.readonly,
+                );
                 cstring_path("rootfs.path", &spec.rootfs.path)?;
                 let writable = spec.rootfs.storage.is_some();
                 let disk =
@@ -222,25 +231,40 @@ impl KrunContext {
                         let store = services.root_storage.clone().ok_or_else(|| {
                             KrunError::new("root COW block store missing", -libc::EINVAL)
                         })?;
+                        let open_start = Instant::now();
                         let storage = Box::<dyn DynStorage>::open_sync(
                             StorageOpenOptions::new()
                                 .filename(&spec.rootfs.path)
                                 .write(false),
                         )
                         .map_err(|_| KrunError::new("Qcow2 storage open", -libc::EIO))?;
+                        rootfs_trace.stage("open_container", open_start);
+                        let qcow_start = Instant::now();
                         let qcow2 = open_qcow2_access(storage, false)?;
+                        rootfs_trace.stage("open_qcow2", qcow_start);
+                        let cow_start = Instant::now();
                         let cow = CowBlockStorage::open_storage(qcow2, store)
                             .map_err(|_| KrunError::new("CowBlockStorage::open", -libc::EIO))?;
-                        open_raw_disk(Box::new(cow), writable)?
+                        rootfs_trace.stage("open_cow", cow_start);
+                        let raw_start = Instant::now();
+                        let disk = open_raw_disk(Box::new(cow), writable)?;
+                        rootfs_trace.stage("open_raw", raw_start);
+                        disk
                     } else {
+                        let open_start = Instant::now();
                         let storage = Box::<dyn DynStorage>::open_sync(
                             StorageOpenOptions::new()
                                 .filename(&spec.rootfs.path)
                                 .write(false),
                         )
                         .map_err(|_| KrunError::new("Qcow2 storage open", -libc::EIO))?;
-                        open_qcow2_disk(storage, false)?
+                        rootfs_trace.stage("open_container", open_start);
+                        let qcow_start = Instant::now();
+                        let disk = open_qcow2_disk(storage, false)?;
+                        rootfs_trace.stage("open_qcow2", qcow_start);
+                        disk
                     };
+                let add_disk_start = Instant::now();
                 check_krun(
                     "krun_add_storage_disk",
                     krun::krun_add_storage_disk(
@@ -251,7 +275,9 @@ impl KrunContext {
                         sync_mode(),
                     ),
                 )?;
+                rootfs_trace.stage("add_storage_disk", add_disk_start);
 
+                let root_start = Instant::now();
                 check_krun(
                     "krun_set_direct_block_root",
                     krun::krun_set_direct_block_root(
@@ -261,7 +287,10 @@ impl KrunContext {
                         if spec.rootfs.readonly { "ro" } else { "rw" }.to_string(),
                         "/sandbox-init".to_string(),
                     ),
-                )
+                )?;
+                rootfs_trace.stage("set_direct_block_root", root_start);
+                rootfs_trace.finish();
+                Ok(())
             }
         }
     }
@@ -366,6 +395,43 @@ fn init_krun_logging() {
             let _ = krun::krun_set_log_level(4);
         }
     });
+}
+
+struct RootfsTrace {
+    enabled: bool,
+    started_at: Instant,
+    format: &'static str,
+    readonly: bool,
+}
+
+impl RootfsTrace {
+    fn start(format: &'static str, readonly: bool) -> Self {
+        let trace = Self {
+            enabled: std::env::var_os("SANDBOX_ROOTFS_TRACE").is_some(),
+            started_at: Instant::now(),
+            format,
+            readonly,
+        };
+        trace.event("start", 0.0);
+        trace
+    }
+
+    fn stage(&self, stage: &'static str, started_at: Instant) {
+        self.event(stage, started_at.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    fn finish(&self) {
+        self.event("finish", self.started_at.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    fn event(&self, stage: &'static str, elapsed_ms: f64) {
+        if self.enabled {
+            eprintln!(
+                "sandbox.rootfs stage={stage} elapsed_ms={elapsed_ms:.3} format={} readonly={}",
+                self.format, self.readonly
+            );
+        }
+    }
 }
 
 #[cfg(sandbox_static_kernel)]

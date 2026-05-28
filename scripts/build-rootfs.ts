@@ -51,6 +51,7 @@ await run("docker", [
   [
     `apk add --no-cache ${agentPackages.map(shellArg).join(" ")}`,
     installGithubCliScript(),
+    cleanupRootfsScript(),
     "cd /",
     "tar --exclude=out --exclude=proc --exclude=sys --exclude=dev --exclude=tmp -cf - . | tar -C /out -xf -",
     `chown -R ${getuid?.() ?? 0}:${getgid?.() ?? 0} /out`,
@@ -100,6 +101,14 @@ function installGithubCliScript(): string {
     "tar -xzf \"$tmp/gh.tar.gz\" -C \"$tmp\"",
     `install -m 0755 "$tmp/gh_${githubCliVersion}_linux_\${gh_arch}/bin/gh" /usr/local/bin/gh`,
     "rm -rf \"$tmp\"",
+  ].join(" && ");
+}
+
+function cleanupRootfsScript(): string {
+  return [
+    "rm -rf /var/cache/apk/* /etc/apk/cache/*",
+    "rm -rf /root/.cache /tmp/* /var/tmp/*",
+    "rm -rf /usr/share/doc /usr/share/man /usr/share/info",
   ].join(" && ");
 }
 
