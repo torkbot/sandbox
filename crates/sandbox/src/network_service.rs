@@ -561,6 +561,8 @@ fn poll_plain_http_socket(
 
     let connection = if port_is_probe(destination.port) {
         HttpConnection::response(HOST_HTTP_PROBE_RESPONSE)
+    } else if uses_raw_tcp_relay(destination.port) {
+        HttpConnection::tcp_relay(destination)
     } else {
         HttpConnection::intercept(
             destination,
@@ -575,6 +577,10 @@ fn poll_plain_http_socket(
 
 fn port_is_probe(port: u16) -> bool {
     port == HOST_HTTP_PROBE_PORT
+}
+
+fn uses_raw_tcp_relay(port: u16) -> bool {
+    !matches!(port, HOST_HTTP_PORT | HOST_HTTPS_PORT | HOST_ALT_HTTPS_PORT)
 }
 
 fn poll_http_connection(socket: &mut tcp::Socket<'_>, connection: &mut HttpConnection) {
@@ -1265,6 +1271,22 @@ fn is_public_ipv4_destination(destination_ip: &str) -> bool {
         })
 }
 
+fn upstream_socket_addr(destination_ip: &str, destination_port: u16) -> (String, u16) {
+    let public_test_ip = Ipv4Address::new(
+        DNS_PUBLIC_TEST_IP[0],
+        DNS_PUBLIC_TEST_IP[1],
+        DNS_PUBLIC_TEST_IP[2],
+        DNS_PUBLIC_TEST_IP[3],
+    )
+    .to_string();
+    let upstream_ip = if destination_ip == public_test_ip {
+        "127.0.0.1".to_string()
+    } else {
+        destination_ip.to_string()
+    };
+    (upstream_ip, destination_port)
+}
+
 fn dns_response(request: &[u8]) -> Option<Vec<u8>> {
     if request.len() < 12 {
         return None;
@@ -1359,6 +1381,7 @@ struct LibkrunNetDevice {
     tx: UnixStream,
     nat: TransparentTcpNat,
     rx_buffer: Vec<u8>,
+    staged_rx: Option<Vec<u8>>,
     pending_tx: Vec<u8>,
 }
 
@@ -1369,6 +1392,7 @@ impl LibkrunNetDevice {
             tx,
             nat: TransparentTcpNat::new(host_ip),
             rx_buffer: Vec::new(),
+            staged_rx: None,
             pending_tx: Vec::new(),
         }
     }
@@ -1431,10 +1455,22 @@ impl Device for LibkrunNetDevice {
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         self.flush_pending_tx();
+        if let Some(frame) = self.staged_rx.take() {
+            return Some((
+                LibkrunRxToken { frame },
+                LibkrunTxToken {
+                    pending_tx: &mut self.pending_tx,
+                    nat: &mut self.nat,
+                },
+            ));
+        }
         match self.read_frame() {
             Ok(frame) => {
                 let mut frame = frame?;
-                self.nat.rewrite_guest_frame(&mut frame);
+                if self.nat.rewrite_guest_frame(&mut frame) {
+                    self.staged_rx = Some(frame);
+                    return None;
+                }
                 Some((
                     LibkrunRxToken { frame },
                     LibkrunTxToken {
@@ -1531,6 +1567,27 @@ impl HttpConnection {
             to_upstream: Vec::new(),
             close_after_flush: false,
         })
+    }
+
+    fn tcp_relay(destination: HttpDestination) -> Self {
+        let upstream = TcpStream::connect(upstream_socket_addr(&destination.ip, destination.port));
+        match upstream {
+            Ok(upstream) => {
+                let _ = upstream.set_nonblocking(true);
+                Self::Intercept(InterceptConnection {
+                    destination,
+                    runtime: None,
+                    tls_authority: None,
+                    outbound_rules: None,
+                    state: InterceptState::Relaying,
+                    upstream: Some(upstream),
+                    to_guest: Vec::new(),
+                    to_upstream: Vec::new(),
+                    close_after_flush: false,
+                })
+            }
+            Err(_) => Self::response(OUTBOUND_DENIED_RESPONSE),
+        }
     }
 
     fn is_finished(&self) -> bool {
@@ -1716,14 +1773,16 @@ impl TlsInterceptConnection {
                 return;
             }
         };
-        let upstream =
-            match TcpStream::connect((rewrite.upstream_ip.as_str(), rewrite.upstream_port)) {
-                Ok(upstream) => upstream,
-                Err(_) => {
-                    self.close_after_flush = true;
-                    return;
-                }
-            };
+        let upstream = match TcpStream::connect(upstream_socket_addr(
+            &rewrite.upstream_ip,
+            rewrite.upstream_port,
+        )) {
+            Ok(upstream) => upstream,
+            Err(_) => {
+                self.close_after_flush = true;
+                return;
+            }
+        };
         let _ = upstream.set_nonblocking(true);
         let mut client = match self.authority.client_connection(
             self.sni
@@ -1954,8 +2013,8 @@ impl InterceptConnection {
                 self.runtime.as_deref(),
             ) {
                 Ok(Some(rewritten)) => {
-                    match TcpStream::connect((
-                        rewritten.upstream_ip.as_str(),
+                    match TcpStream::connect(upstream_socket_addr(
+                        &rewritten.upstream_ip,
                         rewritten.upstream_port,
                     )) {
                         Ok(upstream) => {
@@ -2074,13 +2133,13 @@ impl TransparentTcpNat {
         }
     }
 
-    fn rewrite_guest_frame(&mut self, frame: &mut [u8]) {
+    fn rewrite_guest_frame(&mut self, frame: &mut [u8]) -> bool {
         self.prune_expired_flows();
         let Some(packet) = Ipv4TcpPacket::parse(frame) else {
-            return;
+            return false;
         };
         if packet.destination_ip(frame) == self.host_ip {
-            return;
+            return false;
         }
 
         let flow = TcpFlow {
@@ -2088,6 +2147,7 @@ impl TransparentTcpNat {
             guest_port: packet.source_port(frame),
             host_port: packet.destination_port(frame),
         };
+        let new_host_port = !self.flows.contains_key(&flow);
         let flags = packet.tcp_flags(frame);
         if flags.rst {
             self.flows.remove(&flow);
@@ -2103,6 +2163,7 @@ impl TransparentTcpNat {
         }
         packet.set_destination_ip(frame, self.host_ip);
         packet.recompute_checksums(frame);
+        new_host_port
     }
 
     fn rewrite_host_frame(&mut self, frame: &mut [u8]) {
