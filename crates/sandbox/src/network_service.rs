@@ -10,6 +10,12 @@ use std::sync::LazyLock;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant as StdInstant};
 
+use rama_core::extensions::Extensions;
+use rama_core::io::BridgeIo;
+use rama_core::rt::Executor;
+use rama_core::service::Service;
+use rama_http_backend::proxy::mitm::HttpMitmRelay;
+use rama_tcp::stream::TcpStream as RamaTcpStream;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::UnixTime;
 use rustls::DigitallySignedStruct;
@@ -20,6 +26,7 @@ use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
 
+use crate::async_bridge::SyncAsyncBridge;
 use crate::http_flow::{HttpInterceptRuntime, InterceptedDestination, InterceptedHttpRequest};
 use crate::http_interception::HttpRequestProtocol;
 use crate::network::{CidrRange, OutboundRulePlan};
@@ -33,6 +40,7 @@ const HOST_ALT_HTTPS_PORT: u16 = 8443;
 const HOST_DNS_PORT: u16 = 53;
 const HTTP_LISTENERS_PER_PORT: usize = 16;
 const HTTP_SOCKET_BUFFER_BYTES: usize = 256 * 1024;
+const HTTP_BRIDGE_BUFFER_BYTES: usize = 256 * 1024;
 const TLS_READ_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_INTERCEPT_HEAD_BYTES: usize = 64 * 1024;
 const DNS_PACKET_BUFFER_BYTES: usize = 4096;
@@ -1891,6 +1899,7 @@ struct HttpResponseConnection {
 
 enum InterceptState {
     ReadingHead { guest_head: Vec<u8> },
+    RamaHttp(RamaHttpConnection),
     Tls(TlsInterceptConnection),
     Relaying,
     Closing,
@@ -1919,6 +1928,84 @@ struct TlsInterceptConnection {
     to_guest: Vec<u8>,
     to_upstream: Vec<u8>,
     close_after_flush: bool,
+}
+
+struct RamaHttpConnection {
+    bridge: SyncAsyncBridge,
+    to_guest: Vec<u8>,
+    close_after_flush: bool,
+}
+
+impl RamaHttpConnection {
+    fn start(destination: &HttpDestination, initial_guest_bytes: Vec<u8>) -> io::Result<Self> {
+        let upstream = TcpStream::connect(upstream_socket_addr(&destination.ip, destination.port))?;
+        upstream.set_nonblocking(true)?;
+        let (bridge, async_io) = SyncAsyncBridge::new(HTTP_BRIDGE_BUFFER_BYTES);
+        if !initial_guest_bytes.is_empty() {
+            bridge.push_from_sync(&initial_guest_bytes);
+        }
+        thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Runtime::new() else {
+                return;
+            };
+            runtime.block_on(async move {
+                let Ok(upstream) =
+                    RamaTcpStream::try_from_std_tcp_stream(upstream, Extensions::new())
+                else {
+                    return;
+                };
+                let relay = HttpMitmRelay::new(Executor::default());
+                let _ = relay.serve(BridgeIo(async_io, upstream)).await;
+            });
+        });
+        Ok(Self {
+            bridge,
+            to_guest: Vec::new(),
+            close_after_flush: false,
+        })
+    }
+
+    fn poll(&mut self, socket: &mut tcp::Socket<'_>) {
+        while socket.can_recv() {
+            let writable = self.bridge.sync_write_capacity();
+            if writable == 0 {
+                break;
+            }
+            let mut buffer = [0; TLS_READ_BUFFER_BYTES];
+            let received = socket
+                .recv_slice(&mut buffer[..writable.min(TLS_READ_BUFFER_BYTES)])
+                .unwrap_or(0);
+            if received == 0 {
+                self.bridge.close_sync();
+                break;
+            }
+            if self.bridge.push_from_sync(&buffer[..received]) != received {
+                break;
+            }
+        }
+        while self.to_guest.len() < TLS_READ_BUFFER_BYTES {
+            let mut buffer = [0; TLS_READ_BUFFER_BYTES];
+            let read = self.bridge.pull_to_sync(&mut buffer);
+            if read == 0 {
+                break;
+            }
+            self.to_guest.extend_from_slice(&buffer[..read]);
+        }
+        while socket.can_send() && !self.to_guest.is_empty() {
+            let sent = socket.send_slice(&self.to_guest).unwrap_or(0);
+            if sent == 0 {
+                break;
+            }
+            self.to_guest.drain(..sent);
+        }
+        if self.bridge.async_is_closed() {
+            self.close_after_flush = true;
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.close_after_flush && self.to_guest.is_empty()
+    }
 }
 
 impl TlsInterceptConnection {
@@ -2221,6 +2308,13 @@ impl InterceptConnection {
         if matches!(self.state, InterceptState::ReadingHead { .. }) {
             self.read_guest_head(socket);
         }
+        if let InterceptState::RamaHttp(relay) = &mut self.state {
+            relay.poll(socket);
+            if relay.is_finished() {
+                self.close_after_flush = true;
+            }
+            return;
+        }
         if let InterceptState::Tls(tls) = &mut self.state {
             tls.poll(
                 socket,
@@ -2283,6 +2377,20 @@ impl InterceptConnection {
                         self.state = InterceptState::Tls(tls);
                     }
                     Err(_) => {
+                        self.close_after_flush = true;
+                        self.state = InterceptState::Closing;
+                    }
+                }
+                return;
+            }
+            if guest_head.starts_with(H2_PREFACE) {
+                let initial_bytes = std::mem::take(guest_head);
+                match RamaHttpConnection::start(&self.destination, initial_bytes) {
+                    Ok(relay) => {
+                        self.state = InterceptState::RamaHttp(relay);
+                    }
+                    Err(_) => {
+                        self.to_guest.extend_from_slice(OUTBOUND_DENIED_RESPONSE);
                         self.close_after_flush = true;
                         self.state = InterceptState::Closing;
                     }

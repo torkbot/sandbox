@@ -66,6 +66,15 @@ impl SyncAsyncBridge {
         written
     }
 
+    pub(crate) fn sync_write_capacity(&self) -> usize {
+        let state = self.inner.lock().unwrap();
+        if state.async_closed {
+            0
+        } else {
+            self.capacity.saturating_sub(state.sync_to_async.len())
+        }
+    }
+
     pub(crate) fn pull_to_sync(&self, output: &mut [u8]) -> usize {
         let mut state = self.inner.lock().unwrap();
         let read = output.len().min(state.async_to_sync.len());
@@ -144,6 +153,13 @@ impl AsyncWrite for AsyncBridgeIo {
         let mut state = self.inner.lock().unwrap();
         state.async_closed = true;
         Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for AsyncBridgeIo {
+    fn drop(&mut self) {
+        let mut state = self.inner.lock().unwrap();
+        state.async_closed = true;
     }
 }
 
