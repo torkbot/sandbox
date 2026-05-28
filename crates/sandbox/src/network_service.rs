@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, TcpStream, ToSocketAddrs, UdpSocket};
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -36,6 +36,7 @@ const HTTP_SOCKET_BUFFER_BYTES: usize = 256 * 1024;
 const TLS_READ_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_INTERCEPT_HEAD_BYTES: usize = 64 * 1024;
 const DNS_PACKET_BUFFER_BYTES: usize = 4096;
+const UDP_RELAY_BUFFER_BYTES: usize = 64 * 1024;
 const DNS_PROTECTED_TEST_IP: [u8; 4] = [10, 1, 2, 3];
 const DNS_PUBLIC_TEST_IP: [u8; 4] = [93, 184, 216, 34];
 const NAT_FLOW_IDLE_TTL: Duration = Duration::from_secs(300);
@@ -332,6 +333,8 @@ fn run_network_service(
     let mut tcp_dns_connections = HashMap::new();
     let mut http_sockets = HashMap::new();
     let mut http_connections = HashMap::new();
+    let mut udp_sockets = HashMap::new();
+    let mut udp_relays = HashMap::new();
     add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTP_PORT);
     add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTP_PROBE_PORT);
     if tls_authority.is_some() {
@@ -358,16 +361,36 @@ fn run_network_service(
             );
         }
         device.nat.prune_expired_flows();
-        let active_nat_ports = device.nat.host_ports().collect::<HashSet<_>>();
-        for port in &active_nat_ports {
+        let active_tcp_nat_ports = device.nat.tcp_host_ports().collect::<HashSet<_>>();
+        for port in &active_tcp_nat_ports {
             add_http_listener(&mut sockets, &mut http_sockets, *port);
         }
         prune_dynamic_http_listeners(
             &mut sockets,
             &mut http_sockets,
-            &active_nat_ports,
+            &active_tcp_nat_ports,
             &http_connections,
         );
+        let active_udp_nat_ports = device.nat.udp_host_ports().collect::<HashSet<_>>();
+        for port in &active_udp_nat_ports {
+            add_udp_relay_socket(&mut sockets, &mut udp_sockets, *port);
+        }
+        prune_dynamic_udp_relays(&mut sockets, &mut udp_sockets, &active_udp_nat_ports);
+        for (port, handle) in udp_sockets
+            .iter()
+            .map(|(port, handle)| (*port, *handle))
+            .collect::<Vec<_>>()
+        {
+            poll_udp_relay_socket(
+                &mut sockets,
+                handle,
+                port,
+                &device.nat,
+                outbound_rules.as_deref(),
+                policy.as_deref(),
+                &mut udp_relays,
+            );
+        }
         for (port, handle) in http_sockets
             .iter()
             .flat_map(|(port, handles)| handles.iter().map(|handle| (*port, *handle)))
@@ -487,6 +510,165 @@ fn poll_dns_socket(
             &response,
             IpEndpoint::new(remote.endpoint.addr, remote.endpoint.port),
         );
+    }
+}
+
+fn add_udp_relay_socket(
+    sockets: &mut SocketSet<'_>,
+    udp_sockets: &mut HashMap<u16, SocketHandle>,
+    port: u16,
+) {
+    udp_sockets.entry(port).or_insert_with(|| {
+        let rx = udp::PacketBuffer::new(
+            vec![udp::PacketMetadata::EMPTY; 8],
+            vec![0; UDP_RELAY_BUFFER_BYTES],
+        );
+        let tx = udp::PacketBuffer::new(
+            vec![udp::PacketMetadata::EMPTY; 8],
+            vec![0; UDP_RELAY_BUFFER_BYTES],
+        );
+        let mut socket = udp::Socket::new(rx, tx);
+        let _ = socket.bind(port);
+        sockets.add(socket)
+    });
+}
+
+fn prune_dynamic_udp_relays(
+    sockets: &mut SocketSet<'_>,
+    udp_sockets: &mut HashMap<u16, SocketHandle>,
+    active_nat_ports: &HashSet<u16>,
+) {
+    let stale_ports = udp_sockets
+        .keys()
+        .copied()
+        .filter(|port| !active_nat_ports.contains(port))
+        .collect::<Vec<_>>();
+    for port in stale_ports {
+        if let Some(handle) = udp_sockets.remove(&port) {
+            sockets.remove(handle);
+        }
+    }
+}
+
+fn poll_udp_relay_socket(
+    sockets: &mut SocketSet<'_>,
+    handle: SocketHandle,
+    host_port: u16,
+    nat: &TransparentNat,
+    outbound_rules: Option<&[OutboundRulePlan]>,
+    policy: Option<&dyn NetworkPolicyRuntime>,
+    relays: &mut HashMap<UdpFlow, UdpRelay>,
+) {
+    let socket = sockets.get_mut::<udp::Socket>(handle);
+    while socket.can_recv() {
+        let Ok((payload, remote)) = socket.recv() else {
+            break;
+        };
+        let Some(destination) =
+            nat.udp_original_destination(remote.endpoint.addr, remote.endpoint.port, host_port)
+        else {
+            continue;
+        };
+        if outbound_rules
+            .is_some_and(|rules| !is_allowed_outbound_udp(&destination.ip, destination.port, rules))
+        {
+            continue;
+        }
+        if policy.is_some_and(|policy| {
+            !policy_allows_connection(
+                policy,
+                NetworkProtocol::Udp,
+                NetworkEndpoint {
+                    ip: remote.endpoint.addr.to_string(),
+                    port: remote.endpoint.port,
+                },
+                NetworkEndpoint {
+                    ip: destination.ip.clone(),
+                    port: destination.port,
+                },
+            )
+        }) {
+            continue;
+        }
+        let flow = UdpFlow {
+            guest_ip: remote.endpoint.addr,
+            guest_port: remote.endpoint.port,
+            host_port,
+        };
+        let relay = relays.entry(flow).or_insert_with(|| {
+            UdpRelay::connect(&destination.ip, destination.port)
+                .unwrap_or_else(|_| UdpRelay::closed())
+        });
+        relay.send(payload);
+    }
+
+    let stale = relays
+        .iter_mut()
+        .filter_map(|(flow, relay)| {
+            if flow.host_port != host_port {
+                return None;
+            }
+            relay.recv().map(|payload| (*flow, payload))
+        })
+        .collect::<Vec<_>>();
+    for (flow, payload) in stale {
+        let _ = socket.send_slice(&payload, IpEndpoint::new(flow.guest_ip, flow.guest_port));
+    }
+    relays.retain(|_, relay| !relay.is_expired());
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct UdpFlow {
+    guest_ip: IpAddress,
+    guest_port: u16,
+    host_port: u16,
+}
+
+struct UdpRelay {
+    socket: Option<UdpSocket>,
+    last_seen: StdInstant,
+}
+
+impl UdpRelay {
+    fn connect(destination_ip: &str, destination_port: u16) -> io::Result<Self> {
+        let socket = UdpSocket::bind(("127.0.0.1", 0))?;
+        socket.connect(upstream_socket_addr(destination_ip, destination_port))?;
+        socket.set_nonblocking(true)?;
+        Ok(Self {
+            socket: Some(socket),
+            last_seen: StdInstant::now(),
+        })
+    }
+
+    fn closed() -> Self {
+        Self {
+            socket: None,
+            last_seen: StdInstant::now(),
+        }
+    }
+
+    fn send(&mut self, payload: &[u8]) {
+        self.last_seen = StdInstant::now();
+        if let Some(socket) = &self.socket {
+            let _ = socket.send(payload);
+        }
+    }
+
+    fn recv(&mut self) -> Option<Vec<u8>> {
+        let socket = self.socket.as_ref()?;
+        let mut buffer = [0; UDP_RELAY_BUFFER_BYTES];
+        match socket.recv(&mut buffer) {
+            Ok(read) => {
+                self.last_seen = StdInstant::now();
+                Some(buffer[..read].to_vec())
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => None,
+            Err(_) => None,
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        StdInstant::now().duration_since(self.last_seen) > NAT_FLOW_IDLE_TTL
     }
 }
 
@@ -631,7 +813,7 @@ fn poll_http_socket(
     sockets: &mut SocketSet<'_>,
     handle: SocketHandle,
     port: u16,
-    nat: &TransparentTcpNat,
+    nat: &TransparentNat,
     outbound_rules: Option<&[OutboundRulePlan]>,
     http: Option<Arc<dyn HttpInterceptRuntime>>,
     policy: Option<Arc<dyn NetworkPolicyRuntime>>,
@@ -704,7 +886,7 @@ struct HttpDestination {
 
 fn original_http_destination(
     socket: &tcp::Socket<'_>,
-    nat: &TransparentTcpNat,
+    nat: &TransparentNat,
 ) -> Option<HttpDestination> {
     let remote = socket.remote_endpoint()?;
     let local = socket.local_endpoint()?;
@@ -720,7 +902,7 @@ fn original_http_destination(
 fn poll_plain_http_socket(
     socket: &mut tcp::Socket<'_>,
     handle: SocketHandle,
-    nat: &TransparentTcpNat,
+    nat: &TransparentNat,
     outbound_rules: Option<&[OutboundRulePlan]>,
     http: Option<Arc<dyn HttpInterceptRuntime>>,
     policy: Option<Arc<dyn NetworkPolicyRuntime>>,
@@ -1464,7 +1646,10 @@ fn is_allowed_outbound_udp(
         OutboundRulePlan::AcceptUdp { cidr, ports } => {
             port_matches(ports, destination_port) && cidr_contains(cidr, destination_ip)
         }
-        OutboundRulePlan::AcceptTcp { .. } | OutboundRulePlan::AcceptPublicInternet { .. } => false,
+        OutboundRulePlan::AcceptTcp { .. } => false,
+        OutboundRulePlan::AcceptPublicInternet { ports } => {
+            port_matches(ports, destination_port) && is_public_ipv4_destination(destination_ip)
+        }
     })
 }
 
@@ -1738,7 +1923,7 @@ fn dns_address(name: &str) -> Option<[u8; 4]> {
 struct LibkrunNetDevice {
     rx: UnixStream,
     tx: UnixStream,
-    nat: TransparentTcpNat,
+    nat: TransparentNat,
     rx_buffer: Vec<u8>,
     staged_rx: Option<Vec<u8>>,
     pending_tx: Vec<u8>,
@@ -1749,7 +1934,7 @@ impl LibkrunNetDevice {
         Self {
             rx,
             tx,
-            nat: TransparentTcpNat::new(host_ip),
+            nat: TransparentNat::new(host_ip),
             rx_buffer: Vec::new(),
             staged_rx: None,
             pending_tx: Vec::new(),
@@ -1875,7 +2060,7 @@ impl phy::RxToken for LibkrunRxToken {
 
 struct LibkrunTxToken<'a> {
     pending_tx: &'a mut Vec<u8>,
-    nat: &'a mut TransparentTcpNat,
+    nat: &'a mut TransparentNat,
 }
 
 impl phy::TxToken for LibkrunTxToken<'_> {
@@ -2474,9 +2659,10 @@ impl InterceptConnection {
 }
 
 #[derive(Debug)]
-struct TransparentTcpNat {
+struct TransparentNat {
     host_ip: [u8; 4],
-    flows: HashMap<TcpFlow, NatFlow>,
+    tcp_flows: HashMap<TcpFlow, NatFlow>,
+    udp_flows: HashMap<UdpNatFlow, NatFlow>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2493,42 +2679,79 @@ struct NatFlow {
     closing: bool,
 }
 
-impl TransparentTcpNat {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct UdpNatFlow {
+    guest_ip: [u8; 4],
+    guest_port: u16,
+    host_port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UdpDestination {
+    ip: String,
+    port: u16,
+}
+
+impl TransparentNat {
     fn new(host_ip: Ipv4Address) -> Self {
         Self {
             host_ip: host_ip.octets(),
-            flows: HashMap::new(),
+            tcp_flows: HashMap::new(),
+            udp_flows: HashMap::new(),
         }
     }
 
     fn rewrite_guest_frame(&mut self, frame: &mut [u8]) -> bool {
         self.prune_expired_flows();
-        let Some(packet) = Ipv4TcpPacket::parse(frame) else {
+        if let Some(packet) = Ipv4TcpPacket::parse(frame) {
+            if packet.destination_ip(frame) == self.host_ip {
+                return false;
+            }
+
+            let flow = TcpFlow {
+                guest_ip: packet.source_ip(frame),
+                guest_port: packet.source_port(frame),
+                host_port: packet.destination_port(frame),
+            };
+            let new_host_port = !self.tcp_flows.contains_key(&flow);
+            let flags = packet.tcp_flags(frame);
+            if flags.rst {
+                self.tcp_flows.remove(&flow);
+            } else {
+                self.tcp_flows.insert(
+                    flow,
+                    NatFlow {
+                        destination_ip: packet.destination_ip(frame),
+                        last_seen: StdInstant::now(),
+                        closing: flags.fin,
+                    },
+                );
+            }
+            packet.set_destination_ip(frame, self.host_ip);
+            packet.recompute_checksums(frame);
+            return new_host_port;
+        }
+
+        let Some(packet) = Ipv4UdpPacket::parse(frame) else {
             return false;
         };
         if packet.destination_ip(frame) == self.host_ip {
             return false;
         }
-
-        let flow = TcpFlow {
+        let flow = UdpNatFlow {
             guest_ip: packet.source_ip(frame),
             guest_port: packet.source_port(frame),
             host_port: packet.destination_port(frame),
         };
-        let new_host_port = !self.flows.contains_key(&flow);
-        let flags = packet.tcp_flags(frame);
-        if flags.rst {
-            self.flows.remove(&flow);
-        } else {
-            self.flows.insert(
-                flow,
-                NatFlow {
-                    destination_ip: packet.destination_ip(frame),
-                    last_seen: StdInstant::now(),
-                    closing: flags.fin,
-                },
-            );
-        }
+        let new_host_port = !self.udp_flows.contains_key(&flow);
+        self.udp_flows.insert(
+            flow,
+            NatFlow {
+                destination_ip: packet.destination_ip(frame),
+                last_seen: StdInstant::now(),
+                closing: false,
+            },
+        );
         packet.set_destination_ip(frame, self.host_ip);
         packet.recompute_checksums(frame);
         new_host_port
@@ -2536,28 +2759,45 @@ impl TransparentTcpNat {
 
     fn rewrite_host_frame(&mut self, frame: &mut [u8]) {
         self.prune_expired_flows();
-        let Some(packet) = Ipv4TcpPacket::parse(frame) else {
+        if let Some(packet) = Ipv4TcpPacket::parse(frame) {
+            if packet.source_ip(frame) != self.host_ip {
+                return;
+            }
+
+            let flow = TcpFlow {
+                guest_ip: packet.destination_ip(frame),
+                guest_port: packet.destination_port(frame),
+                host_port: packet.source_port(frame),
+            };
+            let Some(nat_flow) = self.tcp_flows.get_mut(&flow) else {
+                return;
+            };
+            nat_flow.last_seen = StdInstant::now();
+            let original_destination = nat_flow.destination_ip;
+            let flags = packet.tcp_flags(frame);
+            packet.set_source_ip(frame, original_destination);
+            packet.recompute_checksums(frame);
+            if flags.fin || flags.rst {
+                self.tcp_flows.remove(&flow);
+            }
+            return;
+        }
+
+        let Some(packet) = Ipv4UdpPacket::parse(frame) else {
             return;
         };
         if packet.source_ip(frame) != self.host_ip {
             return;
         }
-
-        let flow = TcpFlow {
+        let flow = UdpNatFlow {
             guest_ip: packet.destination_ip(frame),
             guest_port: packet.destination_port(frame),
             host_port: packet.source_port(frame),
         };
-        let Some(nat_flow) = self.flows.get_mut(&flow) else {
-            return;
-        };
-        nat_flow.last_seen = StdInstant::now();
-        let original_destination = nat_flow.destination_ip;
-        let flags = packet.tcp_flags(frame);
-        packet.set_source_ip(frame, original_destination);
-        packet.recompute_checksums(frame);
-        if flags.fin || flags.rst {
-            self.flows.remove(&flow);
+        if let Some(nat_flow) = self.udp_flows.get_mut(&flow) {
+            nat_flow.last_seen = StdInstant::now();
+            packet.set_source_ip(frame, nat_flow.destination_ip);
+            packet.recompute_checksums(frame);
         }
     }
 
@@ -2575,19 +2815,46 @@ impl TransparentTcpNat {
             guest_port,
             host_port,
         };
-        self.flows.get(&flow).map(|flow| {
+        self.tcp_flows.get(&flow).map(|flow| {
             let address = flow.destination_ip;
             Ipv4Address::new(address[0], address[1], address[2], address[3]).to_string()
         })
     }
 
-    fn host_ports(&self) -> impl Iterator<Item = u16> + '_ {
-        self.flows.keys().map(|flow| flow.host_port)
+    fn udp_original_destination(
+        &self,
+        guest_ip: IpAddress,
+        guest_port: u16,
+        host_port: u16,
+    ) -> Option<UdpDestination> {
+        let guest_ip = match guest_ip {
+            IpAddress::Ipv4(guest_ip) => guest_ip.octets(),
+        };
+        let flow = UdpNatFlow {
+            guest_ip,
+            guest_port,
+            host_port,
+        };
+        self.udp_flows.get(&flow).map(|flow| {
+            let address = flow.destination_ip;
+            UdpDestination {
+                ip: Ipv4Address::new(address[0], address[1], address[2], address[3]).to_string(),
+                port: host_port,
+            }
+        })
+    }
+
+    fn tcp_host_ports(&self) -> impl Iterator<Item = u16> + '_ {
+        self.tcp_flows.keys().map(|flow| flow.host_port)
+    }
+
+    fn udp_host_ports(&self) -> impl Iterator<Item = u16> + '_ {
+        self.udp_flows.keys().map(|flow| flow.host_port)
     }
 
     fn prune_expired_flows(&mut self) {
         let now = StdInstant::now();
-        self.flows.retain(|_, flow| {
+        self.tcp_flows.retain(|_, flow| {
             now.duration_since(flow.last_seen)
                 < if flow.closing {
                     NAT_FLOW_CLOSING_TTL
@@ -2595,6 +2862,8 @@ impl TransparentTcpNat {
                     NAT_FLOW_IDLE_TTL
                 }
         });
+        self.udp_flows
+            .retain(|_, flow| now.duration_since(flow.last_seen) < NAT_FLOW_IDLE_TTL);
     }
 }
 
@@ -2704,6 +2973,94 @@ struct TcpFlags {
     rst: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Ipv4UdpPacket {
+    ip_start: usize,
+    udp_start: usize,
+}
+
+impl Ipv4UdpPacket {
+    fn parse(frame: &[u8]) -> Option<Self> {
+        if frame.len() < 14 + 20 {
+            return None;
+        }
+        if u16::from_be_bytes([frame[12], frame[13]]) != 0x0800 {
+            return None;
+        }
+        let ip_start = 14;
+        let version = frame[ip_start] >> 4;
+        let ihl = usize::from(frame[ip_start] & 0x0f) * 4;
+        if version != 4 || ihl < 20 || frame.len() < ip_start + ihl {
+            return None;
+        }
+        if frame[ip_start + 9] != 17 {
+            return None;
+        }
+        let total_len = usize::from(u16::from_be_bytes([
+            frame[ip_start + 2],
+            frame[ip_start + 3],
+        ]));
+        if total_len < ihl + 8 || frame.len() < ip_start + total_len {
+            return None;
+        }
+        let udp_start = ip_start + ihl;
+        Some(Self {
+            ip_start,
+            udp_start,
+        })
+    }
+
+    fn source_ip(self, frame: &[u8]) -> [u8; 4] {
+        frame[self.ip_start + 12..self.ip_start + 16]
+            .try_into()
+            .unwrap()
+    }
+
+    fn destination_ip(self, frame: &[u8]) -> [u8; 4] {
+        frame[self.ip_start + 16..self.ip_start + 20]
+            .try_into()
+            .unwrap()
+    }
+
+    fn set_source_ip(self, frame: &mut [u8], address: [u8; 4]) {
+        frame[self.ip_start + 12..self.ip_start + 16].copy_from_slice(&address);
+    }
+
+    fn set_destination_ip(self, frame: &mut [u8], address: [u8; 4]) {
+        frame[self.ip_start + 16..self.ip_start + 20].copy_from_slice(&address);
+    }
+
+    fn source_port(self, frame: &[u8]) -> u16 {
+        u16::from_be_bytes([frame[self.udp_start], frame[self.udp_start + 1]])
+    }
+
+    fn destination_port(self, frame: &[u8]) -> u16 {
+        u16::from_be_bytes([frame[self.udp_start + 2], frame[self.udp_start + 3]])
+    }
+
+    fn recompute_checksums(self, frame: &mut [u8]) {
+        let total_len = usize::from(u16::from_be_bytes([
+            frame[self.ip_start + 2],
+            frame[self.ip_start + 3],
+        ]));
+        frame[self.ip_start + 10] = 0;
+        frame[self.ip_start + 11] = 0;
+        let ip_header_len = self.udp_start - self.ip_start;
+        let ip_checksum = internet_checksum(&frame[self.ip_start..self.udp_start]);
+        frame[self.ip_start + 10..self.ip_start + 12].copy_from_slice(&ip_checksum.to_be_bytes());
+
+        let udp_len = total_len - ip_header_len;
+        frame[self.udp_start + 6] = 0;
+        frame[self.udp_start + 7] = 0;
+        let checksum = udp_ipv4_checksum(
+            self.source_ip(frame),
+            self.destination_ip(frame),
+            &frame[self.udp_start..self.udp_start + udp_len],
+        );
+        frame[self.udp_start + 6..self.udp_start + 8].copy_from_slice(&checksum.to_be_bytes());
+    }
+}
+
 fn tcp_ipv4_checksum(source: [u8; 4], destination: [u8; 4], tcp: &[u8]) -> u16 {
     let mut pseudo_header = Vec::with_capacity(12 + tcp.len());
     pseudo_header.extend_from_slice(&source);
@@ -2713,6 +3070,18 @@ fn tcp_ipv4_checksum(source: [u8; 4], destination: [u8; 4], tcp: &[u8]) -> u16 {
     pseudo_header.extend_from_slice(&(tcp.len() as u16).to_be_bytes());
     pseudo_header.extend_from_slice(tcp);
     internet_checksum(&pseudo_header)
+}
+
+fn udp_ipv4_checksum(source: [u8; 4], destination: [u8; 4], udp: &[u8]) -> u16 {
+    let mut pseudo_header = Vec::with_capacity(12 + udp.len());
+    pseudo_header.extend_from_slice(&source);
+    pseudo_header.extend_from_slice(&destination);
+    pseudo_header.push(0);
+    pseudo_header.push(17);
+    pseudo_header.extend_from_slice(&(udp.len() as u16).to_be_bytes());
+    pseudo_header.extend_from_slice(udp);
+    let checksum = internet_checksum(&pseudo_header);
+    if checksum == 0 { 0xffff } else { checksum }
 }
 
 fn internet_checksum(bytes: &[u8]) -> u16 {
@@ -2997,7 +3366,7 @@ mod tests {
 
     #[test]
     fn transparent_nat_prunes_flow_after_host_fin() {
-        let mut nat = TransparentTcpNat::new(Ipv4Address::new(10, 0, 2, 1));
+        let mut nat = TransparentNat::new(Ipv4Address::new(10, 0, 2, 1));
         let mut guest_frame = tcp_frame([10, 0, 2, 15], [93, 184, 216, 34], 50_000, 443, 0x02);
 
         nat.rewrite_guest_frame(&mut guest_frame);
@@ -3013,7 +3382,7 @@ mod tests {
             nat.original_destination(IpAddress::v4(10, 0, 2, 15), 50_000, 443),
             None
         );
-        assert_eq!(nat.host_ports().count(), 0);
+        assert_eq!(nat.tcp_host_ports().count(), 0);
     }
 
     #[test]
