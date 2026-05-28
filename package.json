@@ -1,6 +1,6 @@
 {
   "name": "@torkbot/sandbox",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": false,
   "type": "module",
   "description": "A TypeScript-first Node.js library for spawning libkrun-backed microVMs.",
