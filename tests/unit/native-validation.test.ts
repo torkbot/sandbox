@@ -38,7 +38,7 @@ test("defineSandbox rejects invalid COW rootfs", () => {
   assert.throws(
     () => defineSandbox({
       rootfs: rootfs.cow({
-        base: rootfs.builtIn("alpine:3.23"),
+        base: rootfs.builtIn("alpine:3.20"),
         writable: {
           ...memoryBlockStore(),
           blockSize: 0,
@@ -52,7 +52,7 @@ test("defineSandbox rejects invalid COW rootfs", () => {
 test("defineSandbox rejects invalid resource limits", () => {
   assert.throws(
     () => defineSandbox({
-      rootfs: rootfs.builtIn("alpine:3.23"),
+      rootfs: rootfs.builtIn("alpine:3.20"),
       resources: { cpus: 0 },
     }),
     /invalid sandbox definition: resources\.cpus must be a positive integer/,
@@ -60,7 +60,7 @@ test("defineSandbox rejects invalid resource limits", () => {
 
   assert.throws(
     () => defineSandbox({
-      rootfs: rootfs.builtIn("alpine:3.23"),
+      rootfs: rootfs.builtIn("alpine:3.20"),
       resources: { cpus: 256 },
     }),
     /invalid sandbox definition: resources\.cpus must be less than or equal to 255/,
@@ -68,7 +68,7 @@ test("defineSandbox rejects invalid resource limits", () => {
 
   assert.throws(
     () => defineSandbox({
-      rootfs: rootfs.builtIn("alpine:3.23"),
+      rootfs: rootfs.builtIn("alpine:3.20"),
       resources: { memoryMiB: 0 },
     }),
     /invalid sandbox definition: resources\.memoryMiB must be a positive integer/,
@@ -77,7 +77,7 @@ test("defineSandbox rejects invalid resource limits", () => {
 
 test("boot rejects relative mount paths before runtime launch", async () => {
   const sandbox = defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: rootfs.builtIn("alpine:3.20"),
   });
 
   await assert.rejects(
@@ -92,7 +92,7 @@ test("boot rejects relative mount paths before runtime launch", async () => {
 
 test("boot rejects root and dot-component mount paths before runtime launch", async () => {
   const sandbox = defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: rootfs.builtIn("alpine:3.20"),
   });
 
   await assert.rejects(
@@ -116,7 +116,7 @@ test("boot rejects root and dot-component mount paths before runtime launch", as
 
 test("boot rejects mount paths with NUL bytes before runtime launch", async () => {
   const sandbox = defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: rootfs.builtIn("alpine:3.20"),
   });
 
   await assert.rejects(
@@ -131,7 +131,7 @@ test("boot rejects mount paths with NUL bytes before runtime launch", async () =
 
 test("boot rejects writable mounts without POSIX filesystem support", async () => {
   const sandbox = defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: rootfs.builtIn("alpine:3.20"),
   });
 
   await assert.rejects(

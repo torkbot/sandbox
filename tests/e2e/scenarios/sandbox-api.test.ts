@@ -14,7 +14,7 @@ test("new public API boots a built-in rootfs and runs a process", async (t) => {
   }
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: rootfs.builtIn("alpine:3.20"),
   }).boot();
 
   const result = await sandbox.exec("/bin/sh", ["-lc", "printf '%s' ready"]);
@@ -39,7 +39,7 @@ test("boot options provide instance-specific virtual mounts", async (t) => {
     },
   });
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: rootfs.builtIn("alpine:3.20"),
   }).boot({
     mounts: {
       "/mnt": fs.virtual(laneFs),
@@ -58,7 +58,7 @@ test("boot cwd becomes the default process working directory", async (t) => {
   }
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: rootfs.builtIn("alpine:3.20"),
   }).boot({
     cwd: "/tmp",
   });
@@ -77,7 +77,7 @@ test("COW rootfs round-trips rootfs mutations across instances", async (t) => {
   const blockStore = memoryBlockStore();
   const sandboxDefinition = defineSandbox({
     rootfs: rootfs.cow({
-      base: rootfs.builtIn("alpine:3.23"),
+      base: rootfs.builtIn("alpine:3.20"),
       writable: blockStore,
     }),
   });
@@ -99,7 +99,7 @@ test("COW rootfs round-trips rootfs mutations across instances", async (t) => {
   assert.equal(read.exitCode, 0, read.stderr);
   assert.equal(read.stdout, "persisted");
   assert.deepEqual(blockStore.observedBaseIdentities().length, 1);
-  assert.match(blockStore.observedBaseIdentities()[0] ?? "", /built-in:alpine:3\.23:ext4:/);
+  assert.match(blockStore.observedBaseIdentities()[0] ?? "", /built-in:alpine:3\.20:ext4:/);
 });
 
 test("COW rootfs close sync ignores the instance cwd", async (t) => {
@@ -110,7 +110,7 @@ test("COW rootfs close sync ignores the instance cwd", async (t) => {
   const blockStore = memoryBlockStore();
   const sandboxDefinition = defineSandbox({
     rootfs: rootfs.cow({
-      base: rootfs.builtIn("alpine:3.23"),
+      base: rootfs.builtIn("alpine:3.20"),
       writable: blockStore,
     }),
   });

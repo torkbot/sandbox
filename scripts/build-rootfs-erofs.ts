@@ -3,11 +3,8 @@ import { basename, dirname, resolve } from "node:path";
 import { spawn } from "node:child_process";
 
 const repoRoot = resolve(import.meta.dirname, "..");
-const sourceDir = resolve(repoRoot, process.env.SANDBOX_ROOTFS_SOURCE_DIR ?? "dist/rootfs/alpine-3.23");
-const outPath = resolve(repoRoot, process.env.SANDBOX_ROOTFS_EROFS_OUT ?? "dist/rootfs/alpine-3.23.erofs");
-const compression = process.env.SANDBOX_EROFS_COMPRESSION ?? "lz4hc,level=12";
-const clusterSize = process.env.SANDBOX_EROFS_CLUSTER_SIZE ?? "1048576";
-const extendedOptions = process.env.SANDBOX_EROFS_EXTENDED_OPTIONS ?? "fragments";
+const sourceDir = resolve(repoRoot, process.env.SANDBOX_ROOTFS_SOURCE_DIR ?? "dist/rootfs/alpine-3.20");
+const outPath = resolve(repoRoot, process.env.SANDBOX_ROOTFS_EROFS_OUT ?? "dist/rootfs/alpine-3.20.erofs");
 
 await assertDirectory(sourceDir);
 const outDir = dirname(outPath);
@@ -20,24 +17,13 @@ await run("docker", [
   `${sourceDir}:/rootfs:ro`,
   "--volume",
   `${outDir}:/out`,
-  process.env.SANDBOX_EROFS_BUILDER_IMAGE ?? "alpine:3.23",
+  process.env.SANDBOX_EROFS_BUILDER_IMAGE ?? "debian:bookworm",
   "sh",
   "-lc",
   [
-    "apk add --no-cache erofs-utils ca-certificates",
-    [
-      "mkfs.erofs",
-      "--quiet",
-      "-x-1",
-      `-z${shellArg(compression)}`,
-      `-C${shellArg(clusterSize)}`,
-      `-E${shellArg(extendedOptions)}`,
-      "-T0",
-      "-U 00000000-0000-0000-0000-000000000000",
-      "--all-root",
-      `/out/${shellArg(basename(outPath))}`,
-      "/rootfs",
-    ].join(" "),
+    "apt-get update",
+    "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends erofs-utils ca-certificates",
+    `mkfs.erofs -x-1 -T0 -U 00000000-0000-0000-0000-000000000000 --all-root /out/${shellArg(basename(outPath))} /rootfs`,
   ].join(" && "),
 ]);
 

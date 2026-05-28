@@ -3,8 +3,8 @@ import { basename, dirname, resolve } from "node:path";
 import { spawn } from "node:child_process";
 
 const repoRoot = resolve(import.meta.dirname, "..");
-const sourceDir = resolve(repoRoot, process.env.SANDBOX_ROOTFS_SOURCE_DIR ?? "dist/rootfs/alpine-3.23");
-const outPath = resolve(repoRoot, process.env.SANDBOX_ROOTFS_EXT4_OUT ?? "dist/rootfs/alpine-3.23.ext4");
+const sourceDir = resolve(repoRoot, process.env.SANDBOX_ROOTFS_SOURCE_DIR ?? "dist/rootfs/alpine-3.20");
+const outPath = resolve(repoRoot, process.env.SANDBOX_ROOTFS_EXT4_OUT ?? "dist/rootfs/alpine-3.20.ext4");
 
 await assertDirectory(sourceDir);
 const outDir = dirname(outPath);

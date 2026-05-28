@@ -73,7 +73,7 @@ const report = {
   platform: platform(),
   arch: process.arch,
   command: config.command,
-  rootfs: "alpine:3.23",
+  rootfs: "alpine:3.20",
   git: gitMetadata(),
   node: {
     execPath: process.execPath,
@@ -104,7 +104,7 @@ async function runLifecycleIteration(
   const totalStart = nowMs();
   const bootStart = totalStart;
   const sandboxDefinition = defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: rootfs.builtIn("alpine:3.20"),
   });
 
   const sandbox = await sandboxDefinition.boot();
@@ -153,7 +153,7 @@ async function assertVmLaunchSupport(): Promise<{
   if (process.platform !== "darwin" && process.platform !== "linux") {
     throw new Error(`unsupported VM launch host platform: ${process.platform}`);
   }
-  const rootfsPath = resolve(repoRoot, "dist/rootfs/alpine-3.23.erofs");
+  const rootfsPath = resolve(repoRoot, "dist/rootfs/alpine-3.20.erofs");
   await access(rootfsPath);
   return {
     hostBinary: await artifactMetadata(hostBinary),

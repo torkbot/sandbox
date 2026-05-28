@@ -24,7 +24,7 @@ const workspace = fs.memory({});
 
 const sandbox = defineSandbox({
   rootfs: rootfs.cow({
-    base: rootfs.builtIn("alpine:3.23"),
+    base: rootfs.builtIn("alpine:3.20"),
     writable: blockStore,
   }),
   network: network.policy((connection) => {

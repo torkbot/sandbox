@@ -235,8 +235,8 @@ jobs:
         with:
           name: rootfs-${{ matrix.guest_arch }}
           path: |
-            dist/rootfs/alpine-3.23.erofs
-            dist/rootfs/alpine-3.23.ext4
+            dist/rootfs/alpine-3.20.erofs
+            dist/rootfs/alpine-3.20.ext4
           if-no-files-found: error
 
   build-root:

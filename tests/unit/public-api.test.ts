@@ -11,9 +11,9 @@ import {
 } from "../../src/index.ts";
 
 test("rootfs.builtIn creates a typed built-in rootfs reference", () => {
-  assert.deepEqual(rootfs.builtIn("alpine:3.23"), {
+  assert.deepEqual(rootfs.builtIn("alpine:3.20"), {
     kind: "built-in-rootfs",
-    name: "alpine:3.23",
+    name: "alpine:3.20",
   });
 });
 
@@ -30,13 +30,13 @@ test("rootfs.cow couples a built-in base with writable block storage", () => {
   const blockStore = memoryBlockStore();
 
   assert.deepEqual(rootfs.cow({
-    base: rootfs.builtIn("alpine:3.23"),
+    base: rootfs.builtIn("alpine:3.20"),
     writable: blockStore,
   }), {
     kind: "cow-rootfs",
     base: {
       kind: "built-in-rootfs",
-      name: "alpine:3.23",
+      name: "alpine:3.20",
     },
     writable: blockStore,
   });
@@ -202,7 +202,7 @@ test("fs.memory rejects directory renames into their own subtree", async () => {
 
 test("defineSandbox accepts resource limits", () => {
   const sandbox = defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: rootfs.builtIn("alpine:3.20"),
     resources: {
       cpus: 2,
       memoryMiB: 1024,
@@ -215,7 +215,7 @@ test("defineSandbox accepts resource limits", () => {
 test("defineSandbox accepts COW rootfs", () => {
   const sandbox = defineSandbox({
     rootfs: rootfs.cow({
-      base: rootfs.builtIn("alpine:3.23"),
+      base: rootfs.builtIn("alpine:3.20"),
       writable: memoryBlockStore(),
     }),
   });
@@ -227,7 +227,7 @@ test("defineSandbox rejects invalid COW rootfs block store", () => {
   assert.throws(
     () => defineSandbox({
       rootfs: rootfs.cow({
-        base: rootfs.builtIn("alpine:3.23"),
+        base: rootfs.builtIn("alpine:3.20"),
         writable: {
           ...memoryBlockStore(),
           blockSize: 1_000,

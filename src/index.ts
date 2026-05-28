@@ -92,7 +92,7 @@ export interface SandboxHttpRequest {
   };
 }
 
-export type BuiltInRootfsName = "alpine:3.23";
+export type BuiltInRootfsName = "alpine:3.20";
 
 export type BuiltInRootfsConfig = {
   readonly kind: "built-in-rootfs";
@@ -700,7 +700,7 @@ function validateSandboxDefinitionOptions(options: SandboxDefinitionOptions): vo
 }
 
 function validateBuiltInRootfsName(name: string): void {
-  if (name !== "alpine:3.23") {
+  if (name !== "alpine:3.20") {
     throw new Error(`unsupported built-in rootfs: ${name}`);
   }
 }
