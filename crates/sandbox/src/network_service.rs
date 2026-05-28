@@ -4,16 +4,16 @@ use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs, UdpSocket};
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant as StdInstant};
 
-use rustls::DigitallySignedStruct;
-use rustls::SignatureScheme;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::UnixTime;
+use rustls::DigitallySignedStruct;
+use rustls::SignatureScheme;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::{tcp, udp};
@@ -37,6 +37,8 @@ const TLS_READ_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_INTERCEPT_HEAD_BYTES: usize = 64 * 1024;
 const DNS_PACKET_BUFFER_BYTES: usize = 4096;
 const UDP_RELAY_BUFFER_BYTES: usize = 64 * 1024;
+const UDP_NAT_PORT_START: u16 = 40_000;
+const UDP_NAT_PORT_END: u16 = 60_999;
 const DNS_PROTECTED_TEST_IP: [u8; 4] = [10, 1, 2, 3];
 const DNS_PUBLIC_TEST_IP: [u8; 4] = [93, 184, 216, 34];
 const NAT_FLOW_IDLE_TTL: Duration = Duration::from_secs(300);
@@ -594,6 +596,8 @@ fn poll_udp_relay_socket(
             guest_ip: remote.endpoint.addr,
             guest_port: remote.endpoint.port,
             host_port,
+            destination_ip: destination.ip.clone(),
+            destination_port: destination.port,
         };
         let relay = relays.entry(flow).or_insert_with(|| {
             UdpRelay::connect(&destination.ip, destination.port)
@@ -608,7 +612,7 @@ fn poll_udp_relay_socket(
             if flow.host_port != host_port {
                 return None;
             }
-            relay.recv().map(|payload| (*flow, payload))
+            relay.recv().map(|payload| (flow.clone(), payload))
         })
         .collect::<Vec<_>>();
     for (flow, payload) in stale {
@@ -617,11 +621,13 @@ fn poll_udp_relay_socket(
     relays.retain(|_, relay| !relay.is_expired());
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct UdpFlow {
     guest_ip: IpAddress,
     guest_port: u16,
     host_port: u16,
+    destination_ip: String,
+    destination_port: u16,
 }
 
 struct UdpRelay {
@@ -631,7 +637,7 @@ struct UdpRelay {
 
 impl UdpRelay {
     fn connect(destination_ip: &str, destination_port: u16) -> io::Result<Self> {
-        let socket = UdpSocket::bind(("127.0.0.1", 0))?;
+        let socket = UdpSocket::bind(("0.0.0.0", 0))?;
         socket.connect(upstream_socket_addr(destination_ip, destination_port))?;
         socket.set_nonblocking(true)?;
         Ok(Self {
@@ -860,20 +866,40 @@ fn bytes_could_be_http_request(bytes: &[u8]) -> bool {
     if H2_PREFACE.starts_with(bytes) {
         return true;
     }
-    const METHODS: [&[u8]; 9] = [
-        b"GET ",
-        b"HEAD ",
-        b"POST ",
-        b"PUT ",
-        b"PATCH ",
-        b"DELETE ",
-        b"OPTIONS ",
-        b"TRACE ",
-        b"CONNECT ",
-    ];
-    METHODS
-        .iter()
-        .any(|method| method.starts_with(bytes) || bytes.starts_with(method))
+    if bytes.is_empty() {
+        return true;
+    }
+    let mut saw_method_byte = false;
+    for byte in bytes {
+        if is_http_method_token_byte(*byte) {
+            saw_method_byte = true;
+            continue;
+        }
+        return saw_method_byte && *byte == b' ';
+    }
+    saw_method_byte
+}
+
+fn is_http_method_token_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'!' | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~'
+            | b'0'..=b'9'
+            | b'A'..=b'Z'
+    )
 }
 
 #[derive(Clone)]
@@ -1490,7 +1516,11 @@ fn validate_upstream_allowed(
 }
 
 fn default_port_for_scheme(scheme: &str) -> u16 {
-    if scheme == "https" { 443 } else { 80 }
+    if scheme == "https" {
+        443
+    } else {
+        80
+    }
 }
 
 fn tls_client_hello_sni(bytes: &[u8]) -> Option<String> {
@@ -1802,21 +1832,44 @@ fn dns_policy_response(
 ) -> Option<Vec<u8>> {
     let mut answers = Vec::new();
     for answer in &policy_response.answers {
-        if answer.answer_type != "A" {
-            continue;
-        }
-        let Some(address) = answer
-            .address
-            .as_deref()
-            .and_then(|address| address.parse::<std::net::Ipv4Addr>().ok())
-        else {
-            continue;
+        let name = answer.name.as_deref().unwrap_or(question_name);
+        let encoded_name = encode_dns_answer_name(name, question_name)?;
+        let record = match answer.answer_type.as_str() {
+            "A" => {
+                let address = answer
+                    .address
+                    .as_deref()
+                    .and_then(|address| address.parse::<std::net::Ipv4Addr>().ok())?;
+                Some((encoded_name, 1u16, address.octets().to_vec()))
+            }
+            "AAAA" => {
+                let address = answer
+                    .address
+                    .as_deref()
+                    .and_then(|address| address.parse::<std::net::Ipv6Addr>().ok())?;
+                Some((encoded_name, 28u16, address.octets().to_vec()))
+            }
+            "CNAME" => {
+                let target = answer.target.as_deref()?;
+                Some((encoded_name, 5u16, encode_dns_name(target)?))
+            }
+            "TXT" => {
+                let mut rdata = Vec::new();
+                for value in &answer.values {
+                    let bytes = value.as_bytes();
+                    if bytes.len() > u8::MAX as usize {
+                        return None;
+                    }
+                    rdata.push(bytes.len() as u8);
+                    rdata.extend_from_slice(bytes);
+                }
+                Some((encoded_name, 16u16, rdata))
+            }
+            _ => None,
         };
-        answers.push((
-            answer.name.as_deref().unwrap_or(question_name),
-            answer.ttl,
-            address,
-        ));
+        if let Some((name, record_type, rdata)) = record {
+            answers.push((name, answer.ttl, record_type, rdata));
+        }
     }
     let rcode = match policy_response.code.as_str() {
         "NXDOMAIN" => 3,
@@ -1831,15 +1884,37 @@ fn dns_policy_response(
     response.extend_from_slice(&(answers.len() as u16).to_be_bytes());
     response.extend_from_slice(&[0, 0, 0, 0]);
     response.extend_from_slice(&request[12..question_end + 4]);
-    for (_name, ttl, address) in answers {
-        response.extend_from_slice(&[0xc0, 0x0c]);
-        response.extend_from_slice(&1u16.to_be_bytes());
+    for (name, ttl, record_type, rdata) in answers {
+        response.extend_from_slice(&name);
+        response.extend_from_slice(&record_type.to_be_bytes());
         response.extend_from_slice(&1u16.to_be_bytes());
         response.extend_from_slice(&ttl.to_be_bytes());
-        response.extend_from_slice(&4u16.to_be_bytes());
-        response.extend_from_slice(&address.octets());
+        response.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        response.extend_from_slice(&rdata);
     }
     Some(response)
+}
+
+fn encode_dns_answer_name(name: &str, question_name: &str) -> Option<Vec<u8>> {
+    if name.eq_ignore_ascii_case(question_name) {
+        Some(vec![0xc0, 0x0c])
+    } else {
+        encode_dns_name(name)
+    }
+}
+
+fn encode_dns_name(name: &str) -> Option<Vec<u8>> {
+    let mut encoded = Vec::new();
+    for label in name.trim_end_matches('.').split('.') {
+        let bytes = label.as_bytes();
+        if bytes.is_empty() || bytes.len() > 63 {
+            return None;
+        }
+        encoded.push(bytes.len() as u8);
+        encoded.extend_from_slice(bytes);
+    }
+    encoded.push(0);
+    Some(encoded)
 }
 
 fn dns_questions(request: &[u8]) -> Option<Vec<DnsQuestion>> {
@@ -2663,6 +2738,7 @@ struct TransparentNat {
     host_ip: [u8; 4],
     tcp_flows: HashMap<TcpFlow, NatFlow>,
     udp_flows: HashMap<UdpNatFlow, NatFlow>,
+    next_udp_host_port: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2675,6 +2751,7 @@ struct TcpFlow {
 #[derive(Debug, Clone, Copy)]
 struct NatFlow {
     destination_ip: [u8; 4],
+    destination_port: u16,
     last_seen: StdInstant,
     closing: bool,
 }
@@ -2698,6 +2775,7 @@ impl TransparentNat {
             host_ip: host_ip.octets(),
             tcp_flows: HashMap::new(),
             udp_flows: HashMap::new(),
+            next_udp_host_port: UDP_NAT_PORT_START,
         }
     }
 
@@ -2722,6 +2800,7 @@ impl TransparentNat {
                     flow,
                     NatFlow {
                         destination_ip: packet.destination_ip(frame),
+                        destination_port: packet.destination_port(frame),
                         last_seen: StdInstant::now(),
                         closing: flags.fin,
                     },
@@ -2738,21 +2817,33 @@ impl TransparentNat {
         if packet.destination_ip(frame) == self.host_ip {
             return false;
         }
+        let guest_ip = packet.source_ip(frame);
+        let guest_port = packet.source_port(frame);
+        let destination_ip = packet.destination_ip(frame);
+        let destination_port = packet.destination_port(frame);
+        let host_port = self.udp_host_port_for_destination(
+            guest_ip,
+            guest_port,
+            destination_ip,
+            destination_port,
+        );
         let flow = UdpNatFlow {
-            guest_ip: packet.source_ip(frame),
-            guest_port: packet.source_port(frame),
-            host_port: packet.destination_port(frame),
+            guest_ip,
+            guest_port,
+            host_port,
         };
         let new_host_port = !self.udp_flows.contains_key(&flow);
         self.udp_flows.insert(
             flow,
             NatFlow {
-                destination_ip: packet.destination_ip(frame),
+                destination_ip,
+                destination_port,
                 last_seen: StdInstant::now(),
                 closing: false,
             },
         );
         packet.set_destination_ip(frame, self.host_ip);
+        packet.set_destination_port(frame, host_port);
         packet.recompute_checksums(frame);
         new_host_port
     }
@@ -2797,6 +2888,7 @@ impl TransparentNat {
         if let Some(nat_flow) = self.udp_flows.get_mut(&flow) {
             nat_flow.last_seen = StdInstant::now();
             packet.set_source_ip(frame, nat_flow.destination_ip);
+            packet.set_source_port(frame, nat_flow.destination_port);
             packet.recompute_checksums(frame);
         }
     }
@@ -2839,7 +2931,7 @@ impl TransparentNat {
             let address = flow.destination_ip;
             UdpDestination {
                 ip: Ipv4Address::new(address[0], address[1], address[2], address[3]).to_string(),
-                port: host_port,
+                port: flow.destination_port,
             }
         })
     }
@@ -2864,6 +2956,41 @@ impl TransparentNat {
         });
         self.udp_flows
             .retain(|_, flow| now.duration_since(flow.last_seen) < NAT_FLOW_IDLE_TTL);
+    }
+
+    fn udp_host_port_for_destination(
+        &mut self,
+        guest_ip: [u8; 4],
+        guest_port: u16,
+        destination_ip: [u8; 4],
+        destination_port: u16,
+    ) -> u16 {
+        if let Some((flow, _)) = self.udp_flows.iter().find(|(flow, nat_flow)| {
+            flow.guest_ip == guest_ip
+                && flow.guest_port == guest_port
+                && nat_flow.destination_ip == destination_ip
+                && nat_flow.destination_port == destination_port
+        }) {
+            return flow.host_port;
+        }
+
+        loop {
+            let candidate = self.next_udp_host_port;
+            self.next_udp_host_port = if self.next_udp_host_port == UDP_NAT_PORT_END {
+                UDP_NAT_PORT_START
+            } else {
+                self.next_udp_host_port + 1
+            };
+            if is_static_listener_port(candidate)
+                || self
+                    .udp_flows
+                    .keys()
+                    .any(|flow| flow.host_port == candidate)
+            {
+                continue;
+            }
+            return candidate;
+        }
     }
 }
 
@@ -3034,8 +3161,16 @@ impl Ipv4UdpPacket {
         u16::from_be_bytes([frame[self.udp_start], frame[self.udp_start + 1]])
     }
 
+    fn set_source_port(self, frame: &mut [u8], port: u16) {
+        frame[self.udp_start..self.udp_start + 2].copy_from_slice(&port.to_be_bytes());
+    }
+
     fn destination_port(self, frame: &[u8]) -> u16 {
         u16::from_be_bytes([frame[self.udp_start + 2], frame[self.udp_start + 3]])
+    }
+
+    fn set_destination_port(self, frame: &mut [u8], port: u16) {
+        frame[self.udp_start + 2..self.udp_start + 4].copy_from_slice(&port.to_be_bytes());
     }
 
     fn recompute_checksums(self, frame: &mut [u8]) {
@@ -3081,7 +3216,11 @@ fn udp_ipv4_checksum(source: [u8; 4], destination: [u8; 4], udp: &[u8]) -> u16 {
     pseudo_header.extend_from_slice(&(udp.len() as u16).to_be_bytes());
     pseudo_header.extend_from_slice(udp);
     let checksum = internet_checksum(&pseudo_header);
-    if checksum == 0 { 0xffff } else { checksum }
+    if checksum == 0 {
+        0xffff
+    } else {
+        checksum
+    }
 }
 
 fn internet_checksum(bytes: &[u8]) -> u16 {
@@ -3266,6 +3405,14 @@ mod tests {
     }
 
     #[test]
+    fn raw_tcp_classifier_keeps_extension_http_methods_interceptable() {
+        assert!(bytes_could_be_http_request(b"PROPFIND /dav HTTP/1.1\r\n"));
+        assert!(bytes_could_be_http_request(b"CUSTOM-METHOD "));
+        assert!(!bytes_could_be_http_request(b"hello sandbox\n"));
+        assert!(!bytes_could_be_http_request(b"PING\r\n"));
+    }
+
+    #[test]
     fn h1_rewrite_rejects_duplicate_host_headers() {
         let destination = HttpDestination {
             source_ip: "10.0.2.15".to_string(),
@@ -3386,11 +3533,99 @@ mod tests {
     }
 
     #[test]
+    fn transparent_nat_assigns_distinct_udp_ports_for_distinct_destinations() {
+        let mut nat = TransparentNat::new(Ipv4Address::new(10, 0, 2, 1));
+        let mut first = udp_frame([10, 0, 2, 15], [1, 1, 1, 1], 50_000, 53);
+        let mut second = udp_frame([10, 0, 2, 15], [8, 8, 8, 8], 50_000, 53);
+
+        nat.rewrite_guest_frame(&mut first);
+        nat.rewrite_guest_frame(&mut second);
+
+        let first_packet = Ipv4UdpPacket::parse(&first).unwrap();
+        let second_packet = Ipv4UdpPacket::parse(&second).unwrap();
+        let first_host_port = first_packet.destination_port(&first);
+        let second_host_port = second_packet.destination_port(&second);
+        assert_ne!(first_host_port, second_host_port);
+        assert_eq!(
+            nat.udp_original_destination(IpAddress::v4(10, 0, 2, 15), 50_000, first_host_port),
+            Some(UdpDestination {
+                ip: "1.1.1.1".to_string(),
+                port: 53,
+            }),
+        );
+        assert_eq!(
+            nat.udp_original_destination(IpAddress::v4(10, 0, 2, 15), 50_000, second_host_port),
+            Some(UdpDestination {
+                ip: "8.8.8.8".to_string(),
+                port: 53,
+            }),
+        );
+
+        let mut response = udp_frame([10, 0, 2, 1], [10, 0, 2, 15], first_host_port, 50_000);
+        nat.rewrite_host_frame(&mut response);
+        let response_packet = Ipv4UdpPacket::parse(&response).unwrap();
+        assert_eq!(response_packet.source_ip(&response), [1, 1, 1, 1]);
+        assert_eq!(response_packet.source_port(&response), 53);
+    }
+
+    #[test]
     fn dns_unsupported_query_type_returns_nodata_for_known_name() {
         let response = dns_response(&dns_query("public.sandbox.test", 28)).unwrap();
 
         assert_eq!(&response[2..4], &[0x81, 0x80]);
         assert_eq!(&response[6..8], &[0, 0]);
+    }
+
+    #[test]
+    fn dns_policy_response_emits_supported_answer_types() {
+        let query = dns_query("policy.sandbox.test", 1);
+        let response = dns_response_with_decision(
+            &query,
+            Some(&DnsPolicyResponse {
+                code: "NOERROR".to_string(),
+                answers: vec![
+                    DnsPolicyAnswer {
+                        answer_type: "A".to_string(),
+                        name: None,
+                        address: Some("192.0.2.10".to_string()),
+                        target: None,
+                        values: Vec::new(),
+                        ttl: 60,
+                    },
+                    DnsPolicyAnswer {
+                        answer_type: "AAAA".to_string(),
+                        name: None,
+                        address: Some("2001:db8::10".to_string()),
+                        target: None,
+                        values: Vec::new(),
+                        ttl: 60,
+                    },
+                    DnsPolicyAnswer {
+                        answer_type: "CNAME".to_string(),
+                        name: None,
+                        address: None,
+                        target: Some("target.sandbox.test".to_string()),
+                        values: Vec::new(),
+                        ttl: 60,
+                    },
+                    DnsPolicyAnswer {
+                        answer_type: "TXT".to_string(),
+                        name: None,
+                        address: None,
+                        target: None,
+                        values: vec!["sandbox".to_string()],
+                        ttl: 60,
+                    },
+                ],
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(&response[6..8], &4u16.to_be_bytes());
+        assert!(dns_response_answer_types(&response).contains(&1));
+        assert!(dns_response_answer_types(&response).contains(&28));
+        assert!(dns_response_answer_types(&response).contains(&5));
+        assert!(dns_response_answer_types(&response).contains(&16));
     }
 
     #[test]
@@ -3419,6 +3654,44 @@ mod tests {
         query
     }
 
+    fn dns_response_answer_types(response: &[u8]) -> Vec<u16> {
+        let question_count = u16::from_be_bytes([response[4], response[5]]) as usize;
+        let answer_count = u16::from_be_bytes([response[6], response[7]]) as usize;
+        let mut offset = 12;
+        for _ in 0..question_count {
+            let (_, question_end) = parse_dns_name(response, offset).unwrap();
+            offset = question_end + 4;
+        }
+        let mut answer_types = Vec::new();
+        for _ in 0..answer_count {
+            let name_end = skip_dns_name(response, offset).unwrap();
+            let answer_type = u16::from_be_bytes([response[name_end], response[name_end + 1]]);
+            let data_len =
+                u16::from_be_bytes([response[name_end + 8], response[name_end + 9]]) as usize;
+            answer_types.push(answer_type);
+            offset = name_end + 10 + data_len;
+        }
+        answer_types
+    }
+
+    fn skip_dns_name(packet: &[u8], mut offset: usize) -> Option<usize> {
+        loop {
+            let len = *packet.get(offset)?;
+            offset += 1;
+            if len == 0 {
+                return Some(offset);
+            }
+            if len & 0xc0 == 0xc0 {
+                packet.get(offset)?;
+                return Some(offset + 1);
+            }
+            if len > 63 || packet.len() < offset + usize::from(len) {
+                return None;
+            }
+            offset += usize::from(len);
+        }
+    }
+
     fn tcp_frame(
         source_ip: [u8; 4],
         destination_ip: [u8; 4],
@@ -3439,6 +3712,27 @@ mod tests {
         frame[tcp_start + 2..tcp_start + 4].copy_from_slice(&destination_port.to_be_bytes());
         frame[tcp_start + 12] = 5 << 4;
         frame[tcp_start + 13] = tcp_flags;
+        frame
+    }
+
+    fn udp_frame(
+        source_ip: [u8; 4],
+        destination_ip: [u8; 4],
+        source_port: u16,
+        destination_port: u16,
+    ) -> Vec<u8> {
+        let mut frame = vec![0; 14 + 20 + 8];
+        frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        let ip_start = 14;
+        frame[ip_start] = 0x45;
+        frame[ip_start + 2..ip_start + 4].copy_from_slice(&28u16.to_be_bytes());
+        frame[ip_start + 9] = 17;
+        frame[ip_start + 12..ip_start + 16].copy_from_slice(&source_ip);
+        frame[ip_start + 16..ip_start + 20].copy_from_slice(&destination_ip);
+        let udp_start = ip_start + 20;
+        frame[udp_start..udp_start + 2].copy_from_slice(&source_port.to_be_bytes());
+        frame[udp_start + 2..udp_start + 4].copy_from_slice(&destination_port.to_be_bytes());
+        frame[udp_start + 4..udp_start + 6].copy_from_slice(&8u16.to_be_bytes());
         frame
     }
 
