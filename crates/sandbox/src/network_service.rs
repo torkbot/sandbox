@@ -79,6 +79,29 @@ pub struct MitmTlsConfig {
     pub ca_private_key_pem: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkEndpoint {
+    pub ip: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkProtocol {
+    Tcp,
+    Udp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkConnectionAttempt {
+    pub protocol: NetworkProtocol,
+    pub src: NetworkEndpoint,
+    pub dst: NetworkEndpoint,
+}
+
+pub trait NetworkPolicyRuntime: Send + Sync + std::fmt::Debug {
+    fn allow_connection(&self, connection: NetworkConnectionAttempt) -> io::Result<bool>;
+}
+
 #[derive(Debug)]
 struct MitmTlsAuthority {
     ca_certificate_pem: String,
@@ -165,6 +188,7 @@ impl HostNetwork {
         tls_config: Option<MitmTlsConfig>,
         outbound_rules: Option<Vec<OutboundRulePlan>>,
         http: Option<Arc<dyn HttpInterceptRuntime>>,
+        policy: Option<Arc<dyn NetworkPolicyRuntime>>,
     ) -> io::Result<Self> {
         let (host, guest) = UnixStream::pair()?;
         let tls_authority = tls_config
@@ -174,7 +198,14 @@ impl HostNetwork {
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = shutdown.clone();
         let worker = thread::spawn(move || {
-            run_network_service(host, worker_shutdown, tls_authority, outbound_rules, http)
+            run_network_service(
+                host,
+                worker_shutdown,
+                tls_authority,
+                outbound_rules,
+                http,
+                policy,
+            )
         });
         Ok(Self {
             guest_fd: guest.into_raw_fd(),
@@ -203,6 +234,7 @@ fn run_network_service(
     tls_authority: Option<Arc<MitmTlsAuthority>>,
     outbound_rules: Option<Vec<OutboundRulePlan>>,
     http: Option<Arc<dyn HttpInterceptRuntime>>,
+    policy: Option<Arc<dyn NetworkPolicyRuntime>>,
 ) {
     let _ = stream.set_nonblocking(true);
     let tx = match stream.try_clone() {
@@ -232,7 +264,12 @@ fn run_network_service(
     while !shutdown.load(Ordering::Acquire) {
         let timestamp = Instant::now();
         let _ = iface.poll(timestamp, &mut device, &mut sockets);
-        poll_dns_socket(&mut sockets, dns_handle, outbound_rules.as_deref());
+        poll_dns_socket(
+            &mut sockets,
+            dns_handle,
+            outbound_rules.as_deref(),
+            policy.as_deref(),
+        );
         device.nat.prune_expired_flows();
         let active_nat_ports = device.nat.host_ports().collect::<HashSet<_>>();
         for port in &active_nat_ports {
@@ -256,6 +293,7 @@ fn run_network_service(
                 &device.nat,
                 outbound_rules.as_deref(),
                 http.clone(),
+                policy.clone(),
                 tls_authority.clone(),
                 &mut http_connections,
             );
@@ -317,6 +355,7 @@ fn poll_dns_socket(
     sockets: &mut SocketSet<'_>,
     handle: SocketHandle,
     outbound_rules: Option<&[OutboundRulePlan]>,
+    policy: Option<&dyn NetworkPolicyRuntime>,
 ) {
     let socket = sockets.get_mut::<udp::Socket>(handle);
     while socket.can_recv() && socket.can_send() {
@@ -326,6 +365,22 @@ fn poll_dns_socket(
         if outbound_rules
             .is_some_and(|rules| !is_allowed_outbound_udp("10.0.2.1", HOST_DNS_PORT, rules))
         {
+            continue;
+        }
+        if policy.is_some_and(|policy| {
+            !policy_allows_connection(
+                policy,
+                NetworkProtocol::Udp,
+                NetworkEndpoint {
+                    ip: remote.endpoint.addr.to_string(),
+                    port: remote.endpoint.port,
+                },
+                NetworkEndpoint {
+                    ip: "10.0.2.1".to_string(),
+                    port: HOST_DNS_PORT,
+                },
+            )
+        }) {
             continue;
         }
         let Some(response) = dns_response(request) else {
@@ -397,6 +452,7 @@ fn poll_http_socket(
     nat: &TransparentTcpNat,
     outbound_rules: Option<&[OutboundRulePlan]>,
     http: Option<Arc<dyn HttpInterceptRuntime>>,
+    policy: Option<Arc<dyn NetworkPolicyRuntime>>,
     tls_authority: Option<Arc<MitmTlsAuthority>>,
     http_connections: &mut HashMap<SocketHandle, HttpConnection>,
 ) {
@@ -422,6 +478,7 @@ fn poll_http_socket(
         nat,
         outbound_rules,
         http,
+        policy,
         tls_authority,
         http_connections,
     );
@@ -433,6 +490,8 @@ fn looks_like_tls(bytes: &[u8]) -> bool {
 
 #[derive(Clone)]
 struct HttpDestination {
+    source_ip: String,
+    source_port: u16,
     ip: String,
     port: u16,
 }
@@ -445,6 +504,8 @@ fn original_http_destination(
     let local = socket.local_endpoint()?;
     let ip = nat.original_destination(remote.addr, remote.port, local.port)?;
     Some(HttpDestination {
+        source_ip: remote.addr.to_string(),
+        source_port: remote.port,
         ip,
         port: local.port,
     })
@@ -456,6 +517,7 @@ fn poll_plain_http_socket(
     nat: &TransparentTcpNat,
     outbound_rules: Option<&[OutboundRulePlan]>,
     http: Option<Arc<dyn HttpInterceptRuntime>>,
+    policy: Option<Arc<dyn NetworkPolicyRuntime>>,
     tls_authority: Option<Arc<MitmTlsAuthority>>,
     http_connections: &mut HashMap<SocketHandle, HttpConnection>,
 ) {
@@ -466,6 +528,30 @@ fn poll_plain_http_socket(
     if outbound_rules
         .is_some_and(|rules| !is_allowed_outbound_tcp(&destination.ip, destination.port, rules))
     {
+        let connection = http_connections
+            .entry(handle)
+            .or_insert_with(|| HttpConnection::response(OUTBOUND_DENIED_RESPONSE));
+        poll_http_connection(socket, connection);
+        return;
+    }
+    let Some(remote) = socket.remote_endpoint() else {
+        socket.close();
+        return;
+    };
+    if policy.as_deref().is_some_and(|policy| {
+        !policy_allows_connection(
+            policy,
+            NetworkProtocol::Tcp,
+            NetworkEndpoint {
+                ip: remote.addr.to_string(),
+                port: remote.port,
+            },
+            NetworkEndpoint {
+                ip: destination.ip.clone(),
+                port: destination.port,
+            },
+        )
+    }) {
         let connection = http_connections
             .entry(handle)
             .or_insert_with(|| HttpConnection::response(OUTBOUND_DENIED_RESPONSE));
@@ -612,6 +698,10 @@ fn rewrite_h1_head(
             ip: destination.ip.clone(),
             port: destination.port,
         },
+        source: InterceptedDestination {
+            ip: destination.source_ip.clone(),
+            port: destination.source_port,
+        },
         upstream_dial: InterceptedDestination {
             ip: upstream.ip.clone(),
             port: upstream.port,
@@ -746,6 +836,10 @@ fn rewrite_h2_head(
             protocol: HttpRequestProtocol::Http2,
             method,
             url: format!("{scheme}://{authority}{path}"),
+            source: InterceptedDestination {
+                ip: destination.source_ip.clone(),
+                port: destination.source_port,
+            },
             original_destination: InterceptedDestination {
                 ip: destination.ip.clone(),
                 port: destination.port,
@@ -1138,6 +1232,17 @@ fn is_allowed_outbound_udp(
         }
         OutboundRulePlan::AcceptTcp { .. } | OutboundRulePlan::AcceptPublicInternet { .. } => false,
     })
+}
+
+fn policy_allows_connection(
+    policy: &dyn NetworkPolicyRuntime,
+    protocol: NetworkProtocol,
+    src: NetworkEndpoint,
+    dst: NetworkEndpoint,
+) -> bool {
+    policy
+        .allow_connection(NetworkConnectionAttempt { protocol, src, dst })
+        .unwrap_or(false)
 }
 
 fn port_matches(ports: &[u16], destination_port: u16) -> bool {
@@ -2365,6 +2470,8 @@ mod tests {
     #[test]
     fn h1_rewrite_rejects_duplicate_host_headers() {
         let destination = HttpDestination {
+            source_ip: "10.0.2.15".to_string(),
+            source_port: 50_000,
             ip: "93.184.216.34".to_string(),
             port: 80,
         };
@@ -2417,6 +2524,8 @@ mod tests {
         let rewritten = rewrite_h2_head(
             &request,
             &HttpDestination {
+                source_ip: "10.0.2.15".to_string(),
+                source_port: 50_000,
                 ip: "93.184.216.34".to_string(),
                 port: 443,
             },
@@ -2441,6 +2550,8 @@ mod tests {
     #[test]
     fn tls_intercept_server_name_falls_back_to_destination_ip_without_sni() {
         let destination = HttpDestination {
+            source_ip: "10.0.2.15".to_string(),
+            source_port: 50_000,
             ip: "93.184.216.34".to_string(),
             port: 443,
         };

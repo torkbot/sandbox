@@ -9,12 +9,13 @@ use bson::{Bson, Document, doc};
 use sandbox::block_storage::CowBlockStore;
 use sandbox::config::MountSpec;
 use sandbox::config::{
-    HttpRequestHeaderHookSpec, HttpSpecInput, MicroVmSpecInput, MountSpecInput, OutboundPolicy,
-    OutboundRuleSpec, OutboundSpec, RootfsStorageSpecInput,
+    HttpRequestHeaderHookSpec, HttpSpecInput, MicroVmSpecInput, MountSpecInput, NetworkPolicySpec,
+    OutboundPolicy, OutboundRuleSpec, OutboundSpec, RootfsStorageSpecInput,
 };
 use sandbox::http_flow::{
     HookBackedHttpInterceptRuntime, HttpHookExecutor, InterceptedHttpRequest,
 };
+use sandbox::network_service::{NetworkConnectionAttempt, NetworkPolicyRuntime, NetworkProtocol};
 use sandbox::runtime::{ControlSocket, HostServices, StartStatusObserver, VirtualFsDevice};
 
 mod host_vfs;
@@ -116,6 +117,7 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
     let virtual_fs = virtual_fs_devices(&spec, bridge.clone());
     let services = HostServices {
         http: http_intercept_runtime(&spec, bridge.clone())?,
+        network_policy: network_policy_runtime(&spec, bridge.clone()),
         root_storage: spec.rootfs.storage.as_ref().map(|storage| {
             Arc::new(NodeCowBlockStore::new(
                 bridge.clone(),
@@ -171,6 +173,17 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(error) => Err(format!("control bridge stopped: {error}").into()),
     }
+}
+
+fn network_policy_runtime(
+    spec: &sandbox::MicroVmSpec,
+    bridge: Arc<HostIoBridge>,
+) -> Option<Arc<dyn NetworkPolicyRuntime>> {
+    spec.network
+        .as_ref()
+        .and_then(|network| network.policy.as_ref())
+        .and_then(|policy| policy.connection_hook.then_some(()))
+        .map(|()| Arc::new(NodeNetworkPolicyRuntime { bridge }) as Arc<dyn NetworkPolicyRuntime>)
 }
 
 fn http_intercept_runtime(
@@ -255,6 +268,11 @@ impl RequestHookSelector {
 struct NodeHttpHookExecutor {
     bridge: Arc<HostIoBridge>,
     hooks: Vec<NodeRequestHeaderHook>,
+}
+
+#[derive(Debug)]
+struct NodeNetworkPolicyRuntime {
+    bridge: Arc<HostIoBridge>,
 }
 
 #[derive(Debug)]
@@ -352,6 +370,29 @@ impl CowBlockStore for NodeCowBlockStore {
     }
 }
 
+impl NetworkPolicyRuntime for NodeNetworkPolicyRuntime {
+    fn allow_connection(&self, connection: NetworkConnectionAttempt) -> io::Result<bool> {
+        let response = self.bridge.request(doc! {
+            "type": "host.network.connection",
+            "protocol": match connection.protocol {
+                NetworkProtocol::Tcp => "tcp",
+                NetworkProtocol::Udp => "udp",
+            },
+            "transport": match connection.protocol {
+                NetworkProtocol::Tcp => "tcp",
+                NetworkProtocol::Udp => "udp",
+            },
+            "srcIp": connection.src.ip,
+            "srcPort": i32::from(connection.src.port),
+            "dstIp": connection.dst.ip,
+            "dstPort": i32::from(connection.dst.port),
+        })?;
+        response
+            .get_bool("allowed")
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+}
+
 #[derive(Debug)]
 struct NodeRequestHeaderHook {
     id: String,
@@ -383,6 +424,8 @@ impl HttpHookExecutor for NodeHttpHookExecutor {
             },
             "method": request.method,
             "url": request.url,
+            "sourceIp": request.source.ip,
+            "sourcePort": i32::from(request.source.port),
             "originalDestinationIp": request.original_destination.ip,
             "originalDestinationPort": i32::from(request.original_destination.port),
             "upstreamDialIp": request.upstream_dial.ip,
@@ -635,7 +678,19 @@ fn parse_spawn(document: Document) -> Result<MicroVmSpecInput, Box<dyn std::erro
         mounts: parse_mounts(document.get_array("mounts")?)?,
         network_outbound: parse_network_outbound(document.get_document("networkOutbound").ok())?,
         network_http: parse_network_http(document.get_document("networkHttp").ok())?,
+        network_policy: parse_network_policy(document.get_document("networkPolicy").ok())?,
     })
+}
+
+fn parse_network_policy(
+    document: Option<&Document>,
+) -> Result<Option<NetworkPolicySpec>, Box<dyn std::error::Error>> {
+    let Some(document) = document else {
+        return Ok(None);
+    };
+    Ok(Some(NetworkPolicySpec {
+        connection_hook: document.get_bool("connectionHook")?,
+    }))
 }
 
 fn parse_rootfs_storage(

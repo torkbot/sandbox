@@ -60,6 +60,12 @@ pub enum MountSpec {
 pub struct NetworkSpec {
     pub outbound: Option<OutboundSpec>,
     pub http: Option<HttpSpec>,
+    pub policy: Option<NetworkPolicySpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkPolicySpec {
+    pub connection_hook: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,7 +208,10 @@ impl MicroVmSpec {
         crate::mounts::MountTable::plan(&mounts)
             .map_err(|error| SpecError::new(error.to_string()))?;
 
-        let network = if input.network_outbound.is_some() || input.network_http.is_some() {
+        let network = if input.network_outbound.is_some()
+            || input.network_http.is_some()
+            || input.network_policy.is_some()
+        {
             Some(NetworkSpec {
                 outbound: input.network_outbound,
                 http: input
@@ -210,6 +219,7 @@ impl MicroVmSpec {
                     .map(HttpSpec::from_input)
                     .transpose()
                     .map_err(|error| SpecError::new(error.to_string()))?,
+                policy: input.network_policy,
             })
         } else {
             None
@@ -302,6 +312,7 @@ pub struct MicroVmSpecInput {
     pub mounts: Vec<MountSpecInput>,
     pub network_outbound: Option<OutboundSpec>,
     pub network_http: Option<HttpSpecInput>,
+    pub network_policy: Option<NetworkPolicySpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -363,6 +374,7 @@ mod tests {
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
+            network_policy: None,
         }
     }
 

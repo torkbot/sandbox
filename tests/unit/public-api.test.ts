@@ -240,7 +240,7 @@ test("defineSandbox rejects invalid COW rootfs block store", () => {
 
 test("network.policy creates an opaque connection policy", () => {
   const policy = network.policy(async (conn) => {
-    if (conn.host === "registry.npmjs.org") {
+    if (conn.protocol === "http" && conn.host === "registry.npmjs.org") {
       conn.allowHttp();
     }
   });

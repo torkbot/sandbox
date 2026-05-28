@@ -14,6 +14,7 @@ pub struct InterceptedHttpRequest {
     pub protocol: HttpRequestProtocol,
     pub method: String,
     pub url: String,
+    pub source: InterceptedDestination,
     pub original_destination: InterceptedDestination,
     pub upstream_dial: InterceptedDestination,
     pub headers: Vec<(String, String)>,

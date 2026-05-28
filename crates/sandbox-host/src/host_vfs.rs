@@ -74,6 +74,7 @@ impl HostIoBridge {
         let response_type = document.get_str("type").ok();
         if response_type != Some("host.vfs.response")
             && response_type != Some("host.http.response")
+            && response_type != Some("host.network.response")
             && response_type != Some("host.block.response")
         {
             return false;

@@ -19,7 +19,7 @@ use crate::config::{KernelFormat, RootfsFormat, RootfsStorageSpec};
 use crate::control::INIT_CONTROL_PORT;
 use crate::http_flow::HttpInterceptRuntime;
 use crate::network::OutboundRulePlan;
-use crate::network_service::{HostNetwork, MitmTlsConfig};
+use crate::network_service::{HostNetwork, MitmTlsConfig, NetworkPolicyRuntime};
 use crate::vfs::VirtioVirtualFsBackend;
 
 #[derive(Debug)]
@@ -31,6 +31,7 @@ pub struct KrunContext {
 #[derive(Default, Clone)]
 pub struct HostServices {
     pub http: Option<Arc<dyn HttpInterceptRuntime>>,
+    pub network_policy: Option<Arc<dyn NetworkPolicyRuntime>>,
     pub root_storage: Option<Arc<dyn CowBlockStore>>,
 }
 
@@ -143,8 +144,21 @@ impl KrunContext {
                     .map_err(|_| KrunError::new("NetworkPlan::from_spec", -libc::EINVAL))
             })
             .transpose()?;
-        let network = HostNetwork::new(tls_config, outbound_rules, _services.http.clone())
-            .map_err(|_| KrunError::new("HostNetwork::new", -libc::EIO))?;
+        let network = HostNetwork::new(
+            tls_config,
+            outbound_rules,
+            _services.http.clone(),
+            network
+                .policy
+                .as_ref()
+                .and_then(|policy| {
+                    policy
+                        .connection_hook
+                        .then(|| _services.network_policy.clone())
+                })
+                .flatten(),
+        )
+        .map_err(|_| KrunError::new("HostNetwork::new", -libc::EIO))?;
         let guest_fd = network.guest_fd();
         let mac = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xef];
         let features = 0;
@@ -738,6 +752,7 @@ mod tests {
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
+            network_policy: None,
         })
         .unwrap();
 
@@ -760,6 +775,7 @@ mod tests {
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
+            network_policy: None,
         })
         .unwrap_err();
 
@@ -785,6 +801,7 @@ mod tests {
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
+            network_policy: None,
         })
         .unwrap();
 
@@ -821,6 +838,7 @@ mod tests {
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
+            network_policy: None,
         })
         .unwrap();
 
@@ -1027,6 +1045,7 @@ mod tests {
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
+            network_policy: None,
         })
         .unwrap();
 

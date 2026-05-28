@@ -16,6 +16,7 @@ import type {
   InternalNetworkConfig,
   InternalSandboxOptions,
   RegisteredHttpRequestHeadersHook,
+  RegisteredNetworkConnectionHook,
   SandboxHttpRequestSelector,
 } from "./launch-options.ts";
 
@@ -81,6 +82,8 @@ export interface SandboxHttpRequest {
   readonly method: string;
   readonly headers: Headers;
   readonly destination: {
+    readonly sourceIp: string;
+    readonly sourcePort: number;
     readonly originalIp: string;
     readonly originalPort: number;
     readonly upstreamIp: string;
@@ -149,18 +152,55 @@ export interface NetworkGrant {
 export interface HttpNetworkGrant extends NetworkGrant {
 }
 
-export interface NetworkConnectionRequest {
-  readonly transport: "tcp" | "udp";
+export type NetworkTransport = "tcp" | "udp";
+
+export interface NetworkEndpoint {
+  readonly ip: string;
+  readonly port: number;
+  isLoopback(): boolean;
+  isPrivate(): boolean;
+  isLinkLocal(): boolean;
+  isMulticast(): boolean;
+  isBroadcast(): boolean;
+  isDocumentation(): boolean;
+  isReserved(): boolean;
+  isPublicInternet(): boolean;
+}
+
+export interface NetworkConnectionRequestBase {
+  readonly transport: NetworkTransport;
+  readonly src: NetworkEndpoint;
+  readonly dst: NetworkEndpoint;
   readonly host?: string;
   readonly ip?: string;
   readonly port: number;
   /**
-   * Allows HTTP(S)-classified traffic for this connection without request middleware.
-   * Raw non-HTTP egress is not exposed by the first public policy API.
+   * Allows this observed connection, request, or flow using the default semantics
+   * for its protocol.
    */
   allow(): NetworkGrant;
+}
+
+export interface HttpNetworkConnectionRequest extends NetworkConnectionRequestBase {
+  readonly protocol: "http";
+  readonly transport: "tcp";
   allowHttp(middleware?: HttpRequestMiddleware): HttpNetworkGrant;
 }
+
+export interface TcpNetworkConnectionRequest extends NetworkConnectionRequestBase {
+  readonly protocol: "tcp";
+  readonly transport: "tcp";
+}
+
+export interface UdpNetworkConnectionRequest extends NetworkConnectionRequestBase {
+  readonly protocol: "udp";
+  readonly transport: "udp";
+}
+
+export type NetworkConnectionRequest =
+  | HttpNetworkConnectionRequest
+  | TcpNetworkConnectionRequest
+  | UdpNetworkConnectionRequest;
 
 export type NetworkConnectionRequestHandler = (
   connection: NetworkConnectionRequest,
@@ -175,6 +215,7 @@ export type NetworkPolicy = {
 
 type NetworkPolicyHookRegistration = {
   readonly hooks: readonly RegisteredHttpRequestHeadersHook[];
+  readonly connectionHook: RegisteredNetworkConnectionHook;
   readonly network: InternalNetworkConfig;
 };
 
@@ -310,6 +351,7 @@ class DefinedSandbox implements SandboxDefinition {
         launchOptions,
         hostOptions,
         new Map((networkPolicy?.hooks ?? []).map((hook) => [hook.id, hook])),
+        networkPolicy?.connectionHook,
       );
       return new HostBackedSandboxVm(hostVm, launchOptions);
     } catch (error) {
@@ -508,6 +550,7 @@ function toHostSpawnOptions(
             origin: hook.selector.origin,
           })),
         },
+      policy: options.network?.policy,
     };
 
   return {
@@ -562,7 +605,16 @@ function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPoli
       readonly middleware?: HttpRequestMiddleware;
     }> = [];
     const connection: NetworkConnectionRequest = {
+      protocol: "http",
       transport: "tcp",
+      src: createNetworkEndpoint(
+        request.destination.sourceIp,
+        request.destination.sourcePort,
+      ),
+      dst: createNetworkEndpoint(
+        request.destination.upstreamIp,
+        request.destination.upstreamPort,
+      ),
       host: request.url.hostname,
       ip: request.destination.upstreamIp,
       port: request.destination.upstreamPort,
@@ -604,7 +656,14 @@ function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPoli
   ];
   return {
     hooks,
+    connectionHook: {
+      hook: policy[networkPolicyHandler],
+      active: true,
+    },
     network: {
+      policy: {
+        connectionHook: true,
+      },
       outbound: {
         policy: "deny",
         rules: [
@@ -614,6 +673,118 @@ function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPoli
       },
     },
   };
+}
+
+function createNetworkEndpoint(ip: string, port: number): NetworkEndpoint {
+  return {
+    ip,
+    port,
+    isLoopback: () => isLoopbackIp(ip),
+    isPrivate: () => isPrivateIp(ip),
+    isLinkLocal: () => isLinkLocalIp(ip),
+    isMulticast: () => isMulticastIp(ip),
+    isBroadcast: () => ip === "255.255.255.255",
+    isDocumentation: () => isDocumentationIp(ip),
+    isReserved: () => isReservedIp(ip),
+    isPublicInternet: () => isPublicInternetIp(ip),
+  };
+}
+
+function isLoopbackIp(ip: string): boolean {
+  const ipv4 = parseIpv4(ip);
+  if (ipv4 !== undefined) {
+    return ipv4[0] === 127;
+  }
+  return normalizeIpv6(ip) === "::1";
+}
+
+function isPrivateIp(ip: string): boolean {
+  const ipv4 = parseIpv4(ip);
+  if (ipv4 !== undefined) {
+    return ipv4[0] === 10
+      || (ipv4[0] === 172 && ipv4[1] >= 16 && ipv4[1] <= 31)
+      || (ipv4[0] === 192 && ipv4[1] === 168);
+  }
+  return ipv6StartsWith(ip, "fc") || ipv6StartsWith(ip, "fd");
+}
+
+function isLinkLocalIp(ip: string): boolean {
+  const ipv4 = parseIpv4(ip);
+  if (ipv4 !== undefined) {
+    return ipv4[0] === 169 && ipv4[1] === 254;
+  }
+  return ipv6StartsWith(ip, "fe8")
+    || ipv6StartsWith(ip, "fe9")
+    || ipv6StartsWith(ip, "fea")
+    || ipv6StartsWith(ip, "feb");
+}
+
+function isMulticastIp(ip: string): boolean {
+  const ipv4 = parseIpv4(ip);
+  if (ipv4 !== undefined) {
+    return ipv4[0] >= 224 && ipv4[0] <= 239;
+  }
+  return ipv6StartsWith(ip, "ff");
+}
+
+function isDocumentationIp(ip: string): boolean {
+  const ipv4 = parseIpv4(ip);
+  if (ipv4 !== undefined) {
+    return (ipv4[0] === 192 && ipv4[1] === 0 && ipv4[2] === 2)
+      || (ipv4[0] === 198 && ipv4[1] === 51 && ipv4[2] === 100)
+      || (ipv4[0] === 203 && ipv4[1] === 0 && ipv4[2] === 113);
+  }
+  return normalizeIpv6(ip).startsWith("2001:db8:");
+}
+
+function isReservedIp(ip: string): boolean {
+  const ipv4 = parseIpv4(ip);
+  if (ipv4 !== undefined) {
+    return ipv4[0] === 0
+      || (ipv4[0] === 100 && ipv4[1] >= 64 && ipv4[1] <= 127)
+      || (ipv4[0] === 192 && ipv4[1] === 0 && ipv4[2] === 0)
+      || (ipv4[0] === 192 && ipv4[1] === 88 && ipv4[2] === 99)
+      || (ipv4[0] === 198 && (ipv4[1] === 18 || ipv4[1] === 19))
+      || ipv4[0] >= 240
+      || isDocumentationIp(ip);
+  }
+  return normalizeIpv6(ip).startsWith("2001:db8:");
+}
+
+function isPublicInternetIp(ip: string): boolean {
+  return parseIpv4(ip) !== undefined
+    && !isLoopbackIp(ip)
+    && !isPrivateIp(ip)
+    && !isLinkLocalIp(ip)
+    && !isMulticastIp(ip)
+    && !isReservedIp(ip)
+    && !isDocumentationIp(ip)
+    && ip !== "255.255.255.255";
+}
+
+function parseIpv4(ip: string): [number, number, number, number] | undefined {
+  const parts = ip.split(".");
+  if (parts.length !== 4) {
+    return undefined;
+  }
+  const octets = parts.map((part) => {
+    if (!/^(0|[1-9][0-9]{0,2})$/.test(part)) {
+      return undefined;
+    }
+    const value = Number(part);
+    return value <= 255 ? value : undefined;
+  });
+  return octets.every((part) => part !== undefined)
+    ? octets as [number, number, number, number]
+    : undefined;
+}
+
+function normalizeIpv6(ip: string): string {
+  return ip.toLowerCase();
+}
+
+function ipv6StartsWith(ip: string, prefix: string): boolean {
+  return parseIpv4(ip) === undefined && normalizeIpv6(ip).startsWith(prefix);
 }
 
 async function lowerRootfs(

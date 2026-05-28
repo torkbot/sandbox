@@ -225,19 +225,35 @@ connection requests and grants only the traffic it explicitly allows:
 
 ```ts
 const policy = network.policy(async (conn) => {
-  if (conn.host === "registry.npmjs.org") {
+  if (conn.protocol === "udp" && conn.dst.port === 53) {
+    conn.allow();
+  }
+  if (conn.protocol === "tcp" && conn.dst.isPublicInternet() && conn.dst.port === 443) {
+    conn.allow();
+  }
+  if (conn.protocol === "http" && conn.host === "registry.npmjs.org") {
     conn.allowHttp();
   }
 });
 ```
 
-`conn.allow()` grants HTTP(S)-classified traffic without request middleware.
-`conn.allowHttp(...)` grants HTTP(S)-classified traffic and can apply request
-middleware:
+`conn.allow()` grants the observed connection, request, or flow using the
+default semantics for its protocol. Protocol-specific grant helpers add
+protocol-specific behavior. `conn.allowHttp(...)` grants HTTP(S)-classified
+traffic and can apply request middleware:
 
 ```ts
 const policy = network.policy(async (conn) => {
-  if (conn.host !== "api.example.com") return;
+  if (conn.protocol === "udp" && conn.dst.port === 53) {
+    conn.allow();
+    return;
+  }
+  if (conn.protocol === "tcp" && conn.dst.isPublicInternet() && conn.dst.port === 443) {
+    conn.allow();
+    return;
+  }
+  if (conn.dst.isPrivate() || conn.dst.isLinkLocal()) return;
+  if (conn.protocol !== "http" || conn.host !== "api.example.com") return;
 
   conn.allowHttp(async (request) => {
     request.headers.set(
@@ -247,6 +263,28 @@ const policy = network.policy(async (conn) => {
   });
 });
 ```
+
+Every TCP and UDP policy request carries source and destination IP-layer
+endpoints:
+
+```ts
+conn.src.ip;
+conn.src.port;
+conn.dst.ip;
+conn.dst.port;
+```
+
+Endpoint helpers classify logical address ranges without relying on hostnames:
+`isLoopback()`, `isPrivate()`, `isLinkLocal()`, `isMulticast()`,
+`isBroadcast()`, `isDocumentation()`, `isReserved()`, and
+`isPublicInternet()`. Hostname-oriented metadata such as `conn.host` is
+available only when the runtime can derive it from higher-level protocol
+classification.
+
+The callback may run more than once for a higher-level request: first for the
+transport flow, then again when HTTP metadata is available. Transport callbacks
+should grant the IP-layer reachability they intend to permit; HTTP callbacks can
+then apply request-specific policy or header middleware.
 
 Deny remains the default. If the policy callback does not create a grant, the
 connection is blocked. The `NetworkGrant` returned by `allow()` and
