@@ -48,6 +48,9 @@ test("release workflow builds platform packages before publishing the root packa
   assert.match(workflow, /SANDBOX_KERNEL_ARCH/);
   assert.match(workflow, /Download kernel artifact/);
   assert.match(workflow, /Download rootfs artifact/);
+  assert.match(workflow, /dist\/rootfs\/alpine-3\.23\.erofs/);
+  assert.match(workflow, /dist\/rootfs\/alpine-3\.23\.ext4/);
+  assert.doesNotMatch(workflow, /alpine-3\.20/);
   assert.match(workflow, /prepare-npm-packages\.ts --platform --current/);
   assert.match(workflow, /Publish platform packages/);
   assert.match(workflow, /Publish root package/);
@@ -85,4 +88,59 @@ test("local release scripts build current rootfs before packaging platform packa
       `${scriptName} should build the writable rootfs image before packaging the platform package`,
     );
   }
+});
+
+test("default rootfs includes agent utility packages", async () => {
+  const buildRootfsScript = await readFile(
+    new URL("../../scripts/build-rootfs.ts", import.meta.url),
+    "utf8",
+  );
+
+  for (const packageName of [
+    "bash",
+    "coreutils",
+    "curl",
+    "exiftool",
+    "ffmpeg",
+    "file",
+    "findutils",
+    "git",
+    "imagemagick",
+    "jq",
+    "less",
+    "openssh-client",
+    "poppler-utils",
+    "ripgrep",
+    "tar",
+    "unzip",
+    "xz",
+    "zip",
+  ]) {
+    assert.match(buildRootfsScript, new RegExp(`"${packageName}"`));
+  }
+});
+
+test("rootfs EROFS builder uses compressed images", async () => {
+  const buildErofsScript = await readFile(
+    new URL("../../scripts/build-rootfs-erofs.ts", import.meta.url),
+    "utf8",
+  );
+  const x86KernelConfig = await readFile(
+    new URL("../../deps/libkrunfw/config-libkrunfw_x86_64", import.meta.url),
+    "utf8",
+  );
+  const armKernelConfig = await readFile(
+    new URL("../../deps/libkrunfw/config-libkrunfw_aarch64", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(buildErofsScript, /SANDBOX_EROFS_BUILDER_IMAGE \?\? "alpine:3\.23"/);
+  assert.match(buildErofsScript, /SANDBOX_EROFS_COMPRESSION \?\? "lz4hc,level=12"/);
+  assert.match(buildErofsScript, /SANDBOX_EROFS_CLUSTER_SIZE \?\? "1048576"/);
+  assert.match(buildErofsScript, /SANDBOX_EROFS_EXTENDED_OPTIONS \?\? "fragments"/);
+  assert.match(buildErofsScript, /--quiet/);
+  assert.match(buildErofsScript, /-z/);
+  assert.match(buildErofsScript, /-E/);
+  assert.match(x86KernelConfig, /^CONFIG_EROFS_FS_ZIP=y$/m);
+  assert.match(armKernelConfig, /^CONFIG_EROFS_FS_ZIP=y$/m);
 });

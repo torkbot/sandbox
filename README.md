@@ -17,7 +17,7 @@ const workspaceFs = fs.memory({
 });
 
 const sandbox = defineSandbox({
-  rootfs: rootfs.builtIn("alpine:3.20"),
+  rootfs: rootfs.builtIn("alpine:3.23"),
   resources: {
     cpus: 2,
     memoryMiB: 2048,
@@ -53,7 +53,7 @@ import {
 const workspaceFs = fs.memory();
 
 const sandbox = defineSandbox({
-  rootfs: rootfs.builtIn("alpine:3.20"),
+  rootfs: rootfs.builtIn("alpine:3.23"),
 });
 
 await using lane = await sandbox.boot({
@@ -79,7 +79,7 @@ The public API is split into three layers:
 - `lane.exec(...)` runs buffered work inside the booted instance.
 
 Expensive artifact preparation is intentionally outside `boot()`.
-`rootfs.builtIn("alpine:3.20")` selects a built-in rootfs artifact that must
+`rootfs.builtIn("alpine:3.23")` selects a built-in rootfs artifact that must
 already be installed with Sandbox. It does not pull an image or build a rootfs
 at runtime.
 
@@ -102,7 +102,7 @@ type SandboxDefinition = {
 the read-only built-in catalog:
 
 ```ts
-rootfs.builtIn("alpine:3.20");
+rootfs.builtIn("alpine:3.23");
 ```
 
 `resources` controls the VM shape used by every instance booted from the
@@ -110,7 +110,7 @@ definition. Omitted values use Sandbox defaults.
 
 ```ts
 defineSandbox({
-  rootfs: rootfs.builtIn("alpine:3.20"),
+  rootfs: rootfs.builtIn("alpine:3.23"),
   resources: {
     cpus: 4,
     memoryMiB: 4096,
@@ -127,7 +127,7 @@ image used as the COW base.
 ```ts
 defineSandbox({
   rootfs: rootfs.cow({
-    base: rootfs.builtIn("alpine:3.20"),
+    base: rootfs.builtIn("alpine:3.23"),
     writable: laneBlockStore,
   }),
 });

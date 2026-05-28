@@ -19,8 +19,8 @@ const targets = [
     packageName: "@torkbot/sandbox-darwin-arm64",
     hostBinaryName: "sandbox-host",
     rootfsNames: {
-      erofs: "rootfs/alpine-3.20.erofs",
-      ext4: "rootfs/alpine-3.20.ext4",
+      erofs: "rootfs/alpine-3.23.erofs",
+      ext4: "rootfs/alpine-3.23.ext4",
     },
     platform: "darwin",
     arch: "arm64",
@@ -29,8 +29,8 @@ const targets = [
     packageName: "@torkbot/sandbox-linux-x64-gnu",
     hostBinaryName: "sandbox-host",
     rootfsNames: {
-      erofs: "rootfs/alpine-3.20.erofs",
-      ext4: "rootfs/alpine-3.20.ext4",
+      erofs: "rootfs/alpine-3.23.erofs",
+      ext4: "rootfs/alpine-3.23.ext4",
     },
     platform: "linux",
     arch: "x64",
@@ -56,16 +56,16 @@ export function hostBinaryPath(): string {
   return rawHostBinaryPath();
 }
 
-export function builtInRootfsPath(name: "alpine:3.20", format: BuiltInRootfsFormat = "erofs"): string {
-  if (name === "alpine:3.20") {
+export function builtInRootfsPath(name: "alpine:3.23", format: BuiltInRootfsFormat = "erofs"): string {
+  if (name === "alpine:3.23") {
     const target = currentSandboxTarget();
     return resolveArtifactPath(target, target.rootfsNames[format]);
   }
   throw new Error(`unsupported built-in rootfs: ${name satisfies never}`);
 }
 
-export function builtInRootfsIdentity(name: "alpine:3.20", format: BuiltInRootfsFormat): string {
-  if (name === "alpine:3.20") {
+export function builtInRootfsIdentity(name: "alpine:3.23", format: BuiltInRootfsFormat): string {
+  if (name === "alpine:3.23") {
     const target = currentSandboxTarget();
     const packageVersion = platformPackageVersion(target);
     return [

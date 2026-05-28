@@ -4,12 +4,33 @@ import { spawn } from "node:child_process";
 import { getgid, getuid } from "node:process";
 
 const repoRoot = resolve(import.meta.dirname, "..");
-const image = process.env.SANDBOX_ROOTFS_IMAGE ?? "alpine:3.20";
-const outDir = resolve(repoRoot, process.env.SANDBOX_ROOTFS_OUT_DIR ?? "dist/rootfs/alpine-3.20");
+const image = process.env.SANDBOX_ROOTFS_IMAGE ?? "alpine:3.23";
+const outDir = resolve(repoRoot, process.env.SANDBOX_ROOTFS_OUT_DIR ?? "dist/rootfs/alpine-3.23");
 const initPath = resolve(
   repoRoot,
   process.env.SANDBOX_INIT_BINARY_PATH ?? `dist/init/${guestTarget()}/sandbox-init`,
 );
+const agentPackages = [
+  "bash",
+  "ca-certificates",
+  "coreutils",
+  "curl",
+  "exiftool",
+  "ffmpeg",
+  "file",
+  "findutils",
+  "git",
+  "imagemagick",
+  "jq",
+  "less",
+  "openssh-client",
+  "poppler-utils",
+  "ripgrep",
+  "tar",
+  "unzip",
+  "xz",
+  "zip",
+] as const;
 
 await rm(outDir, { recursive: true, force: true });
 await mkdir(outDir, { recursive: true });
@@ -22,7 +43,12 @@ await run("docker", [
   image,
   "sh",
   "-lc",
-  `apk add --no-cache curl && cd / && tar --exclude=out --exclude=proc --exclude=sys --exclude=dev --exclude=tmp -cf - . | tar -C /out -xf - && chown -R ${getuid?.() ?? 0}:${getgid?.() ?? 0} /out`,
+  [
+    `apk add --no-cache ${agentPackages.map(shellArg).join(" ")}`,
+    "cd /",
+    "tar --exclude=out --exclude=proc --exclude=sys --exclude=dev --exclude=tmp -cf - . | tar -C /out -xf -",
+    `chown -R ${getuid?.() ?? 0}:${getgid?.() ?? 0} /out`,
+  ].join(" && "),
 ]);
 
 await assertExists(initPath);
@@ -52,6 +78,10 @@ function guestTarget(): string {
     default:
       throw new Error(`unsupported host architecture for rootfs build: ${process.arch}`);
   }
+}
+
+function shellArg(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 async function assertExists(path: string): Promise<void> {

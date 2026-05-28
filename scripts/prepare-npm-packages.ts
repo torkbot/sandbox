@@ -33,8 +33,8 @@ const platformPackages = [
     libc: undefined,
     files: {
       host: "sandbox-host",
-      erofsRootfs: "rootfs/alpine-3.20.erofs",
-      ext4Rootfs: "rootfs/alpine-3.20.ext4",
+      erofsRootfs: "rootfs/alpine-3.23.erofs",
+      ext4Rootfs: "rootfs/alpine-3.23.ext4",
     },
   },
   {
@@ -45,8 +45,8 @@ const platformPackages = [
     libc: ["glibc"],
     files: {
       host: "sandbox-host",
-      erofsRootfs: "rootfs/alpine-3.20.erofs",
-      ext4Rootfs: "rootfs/alpine-3.20.ext4",
+      erofsRootfs: "rootfs/alpine-3.23.erofs",
+      ext4Rootfs: "rootfs/alpine-3.23.ext4",
     },
   },
 ] as const satisfies readonly PlatformPackage[];
@@ -149,11 +149,11 @@ for (const platformPackage of preparePlatforms ? selectedPlatformPackages : []) 
   );
   await mkdir(resolve(packageRoot, "rootfs"), { recursive: true });
   await copyFile(
-    resolve(repoRoot, "dist/rootfs/alpine-3.20.erofs"),
+    resolve(repoRoot, "dist/rootfs/alpine-3.23.erofs"),
     resolve(packageRoot, platformPackage.files.erofsRootfs),
   );
   await copyFile(
-    resolve(repoRoot, "dist/rootfs/alpine-3.20.ext4"),
+    resolve(repoRoot, "dist/rootfs/alpine-3.23.ext4"),
     resolve(packageRoot, platformPackage.files.ext4Rootfs),
   );
 

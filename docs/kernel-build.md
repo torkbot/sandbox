@@ -49,7 +49,7 @@ npm run build:rootfs
 npm run build:rootfs:erofs
 ```
 
-`build:init` cross-builds `crates/sandbox-init` as a static Linux guest binary. `build:rootfs` exports a simple Alpine rootfs and copies that init binary into it as `/sandbox-init`. `build:rootfs:erofs` packs that directory into `dist/rootfs/alpine-3.20.erofs` with `mkfs.erofs` in Docker. These are development and CI fixtures, not runtime APIs.
+`build:init` cross-builds `crates/sandbox-init` as a static Linux guest binary. `build:rootfs` exports an Alpine rootfs with agent-oriented command-line utilities and copies that init binary into it as `/sandbox-init`. The default image includes basics such as `bash`, `coreutils`, `curl`, `file`, `findutils`, `git`, `jq`, `less`, `openssh-client`, `ripgrep`, archive tools, PDF tools through `poppler-utils`, image metadata/conversion tools through `exiftool` and ImageMagick, and media inspection/conversion through `ffmpeg`. `build:rootfs:erofs` packs that directory into `dist/rootfs/alpine-3.23.erofs` with deterministic `mkfs.erofs` settings, `lz4hc` compression, a 1 MiB compression cluster, and packed tail fragments. These are development and CI fixtures, not runtime APIs.
 
 ## Static Link Handoff
 
