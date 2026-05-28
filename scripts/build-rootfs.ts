@@ -20,7 +20,6 @@ const agentPackages = [
   "file",
   "findutils",
   "git",
-  "github-cli",
   "imagemagick",
   "jq",
   "less",
@@ -36,6 +35,7 @@ const agentPackages = [
   "xz",
   "zip",
 ] as const;
+const githubCliVersion = "2.83.0";
 
 await rm(outDir, { recursive: true, force: true });
 await mkdir(outDir, { recursive: true });
@@ -50,6 +50,7 @@ await run("docker", [
   "-lc",
   [
     `apk add --no-cache ${agentPackages.map(shellArg).join(" ")}`,
+    installGithubCliScript(),
     "cd /",
     "tar --exclude=out --exclude=proc --exclude=sys --exclude=dev --exclude=tmp -cf - . | tar -C /out -xf -",
     `chown -R ${getuid?.() ?? 0}:${getgid?.() ?? 0} /out`,
@@ -87,6 +88,19 @@ function guestTarget(): string {
 
 function shellArg(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function installGithubCliScript(): string {
+  return [
+    "apk_arch=$(apk --print-arch)",
+    "case \"$apk_arch\" in x86_64) gh_arch=amd64 ;; aarch64) gh_arch=arm64 ;; *) echo unsupported gh architecture: \"$apk_arch\" >&2; exit 1 ;; esac",
+    `gh_url=https://github.com/cli/cli/releases/download/v${githubCliVersion}/gh_${githubCliVersion}_linux_\${gh_arch}.tar.gz`,
+    "tmp=$(mktemp -d)",
+    "curl -fsSL \"$gh_url\" -o \"$tmp/gh.tar.gz\"",
+    "tar -xzf \"$tmp/gh.tar.gz\" -C \"$tmp\"",
+    `install -m 0755 "$tmp/gh_${githubCliVersion}_linux_\${gh_arch}/bin/gh" /usr/local/bin/gh`,
+    "rm -rf \"$tmp\"",
+  ].join(" && ");
 }
 
 async function assertExists(path: string): Promise<void> {

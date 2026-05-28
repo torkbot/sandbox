@@ -105,7 +105,6 @@ test("default rootfs includes agent utility packages", async () => {
     "file",
     "findutils",
     "git",
-    "github-cli",
     "imagemagick",
     "jq",
     "less",
@@ -123,6 +122,8 @@ test("default rootfs includes agent utility packages", async () => {
   ]) {
     assert.match(buildRootfsScript, new RegExp(`"${packageName}"`));
   }
+  assert.match(buildRootfsScript, /githubCliVersion = "2\.83\.0"/);
+  assert.match(buildRootfsScript, /gh_\$\{githubCliVersion\}_linux_/);
 });
 
 test("rootfs EROFS builder uses compressed images", async () => {
