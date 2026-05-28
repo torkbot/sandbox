@@ -14,7 +14,7 @@ test("new public API boots a built-in rootfs and runs a process", async (t) => {
   }
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.20"),
+    rootfs: rootfs.builtIn("alpine:3.23"),
   }).boot();
 
   const result = await sandbox.exec("/bin/sh", ["-lc", "printf '%s' ready"]);
@@ -28,6 +28,38 @@ test("new public API boots a built-in rootfs and runs a process", async (t) => {
   assert.equal(result.stderr, "");
 });
 
+test("built-in agent rootfs includes common agent runtimes and CLIs", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot();
+
+  const result = await sandbox.exec("/bin/sh", [
+    "-lc",
+    [
+      "gh --version | head -n1",
+      "node --version",
+      "npm --version",
+      "python3 --version",
+      "python3 -m pip --version",
+    ].join(" && "),
+  ]);
+
+  assert.equal(
+    result.exitCode,
+    0,
+    `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+  );
+  assert.match(result.stdout, /^gh version /m);
+  assert.match(result.stdout, /^v24\./m);
+  assert.match(result.stdout, /^11\./m);
+  assert.match(result.stdout, /^Python 3\./m);
+  assert.match(result.stdout, /^pip /m);
+});
+
 test("boot options provide instance-specific virtual mounts", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
@@ -39,7 +71,7 @@ test("boot options provide instance-specific virtual mounts", async (t) => {
     },
   });
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.20"),
+    rootfs: rootfs.builtIn("alpine:3.23"),
   }).boot({
     mounts: {
       "/mnt": fs.virtual(laneFs),
@@ -58,7 +90,7 @@ test("boot cwd becomes the default process working directory", async (t) => {
   }
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.20"),
+    rootfs: rootfs.builtIn("alpine:3.23"),
   }).boot({
     cwd: "/tmp",
   });
@@ -77,7 +109,7 @@ test("COW rootfs round-trips rootfs mutations across instances", async (t) => {
   const blockStore = memoryBlockStore();
   const sandboxDefinition = defineSandbox({
     rootfs: rootfs.cow({
-      base: rootfs.builtIn("alpine:3.20"),
+      base: rootfs.builtIn("alpine:3.23"),
       writable: blockStore,
     }),
   });
@@ -99,7 +131,7 @@ test("COW rootfs round-trips rootfs mutations across instances", async (t) => {
   assert.equal(read.exitCode, 0, read.stderr);
   assert.equal(read.stdout, "persisted");
   assert.deepEqual(blockStore.observedBaseIdentities().length, 1);
-  assert.match(blockStore.observedBaseIdentities()[0] ?? "", /built-in:alpine:3\.20:ext4:/);
+  assert.match(blockStore.observedBaseIdentities()[0] ?? "", /built-in:alpine:3\.23:qcow2:/);
 });
 
 test("COW rootfs close sync ignores the instance cwd", async (t) => {
@@ -110,7 +142,7 @@ test("COW rootfs close sync ignores the instance cwd", async (t) => {
   const blockStore = memoryBlockStore();
   const sandboxDefinition = defineSandbox({
     rootfs: rootfs.cow({
-      base: rootfs.builtIn("alpine:3.20"),
+      base: rootfs.builtIn("alpine:3.23"),
       writable: blockStore,
     }),
   });
@@ -145,7 +177,7 @@ function memoryBlockStore(): SandboxBlockStore & { observedBaseIdentities(): rea
   const blocks = new Map<bigint, Uint8Array>();
   const baseIdentities = new Set<string>();
   return {
-    blockSize: 4096,
+    blockSize: 65536,
     async list(context) {
       baseIdentities.add(context.base);
       return Array.from(blocks.keys());

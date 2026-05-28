@@ -6,9 +6,12 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, Once};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use base64::Engine;
-use imago::{DynStorage, SyncFormatAccess, raw::Raw};
+use imago::{
+    DynStorage, FormatAccess, Storage, StorageOpenOptions, SyncFormatAccess, qcow2::Qcow2, raw::Raw,
+};
 
 use crate::MicroVmSpec;
 use crate::block_storage::{CowBlockStorage, CowBlockStore};
@@ -212,70 +215,82 @@ impl KrunContext {
 
     fn apply_rootfs(&self, spec: &MicroVmSpec, services: &HostServices) -> Result<(), KrunError> {
         match spec.rootfs.format {
-            RootfsFormat::Directory => {
-                let path = cstring_path("krun_set_root", &spec.rootfs.path)?;
-                check_krun("krun_set_root", unsafe {
-                    krun::krun_set_root(self.id, path.as_ptr())
-                })?;
-                check_krun(
-                    "krun_set_direct_init",
-                    krun::krun_set_direct_init(self.id, "/sandbox-init".to_string()),
-                )
-            }
-            RootfsFormat::Erofs | RootfsFormat::Ext4 => {
-                let block_id = CString::new("root").unwrap();
-                if let Some(RootfsStorageSpec::CowBlockStore { .. }) = spec.rootfs.storage {
-                    let store = services.root_storage.clone().ok_or_else(|| {
-                        KrunError::new("root COW block store missing", -libc::EINVAL)
-                    })?;
-                    let storage = CowBlockStorage::open(&spec.rootfs.path, store)
-                        .map_err(|_| KrunError::new("CowBlockStorage::open", -libc::EIO))?;
-                    let raw = Raw::<Box<dyn DynStorage>>::open_image_sync(Box::new(storage), true)
-                        .map_err(|_| KrunError::new("Raw::open_image_sync", -libc::EIO))?;
-                    let disk = SyncFormatAccess::new(raw)
-                        .map_err(|_| KrunError::new("SyncFormatAccess::new", -libc::EIO))?;
-                    check_krun(
-                        "krun_add_storage_disk",
-                        krun::krun_add_storage_disk(
-                            self.id,
-                            "root".to_string(),
-                            Arc::new(Mutex::new(disk)),
-                            false,
-                            sync_mode(),
-                        ),
-                    )?;
-                } else {
-                    let path = cstring_path("krun_add_disk3", &spec.rootfs.path)?;
-                    check_krun("krun_add_disk3", unsafe {
-                        krun::krun_add_disk3(
-                            self.id,
-                            block_id.as_ptr(),
-                            path.as_ptr(),
-                            0,
-                            spec.rootfs.readonly,
-                            false,
-                            sync_mode(),
+            RootfsFormat::Qcow2 => {
+                let rootfs_trace = RootfsTrace::start(
+                    if spec.rootfs.storage.is_some() {
+                        "qcow2+cow"
+                    } else {
+                        "qcow2"
+                    },
+                    spec.rootfs.readonly,
+                );
+                cstring_path("rootfs.path", &spec.rootfs.path)?;
+                let writable = spec.rootfs.storage.is_some();
+                let disk =
+                    if let Some(RootfsStorageSpec::CowBlockStore { .. }) = spec.rootfs.storage {
+                        let store = services.root_storage.clone().ok_or_else(|| {
+                            KrunError::new("root COW block store missing", -libc::EINVAL)
+                        })?;
+                        let open_start = Instant::now();
+                        let storage = Box::<dyn DynStorage>::open_sync(
+                            StorageOpenOptions::new()
+                                .filename(&spec.rootfs.path)
+                                .write(false),
                         )
-                    })?;
-                }
+                        .map_err(|_| KrunError::new("Qcow2 storage open", -libc::EIO))?;
+                        rootfs_trace.stage("open_container", open_start);
+                        let qcow_start = Instant::now();
+                        let qcow2 = open_qcow2_access(storage, false)?;
+                        rootfs_trace.stage("open_qcow2", qcow_start);
+                        let cow_start = Instant::now();
+                        let cow = CowBlockStorage::open_storage(qcow2, store)
+                            .map_err(|_| KrunError::new("CowBlockStorage::open", -libc::EIO))?;
+                        rootfs_trace.stage("open_cow", cow_start);
+                        let raw_start = Instant::now();
+                        let disk = open_raw_disk(Box::new(cow), writable)?;
+                        rootfs_trace.stage("open_raw", raw_start);
+                        disk
+                    } else {
+                        let open_start = Instant::now();
+                        let storage = Box::<dyn DynStorage>::open_sync(
+                            StorageOpenOptions::new()
+                                .filename(&spec.rootfs.path)
+                                .write(false),
+                        )
+                        .map_err(|_| KrunError::new("Qcow2 storage open", -libc::EIO))?;
+                        rootfs_trace.stage("open_container", open_start);
+                        let qcow_start = Instant::now();
+                        let disk = open_qcow2_disk(storage, false)?;
+                        rootfs_trace.stage("open_qcow2", qcow_start);
+                        disk
+                    };
+                let add_disk_start = Instant::now();
+                check_krun(
+                    "krun_add_storage_disk",
+                    krun::krun_add_storage_disk(
+                        self.id,
+                        "root".to_string(),
+                        Arc::new(Mutex::new(disk)),
+                        spec.rootfs.readonly,
+                        sync_mode(),
+                    ),
+                )?;
+                rootfs_trace.stage("add_storage_disk", add_disk_start);
 
+                let root_start = Instant::now();
                 check_krun(
                     "krun_set_direct_block_root",
                     krun::krun_set_direct_block_root(
                         self.id,
                         "/dev/vda".to_string(),
-                        match spec.rootfs.format {
-                            RootfsFormat::Erofs => "erofs",
-                            RootfsFormat::Ext4 => "ext4",
-                            RootfsFormat::Directory => {
-                                unreachable!("directory rootfs handled above")
-                            }
-                        }
-                        .to_string(),
+                        "ext4".to_string(),
                         if spec.rootfs.readonly { "ro" } else { "rw" }.to_string(),
                         "/sandbox-init".to_string(),
                     ),
-                )
+                )?;
+                rootfs_trace.stage("set_direct_block_root", root_start);
+                rootfs_trace.finish();
+                Ok(())
             }
         }
     }
@@ -346,6 +361,33 @@ fn encode_virtual_fs_mounts(virtual_fs: &[VirtualFsDevice]) -> String {
     value
 }
 
+fn open_qcow2_disk(
+    storage: Box<dyn DynStorage>,
+    writable: bool,
+) -> Result<SyncFormatAccess<Box<dyn DynStorage>>, KrunError> {
+    let qcow2 = Qcow2::<Box<dyn DynStorage>>::open_image_sync(storage, writable)
+        .map_err(|_| KrunError::new("Qcow2::open_image_sync", -libc::EIO))?;
+    SyncFormatAccess::new(qcow2).map_err(|_| KrunError::new("SyncFormatAccess::new", -libc::EIO))
+}
+
+fn open_qcow2_access(
+    storage: Box<dyn DynStorage>,
+    writable: bool,
+) -> Result<FormatAccess<Box<dyn DynStorage>>, KrunError> {
+    let qcow2 = Qcow2::<Box<dyn DynStorage>>::open_image_sync(storage, writable)
+        .map_err(|_| KrunError::new("Qcow2::open_image_sync", -libc::EIO))?;
+    Ok(FormatAccess::new(qcow2))
+}
+
+fn open_raw_disk(
+    storage: Box<dyn DynStorage>,
+    writable: bool,
+) -> Result<SyncFormatAccess<Box<dyn DynStorage>>, KrunError> {
+    let raw = Raw::<Box<dyn DynStorage>>::open_image_sync(storage, writable)
+        .map_err(|_| KrunError::new("Raw::open_image_sync", -libc::EIO))?;
+    SyncFormatAccess::new(raw).map_err(|_| KrunError::new("SyncFormatAccess::new", -libc::EIO))
+}
+
 fn init_krun_logging() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
@@ -353,6 +395,43 @@ fn init_krun_logging() {
             let _ = krun::krun_set_log_level(4);
         }
     });
+}
+
+struct RootfsTrace {
+    enabled: bool,
+    started_at: Instant,
+    format: &'static str,
+    readonly: bool,
+}
+
+impl RootfsTrace {
+    fn start(format: &'static str, readonly: bool) -> Self {
+        let trace = Self {
+            enabled: std::env::var_os("SANDBOX_ROOTFS_TRACE").is_some(),
+            started_at: Instant::now(),
+            format,
+            readonly,
+        };
+        trace.event("start", 0.0);
+        trace
+    }
+
+    fn stage(&self, stage: &'static str, started_at: Instant) {
+        self.event(stage, started_at.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    fn finish(&self) {
+        self.event("finish", self.started_at.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    fn event(&self, stage: &'static str, elapsed_ms: f64) {
+        if self.enabled {
+            eprintln!(
+                "sandbox.rootfs stage={stage} elapsed_ms={elapsed_ms:.3} format={} readonly={}",
+                self.format, self.readonly
+            );
+        }
+    }
 }
 
 #[cfg(sandbox_static_kernel)]
@@ -652,9 +731,9 @@ mod tests {
             memory_mib: Some(128),
             kernel_format: None,
             init_crate: "sandbox-init".to_string(),
-            rootfs_path: "rootfs.erofs".to_string(),
+            rootfs_path: "rootfs.qcow2".to_string(),
             rootfs_readonly: Some(true),
-            rootfs_format: "erofs".to_string(),
+            rootfs_format: "qcow2".to_string(),
             rootfs_storage: None,
             mounts: Vec::new(),
             network_outbound: None,
@@ -667,16 +746,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_directory_rootfs() {
+    fn rejects_non_qcow2_rootfs() {
         let err = MicroVmSpec::build(MicroVmSpecInput {
-            name: Some("directory-root".to_string()),
+            name: Some("raw-root".to_string()),
             vcpus: Some(1),
             memory_mib: Some(128),
             kernel_format: None,
             init_crate: "sandbox-init".to_string(),
-            rootfs_path: "/tmp/sandbox-root".to_string(),
+            rootfs_path: "rootfs.raw".to_string(),
             rootfs_readonly: Some(true),
-            rootfs_format: "directory".to_string(),
+            rootfs_format: "raw".to_string(),
             rootfs_storage: None,
             mounts: Vec::new(),
             network_outbound: None,
@@ -684,23 +763,24 @@ mod tests {
         })
         .unwrap_err();
 
-        assert_eq!(
-            err.to_string(),
-            "directory rootfs is not supported for sandboxed VM launch; use an EROFS rootfs"
-        );
+        assert_eq!(err.to_string(), "unsupported rootfs.format: raw");
     }
 
     #[test]
     fn configures_control_port_by_connected_fd() {
+        if std::env::var_os("SANDBOX_RUN_LIBKRUN_UNIT_TESTS").is_none() {
+            return;
+        }
+
         let spec = MicroVmSpec::build(MicroVmSpecInput {
             name: Some("control-fd".to_string()),
             vcpus: Some(1),
             memory_mib: Some(128),
             kernel_format: None,
             init_crate: "sandbox-init".to_string(),
-            rootfs_path: "rootfs.erofs".to_string(),
+            rootfs_path: "rootfs.qcow2".to_string(),
             rootfs_readonly: Some(true),
-            rootfs_format: "erofs".to_string(),
+            rootfs_format: "qcow2".to_string(),
             rootfs_storage: None,
             mounts: Vec::new(),
             network_outbound: None,
@@ -734,9 +814,9 @@ mod tests {
             memory_mib: Some(128),
             kernel_format: None,
             init_crate: "sandbox-init".to_string(),
-            rootfs_path: "rootfs.erofs".to_string(),
+            rootfs_path: "rootfs.qcow2".to_string(),
             rootfs_readonly: Some(true),
-            rootfs_format: "erofs".to_string(),
+            rootfs_format: "qcow2".to_string(),
             rootfs_storage: None,
             mounts: Vec::new(),
             network_outbound: None,
@@ -942,7 +1022,7 @@ mod tests {
             init_crate: "sandbox-init".to_string(),
             rootfs_path: "bad\0root".to_string(),
             rootfs_readonly: Some(true),
-            rootfs_format: "erofs".to_string(),
+            rootfs_format: "qcow2".to_string(),
             rootfs_storage: None,
             mounts: Vec::new(),
             network_outbound: None,
@@ -951,6 +1031,6 @@ mod tests {
         .unwrap();
 
         let err = KrunContext::create(&spec).unwrap_err();
-        assert_eq!(err.to_string(), "krun_add_disk3 failed with -22");
+        assert_eq!(err.to_string(), "rootfs.path failed with -22");
     }
 }

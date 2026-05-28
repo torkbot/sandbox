@@ -17,7 +17,7 @@ export type HostSpawnSandboxOptions = {
   readonly rootfs: {
     readonly path: string;
     readonly readonly?: boolean;
-    readonly format: "directory" | "erofs" | "ext4";
+    readonly format: "qcow2";
     readonly storage?: {
       readonly kind: "cow-block-store";
       readonly blockSize: number;

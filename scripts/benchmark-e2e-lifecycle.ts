@@ -1,15 +1,12 @@
-import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { access, mkdir, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
+import { access, mkdir, writeFile } from "node:fs/promises";
 import { platform } from "node:os";
 import { resolve } from "node:path";
 
-import {
-  defineSandbox,
-  rootfs,
-} from "../src/index.ts";
 import { hostBinaryPath } from "../src/host-process.ts";
+import { defineSandbox, rootfs } from "../src/index.ts";
 
 type IterationTiming = {
   readonly iteration: number;
@@ -37,11 +34,15 @@ type BenchmarkConfig = {
   readonly iterations: number;
   readonly warmups: number;
   readonly command: string;
+  readonly commandArgs: readonly string[];
   readonly output: string;
 };
 
 const repoRoot = resolve(import.meta.dirname, "..");
-const runId = new Date().toISOString().replaceAll(":", "-").replaceAll(".", "-");
+const runId = new Date()
+  .toISOString()
+  .replaceAll(":", "-")
+  .replaceAll(".", "-");
 const config = parseArgs(process.argv.slice(2));
 
 const artifacts = await assertVmLaunchSupport();
@@ -52,7 +53,7 @@ const totalRuns = config.warmups + config.iterations;
 console.log(
   `Running ${config.iterations} measured lifecycle iterations` +
     (config.warmups > 0 ? ` after ${config.warmups} warmup iterations` : "") +
-    ` with command: ${config.command}`,
+    ` with command: ${[config.command, ...config.commandArgs].join(" ")}`,
 );
 
 for (let index = 0; index < totalRuns; index += 1) {
@@ -73,7 +74,8 @@ const report = {
   platform: platform(),
   arch: process.arch,
   command: config.command,
-  rootfs: "alpine:3.20",
+  commandArgs: config.commandArgs,
+  rootfs: "alpine:3.23",
   git: gitMetadata(),
   node: {
     execPath: process.execPath,
@@ -94,7 +96,9 @@ const report = {
 const outputPath = resolve(repoRoot, config.output, "summary.json");
 await writeFile(outputPath, `${JSON.stringify(report, null, 2)}\n`);
 console.log(`Wrote benchmark summary to ${outputPath}`);
-console.log(`Total p50=${formatMs(report.stats.total.p50Ms)} p95=${formatMs(report.stats.total.p95Ms)} mean=${formatMs(report.stats.total.meanMs)}`);
+console.log(
+  `Total p50=${formatMs(report.stats.total.p50Ms)} p95=${formatMs(report.stats.total.p95Ms)} mean=${formatMs(report.stats.total.meanMs)}`,
+);
 
 async function runLifecycleIteration(
   iteration: number,
@@ -104,7 +108,7 @@ async function runLifecycleIteration(
   const totalStart = nowMs();
   const bootStart = totalStart;
   const sandboxDefinition = defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.20"),
+    rootfs: rootfs.builtIn("alpine:3.23"),
   });
 
   const sandbox = await sandboxDefinition.boot();
@@ -113,7 +117,7 @@ async function runLifecycleIteration(
     const bootMs = nowMs() - bootStart;
 
     const execStart = nowMs();
-    const result = await sandbox.exec("/bin/sh", ["-lc", input.command]);
+    const result = await sandbox.exec(input.command, input.commandArgs);
     const execMs = nowMs() - execStart;
     if (result.exitCode !== 0) {
       throw new Error(
@@ -153,7 +157,7 @@ async function assertVmLaunchSupport(): Promise<{
   if (process.platform !== "darwin" && process.platform !== "linux") {
     throw new Error(`unsupported VM launch host platform: ${process.platform}`);
   }
-  const rootfsPath = resolve(repoRoot, "dist/rootfs/alpine-3.20.erofs");
+  const rootfsPath = resolve(repoRoot, "dist/rootfs/alpine-3.23.qcow2");
   await access(rootfsPath);
   return {
     hostBinary: await artifactMetadata(hostBinary),
@@ -182,18 +186,22 @@ async function artifactMetadata(path: string): Promise<ArtifactMetadata> {
   };
 }
 
-function gitMetadata(): { readonly commit: string | null; readonly dirty: boolean | null } {
+function gitMetadata(): {
+  readonly commit: string | null;
+  readonly dirty: boolean | null;
+} {
   try {
     const commit = execFileSync("git", ["rev-parse", "HEAD"], {
       cwd: repoRoot,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();
-    const dirty = execFileSync("git", ["status", "--porcelain"], {
-      cwd: repoRoot,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim().length > 0;
+    const dirty =
+      execFileSync("git", ["status", "--porcelain"], {
+        cwd: repoRoot,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim().length > 0;
     return { commit, dirty };
   } catch {
     return { commit: null, dirty: null };
@@ -203,7 +211,8 @@ function gitMetadata(): { readonly commit: string | null; readonly dirty: boolea
 function parseArgs(args: readonly string[]): BenchmarkConfig {
   let iterations = 10;
   let warmups = 1;
-  let command = "true";
+  let command = "/bin/true";
+  let commandArgs: readonly string[] = [];
   let output = `test-results/benchmarks/e2e-lifecycle/${runId}`;
 
   for (let index = 0; index < args.length; index += 1) {
@@ -226,7 +235,14 @@ function parseArgs(args: readonly string[]): BenchmarkConfig {
       continue;
     }
     if (arg === "--command" || arg === "-c") {
+      command = "/bin/sh";
+      commandArgs = ["-lc", readValue(args, index)];
+      index += 1;
+      continue;
+    }
+    if (arg === "--exec") {
       command = readValue(args, index);
+      commandArgs = [];
       index += 1;
       continue;
     }
@@ -238,7 +254,7 @@ function parseArgs(args: readonly string[]): BenchmarkConfig {
     throw new Error(`unknown argument: ${arg}`);
   }
 
-  return { iterations, warmups, command, output };
+  return { iterations, warmups, command, commandArgs, output };
 }
 
 function readValue(args: readonly string[], index: number): string {
@@ -272,7 +288,9 @@ function summarize(values: readonly number[]): LatencyStats {
 
   const sorted = [...values].sort((left, right) => left - right);
   const meanMs = sorted.reduce((sum, value) => sum + value, 0) / sorted.length;
-  const variance = sorted.reduce((sum, value) => sum + (value - meanMs) ** 2, 0) / sorted.length;
+  const variance =
+    sorted.reduce((sum, value) => sum + (value - meanMs) ** 2, 0) /
+    sorted.length;
   const first = sorted[0];
   const last = sorted[sorted.length - 1];
   if (first === undefined || last === undefined) {
@@ -292,7 +310,10 @@ function summarize(values: readonly number[]): LatencyStats {
   };
 }
 
-function percentile(sortedValues: readonly number[], percentileValue: number): number {
+function percentile(
+  sortedValues: readonly number[],
+  percentileValue: number,
+): number {
   if (sortedValues.length === 1) {
     const only = sortedValues[0];
     if (only === undefined) {
@@ -326,13 +347,14 @@ function formatMs(value: number): string {
 function printUsage(): void {
   console.log(`usage: node ./scripts/benchmark-e2e-lifecycle.ts [options]
 
-Boot a sandbox microVM, wait for init.ready, run one guest shell command, close
+Boot a sandbox microVM, wait for init.ready, run one guest command, close
 the VM, and report latency statistics for repeated lifecycle iterations.
 
 Options:
   -n, --iterations <count>  measured iterations to run (default: 10)
       --warmups <count>     warmup iterations excluded from stats (default: 1)
-  -c, --command <script>    guest shell command to run (default: true)
+      --exec <path>          guest executable to run directly (default: /bin/true)
+  -c, --command <script>    guest shell command to run through /bin/sh -lc
       --output <dir>        output directory for summary.json
 `);
 }

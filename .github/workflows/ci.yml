@@ -111,8 +111,7 @@ jobs:
             printf 'init-key-hash=%s\n' "${init_key_hash}"
             git ls-files -z \
               scripts/build-rootfs.ts \
-              scripts/build-rootfs-erofs.ts \
-              scripts/build-rootfs-ext4.ts \
+              scripts/build-rootfs-qcow2.ts \
               | xargs -0 shasum -a 256
           } > rootfs-cache-inputs.txt
           rootfs_key_hash="$(shasum -a 256 rootfs-cache-inputs.txt | cut -d ' ' -f1)"
@@ -160,8 +159,7 @@ jobs:
         if: steps.rootfs-cache.outputs.cache-hit != 'true'
         run: |
           npm run build:rootfs
-          npm run build:rootfs:erofs
-          npm run build:rootfs:ext4
+          npm run build:rootfs:qcow2
 
   e2e-fixtures-arm64:
     name: Build e2e fixtures (ubuntu-24.04-arm)
@@ -211,8 +209,7 @@ jobs:
             printf 'init-key-hash=%s\n' "${init_key_hash}"
             git ls-files -z \
               scripts/build-rootfs.ts \
-              scripts/build-rootfs-erofs.ts \
-              scripts/build-rootfs-ext4.ts \
+              scripts/build-rootfs-qcow2.ts \
               | xargs -0 shasum -a 256
           } > rootfs-cache-inputs.txt
           rootfs_key_hash="$(shasum -a 256 rootfs-cache-inputs.txt | cut -d ' ' -f1)"
@@ -260,8 +257,7 @@ jobs:
         if: steps.rootfs-cache.outputs.cache-hit != 'true'
         run: |
           npm run build:rootfs
-          npm run build:rootfs:erofs
-          npm run build:rootfs:ext4
+          npm run build:rootfs:qcow2
 
   e2e:
     name: Run e2e (ubuntu-24.04)
@@ -342,8 +338,7 @@ jobs:
             printf 'init-key-hash=%s\n' "${init_key_hash}"
             git ls-files -z \
               scripts/build-rootfs.ts \
-              scripts/build-rootfs-erofs.ts \
-              scripts/build-rootfs-ext4.ts \
+              scripts/build-rootfs-qcow2.ts \
               | xargs -0 shasum -a 256
           } > rootfs-cache-inputs.txt
           rootfs_key_hash="$(shasum -a 256 rootfs-cache-inputs.txt | cut -d ' ' -f1)"

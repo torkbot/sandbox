@@ -224,19 +224,15 @@ jobs:
       - name: Build built-in rootfs
         run: npm run build:rootfs
 
-      - name: Build built-in rootfs EROFS image
-        run: npm run build:rootfs:erofs
-
-      - name: Build built-in rootfs ext4 image
-        run: npm run build:rootfs:ext4
+      - name: Build built-in rootfs QCOW2 image
+        run: npm run build:rootfs:qcow2
 
       - name: Upload rootfs artifact
         uses: actions/upload-artifact@v4
         with:
           name: rootfs-${{ matrix.guest_arch }}
           path: |
-            dist/rootfs/alpine-3.20.erofs
-            dist/rootfs/alpine-3.20.ext4
+            dist/rootfs/alpine-3.23.qcow2
           if-no-files-found: error
 
   build-root:

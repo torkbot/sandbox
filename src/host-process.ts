@@ -58,6 +58,9 @@ export class HostProcessSandboxVm implements HostControlChannel {
       const text = chunk.toString("utf8").trim();
       if (text.length > 0) {
         this.#stderr = this.#stderr.length === 0 ? text : `${this.#stderr}\n${text}`;
+        if (process.env.SANDBOX_HOST_STDERR === "1") {
+          process.stderr.write(chunk);
+        }
       }
     });
     child.stdin.on("error", (error: Error) => {

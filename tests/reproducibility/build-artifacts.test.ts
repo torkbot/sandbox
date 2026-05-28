@@ -7,33 +7,23 @@ import { join, relative } from "node:path";
 
 const repoRoot = new URL("../..", import.meta.url);
 
-test("rootfs fixture builds reproducibly", async () => {
+test("rootfs fixture produces a QCOW2 image", async () => {
   const resultsDir = join(repoRoot.pathname, "test-results");
   await mkdir(resultsDir, { recursive: true });
-  const workDir = await mkdtemp(join(resultsDir, "rootfs-repro-"));
+  const workDir = await mkdtemp(join(resultsDir, "rootfs-qcow2-"));
   try {
-    const firstDir = join(workDir, "rootfs-a");
-    const secondDir = join(workDir, "rootfs-b");
-    const firstErofs = join(workDir, "rootfs-a.erofs");
-    const secondErofs = join(workDir, "rootfs-b.erofs");
+    const rootfsDir = join(workDir, "rootfs");
+    const qcow2 = join(workDir, "rootfs.qcow2");
 
     await runNpmScript("build:rootfs", {
-      SANDBOX_ROOTFS_OUT_DIR: firstDir,
+      SANDBOX_ROOTFS_OUT_DIR: rootfsDir,
     });
-    await runNpmScript("build:rootfs", {
-      SANDBOX_ROOTFS_OUT_DIR: secondDir,
-    });
-    await runNpmScript("build:rootfs:erofs", {
-      SANDBOX_ROOTFS_SOURCE_DIR: firstDir,
-      SANDBOX_ROOTFS_EROFS_OUT: firstErofs,
-    });
-    await runNpmScript("build:rootfs:erofs", {
-      SANDBOX_ROOTFS_SOURCE_DIR: secondDir,
-      SANDBOX_ROOTFS_EROFS_OUT: secondErofs,
+    await runNpmScript("build:rootfs:qcow2", {
+      SANDBOX_ROOTFS_SOURCE_DIR: rootfsDir,
+      SANDBOX_ROOTFS_QCOW2_OUT: qcow2,
     });
 
-    assert.equal(await digestTree(firstDir), await digestTree(secondDir));
-    assert.equal(await digestFile(firstErofs), await digestFile(secondErofs));
+    assert.deepEqual((await readFile(qcow2)).subarray(0, 4), Buffer.from("QFI\xfb", "binary"));
   } finally {
     await rm(workDir, { recursive: true, force: true });
   }

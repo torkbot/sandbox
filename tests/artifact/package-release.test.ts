@@ -48,6 +48,10 @@ test("release workflow builds platform packages before publishing the root packa
   assert.match(workflow, /SANDBOX_KERNEL_ARCH/);
   assert.match(workflow, /Download kernel artifact/);
   assert.match(workflow, /Download rootfs artifact/);
+  assert.match(workflow, /dist\/rootfs\/alpine-3\.23\.qcow2/);
+  assert.doesNotMatch(workflow, /dist\/rootfs\/alpine-3\.23\.erofs/);
+  assert.doesNotMatch(workflow, /dist\/rootfs\/alpine-3\.23\.ext4/);
+  assert.doesNotMatch(workflow, /alpine-3\.20/);
   assert.match(workflow, /prepare-npm-packages\.ts --platform --current/);
   assert.match(workflow, /Publish platform packages/);
   assert.match(workflow, /Publish root package/);
@@ -69,20 +73,65 @@ test("local release scripts build current rootfs before packaging platform packa
 
   for (const scriptName of ["release:prepare", "release:pack"]) {
     const script = packageJson.scripts?.[scriptName] ?? "";
-    const buildRootfs = script.indexOf("node --run build:rootfs:erofs");
-    const buildWritableRootfs = script.indexOf("node --run build:rootfs:ext4");
+    const buildRootfs = script.indexOf("node --run build:rootfs:qcow2");
     const packageCurrentPlatform = script.indexOf("prepare-npm-packages.ts --platform --current");
 
     assert.notEqual(buildRootfs, -1, `${scriptName} should build the rootfs image`);
-    assert.notEqual(buildWritableRootfs, -1, `${scriptName} should build the writable rootfs image`);
     assert.notEqual(packageCurrentPlatform, -1, `${scriptName} should package the current platform`);
     assert.ok(
       buildRootfs < packageCurrentPlatform,
       `${scriptName} should build the rootfs image before packaging the platform package`,
     );
-    assert.ok(
-      buildWritableRootfs < packageCurrentPlatform,
-      `${scriptName} should build the writable rootfs image before packaging the platform package`,
-    );
   }
+});
+
+test("default rootfs includes agent utility packages", async () => {
+  const buildRootfsScript = await readFile(
+    new URL("../../scripts/build-rootfs.ts", import.meta.url),
+    "utf8",
+  );
+
+  for (const packageName of [
+    "bash",
+    "coreutils",
+    "curl",
+    "exiftool",
+    "ffmpeg",
+    "file",
+    "findutils",
+    "git",
+    "imagemagick",
+    "jq",
+    "less",
+    "nodejs-current",
+    "npm",
+    "openssh-client",
+    "poppler-utils",
+    "py3-pip",
+    "python3",
+    "ripgrep",
+    "tar",
+    "unzip",
+    "xz",
+    "zip",
+  ]) {
+    assert.match(buildRootfsScript, new RegExp(`"${packageName}"`));
+  }
+  assert.match(buildRootfsScript, /githubCliVersion = "2\.83\.0"/);
+  assert.match(buildRootfsScript, /gh_\$\{githubCliVersion\}_linux_/);
+});
+
+test("rootfs QCOW2 builder uses compressed images", async () => {
+  const buildQcow2Script = await readFile(
+    new URL("../../scripts/build-rootfs-qcow2.ts", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(buildQcow2Script, /SANDBOX_QCOW2_BUILDER_IMAGE \?\? "debian:bookworm"/);
+  assert.match(buildQcow2Script, /decimalEnv\("SANDBOX_QCOW2_CLUSTER_SIZE", "32768"\)/);
+  assert.match(buildQcow2Script, /decimalEnv\("SANDBOX_ROOTFS_FREE_SPACE_KIB", "131072"\)/);
+  assert.match(buildQcow2Script, /qemu-img/);
+  assert.match(buildQcow2Script, /-O qcow2/);
+  assert.match(buildQcow2Script, /-c/);
+  assert.match(buildQcow2Script, /compat=1\.1,cluster_size=/);
 });
