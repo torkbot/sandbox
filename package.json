@@ -36,6 +36,7 @@
     "build:rootfs:ext4": "node ./scripts/build-rootfs-ext4.ts",
     "build:ts": "rm -f dist/*.js dist/*.js.map dist/*.d.ts dist/*.d.ts.map && tsgo --project tsconfig.build.json --pretty",
     "artifacts:link-current": "node ./scripts/prepare-npm-packages.ts --platform --current --install",
+    "test:disk": "node ./scripts/test-disk.ts",
     "benchmark:e2e:lifecycle": "node ./scripts/benchmark-e2e-lifecycle.ts",
     "check:rust": "cargo check --workspace",
     "test:artifact": "npm run artifacts:link-current && node --test tests/artifact/*.test.ts",

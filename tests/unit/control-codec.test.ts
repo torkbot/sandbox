@@ -24,6 +24,22 @@ test("control command codec emits length-prefixed BSON", () => {
   });
 });
 
+test("control command codec encodes guest spawn commands", () => {
+  const packet = encodeControlCommand({
+    type: "guest.spawn",
+    id: "spawn",
+    argv: ["/bin/cat"],
+    env: { FOO: "bar" },
+  });
+
+  assert.deepEqual(BSON.deserialize(packet.subarray(4)), {
+    type: "guest.spawn",
+    id: "spawn",
+    argv: ["/bin/cat"],
+    env: [{ key: "FOO", value: "bar" }],
+  });
+});
+
 test("control event codec decodes init ready and binary exec output", () => {
   assert.deepEqual(
     decodeControlEvent(
@@ -60,6 +76,46 @@ test("control event codec decodes init ready and binary exec output", () => {
       stderr: "",
     },
   );
+
+  const stdout = decodeControlEvent(
+    encodePacket({
+      type: "guest.spawn.stdout",
+      id: "spawn",
+      data: new Binary(new Uint8Array([0, 1, 2])),
+    }),
+  );
+  assert.equal(stdout.type, "guest.spawn.stdout");
+  assert.equal(stdout.id, "spawn");
+  assert.deepEqual([...stdout.data], [0, 1, 2]);
+
+  assert.deepEqual(
+    decodeControlEvent(
+      encodePacket({
+        type: "guest.spawn.exit",
+        id: "spawn",
+        exitCode: 7,
+      }),
+    ),
+    {
+      type: "guest.spawn.exit",
+      id: "spawn",
+      exitCode: 7,
+    },
+  );
+
+  assert.deepEqual(
+    decodeControlEvent(
+      encodePacket({
+        type: "guest.spawn.streams.closed",
+        id: "spawn",
+      }),
+    ),
+    {
+      type: "guest.spawn.streams.closed",
+      id: "spawn",
+    },
+  );
+
 });
 
 test("control event codec rejects malformed packets", () => {

@@ -14,20 +14,47 @@ export type SandboxControlEvent =
       readonly exitCode: number;
       readonly stdout: string;
       readonly stderr: string;
+    }
+  | {
+      readonly type: "guest.spawn.stdout" | "guest.spawn.stderr";
+      readonly id: string;
+      readonly data: Uint8Array;
+    }
+  | {
+      readonly type: "guest.spawn.started";
+      readonly id: string;
+    }
+  | {
+      readonly type: "guest.spawn.exit";
+      readonly id: string;
+      readonly exitCode: number;
+    }
+  | {
+      readonly type: "guest.spawn.streams.closed";
+      readonly id: string;
     };
 
-export type SandboxControlCommand = {
-  readonly type: "guest.exec";
-  readonly id: string;
-  readonly argv: readonly string[];
-  readonly env?: Record<string, string>;
-};
+export type SandboxControlCommand =
+  | {
+      readonly type: "guest.exec" | "guest.spawn";
+      readonly id: string;
+      readonly argv: readonly string[];
+      readonly env?: Record<string, string>;
+    }
+;
 
 export function encodeControlCommand(command: SandboxControlCommand): Uint8Array {
   switch (command.type) {
     case "guest.exec":
       return encodePacket({
         type: "guest.exec",
+        id: command.id,
+        argv: [...command.argv],
+        env: Object.entries(command.env ?? {}).map(([key, value]) => ({ key, value })),
+      });
+    case "guest.spawn":
+      return encodePacket({
+        type: "guest.spawn",
         id: command.id,
         argv: [...command.argv],
         env: Object.entries(command.env ?? {}).map(([key, value]) => ({ key, value })),
@@ -55,6 +82,29 @@ export function decodeControlEvent(packet: Uint8Array): SandboxControlEvent {
         exitCode: readNumber(document, "exitCode"),
         stdout: new TextDecoder().decode(readBytes(document, "stdout")),
         stderr: new TextDecoder().decode(readBytes(document, "stderr")),
+      };
+    case "guest.spawn.stdout":
+    case "guest.spawn.stderr":
+      return {
+        type: frameType,
+        id: readString(document, "id"),
+        data: readBytes(document, "data"),
+      };
+    case "guest.spawn.started":
+      return {
+        type: "guest.spawn.started",
+        id: readString(document, "id"),
+      };
+    case "guest.spawn.exit":
+      return {
+        type: "guest.spawn.exit",
+        id: readString(document, "id"),
+        exitCode: readNumber(document, "exitCode"),
+      };
+    case "guest.spawn.streams.closed":
+      return {
+        type: "guest.spawn.streams.closed",
+        id: readString(document, "id"),
       };
     default:
       throw new Error(`unknown control frame type: ${frameType}`);
