@@ -5,10 +5,10 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use imago::Storage;
 use imago::io_buffers::{IoVector, IoVectorMut};
 use imago::storage::PreallocateMode;
 use imago::storage::drivers::CommonStorageHelper;
+use imago::{DynStorage, FormatAccess, Storage};
 
 pub trait CowBlockStore: Send + Sync {
     fn block_size(&self) -> u64;
@@ -30,7 +30,7 @@ impl fmt::Debug for CowBlockStorage {
 }
 
 struct CowBlockStorageState {
-    base: File,
+    base: CowBlockBase,
     size: u64,
     block_size: u64,
     store: Arc<dyn CowBlockStore>,
@@ -40,8 +40,27 @@ struct CowBlockStorageState {
     modified_blocks: HashSet<u64>,
 }
 
+enum CowBlockBase {
+    File(File),
+    Storage(FormatAccess<Box<dyn DynStorage>>),
+}
+
 impl CowBlockStorage {
     pub fn open(base_path: &Path, store: Arc<dyn CowBlockStore>) -> io::Result<Self> {
+        let base = File::open(base_path)?;
+        let size = base.metadata()?.len();
+        Self::open_base(CowBlockBase::File(base), size, store)
+    }
+
+    pub fn open_storage(
+        base: FormatAccess<Box<dyn DynStorage>>,
+        store: Arc<dyn CowBlockStore>,
+    ) -> io::Result<Self> {
+        let size = base.size();
+        Self::open_base(CowBlockBase::Storage(base), size, store)
+    }
+
+    fn open_base(base: CowBlockBase, size: u64, store: Arc<dyn CowBlockStore>) -> io::Result<Self> {
         let block_size = store.block_size();
         if block_size == 0 || block_size % 512 != 0 {
             return Err(io::Error::new(
@@ -51,8 +70,6 @@ impl CowBlockStorage {
         }
 
         let store_blocks = store.list_blocks()?;
-        let base = File::open(base_path)?;
-        let size = base.metadata()?.len();
         Ok(Self {
             state: Mutex::new(CowBlockStorageState {
                 base,
@@ -110,7 +127,7 @@ impl Storage for CowBlockStorage {
                 .map_err(|_| io::Error::other("COW read buffer is too large"))?;
             let (mut head, tail) = bufv.split_at(chunk_len as u64);
             let mut bytes = vec![0; chunk_len];
-            self.read_into(&mut bytes, offset)?;
+            self.read_into(&mut bytes, offset).await?;
             head.copy_from_slice(&bytes);
             bufv = tail;
             offset = offset
@@ -127,7 +144,7 @@ impl Storage for CowBlockStorage {
             let (head, tail) = bufv.split_at(chunk_len as u64);
             let mut bytes = vec![0; chunk_len];
             head.copy_into_slice(&mut bytes);
-            self.write_from(&bytes, offset)?;
+            self.write_from(&bytes, offset).await?;
             bufv = tail;
             offset = offset
                 .checked_add(chunk_len as u64)
@@ -137,15 +154,15 @@ impl Storage for CowBlockStorage {
     }
 
     async unsafe fn pure_write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
-        self.write_zeroes(offset, length)
+        self.write_zeroes(offset, length).await
     }
 
     async unsafe fn pure_write_allocated_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
-        self.write_zeroes(offset, length)
+        self.write_zeroes(offset, length).await
     }
 
     async unsafe fn pure_discard(&self, offset: u64, length: u64) -> io::Result<()> {
-        self.write_zeroes(offset, length)
+        self.write_zeroes(offset, length).await
     }
 
     async fn flush(&self) -> io::Result<()> {
@@ -206,7 +223,7 @@ impl Storage for CowBlockStorage {
 }
 
 impl CowBlockStorage {
-    fn read_into(&self, output: &mut [u8], offset: u64) -> io::Result<()> {
+    async fn read_into(&self, output: &mut [u8], offset: u64) -> io::Result<()> {
         let mut state = self.state.lock().expect("COW block storage lock poisoned");
         if offset >= state.size {
             output.fill(0);
@@ -214,15 +231,17 @@ impl CowBlockStorage {
         }
 
         let readable = output.len().min((state.size - offset) as usize);
-        state.base.seek(SeekFrom::Start(offset))?;
-        state.base.read_exact(&mut output[..readable])?;
+        state
+            .base
+            .read_exact_at(&mut output[..readable], offset)
+            .await?;
         if readable < output.len() {
             output[readable..].fill(0);
         }
         state.overlay_range(output, offset)
     }
 
-    fn write_from(&self, input: &[u8], offset: u64) -> io::Result<()> {
+    async fn write_from(&self, input: &[u8], offset: u64) -> io::Result<()> {
         let mut state = self.state.lock().expect("COW block storage lock poisoned");
         let end = offset
             .checked_add(input.len() as u64)
@@ -233,17 +252,17 @@ impl CowBlockStorage {
                 "COW root storage write extends beyond base image",
             ));
         }
-        state.write_range(input, offset)
+        state.write_range(input, offset).await
     }
 
-    fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+    async fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
         const ZERO_CHUNK_SIZE: usize = 1024 * 1024;
         let mut remaining = length;
         let mut next_offset = offset;
         let zeroes = vec![0; ZERO_CHUNK_SIZE];
         while remaining > 0 {
             let chunk_len = remaining.min(ZERO_CHUNK_SIZE as u64) as usize;
-            self.write_from(&zeroes[..chunk_len], next_offset)?;
+            self.write_from(&zeroes[..chunk_len], next_offset).await?;
             remaining -= chunk_len as u64;
             next_offset = next_offset
                 .checked_add(chunk_len as u64)
@@ -277,7 +296,7 @@ impl CowBlockStorageState {
         Ok(())
     }
 
-    fn write_range(&mut self, input: &[u8], offset: u64) -> io::Result<()> {
+    async fn write_range(&mut self, input: &[u8], offset: u64) -> io::Result<()> {
         let first_block = offset / self.block_size;
         let last_block = (offset + input.len() as u64 - 1) / self.block_size;
         self.load_store_blocks(first_block, last_block)?;
@@ -291,9 +310,10 @@ impl CowBlockStorageState {
             if !self.cached_blocks.contains_key(&block_index) {
                 let mut block = vec![0; self.block_size as usize];
                 let readable = self.size.saturating_sub(block_start).min(self.block_size) as usize;
-                self.base.seek(SeekFrom::Start(block_start))?;
                 if readable > 0 {
-                    self.base.read_exact(&mut block[..readable])?;
+                    self.base
+                        .read_exact_at(&mut block[..readable], block_start)
+                        .await?;
                 }
                 self.cached_blocks.insert(block_index, block);
                 self.loaded_store_blocks.insert(block_index);
@@ -365,12 +385,27 @@ impl CowBlockStorageState {
     }
 }
 
+impl CowBlockBase {
+    async fn read_exact_at(&mut self, output: &mut [u8], offset: u64) -> io::Result<()> {
+        match self {
+            Self::File(file) => {
+                file.seek(SeekFrom::Start(offset))?;
+                file.read_exact(output)
+            }
+            Self::Storage(storage) => storage.read(output, offset).await,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::env;
     use std::fs;
+    use std::future::Future;
+    use std::pin::pin;
     use std::sync::Mutex;
+    use std::task::{Context, Poll, Waker};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[derive(Debug)]
@@ -418,7 +453,7 @@ mod tests {
             blocks: Mutex::new(HashMap::new()),
         });
         let mut state = CowBlockStorageState {
-            base,
+            base: CowBlockBase::File(base),
             size: 8192,
             block_size: 4096,
             store,
@@ -445,7 +480,7 @@ mod tests {
             blocks: Mutex::new(HashMap::new()),
         });
         let mut state = CowBlockStorageState {
-            base,
+            base: CowBlockBase::File(base),
             size: 8192,
             block_size: 4096,
             store,
@@ -455,8 +490,8 @@ mod tests {
             modified_blocks: HashSet::new(),
         };
 
-        state.write_range(&[1; 4096], 4096).unwrap();
-        state.write_range(&[2; 512], 4096).unwrap();
+        block_on_ready(state.write_range(&[1; 4096], 4096)).unwrap();
+        block_on_ready(state.write_range(&[2; 512], 4096)).unwrap();
 
         assert_eq!(state.cached_blocks.get(&1).unwrap()[..512], [2; 512]);
         assert_eq!(state.cached_blocks.get(&1).unwrap()[512..], [1; 3584]);
@@ -469,5 +504,15 @@ mod tests {
             .unwrap()
             .as_nanos();
         env::temp_dir().join(format!("sandbox-cow-block-storage-test-{nanos}.img"))
+    }
+
+    fn block_on_ready<T>(future: impl Future<Output = T>) -> T {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut future = pin!(future);
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(value) => value,
+            Poll::Pending => panic!("test future unexpectedly pending"),
+        }
     }
 }

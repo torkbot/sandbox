@@ -87,16 +87,16 @@ Evidence:
 - virtual files show host-generated contents and directory metadata.
 - JavaScript can inspect mounted virtual filesystems through stable mount handles without entering the guest.
 
-### Tier 3b: Rootfs Composition E2E
+### Tier 3b: Writable Rootfs E2E
 
-Runs with a real VM and explicit filesystem composition primitives.
+Runs with a real VM and explicit rootfs COW primitives.
 
 Evidence:
 
 - immutable root mode remains the default.
-- `linuxOverlayFs({ lower: prebuiltRootfs(...), upper: scratchFs() })` makes `/` writable through real Linux overlayfs.
-- the prebuilt lower filesystem remains immutable after guest writes through the overlay.
-- each `scratchFs()` upper is isolated to its VM instance.
+- `rootfs.cow({ base: rootfs.builtIn(...), writable })` makes `/` writable through host-side block COW.
+- the built-in base image remains immutable after guest writes through the COW rootfs.
+- each block store owns the mutations for its VM instances.
 - `mount(path, fs)` creates a guest-visible mount boundary.
 - `binding(path, fs)` creates a host-side attachment point without a guest-visible mount boundary.
 
@@ -170,15 +170,15 @@ Detected capabilities:
 - Linux KVM access.
 - macOS HVF access.
 - macOS codesign availability and entitlement verification.
-- EROFS image generation through the Docker-based `build:rootfs:erofs` fixture.
+- QCOW2 rootfs image generation through the Docker-based `build:rootfs:qcow2` fixture.
 
 ## Success Criteria By Project Goal
 
 - Spawn microVMs from Node.js: Node e2e creates a VM, receives readiness, sends commands, and shuts down cleanly.
 - Custom init: the Rust guest init from this repository runs as PID 1, performs setup, reports readiness, and supervises a test workload.
 - Static linking: linkage report shows no dynamic `libkrun` or `libkrunfw` dependency.
-- Immutable root: guest root writes fail unless an explicit overlay root is configured.
-- Rootfs composition: explicit `linuxOverlayFs(...)` can compose a prebuilt lower and scratch upper without mutating the lower.
+- Immutable root: guest root writes fail unless an explicit COW root is configured.
+- Writable rootfs: explicit `rootfs.cow(...)` persists rootfs mutations in a host-side block store without mutating the built-in base image.
 - Virtual filesystem: guest reads host-generated files and metadata through a mounted virtual tree.
 - HTTP interception: TLS traffic is intercepted with guest-trusted CA, request-header hooks mutate upstream headers only, credentials are not exposed to the guest, and forwarding is transparent.
 - Network policy: default-deny outbound rules block unmatched destinations with deterministic evidence before HTTP hook execution.
@@ -199,7 +199,7 @@ The runtime scenario files live under `tests/e2e/scenarios/` as `.test.ts` files
 
 - `boot-smoke.test.ts`: boots a VM, waits for `init.ready`, sends a control command, and checks command output.
 - `filesystem.test.ts`: boots with an immutable root and host-backed virtual filesystem using the same `stat` / `list` / `read` shape as TorkBot plugin filesystems.
-- `rootfs-shaping.test.ts`: expresses immutable roots, Linux overlayfs root composition, scratch isolation, and guest-visible mount boundaries.
+- `rootfs-shaping.test.ts`: expresses immutable built-in roots, explicit QCOW2 COW roots, block-store persistence, and guest-visible mount boundaries.
 - `http-request-headers.test.ts`: injects internal CA trust, intercepts HTTP/HTTPS request headers, applies upstream-only credential mutations, and proves DNS-rebinding attempts do not receive credentials.
 - `network.test.ts`: covers transparent TCP interception, DNS behavior, default-deny outbound rules, IPv6 behavior, and non-HTTP denial.
 - `libkrun-contract.test.ts`: boots the VM with direct Rust init injection.

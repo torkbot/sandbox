@@ -56,7 +56,7 @@ export interface InternalSandboxOptions {
   readonly rootfs: {
     readonly path: string;
     readonly readonly?: boolean;
-    readonly format: "erofs" | "ext4";
+    readonly format: "qcow2";
     readonly storage?: {
       readonly kind: "cow-block-store";
       readonly blockSize: number;

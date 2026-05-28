@@ -624,19 +624,19 @@ async function lowerRootfs(
       return {
         path: builtInRootfsPath(rootfs.name),
         readonly: true,
-        format: "erofs",
+        format: "qcow2",
       };
     case "cow-rootfs":
       return {
-        path: builtInRootfsPath(rootfs.base.name, "ext4"),
+        path: builtInRootfsPath(rootfs.base.name),
         readonly: false,
-        format: "ext4",
+        format: "qcow2",
         storage: {
           kind: "cow-block-store",
           blockSize: rootfs.writable.blockSize,
           blockStore: rootfs.writable,
           context: {
-            base: builtInRootfsIdentity(rootfs.base.name, "ext4"),
+            base: builtInRootfsIdentity(rootfs.base.name),
           },
         },
       };
@@ -729,8 +729,8 @@ function validateInternalSandboxOptions(options: InternalSandboxOptions): void {
   if (options.rootfs.path.length === 0) {
     throw new Error("invalid sandbox options: rootfs.path must not be empty");
   }
-  if (options.rootfs.format !== "erofs" && options.rootfs.format !== "ext4") {
-    throw new Error("invalid sandbox options: rootfs.format must be erofs or ext4");
+  if (options.rootfs.format !== "qcow2") {
+    throw new Error("invalid sandbox options: rootfs.format must be qcow2");
   }
 
   const mountPaths = new Set<string>();

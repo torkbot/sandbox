@@ -12,7 +12,7 @@ import {
 test("defineSandbox rejects non-built-in rootfs objects", () => {
   assert.throws(
     () => defineSandbox({
-      rootfs: { kind: "prebuilt-rootfs", path: "rootfs.erofs", format: "erofs" } as never,
+      rootfs: { kind: "prebuilt-rootfs", path: "rootfs.qcow2", format: "qcow2" } as never,
     }),
     /invalid sandbox definition: rootfs must be created with rootfs\.builtIn\(\.\.\.\) or rootfs\.cow\(\.\.\.\)/,
   );

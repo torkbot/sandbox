@@ -6,32 +6,24 @@ const require = createRequire(import.meta.url);
 type SandboxTarget = {
   readonly packageName: string;
   readonly hostBinaryName: string;
-  readonly rootfsNames: Record<BuiltInRootfsFormat, string>;
+  readonly rootfsName: string;
   readonly platform: NodeJS.Platform;
   readonly arch: NodeJS.Architecture;
   readonly libc?: "glibc";
 };
 
-type BuiltInRootfsFormat = "erofs" | "ext4";
-
 const targets = [
   {
     packageName: "@torkbot/sandbox-darwin-arm64",
     hostBinaryName: "sandbox-host",
-    rootfsNames: {
-      erofs: "rootfs/alpine-3.23.erofs",
-      ext4: "rootfs/alpine-3.23.ext4",
-    },
+    rootfsName: "rootfs/alpine-3.23.qcow2",
     platform: "darwin",
     arch: "arm64",
   },
   {
     packageName: "@torkbot/sandbox-linux-x64-gnu",
     hostBinaryName: "sandbox-host",
-    rootfsNames: {
-      erofs: "rootfs/alpine-3.23.erofs",
-      ext4: "rootfs/alpine-3.23.ext4",
-    },
+    rootfsName: "rootfs/alpine-3.23.qcow2",
     platform: "linux",
     arch: "x64",
     libc: "glibc",
@@ -56,28 +48,28 @@ export function hostBinaryPath(): string {
   return rawHostBinaryPath();
 }
 
-export function builtInRootfsPath(name: "alpine:3.23", format: BuiltInRootfsFormat = "erofs"): string {
+export function builtInRootfsPath(name: "alpine:3.23"): string {
   if (name === "alpine:3.23") {
     const target = currentSandboxTarget();
-    return resolveArtifactPath(target, target.rootfsNames[format]);
+    return resolveArtifactPath(target, target.rootfsName);
   }
   throw new Error(`unsupported built-in rootfs: ${name satisfies never}`);
 }
 
-export function builtInRootfsIdentity(name: "alpine:3.23", format: BuiltInRootfsFormat): string {
+export function builtInRootfsIdentity(name: "alpine:3.23"): string {
   if (name === "alpine:3.23") {
     const target = currentSandboxTarget();
     const packageVersion = platformPackageVersion(target);
     return [
       "built-in",
       name,
-      format,
+      "qcow2",
       target.platform,
       target.arch,
       target.libc ?? "none",
       target.packageName,
       packageVersion,
-      target.rootfsNames[format],
+      target.rootfsName,
     ].join(":");
   }
   throw new Error(`unsupported built-in rootfs: ${name satisfies never}`);

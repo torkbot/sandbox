@@ -48,9 +48,7 @@ pub enum RootfsStorageSpec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootfsFormat {
-    Directory,
-    Erofs,
-    Ext4,
+    Qcow2,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,12 +194,6 @@ impl MicroVmSpec {
                 .map(RootfsStorageSpec::parse)
                 .transpose()?,
         };
-        if rootfs.format == RootfsFormat::Directory {
-            return Err(SpecError::new(
-                "directory rootfs is not supported for sandboxed VM launch; use an EROFS rootfs",
-            ));
-        }
-
         let mounts = input
             .mounts
             .into_iter()
@@ -257,9 +249,7 @@ impl KernelFormat {
 impl RootfsFormat {
     fn parse(value: &str) -> Result<Self, SpecError> {
         match value {
-            "directory" => Ok(Self::Directory),
-            "erofs" => Ok(Self::Erofs),
-            "ext4" => Ok(Self::Ext4),
+            "qcow2" => Ok(Self::Qcow2),
             other => Err(SpecError::new(format!(
                 "unsupported rootfs.format: {other}"
             ))),
@@ -366,9 +356,9 @@ mod tests {
             memory_mib: None,
             kernel_format: None,
             init_crate: "sandbox-init".to_string(),
-            rootfs_path: "rootfs.erofs".to_string(),
+            rootfs_path: "rootfs.qcow2".to_string(),
             rootfs_readonly: None,
-            rootfs_format: "erofs".to_string(),
+            rootfs_format: "qcow2".to_string(),
             rootfs_storage: None,
             mounts: Vec::new(),
             network_outbound: None,
@@ -385,7 +375,7 @@ mod tests {
         assert_eq!(spec.kernel.format, KernelFormat::Auto);
         assert_eq!(spec.init.crate_name, "sandbox-init");
         assert_eq!(spec.rootfs.readonly, true);
-        assert_eq!(spec.rootfs.format, RootfsFormat::Erofs);
+        assert_eq!(spec.rootfs.format, RootfsFormat::Qcow2);
     }
 
     #[test]

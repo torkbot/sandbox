@@ -70,7 +70,7 @@ The guest init is a first-class binary in this repo. It should:
 
 This is where project-specific behavior belongs. The Node-facing API should not rely on shelling into the guest after boot to repair missing setup.
 
-Sandbox boots the `sandbox-init` binary we build in this repository directly as PID 1. The `torkbot/libkrun` fork exposes the command-line override Sandbox needs for both block-backed and directory-backed roots; project-specific control protocol and setup logic stays in `crates/sandbox-init`.
+Sandbox boots the `sandbox-init` binary we build in this repository directly as PID 1. The `torkbot/libkrun` fork exposes the command-line override Sandbox needs for the QCOW2-backed root; project-specific control protocol and setup logic stays in `crates/sandbox-init`.
 
 ## Root Filesystem
 
@@ -78,20 +78,18 @@ Build the guest root filesystem before VM instantiation. The runtime API should 
 
 The build-time tooling can use a simple Docker image create/export/extract flow to shape the rootfs. That flow belongs in packaging or fixture-generation tools, not in the hot runtime path.
 
-The target shape is an immutable read-only root volume, likely EROFS, produced from that extracted rootfs. Runtime writable root behavior should be a filesystem composition, not a second unrelated VM option.
+The target shape is a single compressed QCOW2 artifact containing an ext4 guest filesystem, produced from that extracted rootfs. `rootfs.builtIn(...)` mounts that artifact read-only in the guest. Runtime writable root behavior must be explicit: `rootfs.cow(...)` mounts the same artifact read-write through host-side COW block storage.
 
-The first writable-root primitive is explicit Linux overlayfs:
+The first writable-root primitive is host-backed block COW:
 
 ```ts
-rootfs: linuxOverlayFs({
-  lower: prebuiltRootfs("dist/rootfs/base.erofs", { format: "erofs" }),
-  upper: scratchFs(),
+rootfs: rootfs.cow({
+  base: rootfs.builtIn("alpine:3.23"),
+  writable: blockStore,
 })
 ```
 
-`linuxOverlayFs(...)` means real Linux overlayfs semantics. It should not silently switch to a host-side userspace merge implementation for different inputs. Unsupported lower/upper combinations should be rejected until they are intentionally implemented.
-
-Snapshotting a modified rootfs back into EROFS is deferred. The near-term contract is only that `linuxOverlayFs(...)` makes `/` writable through an isolated scratch upper while leaving the prebuilt lower unchanged.
+The JavaScript block store is an opaque fixed-size block overlay. It records mutations to the rootfs image byte space without knowing about QCOW2 internals or the guest filesystem. The native runtime owns the QCOW2 driver and exposes ext4 to the guest.
 
 ## Networking
 
@@ -174,9 +172,8 @@ Host networking must cover:
 
 Sandbox needs small filesystem primitives:
 
-- `prebuiltRootfs(...)`: a supplied root artifact such as a directory or EROFS image.
-- `scratchFs()`: an isolated writable filesystem owned by one VM instance.
-- `linuxOverlayFs({ lower, upper })`: a real Linux overlayfs composition over generic filesystem values, rejecting combinations that cannot be mounted with Linux overlayfs.
+- `rootfs.builtIn(...)`: a supplied built-in QCOW2 root artifact mounted read-only in the guest.
+- `rootfs.cow(...)`: the same built-in QCOW2 root artifact mounted read-write through a host-side COW block store.
 - `mount(path, fs)`: a guest-visible mount boundary.
 - `virtualFs(...)` / `virtualFsMount(...)`: host Node.js callbacks implementing a guest-visible filesystem.
 
@@ -231,7 +228,7 @@ The first helper protocol is deliberately small. Node starts `sandbox-host --std
 2. Build `sandbox-init` as a static guest binary and boot it directly with an explicit kernel/initramfs.
 3. Add a vsock control channel and adapt it to the TypeScript `Transport` interface.
 4. Add build-time Docker image export/extract rootfs tooling, then consume a prebuilt immutable read-only root volume at VM instantiation.
-5. Add `linuxOverlayFs({ lower: prebuiltRootfs(...), upper: scratchFs() })` so `/` can be writable while the prebuilt lower remains immutable.
+5. Add `rootfs.cow({ base: rootfs.builtIn(...), writable })` so `/` can be writable while the built-in rootfs artifact remains immutable.
 6. Add CA injection and Rust-owned HTTP request-header interception using Rama.
 7. Add a vhost-user filesystem backend for virtual and writable host-implemented guest mounts.
 8. Move any required libkrun changes into `torkbot/libkrun` and keep them upstream-shaped.

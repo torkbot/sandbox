@@ -46,10 +46,10 @@ The project also has build-time fixture helpers:
 ```sh
 npm run build:init
 npm run build:rootfs
-npm run build:rootfs:erofs
+npm run build:rootfs:qcow2
 ```
 
-`build:init` cross-builds `crates/sandbox-init` as a static Linux guest binary. `build:rootfs` exports an Alpine rootfs with agent-oriented command-line utilities and copies that init binary into it as `/sandbox-init`. The default image includes basics such as `bash`, `coreutils`, `curl`, `file`, `findutils`, `git`, `gh`, `jq`, `less`, `openssh-client`, `ripgrep`, Node.js 24 with `npm`, Python with `pip`, archive tools, PDF tools through `poppler-utils`, image metadata/conversion tools through `exiftool` and ImageMagick, and media inspection/conversion through `ffmpeg`. `build:rootfs:erofs` packs that directory into `dist/rootfs/alpine-3.23.erofs` with deterministic `mkfs.erofs` settings, `lz4hc` compression, a 1 MiB compression cluster, and packed tail fragments. These are development and CI fixtures, not runtime APIs.
+`build:init` cross-builds `crates/sandbox-init` as a static Linux guest binary. `build:rootfs` exports an Alpine rootfs with agent-oriented command-line utilities and copies that init binary into it as `/sandbox-init`. The default image includes basics such as `bash`, `coreutils`, `curl`, `file`, `findutils`, `git`, `gh`, `jq`, `less`, `openssh-client`, `ripgrep`, Node.js 24 with `npm`, Python with `pip`, archive tools, PDF tools through `poppler-utils`, image metadata/conversion tools through `exiftool` and ImageMagick, and media inspection/conversion through `ffmpeg`. `build:rootfs:qcow2` packs that directory into a compressed `dist/rootfs/alpine-3.23.qcow2` image whose guest filesystem is ext4. The same QCOW2 artifact is mounted read-only for `rootfs.builtIn(...)` and through host-side COW storage for `rootfs.cow(...)`. These are development and CI fixtures, not runtime APIs.
 
 ## Static Link Handoff
 

@@ -131,7 +131,7 @@ test("COW rootfs round-trips rootfs mutations across instances", async (t) => {
   assert.equal(read.exitCode, 0, read.stderr);
   assert.equal(read.stdout, "persisted");
   assert.deepEqual(blockStore.observedBaseIdentities().length, 1);
-  assert.match(blockStore.observedBaseIdentities()[0] ?? "", /built-in:alpine:3\.23:ext4:/);
+  assert.match(blockStore.observedBaseIdentities()[0] ?? "", /built-in:alpine:3\.23:qcow2:/);
 });
 
 test("COW rootfs close sync ignores the instance cwd", async (t) => {
@@ -177,7 +177,7 @@ function memoryBlockStore(): SandboxBlockStore & { observedBaseIdentities(): rea
   const blocks = new Map<bigint, Uint8Array>();
   const baseIdentities = new Set<string>();
   return {
-    blockSize: 4096,
+    blockSize: 65536,
     async list(context) {
       baseIdentities.add(context.base);
       return Array.from(blocks.keys());

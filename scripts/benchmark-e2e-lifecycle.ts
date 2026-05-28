@@ -153,7 +153,7 @@ async function assertVmLaunchSupport(): Promise<{
   if (process.platform !== "darwin" && process.platform !== "linux") {
     throw new Error(`unsupported VM launch host platform: ${process.platform}`);
   }
-  const rootfsPath = resolve(repoRoot, "dist/rootfs/alpine-3.23.erofs");
+  const rootfsPath = resolve(repoRoot, "dist/rootfs/alpine-3.23.qcow2");
   await access(rootfsPath);
   return {
     hostBinary: await artifactMetadata(hostBinary),

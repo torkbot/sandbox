@@ -4,7 +4,9 @@ import { spawn } from "node:child_process";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 const sourceDir = resolve(repoRoot, process.env.SANDBOX_ROOTFS_SOURCE_DIR ?? "dist/rootfs/alpine-3.23");
-const outPath = resolve(repoRoot, process.env.SANDBOX_ROOTFS_EXT4_OUT ?? "dist/rootfs/alpine-3.23.ext4");
+const outPath = resolve(repoRoot, process.env.SANDBOX_ROOTFS_QCOW2_OUT ?? "dist/rootfs/alpine-3.23.qcow2");
+const clusterSize = process.env.SANDBOX_QCOW2_CLUSTER_SIZE ?? "65536";
+const filesystemUuid = "00000000-0000-0000-0000-000000000000";
 
 await assertDirectory(sourceDir);
 const outDir = dirname(outPath);
@@ -17,23 +19,43 @@ await run("docker", [
   `${sourceDir}:/rootfs:ro`,
   "--volume",
   `${outDir}:/out`,
-  process.env.SANDBOX_EXT4_BUILDER_IMAGE ?? "debian:bookworm",
+  process.env.SANDBOX_QCOW2_BUILDER_IMAGE ?? "debian:bookworm",
   "sh",
   "-lc",
   [
     "apt-get update",
-    "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends e2fsprogs ca-certificates",
+    "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends e2fsprogs qemu-utils ca-certificates",
     "mkdir -p /work/rootfs",
     "tar -C /rootfs -cf - . | tar -C /work/rootfs -xf -",
     "chown -R 0:0 /work/rootfs",
     "size_kb=$(du -sk /work/rootfs | cut -f1)",
     "image_kb=$((size_kb + 131072))",
-    `truncate -s "\${image_kb}K" /out/${shellArg(basename(outPath))}`,
-    `mke2fs -q -t ext4 -O ^has_journal -E root_owner=0:0 -d /work/rootfs /out/${shellArg(basename(outPath))}`,
+    "truncate -s \"${image_kb}K\" /work/rootfs.ext4",
+    "export E2FSPROGS_FAKE_TIME=0",
+    [
+      "mke2fs",
+      "-q",
+      "-t ext4",
+      "-O ^has_journal",
+      `-U ${shellArg(filesystemUuid)}`,
+      `-E root_owner=0:0,hash_seed=${shellArg(filesystemUuid)}`,
+      "-d /work/rootfs",
+      "/work/rootfs.ext4",
+    ].join(" "),
+    [
+      "qemu-img",
+      "convert",
+      "-f raw",
+      "-O qcow2",
+      "-c",
+      `-o compat=1.1,cluster_size=${shellArg(clusterSize)},lazy_refcounts=off`,
+      "/work/rootfs.ext4",
+      `/out/${shellArg(basename(outPath))}`,
+    ].join(" "),
   ].join(" && "),
 ]);
 
-console.log(`rootfs ext4 image written to ${outPath}`);
+console.log(`rootfs QCOW2 image written to ${outPath}`);
 
 async function assertDirectory(path: string): Promise<void> {
   try {

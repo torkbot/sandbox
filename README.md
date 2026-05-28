@@ -83,6 +83,61 @@ Expensive artifact preparation is intentionally outside `boot()`.
 already be installed with Sandbox. It does not pull an image or build a rootfs
 at runtime.
 
+## Durable, Policy-Controlled Instances
+
+Sandbox composes durable rootfs mutation with explicit network policy. In this
+example, dirty COW blocks are synchronized to blob storage, public HTTP(S)
+egress is allowed, and only GitHub API requests receive an installation token:
+
+```ts
+import {
+  defineSandbox,
+  network,
+  rootfs,
+  type SandboxBlockStore,
+} from "@torkbot/sandbox";
+
+const writableRootfs: SandboxBlockStore = new BlobSynchronizedCowBlockStore({
+  bucket: "sandbox-rootfs-overlays",
+  keyPrefix: "lanes/github-worker",
+});
+
+const githubTokens = new GitHubInstallationTokenService({
+  installationId: 123456,
+});
+
+const sandbox = defineSandbox({
+  rootfs: rootfs.cow({
+    base: rootfs.builtIn("alpine:3.23"),
+    writable: writableRootfs,
+  }),
+  resources: {
+    cpus: 4,
+    memoryMiB: 4096,
+  },
+  network: network.policy(async (conn) => {
+    if (conn.host === "api.github.com") {
+      conn.allowHttp(async (request) => {
+        request.headers.set(
+          "authorization",
+          `Bearer ${await githubTokens.tokenForRequest(request)}`,
+        );
+      });
+      return;
+    }
+
+    conn.allowHttp();
+  }),
+});
+
+await using lane = await sandbox.boot({ cwd: "/workspace" });
+
+await lane.exec("sh", [
+  "-lc",
+  "apk add --no-cache git curl && curl -fsSL https://api.github.com/user",
+]);
+```
+
 ## API Overview
 
 ### Configuration
@@ -120,9 +175,10 @@ defineSandbox({
 
 Use `rootfs.cow(...)` when rootfs mutations should persist. The sandbox library
 owns the COW block-device contract; user-space owns the block store's
-durability, compression, migration, and checkpoint policy. Built-in rootfs
-packages include a read-only EROFS image for normal boots and a writable ext4
-image used as the COW base.
+durability, migration, and checkpoint policy. Built-in rootfs packages include
+one compressed QCOW2 image with an ext4 guest filesystem. `rootfs.builtIn(...)`
+mounts that image read-only in the guest; `rootfs.cow(...)` mounts the same base
+read-write through the host COW block store.
 
 ```ts
 defineSandbox({
@@ -262,7 +318,7 @@ Sandbox hides the kernel, init, transport, and host helper behind a small
 TypeScript API:
 
 - The runtime boots a libkrun-backed guest from a prebuilt rootfs artifact:
-  read-only EROFS by default, or writable ext4 when a COW rootfs is used.
+  a compressed QCOW2 image that contains an ext4 guest filesystem.
 - Kernel and init artifacts are implementation details owned by Sandbox.
 - A signed `sandbox-host` helper owns the Node/Rust/libkrun boundary.
 - Guest control traffic uses an implicit fd-backed transport between the host
