@@ -121,6 +121,195 @@ test("HostControlTransport exec waits for matching completion", async () => {
   await control.close();
 });
 
+test("HostControlTransport spawn streams stdio and resolves exit", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const spawned = await startSpawn(control, channel, "spawn");
+
+  assert.deepEqual(
+    channel.writes.map((packet) => BSON.deserialize(packet.subarray(4))),
+    [
+      {
+        type: "guest.spawn",
+        id: "spawn",
+        argv: ["/bin/cat"],
+        env: [],
+      },
+    ],
+  );
+
+  channel.packets.push(
+    encodePacket({
+      type: "guest.spawn.stdout",
+      id: "spawn",
+      data: new Binary(new TextEncoder().encode("out")),
+    }),
+    encodePacket({
+      type: "guest.spawn.stderr",
+      id: "spawn",
+      data: new Binary(new TextEncoder().encode("err")),
+    }),
+    encodePacket({
+      type: "guest.spawn.exit",
+      id: "spawn",
+      exitCode: 7,
+    }),
+    encodePacket({
+      type: "guest.spawn.streams.closed",
+      id: "spawn",
+    }),
+  );
+
+  assert.equal(await readAll(spawned.stdout), "out");
+  assert.equal(await readAll(spawned.stderr), "err");
+  assert.deepEqual(await spawned.exit, { exitCode: 7 });
+  await control.close();
+});
+
+test("HostControlTransport does not duplicate spawn output in incoming events", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const incoming = control.incoming[Symbol.asyncIterator]();
+  const spawned = await startSpawn(control, channel, "spawn");
+
+  assert.equal((await incoming.next()).value?.type, "guest.spawn.started");
+
+  channel.packets.push(
+    encodePacket({
+      type: "guest.spawn.stdout",
+      id: "spawn",
+      data: new Binary(new TextEncoder().encode("out")),
+    }),
+    encodePacket({
+      type: "guest.spawn.stderr",
+      id: "spawn",
+      data: new Binary(new TextEncoder().encode("err")),
+    }),
+    encodePacket({
+      type: "guest.spawn.exit",
+      id: "spawn",
+      exitCode: 0,
+    }),
+    encodePacket({
+      type: "guest.spawn.streams.closed",
+      id: "spawn",
+    }),
+  );
+
+  assert.equal(await readAll(spawned.stdout), "out");
+  assert.equal(await readAll(spawned.stderr), "err");
+  assert.equal((await incoming.next()).value?.type, "guest.spawn.exit");
+  await control.close();
+});
+
+test("HostControlTransport keeps spawn streams open after process exit", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const spawned = await startSpawn(control, channel, "spawn");
+
+  channel.packets.push(
+    encodePacket({
+      type: "guest.spawn.exit",
+      id: "spawn",
+      exitCode: 0,
+    }),
+    encodePacket({
+      type: "guest.spawn.stdout",
+      id: "spawn",
+      data: new Binary(new TextEncoder().encode("tail")),
+    }),
+    encodePacket({
+      type: "guest.spawn.streams.closed",
+      id: "spawn",
+    }),
+  );
+
+  assert.deepEqual(await spawned.exit, { exitCode: 0 });
+  assert.equal(await readAll(spawned.stdout), "tail");
+  await control.close();
+});
+
+test("HostControlTransport rejects pre-start spawn failures without exposing a process", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const spawned = control.spawn({ id: "spawn", argv: ["/bin/cat"] });
+
+  await control.close();
+
+  await assert.rejects(spawned, /sandbox control is closed/);
+});
+
+test("HostControlTransport demultiplexes concurrent spawn output", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const first = await startSpawn(control, channel, "first");
+  const second = await startSpawn(control, channel, "second");
+
+  channel.packets.push(
+    encodePacket({
+      type: "guest.spawn.stdout",
+      id: "second",
+      data: new Binary(new TextEncoder().encode("second")),
+    }),
+    encodePacket({
+      type: "guest.spawn.stdout",
+      id: "first",
+      data: new Binary(new TextEncoder().encode("first")),
+    }),
+    encodePacket({
+      type: "guest.spawn.exit",
+      id: "first",
+      exitCode: 0,
+    }),
+    encodePacket({
+      type: "guest.spawn.streams.closed",
+      id: "first",
+    }),
+    encodePacket({
+      type: "guest.spawn.exit",
+      id: "second",
+      exitCode: 0,
+    }),
+    encodePacket({
+      type: "guest.spawn.streams.closed",
+      id: "second",
+    }),
+  );
+
+  assert.equal(await readAll(first.stdout), "first");
+  assert.equal(await readAll(second.stdout), "second");
+  assert.deepEqual(await first.exit, { exitCode: 0 });
+  assert.deepEqual(await second.exit, { exitCode: 0 });
+  await control.close();
+});
+
+test("HostControlTransport rejects duplicate in-flight spawn ids", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const first = control.spawn({ id: "duplicate", argv: ["/bin/cat"] });
+
+  channel.packets.push(encodePacket({ type: "guest.spawn.started", id: "duplicate" }));
+  await assert.rejects(
+    control.spawn({ id: "duplicate", argv: ["/bin/cat"] }),
+    /sandbox spawn id is already in flight: duplicate/,
+  );
+
+  channel.packets.push(
+    encodePacket({
+      type: "guest.spawn.exit",
+      id: "duplicate",
+      exitCode: 0,
+    }),
+    encodePacket({
+      type: "guest.spawn.streams.closed",
+      id: "duplicate",
+    }),
+  );
+
+  assert.deepEqual(await (await first).exit, { exitCode: 0 });
+  await control.close();
+});
+
 test("HostControlTransport demultiplexes concurrent exec completions", async () => {
   const channel = new MemoryControlChannel();
   const control = new HostControlTransport({ channel });
@@ -262,6 +451,31 @@ class MemoryPacketStream implements AsyncIterable<Uint8Array> {
       },
     };
   }
+}
+
+async function startSpawn(
+  control: HostControlTransport,
+  channel: MemoryControlChannel,
+  id: string,
+) {
+  const spawned = control.spawn({ id, argv: ["/bin/cat"] });
+  channel.packets.push(encodePacket({ type: "guest.spawn.started", id }));
+  return await spawned;
+}
+
+async function readAll(source: AsyncIterable<Uint8Array>): Promise<string> {
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of source) {
+    chunks.push(chunk);
+  }
+  const size = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
+  const data = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    data.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(data);
 }
 
 function encodePacket(document: Record<string, unknown>): Uint8Array {

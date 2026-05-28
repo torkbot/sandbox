@@ -21,6 +21,29 @@ pub enum ControlFrame {
         argv: Vec<String>,
         env: Vec<(String, String)>,
     },
+    GuestSpawn {
+        id: String,
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+    },
+    GuestSpawnStarted {
+        id: String,
+    },
+    GuestSpawnStdout {
+        id: String,
+        data: Vec<u8>,
+    },
+    GuestSpawnStderr {
+        id: String,
+        data: Vec<u8>,
+    },
+    GuestSpawnExit {
+        id: String,
+        exit_code: i32,
+    },
+    GuestSpawnStreamsClosed {
+        id: String,
+    },
     GuestExecComplete {
         id: String,
         exit_code: i32,
@@ -53,6 +76,48 @@ impl ControlFrame {
                     "key": key,
                     "value": value,
                 }).collect::<Vec<_>>(),
+            },
+            Self::GuestSpawn {
+                id,
+                argv,
+                env,
+            } => bson::doc! {
+                "type": "guest.spawn",
+                "id": id,
+                "argv": argv,
+                "env": env.iter().map(|(key, value)| bson::doc! {
+                    "key": key,
+                    "value": value,
+                }).collect::<Vec<_>>(),
+            },
+            Self::GuestSpawnStarted { id } => bson::doc! {
+                "type": "guest.spawn.started",
+                "id": id,
+            },
+            Self::GuestSpawnStdout { id, data } => bson::doc! {
+                "type": "guest.spawn.stdout",
+                "id": id,
+                "data": bson::Binary {
+                    subtype: bson::spec::BinarySubtype::Generic,
+                    bytes: data.clone(),
+                },
+            },
+            Self::GuestSpawnStderr { id, data } => bson::doc! {
+                "type": "guest.spawn.stderr",
+                "id": id,
+                "data": bson::Binary {
+                    subtype: bson::spec::BinarySubtype::Generic,
+                    bytes: data.clone(),
+                },
+            },
+            Self::GuestSpawnExit { id, exit_code } => bson::doc! {
+                "type": "guest.spawn.exit",
+                "id": id,
+                "exitCode": *exit_code,
+            },
+            Self::GuestSpawnStreamsClosed { id } => bson::doc! {
+                "type": "guest.spawn.streams.closed",
+                "id": id,
             },
             Self::GuestExecComplete {
                 id,
@@ -146,6 +211,55 @@ impl ControlFrame {
                     .transpose()?
                     .unwrap_or_default(),
             }),
+            "guest.spawn" => Ok(Self::GuestSpawn {
+                id: document
+                    .get_str("id")
+                    .map_err(|_| ControlFrameError::new("guest.spawn missing id"))?
+                    .to_string(),
+                argv: read_string_array(&document, "argv", "guest.spawn argv")?,
+                env: read_env_array(&document, "env", "guest.spawn env")?,
+            }),
+            "guest.spawn.started" => Ok(Self::GuestSpawnStarted {
+                id: document
+                    .get_str("id")
+                    .map_err(|_| ControlFrameError::new("guest.spawn.started missing id"))?
+                    .to_string(),
+            }),
+            "guest.spawn.stdout" => Ok(Self::GuestSpawnStdout {
+                id: document
+                    .get_str("id")
+                    .map_err(|_| ControlFrameError::new("guest.spawn.stdout missing id"))?
+                    .to_string(),
+                data: document
+                    .get_binary_generic("data")
+                    .map_err(|_| ControlFrameError::new("guest.spawn.stdout missing data"))?
+                    .to_vec(),
+            }),
+            "guest.spawn.stderr" => Ok(Self::GuestSpawnStderr {
+                id: document
+                    .get_str("id")
+                    .map_err(|_| ControlFrameError::new("guest.spawn.stderr missing id"))?
+                    .to_string(),
+                data: document
+                    .get_binary_generic("data")
+                    .map_err(|_| ControlFrameError::new("guest.spawn.stderr missing data"))?
+                    .to_vec(),
+            }),
+            "guest.spawn.exit" => Ok(Self::GuestSpawnExit {
+                id: document
+                    .get_str("id")
+                    .map_err(|_| ControlFrameError::new("guest.spawn.exit missing id"))?
+                    .to_string(),
+                exit_code: document
+                    .get_i32("exitCode")
+                    .map_err(|_| ControlFrameError::new("guest.spawn.exit missing exitCode"))?,
+            }),
+            "guest.spawn.streams.closed" => Ok(Self::GuestSpawnStreamsClosed {
+                id: document
+                    .get_str("id")
+                    .map_err(|_| ControlFrameError::new("guest.spawn.streams.closed missing id"))?
+                    .to_string(),
+            }),
             "guest.exec.complete" => Ok(Self::GuestExecComplete {
                 id: document
                     .get_str("id")
@@ -216,6 +330,55 @@ impl ControlFrame {
     }
 }
 
+fn read_string_array(
+    document: &bson::Document,
+    key: &str,
+    label: &str,
+) -> Result<Vec<String>, ControlFrameError> {
+    document
+        .get_array(key)
+        .map_err(|_| ControlFrameError::new(format!("{label} missing")))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| ControlFrameError::new(format!("{label} must be strings")))
+        })
+        .collect()
+}
+
+fn read_env_array(
+    document: &bson::Document,
+    key: &str,
+    label: &str,
+) -> Result<Vec<(String, String)>, ControlFrameError> {
+    document
+        .get_array(key)
+        .ok()
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| {
+                    let document = value
+                        .as_document()
+                        .ok_or_else(|| ControlFrameError::new(format!("{label} entries must be documents")))?;
+                    let key = document
+                        .get_str("key")
+                        .map_err(|_| ControlFrameError::new(format!("{label} key must be a string")))?
+                        .to_string();
+                    let value = document
+                        .get_str("value")
+                        .map_err(|_| ControlFrameError::new(format!("{label} value must be a string")))?
+                        .to_string();
+                    Ok((key, value))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()
+        .map(|env| env.unwrap_or_default())
+}
+
 impl ControlFrameError {
     fn new(message: impl Into<String>) -> Self {
         Self {
@@ -267,6 +430,40 @@ mod tests {
 
         let encoded = frame.encode().unwrap();
         assert_eq!(ControlFrame::decode(&encoded).unwrap(), frame);
+    }
+
+    #[test]
+    fn round_trips_guest_spawn_frames() {
+        let frames = [
+            ControlFrame::GuestSpawn {
+                id: "spawn".to_string(),
+                argv: vec!["/bin/cat".to_string()],
+                env: vec![("FOO".to_string(), "bar".to_string())],
+            },
+            ControlFrame::GuestSpawnStarted {
+                id: "spawn".to_string(),
+            },
+            ControlFrame::GuestSpawnStdout {
+                id: "spawn".to_string(),
+                data: b"out".to_vec(),
+            },
+            ControlFrame::GuestSpawnStderr {
+                id: "spawn".to_string(),
+                data: b"err".to_vec(),
+            },
+            ControlFrame::GuestSpawnExit {
+                id: "spawn".to_string(),
+                exit_code: 7,
+            },
+            ControlFrame::GuestSpawnStreamsClosed {
+                id: "spawn".to_string(),
+            },
+        ];
+
+        for frame in frames {
+            let encoded = frame.encode().unwrap();
+            assert_eq!(ControlFrame::decode(&encoded).unwrap(), frame);
+        }
     }
 
     #[test]

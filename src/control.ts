@@ -13,6 +13,11 @@ export interface SandboxControl extends Transport<SandboxControlEvent, SandboxCo
     readonly argv: readonly string[];
     readonly env?: Record<string, string>;
   }): Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>>;
+  spawn(input: {
+    readonly id?: string;
+    readonly argv: readonly string[];
+    readonly env?: Record<string, string>;
+  }): Promise<ControlBackedSandboxProcess>;
 }
 
 export interface Transport<TIncoming = unknown, TOutgoing = unknown> {
@@ -35,6 +40,14 @@ export class HostControlTransport implements SandboxControl {
   readonly #pendingExec = new Map<string, {
     resolve(event: Extract<SandboxControlEvent, { type: "guest.exec.complete" }>): void;
     reject(error: unknown): void;
+  }>();
+  readonly #pendingSpawn = new Map<string, {
+    resolve(process: ControlBackedSandboxProcess): void;
+    reject(error: unknown): void;
+    process: ControlBackedSandboxProcess;
+    returned: boolean;
+    exited: boolean;
+    streamsClosed: boolean;
   }>();
   #closed = false;
 
@@ -93,6 +106,41 @@ export class HostControlTransport implements SandboxControl {
     return await completion;
   }
 
+  async spawn(input: {
+    readonly id?: string;
+    readonly argv: readonly string[];
+    readonly env?: Record<string, string>;
+  }): Promise<ControlBackedSandboxProcess> {
+    this.#assertOpen();
+    const id = input.id ?? crypto.randomUUID();
+    if (this.#pendingSpawn.has(id)) {
+      throw new Error(`sandbox spawn id is already in flight: ${id}`);
+    }
+    const process = new ControlBackedSandboxProcess(id, this);
+    const started = new Promise<ControlBackedSandboxProcess>((resolve, reject) => {
+      this.#pendingSpawn.set(id, {
+        resolve,
+        reject,
+        process,
+        returned: false,
+        exited: false,
+        streamsClosed: false,
+      });
+    });
+    try {
+      await this.send({
+        type: "guest.spawn",
+        id,
+        argv: input.argv,
+        env: input.env,
+      });
+    } catch (error) {
+      this.#pendingSpawn.delete(id);
+      throw error;
+    }
+    return await started;
+  }
+
   async close(): Promise<void> {
     if (this.#closed) {
       return;
@@ -100,6 +148,7 @@ export class HostControlTransport implements SandboxControl {
 
     this.#closed = true;
     this.#rejectPendingExec(new Error("sandbox control is closed"));
+    this.#rejectPendingSpawn(new Error("sandbox control is closed"));
     this.#events.close();
   }
 
@@ -138,8 +187,13 @@ export class HostControlTransport implements SandboxControl {
   }
 
   #dispatchEvent(event: SandboxControlEvent): void {
+    if (event.type === "guest.spawn.stdout" || event.type === "guest.spawn.stderr") {
+      this.#dispatchSpawnEvent(event);
+      return;
+    }
     this.#events.push(event);
     if (event.type !== "guest.exec.complete") {
+      this.#dispatchSpawnEvent(event);
       return;
     }
     const pending = this.#pendingExec.get(event.id);
@@ -150,6 +204,39 @@ export class HostControlTransport implements SandboxControl {
     pending.resolve(event);
   }
 
+  #dispatchSpawnEvent(event: SandboxControlEvent): void {
+    if (
+      event.type !== "guest.spawn.stdout"
+      && event.type !== "guest.spawn.stderr"
+      && event.type !== "guest.spawn.started"
+      && event.type !== "guest.spawn.exit"
+      && event.type !== "guest.spawn.streams.closed"
+    ) {
+      return;
+    }
+    const pending = this.#pendingSpawn.get(event.id);
+    if (pending === undefined) {
+      return;
+    }
+    if (event.type === "guest.spawn.started") {
+      pending.returned = true;
+      pending.resolve(pending.process);
+      return;
+    }
+    if (event.type === "guest.spawn.exit") {
+      pending.returned = true;
+      pending.exited = true;
+      pending.resolve(pending.process);
+    }
+    if (event.type === "guest.spawn.streams.closed") {
+      pending.streamsClosed = true;
+    }
+    pending.process.emit(event);
+    if (pending.exited && pending.streamsClosed) {
+      this.#pendingSpawn.delete(event.id);
+    }
+  }
+
   #fail(error: unknown): void {
     if (this.#closed) {
       return;
@@ -157,6 +244,7 @@ export class HostControlTransport implements SandboxControl {
 
     this.#closed = true;
     this.#rejectPendingExec(error);
+    this.#rejectPendingSpawn(error);
     this.#events.close(error);
   }
 
@@ -165,6 +253,69 @@ export class HostControlTransport implements SandboxControl {
       pending.reject(error);
     }
     this.#pendingExec.clear();
+  }
+
+  #rejectPendingSpawn(error: unknown): void {
+    for (const pending of this.#pendingSpawn.values()) {
+      pending.reject(error);
+      if (pending.returned) {
+        pending.process.fail(error);
+      }
+    }
+    this.#pendingSpawn.clear();
+  }
+}
+
+export class ControlBackedSandboxProcess {
+  readonly stdout: AsyncIterable<Uint8Array>;
+  readonly stderr: AsyncIterable<Uint8Array>;
+  readonly exit: Promise<{ readonly exitCode: number }>;
+
+  readonly #id: string;
+  readonly #control: SandboxControl;
+  readonly #stdout = new AsyncQueue<Uint8Array>();
+  readonly #stderr = new AsyncQueue<Uint8Array>();
+  #resolveExit!: (result: { readonly exitCode: number }) => void;
+  #rejectExit!: (error: unknown) => void;
+  #exited = false;
+
+  constructor(id: string, control: SandboxControl) {
+    this.#id = id;
+    this.#control = control;
+    this.stdout = this.#stdout;
+    this.stderr = this.#stderr;
+    this.exit = new Promise((resolve, reject) => {
+      this.#resolveExit = resolve;
+      this.#rejectExit = reject;
+    });
+  }
+
+  emit(event: Extract<SandboxControlEvent, {
+    type: "guest.spawn.stdout" | "guest.spawn.stderr" | "guest.spawn.exit" | "guest.spawn.streams.closed";
+  }>): void {
+    switch (event.type) {
+      case "guest.spawn.stdout":
+        this.#stdout.push(event.data);
+        return;
+      case "guest.spawn.stderr":
+        this.#stderr.push(event.data);
+        return;
+      case "guest.spawn.exit":
+        this.#exited = true;
+        this.#resolveExit({ exitCode: event.exitCode });
+        return;
+      case "guest.spawn.streams.closed":
+        this.#stdout.close();
+        this.#stderr.close();
+        return;
+    }
+  }
+
+  fail(error: unknown): void {
+    this.#exited = true;
+    this.#stdout.close(error);
+    this.#stderr.close(error);
+    this.#rejectExit(error);
   }
 }
 

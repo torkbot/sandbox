@@ -10,7 +10,7 @@ import {
   isSandboxWritableFileSystem,
 } from "./vfs.ts";
 import type { HostSpawnSandboxOptions } from "./spawn-options.ts";
-import type { SandboxControl } from "./control.ts";
+import type { ControlBackedSandboxProcess, SandboxControl } from "./control.ts";
 import type { SandboxControlEvent } from "./control-codec.ts";
 import type {
   InternalNetworkConfig,
@@ -203,10 +203,18 @@ export interface SandboxExecOptions {
   readonly env?: Record<string, string>;
 }
 
+export type SandboxSpawnOptions = SandboxExecOptions;
+
 export interface SandboxExecResult {
   readonly exitCode: number;
   readonly stdout: string;
   readonly stderr: string;
+}
+
+export interface SandboxProcess {
+  readonly stdout: AsyncIterable<Uint8Array>;
+  readonly stderr: AsyncIterable<Uint8Array>;
+  readonly exit: Promise<{ readonly exitCode: number }>;
 }
 
 export interface SandboxInstance {
@@ -215,6 +223,11 @@ export interface SandboxInstance {
     args?: readonly string[],
     options?: SandboxExecOptions,
   ): Promise<SandboxExecResult>;
+  spawn(
+    command: string,
+    args?: readonly string[],
+    options?: SandboxSpawnOptions,
+  ): Promise<SandboxProcess>;
   close(): Promise<void>;
   [Symbol.asyncDispose](): Promise<void>;
 }
@@ -355,9 +368,14 @@ class HostBackedSandboxVm implements SandboxVm {
     let syncError: unknown;
     if (this.#options.rootfs.storage !== undefined) {
       try {
-        const result = await this.#rootExec.exec("/bin/sync");
-        if (result.exitCode !== 0) {
-          throw new Error(`sandbox close sync failed with exit code ${result.exitCode}: ${result.stderr}`);
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          const result = await this.#rootExec.exec("/bin/sync");
+          if (result.exitCode !== 0) {
+            throw new Error(`sandbox close sync failed with exit code ${result.exitCode}: ${result.stderr}`);
+          }
+          if (attempt === 0) {
+            await delay(100);
+          }
         }
       } catch (error) {
         syncError = error;
@@ -383,6 +401,15 @@ class HostBackedSandboxVm implements SandboxVm {
     options: SandboxExecOptions = {},
   ): Promise<SandboxExecResult> {
     return await this.#exec.exec(command, args, options);
+  }
+
+  async spawn(
+    command: string,
+    args: readonly string[] = [],
+    options: SandboxSpawnOptions = {},
+  ): Promise<SandboxProcess> {
+    return await new ControlBackedSandboxSpawn(this.control, this.#options.cwd)
+      .spawn(command, args, options);
   }
 }
 
@@ -422,6 +449,38 @@ class ControlBackedSandboxExec {
     };
   }
 
+}
+
+class ControlBackedSandboxSpawn {
+  readonly #control: SandboxControl;
+  readonly #cwd: string | undefined;
+
+  constructor(control: SandboxControl, cwd: string | undefined) {
+    this.#control = control;
+    this.#cwd = cwd;
+  }
+
+  async spawn(
+    command: string,
+    args: readonly string[] = [],
+    options: SandboxSpawnOptions = {},
+  ): Promise<ControlBackedSandboxProcess> {
+    const cwd = options.cwd ?? this.#cwd;
+    const env = cwd === undefined
+      ? options.env
+      : {
+          ...options.env,
+          SANDBOX_EXEC_CWD: cwd,
+          PWD: cwd,
+        };
+    const argv = cwd === undefined
+      ? [command, ...args]
+      : ["/bin/sh", "-lc", "cd \"$SANDBOX_EXEC_CWD\" && exec \"$@\"", "sandbox-spawn", command, ...args];
+    return await this.#control.spawn({
+      argv,
+      env,
+    });
+  }
 }
 
 function toHostSpawnOptions(
@@ -763,6 +822,10 @@ function parseIpv4Address(address: string): number | null {
     value = ((value << 8) | octet) >>> 0;
   }
   return value;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function parseIpv6Address(address: string): bigint | null {

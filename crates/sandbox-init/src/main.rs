@@ -1,5 +1,8 @@
 use base64::Engine;
 use sandbox_protocol::ControlFrame;
+use std::io::Write;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 #[cfg(target_os = "linux")]
 use sandbox_protocol::INIT_CONTROL_PORT;
 
@@ -331,6 +334,7 @@ fn send_init_ready(control: &mut std::fs::File, packet: &[u8]) -> Result<(), Ini
 }
 
 fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
+    let write_lock = Arc::new(Mutex::new(()));
     loop {
         let frame = match ControlFrame::decode_packet_from_reader(control) {
             Ok(frame) => frame,
@@ -344,11 +348,206 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
                 let packet = response
                     .encode_packet()
                     .map_err(|error| InitError(format!("encode exec completion: {error}")))?;
-                send_packet(control, &packet)?;
+                send_locked_packet(&write_lock, control, &packet)?;
             }
-            ControlFrame::InitReady { .. } | ControlFrame::GuestExecComplete { .. } => {}
+            ControlFrame::GuestSpawn {
+                id,
+                argv,
+                env,
+            } => {
+                let writer = Arc::new(ControlWriter::new(
+                    control
+                        .try_clone()
+                        .map_err(|error| InitError(format!("clone control stream: {error}")))?,
+                    write_lock.clone(),
+                ));
+                match run_guest_spawn(id.clone(), argv, env, writer.clone()) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        send_control_frame(
+                            &writer,
+                            ControlFrame::GuestSpawnStderr {
+                                id: id.clone(),
+                                data: format!("spawn guest command: {error}\n").into_bytes(),
+                            },
+                        )?;
+                        send_control_frame(
+                            &writer,
+                            ControlFrame::GuestSpawnExit {
+                                id: id.clone(),
+                                exit_code: 127,
+                            },
+                        )?;
+                        send_control_frame(
+                            &writer,
+                            ControlFrame::GuestSpawnStreamsClosed { id },
+                        )?;
+                    }
+                }
+            }
+            ControlFrame::InitReady { .. }
+            | ControlFrame::GuestExecComplete { .. }
+            | ControlFrame::GuestSpawnStarted { .. }
+            | ControlFrame::GuestSpawnStdout { .. }
+            | ControlFrame::GuestSpawnStderr { .. }
+            | ControlFrame::GuestSpawnExit { .. }
+            | ControlFrame::GuestSpawnStreamsClosed { .. } => {}
         }
     }
+}
+
+fn run_guest_spawn(
+    id: String,
+    argv: Vec<String>,
+    env: Vec<(String, String)>,
+    control: Arc<ControlWriter>,
+) -> Result<(), InitError> {
+    if argv.is_empty() {
+        return Err(InitError("guest.spawn argv must not be empty".to_string()));
+    }
+
+    prepare_exec_environment(&env)?;
+
+    let mut command = std::process::Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    if std::path::Path::new("/run/sandbox/http-ca.pem").exists() {
+        command.env("SSL_CERT_FILE", "/run/sandbox/http-ca.pem");
+        command.env("CURL_CA_BUNDLE", "/run/sandbox/http-ca.pem");
+    }
+
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+
+    let mut child = command
+        .envs(env)
+        .spawn()
+        .map_err(|error| InitError(format!("{}: {error}", argv[0])))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| InitError("spawned command did not expose stdout".to_string()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| InitError("spawned command did not expose stderr".to_string()))?;
+    send_control_frame(&control, ControlFrame::GuestSpawnStarted { id: id.clone() })?;
+
+    let (events, event_receiver) = mpsc::channel();
+    pump_spawn_output(stdout, events.clone(), SpawnOutputEvent::Stdout, SpawnOutputEvent::StdoutClosed);
+    pump_spawn_output(stderr, events.clone(), SpawnOutputEvent::Stderr, SpawnOutputEvent::StderrClosed);
+    std::thread::spawn(move || {
+        let status = child.wait();
+        let exit_code = match status {
+            Ok(status) => exec_status(status, Vec::new()).0,
+            Err(_) => 128,
+        };
+        let _ = events.send(SpawnOutputEvent::Exit(exit_code));
+    });
+
+    std::thread::spawn(move || {
+        run_spawn_output_coordinator(id, control, event_receiver);
+    });
+
+    Ok(())
+}
+
+fn pump_spawn_output(
+    mut reader: impl std::io::Read + Send + 'static,
+    events: mpsc::Sender<SpawnOutputEvent>,
+    data_event: fn(Vec<u8>) -> SpawnOutputEvent,
+    closed_event: SpawnOutputEvent,
+) {
+    std::thread::spawn(move || {
+        let mut buffer = [0; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => {
+                    let _ = events.send(closed_event);
+                    return;
+                }
+                Ok(length) => {
+                    let data = buffer[..length].to_vec();
+                    if events.send(data_event(data)).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => {
+                    let _ = events.send(closed_event);
+                    return;
+                }
+            }
+        }
+    });
+}
+
+fn run_spawn_output_coordinator(
+    id: String,
+    control: Arc<ControlWriter>,
+    events: mpsc::Receiver<SpawnOutputEvent>,
+) {
+    let mut stdout_open = true;
+    let mut stderr_open = true;
+    let mut exit_code = None;
+    loop {
+        let event = match events.recv() {
+            Ok(event) => event,
+            Err(_) => break,
+        };
+
+        match event {
+            SpawnOutputEvent::Stdout(data) => {
+                let _ = send_control_frame(
+                    &control,
+                    ControlFrame::GuestSpawnStdout {
+                        id: id.clone(),
+                        data,
+                    },
+                );
+            }
+            SpawnOutputEvent::Stderr(data) => {
+                let _ = send_control_frame(
+                    &control,
+                    ControlFrame::GuestSpawnStderr {
+                        id: id.clone(),
+                        data,
+                    },
+                );
+            }
+            SpawnOutputEvent::StdoutClosed => stdout_open = false,
+            SpawnOutputEvent::StderrClosed => stderr_open = false,
+            SpawnOutputEvent::Exit(code) => {
+                exit_code = Some(code);
+                let _ = send_control_frame(
+                    &control,
+                    ControlFrame::GuestSpawnExit {
+                        id: id.clone(),
+                        exit_code: code,
+                    },
+                );
+            }
+        }
+
+        if exit_code.is_some() && !stdout_open && !stderr_open {
+            break;
+        }
+    }
+
+    let _ = send_control_frame(
+        &control,
+        ControlFrame::GuestSpawnStreamsClosed {
+            id,
+        },
+    );
+}
+
+enum SpawnOutputEvent {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    StdoutClosed,
+    StderrClosed,
+    Exit(i32),
 }
 
 fn run_guest_exec(
@@ -454,11 +653,56 @@ fn write_http_ca(certificate: &[u8]) -> Result<(), InitError> {
 }
 
 fn send_packet(control: &mut std::fs::File, packet: &[u8]) -> Result<(), InitError> {
-    use std::io::Write;
-
     control
         .write_all(packet)
         .map_err(|error| InitError(format!("write control packet: {error}")))
+}
+
+fn send_locked_packet(
+    lock: &Arc<Mutex<()>>,
+    control: &mut std::fs::File,
+    packet: &[u8],
+) -> Result<(), InitError> {
+    let _guard = lock
+        .lock()
+        .map_err(|_| InitError("control stream writer lock poisoned".to_string()))?;
+    send_packet(control, packet)
+}
+
+struct ControlWriter {
+    control: Mutex<std::fs::File>,
+    write_lock: Arc<Mutex<()>>,
+}
+
+impl ControlWriter {
+    fn new(control: std::fs::File, write_lock: Arc<Mutex<()>>) -> Self {
+        Self {
+            control: Mutex::new(control),
+            write_lock,
+        }
+    }
+
+    fn send_packet(&self, packet: &[u8]) -> Result<(), InitError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| InitError("control stream writer lock poisoned".to_string()))?;
+        let mut control = self
+            .control
+            .lock()
+            .map_err(|_| InitError("control stream writer lock poisoned".to_string()))?;
+        send_packet(&mut control, packet)
+    }
+}
+
+fn send_control_frame(
+    control: &Arc<ControlWriter>,
+    frame: ControlFrame,
+) -> Result<(), InitError> {
+    let packet = frame
+        .encode_packet()
+        .map_err(|error| InitError(format!("encode control packet: {error}")))?;
+    control.send_packet(&packet)
 }
 
 #[derive(Debug)]
