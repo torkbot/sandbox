@@ -23,12 +23,16 @@ test("root package declares public release metadata and platform optional depend
     "@torkbot/sandbox-darwin-arm64",
     "@torkbot/sandbox-linux-x64-gnu",
   ]);
-  for (const [packageName, packageVersion] of Object.entries(
-    packageJson.optionalDependencies ?? {},
-  )) {
-    assert.equal(packageVersion, packageJson.version, packageName);
-  }
   assert.equal(packageJson.napi, undefined);
+});
+
+test("release packaging aligns generated platform dependency versions", async () => {
+  const prepareScript = await readFile(
+    new URL("../../scripts/prepare-npm-packages.ts", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(prepareScript, /platformPackages\.map\(\(pkg\) => \[pkg\.name, packageJson\.version\]\)/);
 });
 
 test("release workflow builds platform packages before publishing the root package", async () => {

@@ -296,6 +296,7 @@ impl CowBlockStorageState {
                     self.base.read_exact(&mut block[..readable])?;
                 }
                 self.cached_blocks.insert(block_index, block);
+                self.loaded_store_blocks.insert(block_index);
             }
             let block = self.cached_blocks.get_mut(&block_index).unwrap();
             let input_start = (range_start - offset) as usize;
@@ -314,7 +315,8 @@ impl CowBlockStorageState {
         while block <= last_block {
             while block <= last_block
                 && (!self.store_blocks.contains(&block)
-                    || self.loaded_store_blocks.contains(&block))
+                    || self.loaded_store_blocks.contains(&block)
+                    || self.cached_blocks.contains_key(&block))
             {
                 block += 1;
             }
@@ -325,6 +327,7 @@ impl CowBlockStorageState {
             while block <= last_block
                 && self.store_blocks.contains(&block)
                 && !self.loaded_store_blocks.contains(&block)
+                && !self.cached_blocks.contains_key(&block)
             {
                 block += 1;
             }
@@ -429,6 +432,34 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(error.to_string(), "COW block store omitted a listed block");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn overlapping_unflushed_writes_do_not_reload_from_store() {
+        let path = temp_base_image_path();
+        fs::write(&path, [0_u8; 8192]).unwrap();
+        let base = File::open(&path).unwrap();
+        let store = Arc::new(TestBlockStore {
+            block_size: 4096,
+            blocks: Mutex::new(HashMap::new()),
+        });
+        let mut state = CowBlockStorageState {
+            base,
+            size: 8192,
+            block_size: 4096,
+            store,
+            store_blocks: HashSet::new(),
+            loaded_store_blocks: HashSet::new(),
+            cached_blocks: HashMap::new(),
+            modified_blocks: HashSet::new(),
+        };
+
+        state.write_range(&[1; 4096], 4096).unwrap();
+        state.write_range(&[2; 512], 4096).unwrap();
+
+        assert_eq!(state.cached_blocks.get(&1).unwrap()[..512], [2; 512]);
+        assert_eq!(state.cached_blocks.get(&1).unwrap()[512..], [1; 3584]);
         let _ = fs::remove_file(path);
     }
 
