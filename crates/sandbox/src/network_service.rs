@@ -10,15 +10,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant as StdInstant};
 
-use rama_core::error::BoxError;
 use rama_core::extensions::Extensions;
-use rama_core::io::BridgeIo;
-use rama_core::layer::Layer;
 use rama_core::rt::Executor;
 use rama_core::service::Service;
 use rama_http::header::HOST;
 use rama_http::{Body, Request as RamaRequest, Response as RamaResponse, Version as RamaVersion};
-use rama_http_backend::proxy::mitm::HttpMitmRelay;
+use rama_http_backend::client::http_connect;
+use rama_http_backend::server::HttpServer;
 use rama_tcp::stream::TcpStream as RamaTcpStream;
 use rustls::DigitallySignedStruct;
 use rustls::SignatureScheme;
@@ -1940,58 +1938,12 @@ struct RamaHttpConnection {
     close_after_flush: bool,
 }
 
-#[derive(Clone)]
-struct RamaHttpPolicyLayer {
-    destination: HttpDestination,
-    runtime: Option<Arc<dyn HttpInterceptRuntime>>,
-    outbound_rules: Option<Vec<OutboundRulePlan>>,
-}
-
-#[derive(Clone)]
-struct RamaHttpPolicyService<S> {
-    inner: S,
-    destination: HttpDestination,
-    runtime: Option<Arc<dyn HttpInterceptRuntime>>,
-    outbound_rules: Option<Vec<OutboundRulePlan>>,
-}
-
-impl<S> Layer<S> for RamaHttpPolicyLayer {
-    type Service = Arc<RamaHttpPolicyService<S>>;
-
-    fn layer(&self, inner: S) -> Self::Service {
-        Arc::new(RamaHttpPolicyService {
-            inner,
-            destination: self.destination.clone(),
-            runtime: self.runtime.clone(),
-            outbound_rules: self.outbound_rules.clone(),
-        })
-    }
-}
-
-impl<S> Service<RamaRequest<Body>> for RamaHttpPolicyService<S>
-where
-    S: Service<RamaRequest<Body>, Output = RamaResponse, Error: Into<BoxError>>,
-{
-    type Output = RamaResponse;
-    type Error = BoxError;
-
-    async fn serve(&self, request: RamaRequest<Body>) -> Result<Self::Output, Self::Error> {
-        let request = apply_rama_http_policy(
-            request,
-            &self.destination,
-            self.outbound_rules.as_deref(),
-            self.runtime.as_deref(),
-        )?;
-        self.inner.serve(request).await.map_err(Into::into)
-    }
-}
-
 fn apply_rama_http_policy(
     mut request: RamaRequest<Body>,
     destination: &HttpDestination,
     outbound_rules: Option<&[OutboundRulePlan]>,
     runtime: Option<&dyn HttpInterceptRuntime>,
-) -> Result<RamaRequest<Body>, BoxError> {
+) -> io::Result<RamaRequest<Body>> {
     let authority = request_authority(&request, default_port_for_scheme("http"))?;
     let _ = split_authority(&authority, default_port_for_scheme("http"))?;
     let upstream = UpstreamEndpoint {
@@ -2050,8 +2002,7 @@ fn apply_rama_http_policy(
                 return Err(io::Error::new(
                     ErrorKind::PermissionDenied,
                     "request authority resolved to a rebound destination",
-                )
-                .into());
+                ));
             }
             runtime.handle_request_head(intercepted)?
         }
@@ -2073,6 +2024,45 @@ fn apply_rama_http_policy(
         );
     }
     Ok(request)
+}
+
+async fn serve_rama_http_request(
+    request: RamaRequest<Body>,
+    destination: &HttpDestination,
+    runtime: Option<&dyn HttpInterceptRuntime>,
+    outbound_rules: Option<&[OutboundRulePlan]>,
+) -> RamaResponse {
+    let request = match apply_rama_http_policy(request, destination, outbound_rules, runtime) {
+        Ok(request) => request,
+        Err(_) => return rama_response(403, "network policy denied"),
+    };
+    let upstream = match TcpStream::connect(upstream_socket_addr(&destination.ip, destination.port))
+    {
+        Ok(upstream) => upstream,
+        Err(_) => return rama_response(502, "upstream connect failed"),
+    };
+    if upstream.set_nonblocking(true).is_err() {
+        return rama_response(502, "upstream connect failed");
+    }
+    let upstream = match RamaTcpStream::try_from_std_tcp_stream(upstream, Extensions::new()) {
+        Ok(upstream) => upstream,
+        Err(_) => return rama_response(502, "upstream connect failed"),
+    };
+    let connection = match http_connect(upstream, request, Executor::default()).await {
+        Ok(connection) => connection,
+        Err(_) => return rama_response(502, "upstream http connect failed"),
+    };
+    match connection.conn.serve(connection.input).await {
+        Ok(response) => response,
+        Err(_) => rama_response(502, "upstream request failed"),
+    }
+}
+
+fn rama_response(status: u16, body: &'static str) -> RamaResponse {
+    RamaResponse::builder()
+        .status(status)
+        .body(Body::from(body))
+        .unwrap()
 }
 
 fn request_authority(request: &RamaRequest<Body>, default_port: u16) -> io::Result<String> {
@@ -2109,8 +2099,6 @@ impl RamaHttpConnection {
         runtime: Option<Arc<dyn HttpInterceptRuntime>>,
         outbound_rules: Option<Vec<OutboundRulePlan>>,
     ) -> io::Result<Self> {
-        let upstream = TcpStream::connect(upstream_socket_addr(&destination.ip, destination.port))?;
-        upstream.set_nonblocking(true)?;
         let (bridge, async_io) = SyncAsyncBridge::new(HTTP_BRIDGE_BUFFER_BYTES);
         if !initial_guest_bytes.is_empty() {
             bridge.push_from_sync(&initial_guest_bytes);
@@ -2120,19 +2108,26 @@ impl RamaHttpConnection {
                 return;
             };
             tokio_runtime.block_on(async move {
-                let Ok(upstream) =
-                    RamaTcpStream::try_from_std_tcp_stream(upstream, Extensions::new())
-                else {
-                    return;
-                };
-                let relay = HttpMitmRelay::new(Executor::default()).with_http_middleware(
-                    RamaHttpPolicyLayer {
-                        destination,
-                        runtime,
-                        outbound_rules,
-                    },
-                );
-                let _ = relay.serve(BridgeIo(async_io, upstream)).await;
+                let server = HttpServer::auto(Executor::default());
+                let destination = Arc::new(destination);
+                let outbound_rules = outbound_rules.map(Arc::new);
+                let service = rama_core::service::service_fn(move |request: RamaRequest<Body>| {
+                    let destination = destination.clone();
+                    let runtime = runtime.clone();
+                    let outbound_rules = outbound_rules.clone();
+                    async move {
+                        Ok::<_, std::convert::Infallible>(
+                            serve_rama_http_request(
+                                request,
+                                &destination,
+                                runtime.as_deref(),
+                                outbound_rules.as_deref().map(|rules| rules.as_slice()),
+                            )
+                            .await,
+                        )
+                    }
+                });
+                let _ = server.serve(async_io, service).await;
             });
         });
         Ok(Self {

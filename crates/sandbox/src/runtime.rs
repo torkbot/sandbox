@@ -144,19 +144,25 @@ impl KrunContext {
                     .map_err(|_| KrunError::new("NetworkPlan::from_spec", -libc::EINVAL))
             })
             .transpose()?;
+        let network_policy = if network
+            .policy
+            .as_ref()
+            .is_some_and(|policy| policy.connection_hook)
+        {
+            Some(
+                _services
+                    .network_policy
+                    .clone()
+                    .ok_or_else(|| KrunError::new("HostNetwork::new", -libc::EINVAL))?,
+            )
+        } else {
+            None
+        };
         let network = HostNetwork::new(
             tls_config,
             outbound_rules,
             _services.http.clone(),
-            network
-                .policy
-                .as_ref()
-                .and_then(|policy| {
-                    policy
-                        .connection_hook
-                        .then(|| _services.network_policy.clone())
-                })
-                .flatten(),
+            network_policy,
         )
         .map_err(|_| KrunError::new("HostNetwork::new", -libc::EIO))?;
         let guest_fd = network.guest_fd();
@@ -780,6 +786,38 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.to_string(), "unsupported rootfs.format: raw");
+    }
+
+    #[test]
+    fn rejects_connection_hook_without_policy_runtime() {
+        let spec = MicroVmSpec::build(MicroVmSpecInput {
+            name: Some("network-policy-without-runtime".to_string()),
+            vcpus: Some(1),
+            memory_mib: Some(128),
+            kernel_format: None,
+            init_crate: "sandbox-init".to_string(),
+            rootfs_path: "rootfs.qcow2".to_string(),
+            rootfs_readonly: Some(true),
+            rootfs_format: "qcow2".to_string(),
+            rootfs_storage: None,
+            mounts: Vec::new(),
+            network_outbound: None,
+            network_http: None,
+            network_policy: Some(crate::config::NetworkPolicySpec {
+                connection_hook: true,
+            }),
+        })
+        .unwrap();
+        let mut context = KrunContext {
+            id: 0,
+            _networks: Vec::new(),
+        };
+
+        let error = context
+            .apply_network(&spec, &HostServices::default())
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "HostNetwork::new failed with -22");
     }
 
     #[test]
