@@ -34,6 +34,7 @@ use rustls::pki_types::pem::PemObject;
 const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const HOST_HTTP_PROBE_PORT: u16 = 8080;
 const HOST_HTTP_PORT: u16 = 80;
+const HOST_ALT_HTTP_PORT: u16 = 8000;
 const HOST_HTTPS_PORT: u16 = 443;
 const HOST_ALT_HTTPS_PORT: u16 = 8443;
 const HOST_DNS_PORT: u16 = 53;
@@ -310,6 +311,7 @@ fn run_network_service(
     let mut udp_sockets = HashMap::new();
     let mut udp_relays = HashMap::new();
     add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTP_PORT);
+    add_http_listener(&mut sockets, &mut http_sockets, HOST_ALT_HTTP_PORT);
     add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTP_PROBE_PORT);
     if tls_authority.is_some() {
         add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTPS_PORT);
@@ -793,7 +795,11 @@ fn prune_dynamic_http_listeners(
 fn is_static_listener_port(port: u16) -> bool {
     matches!(
         port,
-        HOST_HTTP_PORT | HOST_HTTP_PROBE_PORT | HOST_HTTPS_PORT | HOST_ALT_HTTPS_PORT
+        HOST_HTTP_PORT
+            | HOST_ALT_HTTP_PORT
+            | HOST_HTTP_PROBE_PORT
+            | HOST_HTTPS_PORT
+            | HOST_ALT_HTTPS_PORT
     )
 }
 
@@ -840,57 +846,12 @@ fn looks_like_tls(bytes: &[u8]) -> bool {
     matches!(bytes.first(), Some(0x16))
 }
 
-fn should_use_raw_tcp_relay(bytes: &[u8]) -> bool {
-    if let Some(line_end) = bytes.windows(2).position(|window| window == b"\r\n") {
-        let request_line = &bytes[..line_end];
-        if !request_line.windows(5).any(|window| window == b"HTTP/") {
-            return true;
-        }
-    }
-    !bytes_could_be_http_request(bytes)
+fn is_plain_http_port(port: u16) -> bool {
+    port == HOST_HTTP_PORT || port == HOST_ALT_HTTP_PORT
 }
 
-fn bytes_could_be_http_request(bytes: &[u8]) -> bool {
-    if bytes.starts_with(H2_PREFACE) {
-        return false;
-    }
-    if H2_PREFACE.starts_with(bytes) {
-        return true;
-    }
-    if bytes.is_empty() {
-        return true;
-    }
-    let mut saw_method_byte = false;
-    for byte in bytes {
-        if is_http_method_token_byte(*byte) {
-            saw_method_byte = true;
-            continue;
-        }
-        return saw_method_byte && *byte == b' ';
-    }
-    saw_method_byte
-}
-
-fn is_http_method_token_byte(byte: u8) -> bool {
-    matches!(
-        byte,
-        b'!' | b'#'
-            | b'$'
-            | b'%'
-            | b'&'
-            | b'\''
-            | b'*'
-            | b'+'
-            | b'-'
-            | b'.'
-            | b'^'
-            | b'_'
-            | b'`'
-            | b'|'
-            | b'~'
-            | b'0'..=b'9'
-            | b'A'..=b'Z'
-    )
+fn is_https_port(port: u16) -> bool {
+    port == HOST_HTTPS_PORT || port == HOST_ALT_HTTPS_PORT
 }
 
 #[derive(Clone)]
@@ -1123,14 +1084,6 @@ fn tls_client_hello_sni(bytes: &[u8]) -> Option<String> {
     tls_client_hello_extension(bytes, 0).and_then(tls_sni_from_extension)
 }
 
-fn tls_client_hello_offers_http(bytes: &[u8]) -> bool {
-    tls_client_hello_extension(bytes, 16).is_some_and(|extension| {
-        tls_alpn_protocols(extension)
-            .iter()
-            .any(|protocol| protocol == "http/1.1")
-    })
-}
-
 fn tls_client_hello_extension(bytes: &[u8], requested_type: u16) -> Option<&[u8]> {
     if bytes.len() < 5 || bytes[0] != 0x16 {
         return None;
@@ -1184,35 +1137,13 @@ fn tls_client_hello_extension(bytes: &[u8], requested_type: u16) -> Option<&[u8]
     None
 }
 
-fn tls_alpn_protocols(extension: &[u8]) -> Vec<String> {
-    if extension.len() < 2 {
-        return Vec::new();
+fn tls_client_hello_complete(bytes: &[u8]) -> bool {
+    if bytes.len() < 9 || bytes[0] != 0x16 || bytes.get(5) != Some(&0x01) {
+        return false;
     }
-    let list_len = u16::from_be_bytes([extension[0], extension[1]]) as usize;
-    let mut offset = 2;
-    let end = offset + list_len;
-    if extension.len() < end {
-        return Vec::new();
-    }
-    let mut protocols = Vec::new();
-    while offset < end {
-        let Some(len) = extension.get(offset).copied().map(usize::from) else {
-            return Vec::new();
-        };
-        offset += 1;
-        if offset + len > end {
-            return Vec::new();
-        }
-        if let Ok(protocol) = std::str::from_utf8(&extension[offset..offset + len]) {
-            protocols.push(protocol.to_string());
-        }
-        offset += len;
-    }
-    protocols
-}
-
-fn tls_record_complete(bytes: &[u8]) -> bool {
-    bytes.len() >= 5 && bytes.len() >= 5 + u16::from_be_bytes([bytes[3], bytes[4]]) as usize
+    let handshake_len =
+        ((bytes[6] as usize) << 16) | ((bytes[7] as usize) << 8) | bytes[8] as usize;
+    bytes.len() >= 9 + handshake_len
 }
 
 fn tls_intercept_server_name(destination: &HttpDestination, sni: Option<&str>) -> String {
@@ -2504,7 +2435,32 @@ impl InterceptConnection {
     }
 
     fn read_guest_head(&mut self, socket: &mut tcp::Socket<'_>) {
-        let mut raw_relay = None;
+        if is_plain_http_port(self.destination.port) {
+            match RamaHttpConnection::start(
+                self.destination.clone(),
+                Vec::new(),
+                self.runtime.clone(),
+            ) {
+                Ok(relay) => {
+                    self.state = InterceptState::RamaHttp(relay);
+                }
+                Err(_) => {
+                    self.to_guest.extend_from_slice(OUTBOUND_DENIED_RESPONSE);
+                    self.close_after_flush = true;
+                    self.state = InterceptState::Closing;
+                }
+            }
+            return;
+        }
+        if !is_https_port(self.destination.port) {
+            self.start_raw_relay(Vec::new());
+            return;
+        }
+        if self.tls_authority.is_none() {
+            self.start_raw_relay(Vec::new());
+            return;
+        }
+
         while socket.can_recv() {
             let InterceptState::ReadingHead { guest_head } = &mut self.state else {
                 return;
@@ -2521,92 +2477,30 @@ impl InterceptConnection {
                 self.state = InterceptState::Closing;
                 return;
             }
-            if looks_like_tls(guest_head) {
-                let maybe_server_name = tls_client_hello_sni(guest_head);
-                if !tls_record_complete(guest_head) {
-                    continue;
-                }
-                if !tls_client_hello_offers_http(guest_head) {
-                    raw_relay = Some(std::mem::take(guest_head));
-                    break;
-                }
-                let Some(authority) = self.tls_authority.as_ref() else {
-                    raw_relay = Some(std::mem::take(guest_head));
-                    break;
-                };
-                let sni = maybe_server_name;
-                let server_name = tls_intercept_server_name(&self.destination, sni.as_deref());
-                match TlsInterceptConnection::new(authority.clone(), &server_name, sni, guest_head)
-                {
-                    Ok(tls) => {
-                        self.state = InterceptState::Tls(tls);
-                    }
-                    Err(_) => {
-                        self.close_after_flush = true;
-                        self.state = InterceptState::Closing;
-                    }
-                }
+            if !looks_like_tls(guest_head) {
+                self.close_after_flush = true;
+                self.state = InterceptState::Closing;
                 return;
             }
-            if guest_head.starts_with(H2_PREFACE) {
-                let initial_bytes = std::mem::take(guest_head);
-                match RamaHttpConnection::start(
-                    self.destination.clone(),
-                    initial_bytes,
-                    self.runtime.clone(),
-                ) {
-                    Ok(relay) => {
-                        self.state = InterceptState::RamaHttp(relay);
-                    }
-                    Err(_) => {
-                        self.to_guest.extend_from_slice(OUTBOUND_DENIED_RESPONSE);
-                        self.close_after_flush = true;
-                        self.state = InterceptState::Closing;
-                    }
-                }
-                return;
+            if !tls_client_hello_complete(guest_head) {
+                continue;
             }
-            if should_use_raw_tcp_relay(guest_head) {
-                raw_relay = Some(std::mem::take(guest_head));
-                break;
-            }
-            match rewrite_intercepted_head(
-                guest_head,
-                &self.destination,
-                "http",
-                None,
-                self.runtime.as_deref(),
-            ) {
-                Ok(Some(rewritten)) => {
-                    match TcpStream::connect(upstream_socket_addr(
-                        &self.destination.ip,
-                        self.destination.port,
-                    )) {
-                        Ok(upstream) => {
-                            let _ = upstream.set_nonblocking(true);
-                            self.to_upstream.extend_from_slice(&rewritten.bytes);
-                            self.upstream = Some(upstream);
-                            self.state = InterceptState::Relaying;
-                        }
-                        Err(_) => {
-                            self.to_guest.extend_from_slice(OUTBOUND_DENIED_RESPONSE);
-                            self.close_after_flush = true;
-                            self.state = InterceptState::Closing;
-                        }
-                    }
-                    return;
+            let sni = tls_client_hello_sni(guest_head);
+            let server_name = tls_intercept_server_name(&self.destination, sni.as_deref());
+            let authority = self
+                .tls_authority
+                .as_ref()
+                .expect("HTTPS interception checked TLS authority before reading ClientHello");
+            match TlsInterceptConnection::new(authority.clone(), &server_name, sni, guest_head) {
+                Ok(tls) => {
+                    self.state = InterceptState::Tls(tls);
                 }
-                Ok(None) => {}
                 Err(_) => {
-                    self.to_guest.extend_from_slice(OUTBOUND_DENIED_RESPONSE);
                     self.close_after_flush = true;
                     self.state = InterceptState::Closing;
-                    return;
                 }
             }
-        }
-        if let Some(initial_bytes) = raw_relay {
-            self.start_raw_relay(initial_bytes);
+            return;
         }
     }
 
@@ -3401,16 +3295,6 @@ mod tests {
         .unwrap();
 
         assert!(!decision.allowed);
-    }
-
-    #[test]
-    fn raw_tcp_classifier_keeps_extension_http_methods_interceptable() {
-        assert!(bytes_could_be_http_request(b"PROPFIND /dav HTTP/1.1\r\n"));
-        assert!(bytes_could_be_http_request(b"CUSTOM-METHOD "));
-        assert!(!bytes_could_be_http_request(H2_PREFACE));
-        assert!(!bytes_could_be_http_request(b"hello sandbox\n"));
-        assert!(!bytes_could_be_http_request(b"PING\r\n"));
-        assert!(should_use_raw_tcp_relay(b"GET key\r\n"));
     }
 
     #[test]

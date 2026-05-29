@@ -247,7 +247,8 @@ const policy = network.policy(async (conn) => {
 default semantics for its protocol. Protocol-specific grant helpers add
 protocol-specific behavior. `conn.allowDns(...)` grants DNS over UDP or TCP and
 can provide programmable DNS responses. `conn.allowHttp(...)` grants
-HTTP(S)-classified traffic and can apply request middleware:
+HTTP(S)-classified traffic on the sandbox HTTP ports and can apply request
+middleware:
 
 ```ts
 const policy = network.policy(async (conn) => {
@@ -394,6 +395,11 @@ TypeScript API:
   decisions and delegate to JavaScript only when a policy callback is required.
 - HTTP request middleware is caller-provided JavaScript, but Sandbox owns the
   interception machinery and certificate plumbing.
+- When HTTP interception is enabled, Sandbox init receives the generated CA and
+  installs it using the selected rootfs' native trust-store mechanism when one
+  is discoverable. It probes standard `update-ca-certificates` and
+  `update-ca-trust` layouts, while still exporting a runtime CA file for tools
+  that honor `SSL_CERT_FILE` or `CURL_CA_BUNDLE`.
 
 The intended boundary is that Sandbox knows how to launch, isolate, mount,
 intercept, and enforce. User-space owns artifact selection, filesystem

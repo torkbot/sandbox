@@ -28,7 +28,7 @@ test("network.policy allows plain HTTP over TCP", async (t) => {
       observedHeaders.push(request.match(/^x-sandbox-policy: (.+)$/im)?.[1] ?? "");
       socket.end("HTTP/1.1 200 OK\r\ncontent-length: 7\r\nconnection: close\r\n\r\nhttp-ok");
     });
-  });
+  }, 8000);
   t.after(() => void origin.close());
 
   await using sandbox = await defineSandbox({
@@ -56,7 +56,7 @@ test("network.policy allows plain HTTP over TCP", async (t) => {
 
 test("network.policy rejects untrusted HTTPS upstream certificates", async (t) => {
   if (!requireVmLaunchSupport(t)) return;
-  const origin = await startTlsHttpServer();
+  const origin = await startTlsHttpServer(8443);
   t.after(() => void origin.close());
 
   await using sandbox = await defineSandbox({
@@ -279,6 +279,24 @@ test("network.policy raw-relays token-space TCP commands without HTTP framing", 
   assert.equal(result.exitCode, 0, commandOutput(result));
   assert.equal(result.stdout, "VALUE key 0 5\r\nvalue\r\nEND\r\n");
   assert.ok(commandServer.connections.length >= 1);
+});
+
+test("network.policy opens allowed raw relays for server-first TCP protocols", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+  const banner = await startTcpServer((socket) => {
+    socket.end("220 sandbox.test service ready\r\n");
+  });
+  t.after(() => void banner.close());
+
+  await using sandbox = await bootAllowingNetwork();
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "server-first-raw-tcp",
+    script: pythonTcpReadBanner(banner.port),
+  }), 10_000, "server-first raw TCP exchange");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "220 sandbox.test service ready\r\n");
+  assert.ok(banner.connections.length >= 1);
 });
 
 test("network.policy allows generic UDP echo traffic", async (t) => {
@@ -514,6 +532,10 @@ function pythonTcpRefused(port: number): string {
   return `python3 - <<'PY'\nimport errno, socket\ntry:\n    socket.create_connection((${JSON.stringify(hostOriginAddress())}, ${port}), timeout=3)\nexcept OSError as error:\n    print(errno.errorcode.get(getattr(error, "errno", None), type(error).__name__), end="")\nPY`;
 }
 
+function pythonTcpReadBanner(port: number): string {
+  return `python3 - <<'PY'\nimport socket\ns = socket.create_connection((${JSON.stringify(hostOriginAddress())}, ${port}), timeout=3)\ns.settimeout(3)\nprint(s.recv(4096).decode(), end="")\ns.close()\nPY`;
+}
+
 function pythonTlsExchange(port: number, message: string): string {
   return `python3 - <<'PY'\nimport socket, ssl\nctx = ssl._create_unverified_context()\nraw = socket.create_connection((${JSON.stringify(hostOriginAddress())}, ${port}), timeout=3)\ns = ctx.wrap_socket(raw, server_hostname="localhost")\ns.settimeout(3)\ns.sendall(${JSON.stringify(message)}.encode())\nprint(s.recv(4096).decode(), end="")\ns.close()\nPY`;
 }
@@ -530,7 +552,7 @@ function pythonTcpDnsTwoQueries(first: string, second: string): string {
   return `python3 - <<'PY'\nimport socket, struct\n\ndef query(name, ident):\n    packet = bytearray()\n    packet += struct.pack("!H", ident) + b"\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00"\n    for label in name.split("."):\n        packet.append(len(label))\n        packet += label.encode()\n    packet += b"\\x00\\x00\\x01\\x00\\x01"\n    return bytes(packet)\n\ndef read_name(packet, offset):\n    labels = []\n    jumped = False\n    original = offset\n    while True:\n        length = packet[offset]\n        if length & 0xc0 == 0xc0:\n            pointer = ((length & 0x3f) << 8) | packet[offset + 1]\n            if not jumped:\n                original = offset + 2\n            offset = pointer\n            jumped = True\n            continue\n        offset += 1\n        if length == 0:\n            return ".".join(labels), (original if jumped else offset)\n        labels.append(packet[offset:offset + length].decode())\n        offset += length\n\ndef answer_address(packet):\n    question_count = struct.unpack("!H", packet[4:6])[0]\n    answer_count = struct.unpack("!H", packet[6:8])[0]\n    offset = 12\n    for _ in range(question_count):\n        _, offset = read_name(packet, offset)\n        offset += 4\n    for _ in range(answer_count):\n        _, offset = read_name(packet, offset)\n        rtype, rclass, ttl, rdlen = struct.unpack("!HHIH", packet[offset:offset + 10])\n        offset += 10\n        data = packet[offset:offset + rdlen]\n        offset += rdlen\n        if rtype == 1 and rclass == 1 and rdlen == 4:\n            return ".".join(str(byte) for byte in data)\n    raise RuntimeError("missing A answer")\n\ndef read_response(sock):\n    size = struct.unpack("!H", sock.recv(2))[0]\n    response = b""\n    while len(response) < size:\n        response += sock.recv(size - len(response))\n    return response\n\ns = socket.create_connection(("10.0.2.1", 53), timeout=3)\ns.settimeout(3)\nfor request in [query(${JSON.stringify(first)}, 0x1234), query(${JSON.stringify(second)}, 0x1235)]:\n    s.sendall(struct.pack("!H", len(request)) + request)\nanswers = [answer_address(read_response(s)), answer_address(read_response(s))]\nprint(",".join(answers), end="")\ns.close()\nPY`;
 }
 
-async function startTcpServer(onConnection: (socket: net.Socket) => void): Promise<{
+async function startTcpServer(onConnection: (socket: net.Socket) => void, port = 0): Promise<{
   readonly port: number;
   readonly connections: net.Socket[];
   close(): Promise<void>;
@@ -541,7 +563,7 @@ async function startTcpServer(onConnection: (socket: net.Socket) => void): Promi
     socket.on("error", () => {});
     onConnection(socket);
   });
-  await listen(server);
+  await listen(server, port);
   const address = server.address();
   if (address === null || typeof address === "string") {
     throw new Error("TCP server did not bind a port");
@@ -607,7 +629,7 @@ async function startTlsEchoServer(): Promise<{
   };
 }
 
-async function startTlsHttpServer(): Promise<{
+async function startTlsHttpServer(port = 0): Promise<{
   readonly port: number;
   readonly requests: string[];
   close(): Promise<void>;
@@ -625,7 +647,7 @@ async function startTlsHttpServer(): Promise<{
       socket.end("HTTP/1.1 200 OK\r\ncontent-length: 8\r\nconnection: close\r\n\r\nhttps-ok");
     });
   });
-  await listen(server);
+  await listen(server, port);
   const address = server.address();
   if (address === null || typeof address === "string") {
     throw new Error("TLS HTTP server did not bind a port");
@@ -706,10 +728,10 @@ async function createSelfSignedCertificate(): Promise<{
   return { workDir, keyPath, certPath };
 }
 
-async function listen(server: net.Server | tls.Server): Promise<void> {
+async function listen(server: net.Server | tls.Server, port = 0): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(0, "0.0.0.0", () => {
+    server.listen(port, "0.0.0.0", () => {
       server.off("error", reject);
       resolve();
     });

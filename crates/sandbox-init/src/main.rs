@@ -1,10 +1,10 @@
 use base64::Engine;
 use sandbox_protocol::ControlFrame;
+#[cfg(target_os = "linux")]
+use sandbox_protocol::INIT_CONTROL_PORT;
 use std::io::Write;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-#[cfg(target_os = "linux")]
-use sandbox_protocol::INIT_CONTROL_PORT;
 
 fn main() {
     if let Err(error) = run() {
@@ -350,11 +350,7 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
                     .map_err(|error| InitError(format!("encode exec completion: {error}")))?;
                 send_locked_packet(&write_lock, control, &packet)?;
             }
-            ControlFrame::GuestSpawn {
-                id,
-                argv,
-                env,
-            } => {
+            ControlFrame::GuestSpawn { id, argv, env } => {
                 let writer = Arc::new(ControlWriter::new(
                     control
                         .try_clone()
@@ -378,10 +374,7 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
                                 exit_code: 127,
                             },
                         )?;
-                        send_control_frame(
-                            &writer,
-                            ControlFrame::GuestSpawnStreamsClosed { id },
-                        )?;
+                        send_control_frame(&writer, ControlFrame::GuestSpawnStreamsClosed { id })?;
                     }
                 }
             }
@@ -435,8 +428,18 @@ fn run_guest_spawn(
     send_control_frame(&control, ControlFrame::GuestSpawnStarted { id: id.clone() })?;
 
     let (events, event_receiver) = mpsc::channel();
-    pump_spawn_output(stdout, events.clone(), SpawnOutputEvent::Stdout, SpawnOutputEvent::StdoutClosed);
-    pump_spawn_output(stderr, events.clone(), SpawnOutputEvent::Stderr, SpawnOutputEvent::StderrClosed);
+    pump_spawn_output(
+        stdout,
+        events.clone(),
+        SpawnOutputEvent::Stdout,
+        SpawnOutputEvent::StdoutClosed,
+    );
+    pump_spawn_output(
+        stderr,
+        events.clone(),
+        SpawnOutputEvent::Stderr,
+        SpawnOutputEvent::StderrClosed,
+    );
     std::thread::spawn(move || {
         let status = child.wait();
         let exit_code = match status {
@@ -534,12 +537,7 @@ fn run_spawn_output_coordinator(
         }
     }
 
-    let _ = send_control_frame(
-        &control,
-        ControlFrame::GuestSpawnStreamsClosed {
-            id,
-        },
-    );
+    let _ = send_control_frame(&control, ControlFrame::GuestSpawnStreamsClosed { id });
 }
 
 enum SpawnOutputEvent {
@@ -649,6 +647,44 @@ fn write_http_ca(certificate: &[u8]) -> Result<(), InitError> {
         .map_err(|error| InitError(format!("create /run/sandbox: {error}")))?;
     std::fs::write("/run/sandbox/http-ca.pem", certificate)
         .map_err(|error| InitError(format!("write host HTTP CA certificate: {error}")))?;
+    install_http_ca_into_guest_trust(certificate)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn install_http_ca_into_guest_trust(certificate: &[u8]) -> Result<(), InitError> {
+    if std::path::Path::new("/usr/local/share/ca-certificates").is_dir()
+        && command_exists("/usr/sbin/update-ca-certificates")
+    {
+        std::fs::write(
+            "/usr/local/share/ca-certificates/sandbox-http-interception-ca.crt",
+            certificate,
+        )
+        .map_err(|error| InitError(format!("write Alpine/Debian CA certificate: {error}")))?;
+        run_setup_command("/usr/sbin/update-ca-certificates", &[])?;
+        return Ok(());
+    }
+
+    if std::path::Path::new("/etc/pki/ca-trust/source/anchors").is_dir()
+        && command_exists("/usr/bin/update-ca-trust")
+    {
+        std::fs::write(
+            "/etc/pki/ca-trust/source/anchors/sandbox-http-interception-ca.pem",
+            certificate,
+        )
+        .map_err(|error| InitError(format!("write pki CA certificate: {error}")))?;
+        run_setup_command("/usr/bin/update-ca-trust", &["extract"])?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn command_exists(path: &str) -> bool {
+    std::path::Path::new(path).is_file()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_http_ca_into_guest_trust(_certificate: &[u8]) -> Result<(), InitError> {
     Ok(())
 }
 
@@ -695,10 +731,7 @@ impl ControlWriter {
     }
 }
 
-fn send_control_frame(
-    control: &Arc<ControlWriter>,
-    frame: ControlFrame,
-) -> Result<(), InitError> {
+fn send_control_frame(control: &Arc<ControlWriter>, frame: ControlFrame) -> Result<(), InitError> {
     let packet = frame
         .encode_packet()
         .map_err(|error| InitError(format!("encode control packet: {error}")))?;
