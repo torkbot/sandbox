@@ -130,6 +130,10 @@ pub trait NetworkPolicyRuntime: Send + Sync + std::fmt::Debug {
         &self,
         connection: NetworkConnectionAttempt,
     ) -> io::Result<NetworkPolicyDecision>;
+
+    fn connection_closed(&self, _connection: NetworkConnectionAttempt) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -770,7 +774,9 @@ fn poll_http_socket(
 ) {
     let socket = sockets.get_mut::<tcp::Socket>(handle);
     if !socket.is_active() {
-        http_connections.remove(&handle);
+        if let Some(connection) = http_connections.remove(&handle) {
+            notify_connection_closed(policy.as_deref(), NetworkProtocol::Tcp, &connection);
+        }
         let _ = socket.listen(port);
         return;
     }
@@ -778,7 +784,9 @@ fn poll_http_socket(
     if let Some(connection) = http_connections.get_mut(&handle) {
         poll_http_connection(socket, connection);
         if connection.is_finished() {
-            let _ = http_connections.remove(&handle);
+            if let Some(connection) = http_connections.remove(&handle) {
+                notify_connection_closed(policy.as_deref(), NetworkProtocol::Tcp, &connection);
+            }
             socket.close();
         }
         return;
@@ -794,6 +802,31 @@ fn poll_http_socket(
         tls_authority,
         http_connections,
     );
+}
+
+fn notify_connection_closed(
+    policy: Option<&dyn NetworkPolicyRuntime>,
+    protocol: NetworkProtocol,
+    connection: &HttpConnection,
+) {
+    let Some(policy) = policy else {
+        return;
+    };
+    let Some(destination) = connection.destination() else {
+        return;
+    };
+    let _ = policy.connection_closed(NetworkConnectionAttempt {
+        protocol,
+        transport: protocol,
+        src: NetworkEndpoint {
+            ip: destination.source_ip.clone(),
+            port: destination.source_port,
+        },
+        dst: NetworkEndpoint {
+            ip: destination.ip.clone(),
+            port: destination.port,
+        },
+    });
 }
 
 fn looks_like_tls(bytes: &[u8]) -> bool {
@@ -1404,8 +1437,7 @@ impl LibkrunNetDevice {
             dst,
         );
         if decision.action == NetworkPolicyAction::Accept
-            || (decision.action == NetworkPolicyAction::AcceptHttp
-                && is_static_listener_port(packet.destination_port(frame)))
+            || decision.action == NetworkPolicyAction::AcceptHttp
         {
             return false;
         }
@@ -1531,6 +1563,7 @@ impl HttpConnection {
             destination,
             runtime,
             tls_authority,
+            http_enforced: true,
             state: InterceptState::ReadingHead {
                 guest_head: Vec::new(),
             },
@@ -1546,6 +1579,7 @@ impl HttpConnection {
             destination,
             runtime: None,
             tls_authority: None,
+            http_enforced: false,
             state: InterceptState::ReadingHead {
                 guest_head: Vec::new(),
             },
@@ -1568,6 +1602,13 @@ impl HttpConnection {
             }
         }
     }
+
+    fn destination(&self) -> Option<&HttpDestination> {
+        match self {
+            Self::Response(_) => None,
+            Self::Intercept(intercept) => Some(&intercept.destination),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1588,6 +1629,7 @@ struct InterceptConnection {
     destination: HttpDestination,
     runtime: Option<Arc<dyn HttpInterceptRuntime>>,
     tls_authority: Option<Arc<MitmTlsAuthority>>,
+    http_enforced: bool,
     state: InterceptState,
     upstream: Option<TcpStream>,
     to_guest: Vec<u8>,
@@ -1668,6 +1710,16 @@ fn apply_rama_http_policy(
 ) -> io::Result<RamaRequest<Body>> {
     let authority = request_authority(&request, context.scheme.default_port())?;
     let _ = split_authority(&authority, context.scheme.default_port())?;
+    let policy_headers = request
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_ascii_lowercase(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
     let mut intercepted = InterceptedHttpRequest {
         protocol: match request.version() {
             RamaVersion::HTTP_2 => HttpRequestProtocol::Http2,
@@ -1688,16 +1740,7 @@ fn apply_rama_http_policy(
             ip: context.destination.source_ip.clone(),
             port: context.destination.source_port,
         },
-        headers: request
-            .headers()
-            .iter()
-            .filter_map(|(name, value)| {
-                Some((
-                    name.as_str().to_ascii_lowercase(),
-                    value.to_str().ok()?.to_string(),
-                ))
-            })
-            .collect(),
+        headers: policy_headers.clone(),
         tls: context.tls.clone(),
     };
     if !intercepted
@@ -1713,6 +1756,9 @@ fn apply_rama_http_policy(
         Some(runtime) => runtime.handle_request_head(intercepted)?,
         None => intercepted,
     };
+    if intercepted.headers == policy_headers {
+        return Ok(request);
+    }
     let is_h2 = request.version() == RamaVersion::HTTP_2;
     let headers = request.headers_mut();
     headers.clear();
@@ -2098,31 +2144,14 @@ impl InterceptConnection {
 
     fn read_guest_head(&mut self, socket: &mut tcp::Socket<'_>) {
         if is_plain_http_port(self.destination.port) {
-            match RamaHttpConnection::start(
-                HttpFlowContext {
-                    scheme: HttpScheme::Http,
-                    destination: self.destination.clone(),
-                    tls: None,
-                },
-                Vec::new(),
-                self.runtime.clone(),
-            ) {
-                Ok(relay) => {
-                    self.state = InterceptState::RamaHttp(relay);
-                }
-                Err(_) => {
-                    self.to_guest.extend_from_slice(OUTBOUND_DENIED_RESPONSE);
-                    self.close_after_flush = true;
-                    self.state = InterceptState::Closing;
-                }
-            }
+            self.start_rama_http(Vec::new());
             return;
         }
-        if !is_https_port(self.destination.port) {
+        if !self.http_enforced && !is_https_port(self.destination.port) {
             self.start_raw_relay(Vec::new());
             return;
         }
-        if self.tls_authority.is_none() {
+        if !self.http_enforced && self.tls_authority.is_none() {
             self.start_raw_relay(Vec::new());
             return;
         }
@@ -2144,6 +2173,16 @@ impl InterceptConnection {
                 return;
             }
             if !looks_like_tls(guest_head) {
+                if self.http_enforced {
+                    let initial_bytes = std::mem::take(guest_head);
+                    self.start_rama_http(initial_bytes);
+                    return;
+                }
+                self.close_after_flush = true;
+                self.state = InterceptState::Closing;
+                return;
+            }
+            if self.tls_authority.is_none() {
                 self.close_after_flush = true;
                 self.state = InterceptState::Closing;
                 return;
@@ -2174,6 +2213,27 @@ impl InterceptConnection {
                 }
             }
             return;
+        }
+    }
+
+    fn start_rama_http(&mut self, initial_bytes: Vec<u8>) {
+        match RamaHttpConnection::start(
+            HttpFlowContext {
+                scheme: HttpScheme::Http,
+                destination: self.destination.clone(),
+                tls: None,
+            },
+            initial_bytes,
+            self.runtime.clone(),
+        ) {
+            Ok(relay) => {
+                self.state = InterceptState::RamaHttp(relay);
+            }
+            Err(_) => {
+                self.to_guest.extend_from_slice(OUTBOUND_DENIED_RESPONSE);
+                self.close_after_flush = true;
+                self.state = InterceptState::Closing;
+            }
         }
     }
 

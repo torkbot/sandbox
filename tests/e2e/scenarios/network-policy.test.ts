@@ -52,6 +52,38 @@ test("network.policy allows plain HTTP over TCP", async (t) => {
   assert.ok(origin.connections.length >= 1);
 });
 
+test("network.policy allows HTTP middleware on non-standard TCP ports", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+  const observedHeaders: string[] = [];
+  const origin = await startTcpServer((socket) => {
+    socket.once("data", (chunk) => {
+      const request = chunk.toString("utf8");
+      observedHeaders.push(request.match(/^x-sandbox-policy: (.+)$/im)?.[1] ?? "");
+      socket.end("HTTP/1.1 200 OK\r\ncontent-length: 14\r\nconnection: close\r\n\r\nnonstandard-ok");
+    });
+  }, 18080);
+  t.after(() => void origin.close());
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      if (conn.transport === "tcp") {
+        conn.acceptHttp((request) => {
+          request.headers.set("x-sandbox-policy", "allowed");
+        });
+      }
+    }),
+  }).boot();
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "http-nonstandard-port",
+    script: `curl -fsS --max-time 5 http://${hostOriginAddress()}:${origin.port}/`,
+  }), 10_000, "non-standard HTTP request");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "nonstandard-ok");
+  assert.deepEqual(observedHeaders, ["allowed"]);
+});
+
 test("network.policy rejects untrusted HTTPS upstream certificates", async (t) => {
   if (!requireVmLaunchSupport(t)) return;
   const origin = await startTlsHttpServer(8443);

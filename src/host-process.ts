@@ -283,6 +283,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
       && type !== "host.http.requestHeaders"
       && type !== "host.http.activeRequestHeaderHooks"
       && type !== "host.network.connection"
+      && type !== "host.network.closed"
       && type !== "host.block.list"
       && type !== "host.block.read"
       && type !== "host.block.write"
@@ -297,6 +298,8 @@ export class HostProcessSandboxVm implements HostControlChannel {
       void this.#handleActiveRequestHeaderHooks(document);
     } else if (type === "host.network.connection") {
       void this.#handleNetworkConnection(document);
+    } else if (type === "host.network.closed") {
+      this.#handleNetworkClosed(document);
     } else if (
       type === "host.block.list"
       || type === "host.block.read"
@@ -354,6 +357,35 @@ export class HostProcessSandboxVm implements HostControlChannel {
         id,
         ok: true,
         action: decision.action,
+      }));
+    } catch (error) {
+      this.#tryWriteToHost(encodePacket({
+        type: "host.network.response",
+        id,
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    }
+  }
+
+  #handleNetworkClosed(document: Record<string, unknown>): void {
+    const id = typeof document.id === "string" ? document.id : "";
+    try {
+      const transport = assertNetworkTransport(document.transport);
+      const srcIp = assertString(document.srcIp, "srcIp");
+      const srcPort = assertNumber(document.srcPort, "srcPort");
+      const dstIp = assertString(document.dstIp, "dstIp");
+      const dstPort = assertNumber(document.dstPort, "dstPort");
+      if (transport === "tcp") {
+        this.#httpMiddlewareByFlow.delete(networkFlowKey(
+          createNetworkEndpoint(srcIp, srcPort),
+          createNetworkEndpoint(dstIp, dstPort),
+        ));
+      }
+      this.#tryWriteToHost(encodePacket({
+        type: "host.network.response",
+        id,
+        ok: true,
       }));
     } catch (error) {
       this.#tryWriteToHost(encodePacket({

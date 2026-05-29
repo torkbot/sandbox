@@ -395,6 +395,27 @@ impl NetworkPolicyRuntime for NodeNetworkPolicyRuntime {
         };
         Ok(NetworkPolicyDecision { action })
     }
+
+    fn connection_closed(&self, connection: NetworkConnectionAttempt) -> io::Result<()> {
+        self.bridge.request(doc! {
+            "type": "host.network.closed",
+            "protocol": match connection.protocol {
+                NetworkProtocol::Tcp => "tcp",
+                NetworkProtocol::Udp => "udp",
+                NetworkProtocol::Dns => "dns",
+            },
+            "transport": match connection.transport {
+                NetworkProtocol::Tcp => "tcp",
+                NetworkProtocol::Udp => "udp",
+                NetworkProtocol::Dns => "dns",
+            },
+            "srcIp": connection.src.ip,
+            "srcPort": i32::from(connection.src.port),
+            "dstIp": connection.dst.ip,
+            "dstPort": i32::from(connection.dst.port),
+        })?;
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
