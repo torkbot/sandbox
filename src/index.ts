@@ -218,6 +218,25 @@ export type DnsResolverSpec =
     readonly port?: number;
   };
 
+/** Upstream DNS resolver used to answer an accepted DNS flow. */
+export type DnsUpstreamResolver =
+  | string
+  | {
+    /** Numeric upstream resolver IP address. */
+    readonly ip: string;
+    /** Upstream resolver port. Defaults to 53. */
+    readonly port?: number;
+  };
+
+/** Options for accepting a matched DNS flow. */
+export interface DnsAcceptOptions {
+  /**
+   * Ordered upstream resolvers used to answer this DNS query. Omit to use the
+   * host environment resolver.
+   */
+  readonly resolvers?: readonly DnsUpstreamResolver[];
+}
+
 /** HTTP authority accepted by HTTP match helpers. */
 export type HttpAuthoritySpec =
   | string
@@ -274,7 +293,7 @@ export interface DnsConnectionMatch {
   /** IP transport carrying this DNS flow. */
   readonly transport: NetworkTransport;
   /** Accepts this matched DNS flow. */
-  accept(): NetworkGrant;
+  accept(options?: DnsAcceptOptions): NetworkGrant;
 }
 
 /**

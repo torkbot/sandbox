@@ -16,8 +16,8 @@ use sandbox::http_flow::{
     HookBackedHttpInterceptRuntime, HttpHookExecutor, InterceptedHttpRequest,
 };
 use sandbox::network_service::{
-    NetworkConnectionAttempt, NetworkPolicyAction, NetworkPolicyDecision, NetworkPolicyRuntime,
-    NetworkProtocol,
+    DnsResolver, NetworkConnectionAttempt, NetworkPolicyAction, NetworkPolicyDecision,
+    NetworkPolicyRuntime, NetworkProtocol,
 };
 use sandbox::runtime::{ControlSocket, HostServices, StartStatusObserver, VirtualFsDevice};
 
@@ -394,7 +394,10 @@ impl NetworkPolicyRuntime for NodeNetworkPolicyRuntime {
                 ));
             }
         };
-        Ok(NetworkPolicyDecision { action })
+        Ok(NetworkPolicyDecision {
+            action,
+            dns_resolvers: parse_dns_resolvers(response.get_array("dnsResolvers").ok())?,
+        })
     }
 
     fn connection_closed(&self, connection: NetworkConnectionAttempt) -> io::Result<()> {
@@ -417,6 +420,44 @@ impl NetworkPolicyRuntime for NodeNetworkPolicyRuntime {
         })?;
         Ok(())
     }
+}
+
+fn parse_dns_resolvers(values: Option<&Vec<Bson>>) -> io::Result<Vec<DnsResolver>> {
+    let Some(values) = values else {
+        return Ok(Vec::new());
+    };
+    values
+        .iter()
+        .map(|value| {
+            let document = value.as_document().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "dns resolver must be a document",
+                )
+            })?;
+            let ip = document
+                .get_str("ip")
+                .map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid DNS resolver IP: {error}"),
+                    )
+                })?
+                .to_string();
+            let port = document.get_i32("port").map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid DNS resolver port: {error}"),
+                )
+            })?;
+            Ok(DnsResolver {
+                ip,
+                port: u16::try_from(port).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "DNS resolver port out of range")
+                })?,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug)]

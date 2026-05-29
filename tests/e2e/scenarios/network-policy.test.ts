@@ -446,6 +446,58 @@ test("network.policy matches default DNS over UDP with DNS capability", async (t
   assert.equal(result.stdout, "127.0.0.1");
 });
 
+test("network.policy can answer DNS with custom accept resolvers", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+
+  const dnsServer = await startUdpDnsServer("203.0.113.44");
+  t.after(() => {
+    void dnsServer.close();
+  });
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      if (conn.matchDns("10.0.2.1")?.accept({
+        resolvers: [{ ip: "127.0.0.1", port: dnsServer.port }],
+      })) return;
+    }),
+  }).boot();
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "dns-custom-resolver",
+    script: pythonDnsQuery({ transport: "udp", name: "custom.test" }),
+  }), 8_000, "custom resolver DNS query");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "203.0.113.44");
+  assert.equal(dnsServer.queries, 1);
+});
+
+test("network.policy preserves TCP DNS for custom accept resolvers", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+
+  const dnsServer = await startTcpDnsServer("203.0.113.45");
+  t.after(() => {
+    void dnsServer.close();
+  });
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      if (conn.matchDns("10.0.2.1")?.accept({
+        resolvers: [{ ip: "127.0.0.1", port: dnsServer.port }],
+      })) return;
+    }),
+  }).boot();
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "dns-custom-tcp-resolver",
+    script: pythonDnsQuery({ transport: "tcp", name: "custom-tcp.test" }),
+  }), 8_000, "custom TCP resolver DNS query");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "203.0.113.45");
+  assert.equal(dnsServer.queries, 1);
+});
+
 test("network.policy allows default DNS over TCP as accepted TCP", async (t) => {
   if (!requireVmLaunchSupport(t)) return;
 
@@ -724,6 +776,107 @@ async function startUdpEchoServer(): Promise<{
   };
 }
 
+async function startUdpDnsServer(answer: string): Promise<{
+  readonly port: number;
+  readonly queries: number;
+  close(): Promise<void>;
+}> {
+  let queries = 0;
+  const server = dgram.createSocket("udp4");
+  server.on("message", (request, remote) => {
+    queries += 1;
+    server.send(dnsAnswer(request, answer), remote.port, remote.address);
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.bind(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  const address = server.address();
+  if (typeof address === "string") {
+    throw new Error("UDP DNS server did not bind a port");
+  }
+  return {
+    port: address.port,
+    get queries() {
+      return queries;
+    },
+    async close() {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
+async function startTcpDnsServer(answer: string): Promise<{
+  readonly port: number;
+  readonly queries: number;
+  close(): Promise<void>;
+}> {
+  let queries = 0;
+  const server = net.createServer((socket) => {
+    let buffer = Buffer.alloc(0);
+    socket.on("data", (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      if (buffer.length < 2) return;
+      const requestLength = buffer.readUInt16BE(0);
+      if (buffer.length < requestLength + 2) return;
+      queries += 1;
+      const response = dnsAnswer(buffer.subarray(2, requestLength + 2), answer);
+      const frame = Buffer.alloc(response.length + 2);
+      frame.writeUInt16BE(response.length, 0);
+      response.copy(frame, 2);
+      socket.end(frame);
+    });
+  });
+  await listen(server, 0, "127.0.0.1");
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("TCP DNS server did not bind a port");
+  }
+  return {
+    port: address.port,
+    get queries() {
+      return queries;
+    },
+    async close() {
+      await closeServer(server);
+    },
+  };
+}
+
+function dnsAnswer(request: Buffer, answer: string | readonly string[]): Buffer {
+  const answers = typeof answer === "string" ? [answer] : answer;
+  let offset = 12;
+  while (request[offset] !== 0) {
+    offset += (request[offset] ?? 0) + 1;
+  }
+  const questionEnd = offset + 5;
+  const response = Buffer.alloc(questionEnd + (16 * answers.length));
+  request.copy(response, 0, 0, questionEnd);
+  response[2] = 0x81;
+  response[3] = 0x80;
+  response.writeUInt16BE(answers.length, 6);
+  let answerOffset = questionEnd;
+  for (const address of answers) {
+    response[answerOffset++] = 0xc0;
+    response[answerOffset++] = 0x0c;
+    response.writeUInt16BE(1, answerOffset);
+    answerOffset += 2;
+    response.writeUInt16BE(1, answerOffset);
+    answerOffset += 2;
+    response.writeUInt32BE(60, answerOffset);
+    answerOffset += 4;
+    response.writeUInt16BE(4, answerOffset);
+    answerOffset += 2;
+    for (const part of address.split(".")) {
+      response[answerOffset++] = Number(part);
+    }
+  }
+  return response;
+}
+
 async function createSelfSignedCertificate(): Promise<{
   readonly workDir: string;
   readonly keyPath: string;
@@ -762,10 +915,10 @@ async function createSelfSignedCertificate(): Promise<{
   return { workDir, keyPath, certPath };
 }
 
-async function listen(server: net.Server | tls.Server, port = 0): Promise<void> {
+async function listen(server: net.Server | tls.Server, port = 0, host = "0.0.0.0"): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(port, "0.0.0.0", () => {
+    server.listen(port, host, () => {
       server.off("error", reject);
       resolve();
     });

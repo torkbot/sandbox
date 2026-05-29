@@ -116,6 +116,7 @@ pub struct NetworkConnectionAttempt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkPolicyDecision {
     pub action: NetworkPolicyAction,
+    pub dns_resolvers: Vec<DnsResolver>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +124,12 @@ pub enum NetworkPolicyAction {
     Deny,
     Accept,
     AcceptHttp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsResolver {
+    pub ip: String,
+    pub port: u16,
 }
 
 pub trait NetworkPolicyRuntime: Send + Sync + std::fmt::Debug {
@@ -443,14 +450,15 @@ fn poll_dns_socket(
             ip: "10.0.2.1".to_string(),
             port: HOST_DNS_PORT,
         };
-        match decide_dns(policy, NetworkProtocol::Udp, src, dst) {
-            Ok(decision) if decision.action != NetworkPolicyAction::Deny => {}
+        let decision = match decide_dns(policy, NetworkProtocol::Udp, src, dst) {
+            Ok(decision) if decision.action != NetworkPolicyAction::Deny => decision,
             _ => continue,
         };
-        let Some(answer) = dns_response(request) else {
+        let Some(answer) = dns_response(request, NetworkProtocol::Udp, &decision.dns_resolvers)
+        else {
             continue;
         };
-        if let Some((name, address)) = answer.resolved_address() {
+        for (name, address) in answer.resolved_addresses() {
             interception.record_dns_answer(name, address);
         }
         let _ = socket.send_slice(
@@ -701,12 +709,12 @@ fn handle_tcp_dns_request(
         ip: "10.0.2.1".to_string(),
         port: HOST_DNS_PORT,
     };
-    match decide_dns(policy, NetworkProtocol::Tcp, src, dst) {
-        Ok(decision) if decision.action != NetworkPolicyAction::Deny => {}
+    let decision = match decide_dns(policy, NetworkProtocol::Tcp, src, dst) {
+        Ok(decision) if decision.action != NetworkPolicyAction::Deny => decision,
         _ => return None,
     };
-    let response = dns_response(request)?;
-    if let Some((name, address)) = response.resolved_address() {
+    let response = dns_response(request, NetworkProtocol::Tcp, &decision.dns_resolvers)?;
+    for (name, address) in response.resolved_addresses() {
         interception.record_dns_answer(name, address);
     }
     Some(response)
@@ -1131,12 +1139,14 @@ fn dns_policy_decision(
 fn default_allowed_decision() -> NetworkPolicyDecision {
     NetworkPolicyDecision {
         action: NetworkPolicyAction::Accept,
+        dns_resolvers: Vec::new(),
     }
 }
 
 fn denied_decision() -> NetworkPolicyDecision {
     NetworkPolicyDecision {
         action: NetworkPolicyAction::Deny,
+        dns_resolvers: Vec::new(),
     }
 }
 
@@ -1167,6 +1177,7 @@ fn decide_transport(
             } else {
                 NetworkPolicyAction::Deny
             },
+            dns_resolvers: Vec::new(),
         };
     };
     if decision.action != NetworkPolicyAction::Deny {
@@ -1253,16 +1264,34 @@ fn tcp_reset_frame_for_syn(frame: &[u8], packet: Ipv4TcpPacket) -> Option<Vec<u8
 struct DnsResponse {
     packet: Vec<u8>,
     name: String,
-    answer: Option<[u8; 4]>,
+    answers: Vec<[u8; 4]>,
 }
 
 impl DnsResponse {
-    fn resolved_address(&self) -> Option<(&str, [u8; 4])> {
-        Some((self.name.as_str(), self.answer?))
+    fn resolved_addresses(&self) -> impl Iterator<Item = (&str, [u8; 4])> {
+        self.answers
+            .iter()
+            .copied()
+            .map(|address| (self.name.as_str(), address))
     }
 }
 
-fn dns_response(request: &[u8]) -> Option<DnsResponse> {
+fn dns_response(
+    request: &[u8],
+    transport: NetworkProtocol,
+    resolvers: &[DnsResolver],
+) -> Option<DnsResponse> {
+    if !resolvers.is_empty() {
+        let (name, _) = request_dns_question_name(request)?;
+        let packet = resolve_dns_with_upstreams(request, transport, resolvers)?;
+        let answers = dns_response_addresses(&packet);
+        return Some(DnsResponse {
+            packet,
+            name,
+            answers,
+        });
+    }
+
     if request.len() < 12 {
         return None;
     }
@@ -1272,7 +1301,7 @@ fn dns_response(request: &[u8]) -> Option<DnsResponse> {
         return None;
     }
 
-    let (name, question_end) = parse_dns_name(request, 12)?;
+    let (name, question_end) = request_dns_question_name(request)?;
     if request.len() < question_end + 4 {
         return None;
     }
@@ -1315,17 +1344,156 @@ fn dns_response(request: &[u8]) -> Option<DnsResponse> {
     Some(DnsResponse {
         packet: response,
         name,
-        answer,
+        answers: answer.into_iter().collect(),
     })
+}
+
+fn request_dns_question_name(request: &[u8]) -> Option<(String, usize)> {
+    if request.len() < 12 {
+        return None;
+    }
+    parse_dns_name(request, 12)
+}
+
+fn resolve_dns_with_upstreams(
+    request: &[u8],
+    transport: NetworkProtocol,
+    resolvers: &[DnsResolver],
+) -> Option<Vec<u8>> {
+    for resolver in resolvers {
+        let Ok(ip) = resolver.ip.parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        let address = std::net::SocketAddr::new(ip, resolver.port);
+        let response = match transport {
+            NetworkProtocol::Udp => resolve_dns_with_udp_upstream(request, address),
+            NetworkProtocol::Tcp => resolve_dns_with_tcp_upstream(request, address),
+            NetworkProtocol::Dns => None,
+        };
+        if response.is_some() {
+            return response;
+        }
+    }
+    None
+}
+
+fn resolve_dns_with_udp_upstream(request: &[u8], address: std::net::SocketAddr) -> Option<Vec<u8>> {
+    let ip = address.ip();
+    let bind_address = if ip.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let Ok(socket) = UdpSocket::bind(bind_address) else {
+        return None;
+    };
+    let _ = socket.set_read_timeout(Some(Duration::from_secs(1)));
+    let _ = socket.set_write_timeout(Some(Duration::from_secs(1)));
+    if socket.connect(address).is_err() {
+        return None;
+    }
+    if socket.send(request).is_err() {
+        return None;
+    }
+    let mut response = vec![0; DNS_PACKET_BUFFER_BYTES];
+    let Ok(received) = socket.recv(&mut response) else {
+        return None;
+    };
+    response.truncate(received);
+    Some(response)
+}
+
+fn resolve_dns_with_tcp_upstream(request: &[u8], address: std::net::SocketAddr) -> Option<Vec<u8>> {
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_secs(1)) else {
+        return None;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+    let request_len = u16::try_from(request.len()).ok()?;
+    if stream.write_all(&request_len.to_be_bytes()).is_err() {
+        return None;
+    }
+    if stream.write_all(request).is_err() {
+        return None;
+    }
+    let mut response_len = [0; 2];
+    if stream.read_exact(&mut response_len).is_err() {
+        return None;
+    }
+    let response_len = u16::from_be_bytes(response_len) as usize;
+    if response_len > DNS_PACKET_BUFFER_BYTES {
+        return None;
+    }
+    let mut response = vec![0; response_len];
+    if stream.read_exact(&mut response).is_err() {
+        return None;
+    }
+    Some(response)
+}
+
+fn dns_response_addresses(packet: &[u8]) -> Vec<[u8; 4]> {
+    let mut addresses = Vec::new();
+    if packet.len() < 12 {
+        return addresses;
+    }
+    let question_count = u16::from_be_bytes([packet[4], packet[5]]);
+    let answer_count = u16::from_be_bytes([packet[6], packet[7]]);
+    if question_count != 1 {
+        return addresses;
+    }
+    let Some((_, mut offset)) = parse_dns_name(packet, 12) else {
+        return addresses;
+    };
+    if packet.len() < offset + 4 {
+        return addresses;
+    }
+    offset += 4;
+    for _ in 0..answer_count {
+        let Some((_, answer_end)) = parse_dns_name(packet, offset) else {
+            return addresses;
+        };
+        if packet.len() < answer_end + 10 {
+            return addresses;
+        }
+        let rtype = u16::from_be_bytes([packet[answer_end], packet[answer_end + 1]]);
+        let rclass = u16::from_be_bytes([packet[answer_end + 2], packet[answer_end + 3]]);
+        let rdlen = u16::from_be_bytes([packet[answer_end + 8], packet[answer_end + 9]]) as usize;
+        let data_start = answer_end + 10;
+        if packet.len() < data_start + rdlen {
+            return addresses;
+        }
+        if rtype == 1 && rclass == 1 && rdlen == 4 {
+            addresses.push([
+                packet[data_start],
+                packet[data_start + 1],
+                packet[data_start + 2],
+                packet[data_start + 3],
+            ]);
+        }
+        offset = data_start + rdlen;
+    }
+    addresses
 }
 
 fn parse_dns_name(packet: &[u8], mut offset: usize) -> Option<(String, usize)> {
     let mut labels = Vec::new();
+    let mut jumped = false;
+    let mut next_offset = offset;
+    let mut jumps = 0;
     loop {
         let len = usize::from(*packet.get(offset)?);
+        if len & 0xc0 == 0xc0 {
+            let next = usize::from(*packet.get(offset + 1)?);
+            if !jumped {
+                next_offset = offset + 2;
+            }
+            offset = ((len & 0x3f) << 8) | next;
+            jumped = true;
+            jumps += 1;
+            if jumps > 8 {
+                return None;
+            }
+            continue;
+        }
         offset += 1;
         if len == 0 {
-            return Some((labels.join("."), offset));
+            return Some((labels.join("."), if jumped { next_offset } else { offset }));
         }
         if len > 63 || packet.len() < offset + len {
             return None;
@@ -2944,6 +3112,7 @@ mod tests {
             self.attempts.lock().unwrap().push(connection);
             Ok(NetworkPolicyDecision {
                 action: NetworkPolicyAction::Deny,
+                dns_resolvers: Vec::new(),
             })
         }
     }
@@ -3229,10 +3398,24 @@ mod tests {
 
     #[test]
     fn dns_unsupported_query_type_returns_nodata_for_known_name() {
-        let response = dns_response(&dns_query("localhost", 28)).unwrap();
+        let response =
+            dns_response(&dns_query("localhost", 28), NetworkProtocol::Udp, &[]).unwrap();
 
         assert_eq!(&response.packet[2..4], &[0x81, 0x80]);
         assert_eq!(&response.packet[6..8], &[0, 0]);
+    }
+
+    #[test]
+    fn custom_dns_response_records_all_a_answers() {
+        let packet = dns_answer(
+            &dns_query("multi.example", 1),
+            &[[203, 0, 113, 44], [203, 0, 113, 45]],
+        );
+
+        assert_eq!(
+            dns_response_addresses(&packet),
+            vec![[203, 0, 113, 44], [203, 0, 113, 45]],
+        );
     }
 
     #[test]
@@ -3291,6 +3474,26 @@ mod tests {
         query.extend_from_slice(&qtype.to_be_bytes());
         query.extend_from_slice(&1u16.to_be_bytes());
         query
+    }
+
+    fn dns_answer(request: &[u8], addresses: &[[u8; 4]]) -> Vec<u8> {
+        let (_, question_end) = request_dns_question_name(request).unwrap();
+        let mut response = Vec::new();
+        response.extend_from_slice(&request[..2]);
+        response.extend_from_slice(&[0x81, 0x80]);
+        response.extend_from_slice(&request[4..6]);
+        response.extend_from_slice(&(addresses.len() as u16).to_be_bytes());
+        response.extend_from_slice(&[0, 0, 0, 0]);
+        response.extend_from_slice(&request[12..question_end + 4]);
+        for address in addresses {
+            response.extend_from_slice(&[0xc0, 0x0c]);
+            response.extend_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(&60u32.to_be_bytes());
+            response.extend_from_slice(&4u16.to_be_bytes());
+            response.extend_from_slice(address);
+        }
+        response
     }
 
     fn tcp_frame(
