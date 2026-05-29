@@ -146,6 +146,29 @@ test("network.policy denies raw TCP before upstream receives bytes", async (t) =
   assert.equal(echo.connections.length, 0);
 });
 
+test("network.policy fails closed when the transport hook throws", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+  const echo = await startTcpServer((socket) => {
+    socket.on("data", (chunk) => socket.write(chunk));
+  });
+  t.after(() => void echo.close());
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy(() => {
+      throw new Error("policy failed");
+    }),
+  }).boot();
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "tcp-policy-error-deny",
+    script: pythonTcpRefused(echo.port),
+  }), 8_000, "transport policy error");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "ECONNREFUSED");
+  assert.equal(echo.connections.length, 0);
+});
+
 test("network.policy allows SSH handshake traffic as raw bidirectional TCP", async (t) => {
   if (!requireVmLaunchSupport(t)) return;
   const ssh = await startSshBannerServer();
@@ -300,6 +323,26 @@ test("network.policy supports a custom DNS resolver over TCP", async (t) => {
 
   assert.equal(result.exitCode, 0, commandOutput(result));
   assert.equal(result.stdout, "203.0.113.20");
+});
+
+test("network.policy fails closed when the DNS hook throws", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      if (conn.protocol === "dns") {
+        throw new Error("dns policy failed");
+      }
+      conn.allow();
+    }),
+  }).boot();
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "dns-policy-error-deny",
+    script: pythonDnsQuery({ transport: "udp", name: "localhost" }),
+  }), 8_000, "DNS policy error");
+
+  assert.notEqual(result.exitCode, 0, commandOutput(result));
 });
 
 test("network.policy denies generic UDP before upstream receives datagrams", async (t) => {

@@ -1271,18 +1271,18 @@ fn policy_decision(
     protocol: NetworkProtocol,
     src: NetworkEndpoint,
     dst: NetworkEndpoint,
-) -> Option<NetworkPolicyDecision> {
-    policy.and_then(|policy| {
-        policy
-            .decide_connection(NetworkConnectionAttempt {
+) -> io::Result<Option<NetworkPolicyDecision>> {
+    policy
+        .map(|policy| {
+            policy.decide_connection(NetworkConnectionAttempt {
                 protocol,
                 transport: protocol,
                 src,
                 dst,
                 questions: Vec::new(),
             })
-            .ok()
-    })
+        })
+        .transpose()
 }
 
 fn dns_policy_decision(
@@ -1291,18 +1291,18 @@ fn dns_policy_decision(
     src: NetworkEndpoint,
     dst: NetworkEndpoint,
     request: &[u8],
-) -> Option<NetworkPolicyDecision> {
-    policy.and_then(|policy| {
-        policy
-            .decide_connection(NetworkConnectionAttempt {
+) -> io::Result<Option<NetworkPolicyDecision>> {
+    policy
+        .map(|policy| {
+            policy.decide_connection(NetworkConnectionAttempt {
                 protocol: NetworkProtocol::Dns,
                 transport,
                 src,
                 dst,
                 questions: dns_questions(request).unwrap_or_default(),
             })
-            .ok()
-    })
+        })
+        .transpose()
 }
 
 fn default_allowed_decision() -> NetworkPolicyDecision {
@@ -1329,21 +1329,25 @@ fn decide_transport(
     if is_loopback_destination(&dst.ip) {
         return denied_decision();
     }
-    if let Some(decision) = policy_decision(policy, protocol, src, dst.clone()) {
-        return decision;
-    }
-    let allowed =
-        match protocol {
+    let Some(decision) = policy_decision(policy, protocol, src, dst.clone())
+        .unwrap_or_else(|_| Some(denied_decision()))
+    else {
+        let allowed = match protocol {
             NetworkProtocol::Tcp => outbound_rules
                 .is_some_and(|rules| is_allowed_outbound_tcp(&dst.ip, dst.port, rules)),
             NetworkProtocol::Udp => outbound_rules
                 .is_some_and(|rules| is_allowed_outbound_udp(&dst.ip, dst.port, rules)),
             NetworkProtocol::Dns => true,
         };
-    NetworkPolicyDecision {
-        allowed,
-        dns_response: None,
+        return NetworkPolicyDecision {
+            allowed,
+            dns_response: None,
+        };
+    };
+    if decision.allowed {
+        return decision;
     }
+    decision
 }
 
 fn decide_dns(
@@ -1353,10 +1357,9 @@ fn decide_dns(
     dst: NetworkEndpoint,
     request: &[u8],
 ) -> io::Result<NetworkPolicyDecision> {
-    if let Some(decision) = dns_policy_decision(policy, transport, src, dst, request) {
-        return Ok(decision);
-    }
-    Ok(default_allowed_decision())
+    dns_policy_decision(policy, transport, src, dst, request)
+        .map(|decision| decision.unwrap_or_else(default_allowed_decision))
+        .or_else(|_| Ok(denied_decision()))
 }
 
 fn port_matches(ports: &[u16], destination_port: u16) -> bool {
@@ -3217,6 +3220,18 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    #[derive(Debug)]
+    struct ErrorPolicyRuntime;
+
+    impl NetworkPolicyRuntime for ErrorPolicyRuntime {
+        fn decide_connection(
+            &self,
+            _connection: NetworkConnectionAttempt,
+        ) -> io::Result<NetworkPolicyDecision> {
+            Err(io::Error::other("policy callback failed"))
+        }
+    }
+
     #[test]
     fn reads_libkrun_unixstream_ethernet_frame() {
         let ethernet = [
@@ -3334,6 +3349,45 @@ mod tests {
         ] {
             assert!(!is_allowed_outbound_tcp(address, 80, &rules), "{address}");
         }
+    }
+
+    #[test]
+    fn transport_policy_errors_fail_closed_before_native_defaults() {
+        let decision = decide_transport(
+            Some(&ErrorPolicyRuntime),
+            Some(&[OutboundRulePlan::AcceptPublicInternet { ports: Vec::new() }]),
+            NetworkProtocol::Tcp,
+            NetworkEndpoint {
+                ip: "10.0.2.15".to_string(),
+                port: 50_000,
+            },
+            NetworkEndpoint {
+                ip: "93.184.216.34".to_string(),
+                port: 443,
+            },
+        );
+
+        assert!(!decision.allowed);
+    }
+
+    #[test]
+    fn dns_policy_errors_fail_closed_before_default_resolver() {
+        let decision = decide_dns(
+            Some(&ErrorPolicyRuntime),
+            NetworkProtocol::Udp,
+            NetworkEndpoint {
+                ip: "10.0.2.15".to_string(),
+                port: 50_000,
+            },
+            NetworkEndpoint {
+                ip: "10.0.2.1".to_string(),
+                port: 53,
+            },
+            &dns_query("localhost", 1),
+        )
+        .unwrap();
+
+        assert!(!decision.allowed);
     }
 
     #[test]

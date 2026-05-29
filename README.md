@@ -116,10 +116,11 @@ const sandbox = defineSandbox({
     memoryMiB: 4096,
   },
   network: network.policy(async (conn) => {
-    if (conn.protocol !== "http") {
-      conn.allow();
+    if (conn.protocol === "dns") {
+      conn.allowDns();
       return;
     }
+    if (conn.protocol !== "http") return;
 
     if (conn.host === "api.github.com") {
       conn.allowHttp(async (request) => {
@@ -259,7 +260,12 @@ const policy = network.policy(async (conn) => {
     });
     return;
   }
-  if (conn.transport === "tcp" && conn.dst.isPublicInternet() && conn.dst.port === 443) {
+  if (
+    conn.protocol !== "http" &&
+    conn.transport === "tcp" &&
+    conn.dst.isPublicInternet() &&
+    conn.dst.port === 443
+  ) {
     conn.allow();
     return;
   }
