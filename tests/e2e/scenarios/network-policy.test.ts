@@ -428,6 +428,24 @@ test("network.policy allows default DNS over UDP as accepted UDP", async (t) => 
   assert.equal(result.stdout, "127.0.0.1");
 });
 
+test("network.policy matches default DNS over UDP with DNS capability", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      if (conn.matchDns("10.0.2.1")?.accept()) return;
+    }),
+  }).boot();
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "dns-udp-match",
+    script: pythonDnsQuery({ transport: "udp", name: "localhost" }),
+  }), 8_000, "matched UDP DNS query");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "127.0.0.1");
+});
+
 test("network.policy allows default DNS over TCP as accepted TCP", async (t) => {
   if (!requireVmLaunchSupport(t)) return;
 
@@ -523,7 +541,7 @@ async function bootAllowingDns() {
   return await defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.23"),
     network: network.policy((conn) => {
-      conn.accept();
+      conn.matchDns("10.0.2.1")?.accept();
     }),
   }).boot();
 }

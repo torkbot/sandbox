@@ -18,9 +18,17 @@ import type {
 } from "./launch-options.ts";
 import type {
   NetworkConnectionRequest,
+  DnsConnectionMatch,
+  DnsResolverSpec,
+  HttpAuthoritySpec,
+  HttpConnectionMatch,
   NetworkEndpoint,
+  NetworkEndpointSpec,
+  NetworkMatchPredicate,
   NetworkTransport,
+  TcpConnectionMatch,
   HttpRequestMiddleware,
+  UdpConnectionMatch,
 } from "./index.ts";
 
 const DEFAULT_LAUNCH_TIMEOUT_MS = 60_000;
@@ -317,10 +325,12 @@ export class HostProcessSandboxVm implements HostControlChannel {
     const id = typeof document.id === "string" ? document.id : "";
     try {
       const transport = assertNetworkTransport(document.transport);
+      const protocol = optionalString(document.protocol, "protocol");
       const srcIp = assertString(document.srcIp, "srcIp");
       const srcPort = assertNumber(document.srcPort, "srcPort");
       const dstIp = assertString(document.dstIp, "dstIp");
       const dstPort = assertNumber(document.dstPort, "dstPort");
+      const hostname = optionalString(document.hostname, "hostname");
       const src = createNetworkEndpoint(srcIp, srcPort);
       const dst = createNetworkEndpoint(dstIp, dstPort);
       const decision: { action: "deny" | "accept" | "acceptHttp" } = { action: "deny" };
@@ -334,6 +344,18 @@ export class HostProcessSandboxVm implements HostControlChannel {
         src,
         dst,
         accept,
+        matchDns(matcher: DnsResolverSpec | NetworkMatchPredicate<DnsConnectionMatch>) {
+          if (protocol !== "dns") {
+            return undefined;
+          }
+          const candidate = {
+            src,
+            dst,
+            transport,
+            accept,
+          };
+          return dnsMatcherMatches(matcher, candidate) ? candidate : undefined;
+        },
         ...(transport === "tcp"
           ? {
               acceptHttp(middleware?: HttpRequestMiddleware) {
@@ -341,8 +363,42 @@ export class HostProcessSandboxVm implements HostControlChannel {
                 httpMiddleware = middleware;
                 return {};
               },
+              matchTcp(matcher: NetworkEndpointSpec | NetworkMatchPredicate<TcpConnectionMatch>) {
+                const candidate = {
+                  src,
+                  dst,
+                  accept,
+                };
+                return endpointMatcherMatches(matcher, candidate) ? candidate : undefined;
+              },
+              matchHttp(matcher: HttpAuthoritySpec | NetworkMatchPredicate<HttpConnectionMatch>) {
+                if (hostname === undefined) {
+                  return undefined;
+                }
+                const candidate = {
+                  src,
+                  dst,
+                  hostname,
+                  port: dst.port,
+                  accept(middleware?: HttpRequestMiddleware) {
+                    decision.action = "acceptHttp";
+                    httpMiddleware = middleware;
+                    return {};
+                  },
+                };
+                return httpMatcherMatches(matcher, candidate) ? candidate : undefined;
+              },
             }
-          : {}),
+          : {
+              matchUdp(matcher: NetworkEndpointSpec | NetworkMatchPredicate<UdpConnectionMatch>) {
+                const candidate = {
+                  src,
+                  dst,
+                  accept,
+                };
+                return endpointMatcherMatches(matcher, candidate) ? candidate : undefined;
+              },
+            }),
       } as NetworkConnectionRequest;
 
       if (this.#networkConnectionHook?.active === true) {
@@ -938,6 +994,82 @@ function createNetworkEndpoint(ip: string, port: number): NetworkEndpoint {
     isReserved: () => isReservedIp(ip),
     isPublicInternet: () => isPublicInternetIp(ip),
   };
+}
+
+function dnsMatcherMatches(
+  matcher: DnsResolverSpec | NetworkMatchPredicate<DnsConnectionMatch>,
+  candidate: DnsConnectionMatch,
+): boolean {
+  if (typeof matcher === "function") {
+    return matcher(candidate);
+  }
+  const spec = typeof matcher === "string" ? { ip: matcher, port: 53 } : matcher;
+  return candidate.dst.ip === spec.ip && candidate.dst.port === (spec.port ?? 53);
+}
+
+function endpointMatcherMatches<TMatch extends { readonly dst: NetworkEndpoint }>(
+  matcher: NetworkEndpointSpec | NetworkMatchPredicate<TMatch>,
+  candidate: TMatch,
+): boolean {
+  if (typeof matcher === "function") {
+    return matcher(candidate);
+  }
+  const endpoint = parseEndpointSpec(matcher);
+  return candidate.dst.ip === endpoint.ip && candidate.dst.port === endpoint.port;
+}
+
+function httpMatcherMatches(
+  matcher: HttpAuthoritySpec | NetworkMatchPredicate<HttpConnectionMatch>,
+  candidate: HttpConnectionMatch,
+): boolean {
+  if (typeof matcher === "function") {
+    return matcher(candidate);
+  }
+  const authority = parseHttpAuthoritySpec(matcher);
+  return candidate.hostname === authority.hostname
+    && (authority.port === undefined || candidate.port === authority.port);
+}
+
+function parseEndpointSpec(spec: NetworkEndpointSpec): { readonly ip: string; readonly port: number } {
+  if (typeof spec !== "string") {
+    return spec;
+  }
+  const ipv6Match = /^\[(.*)]:(\d+)$/.exec(spec);
+  if (ipv6Match !== null) {
+    return { ip: ipv6Match[1] ?? "", port: Number(ipv6Match[2]) };
+  }
+  const separator = spec.lastIndexOf(":");
+  if (separator < 0) {
+    throw new Error("network endpoint spec must include a port");
+  }
+  return {
+    ip: spec.slice(0, separator),
+    port: Number(spec.slice(separator + 1)),
+  };
+}
+
+function parseHttpAuthoritySpec(spec: HttpAuthoritySpec): { readonly hostname: string; readonly port?: number } {
+  if (typeof spec !== "string") {
+    return spec;
+  }
+  const ipv6Match = /^\[(.*)](?::(\d+))?$/.exec(spec);
+  if (ipv6Match !== null) {
+    return {
+      hostname: ipv6Match[1] ?? "",
+      port: ipv6Match[2] === undefined ? undefined : Number(ipv6Match[2]),
+    };
+  }
+  const separator = spec.lastIndexOf(":");
+  if (separator > -1) {
+    const portText = spec.slice(separator + 1);
+    if (/^\d+$/.test(portText)) {
+      return {
+        hostname: spec.slice(0, separator),
+        port: Number(portText),
+      };
+    }
+  }
+  return { hostname: spec };
 }
 
 function networkFlowKey(src: NetworkEndpoint, dst: NetworkEndpoint): string {

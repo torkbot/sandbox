@@ -241,13 +241,27 @@ test("defineSandbox rejects invalid COW rootfs block store", () => {
 test("network.policy creates an opaque connection policy", () => {
   const policy = network.policy(async (conn) => {
     conn.accept();
+    conn.matchDns("10.0.2.1")?.accept();
+    conn.matchDns((dns) => dns.dst.port === 53)?.accept();
 
     if (conn.transport === "tcp") {
       conn.acceptHttp();
+      conn.matchTcp("203.0.113.10:5432")?.accept();
+      conn.matchTcp((tcp) => tcp.dst.port === 5432)?.accept();
+      conn.matchHttp("api.example.com")?.accept();
+      conn.matchHttp((http) => http.hostname === "api.example.com")?.accept();
+      // @ts-expect-error UDP matching is UDP-only.
+      conn.matchUdp("203.0.113.10:8125");
     }
     if (conn.transport === "udp") {
+      conn.matchUdp("203.0.113.10:8125")?.accept();
+      conn.matchUdp((udp) => udp.dst.port === 8125)?.accept();
       // @ts-expect-error HTTP enforcement is TCP-only.
       conn.acceptHttp();
+      // @ts-expect-error HTTP matching is TCP-only.
+      conn.matchHttp("api.example.com");
+      // @ts-expect-error TCP matching is TCP-only.
+      conn.matchTcp("203.0.113.10:5432");
     }
   });
 

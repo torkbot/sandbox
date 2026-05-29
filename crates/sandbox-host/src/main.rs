@@ -381,6 +381,7 @@ impl NetworkPolicyRuntime for NodeNetworkPolicyRuntime {
             "srcPort": i32::from(connection.src.port),
             "dstIp": connection.dst.ip,
             "dstPort": i32::from(connection.dst.port),
+            "hostname": connection.hostname,
         })?;
         let action = match response.get_str("action").unwrap_or("deny") {
             "accept" => NetworkPolicyAction::Accept,

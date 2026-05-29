@@ -198,6 +198,39 @@ export interface HttpNetworkGrant extends NetworkGrant {
 /** IP transport observed by the network policy hook. */
 export type NetworkTransport = "tcp" | "udp";
 
+/** Endpoint accepted by transport match helpers. */
+export type NetworkEndpointSpec =
+  | `${string}:${number}`
+  | {
+    /** Numeric destination IP address. */
+    readonly ip: string;
+    /** Destination transport port. */
+    readonly port: number;
+  };
+
+/** DNS resolver accepted by DNS match helpers. */
+export type DnsResolverSpec =
+  | string
+  | {
+    /** Numeric DNS resolver IP address. */
+    readonly ip: string;
+    /** DNS resolver port. Defaults to 53. */
+    readonly port?: number;
+  };
+
+/** HTTP authority accepted by HTTP match helpers. */
+export type HttpAuthoritySpec =
+  | string
+  | {
+    /** Trusted HTTP authority hostname. */
+    readonly hostname: string;
+    /** Trusted HTTP authority port. Omit to match any port. */
+    readonly port?: number;
+  };
+
+/** Synchronous predicate used by protocol-specific match helpers. */
+export type NetworkMatchPredicate<TMatch> = (candidate: TMatch) => boolean;
+
 /**
  * Source or destination endpoint for a network policy event.
  *
@@ -228,16 +261,65 @@ export interface NetworkEndpoint {
 }
 
 /**
- * Explicit application-layer signals observed for a policy event.
+ * Capability returned when a DNS flow matches a policy predicate.
  *
- * This object intentionally does not classify the protocol. It only exposes
- * protocol signals the runtime actually observed, such as TLS SNI or ALPN.
+ * DNS matching normalizes DNS over UDP and DNS over TCP. `accept()` permits the
+ * matched DNS flow using the transport semantics observed by the runtime.
  */
-export interface NetworkApplicationSignals {
-  /** ALPN protocol names offered or negotiated for the flow, when observed. */
-  readonly alpn?: readonly string[];
-  /** TLS Server Name Indication, when observed. */
-  readonly sni?: string;
+export interface DnsConnectionMatch {
+  /** Source endpoint observed at the sandbox network boundary. */
+  readonly src: NetworkEndpoint;
+  /** DNS resolver endpoint observed at the sandbox network boundary. */
+  readonly dst: NetworkEndpoint;
+  /** IP transport carrying this DNS flow. */
+  readonly transport: NetworkTransport;
+  /** Accepts this matched DNS flow. */
+  accept(): NetworkGrant;
+}
+
+/**
+ * Capability returned when a raw TCP endpoint matches a policy predicate.
+ */
+export interface TcpConnectionMatch {
+  /** Source endpoint observed at the sandbox network boundary. */
+  readonly src: TcpNetworkEndpoint;
+  /** Destination endpoint observed at the sandbox network boundary. */
+  readonly dst: TcpNetworkEndpoint;
+  /** Accepts this matched TCP flow without protocol-specific enforcement. */
+  accept(): NetworkGrant;
+}
+
+/**
+ * Capability returned when a raw UDP endpoint matches a policy predicate.
+ */
+export interface UdpConnectionMatch {
+  /** Source endpoint observed at the sandbox network boundary. */
+  readonly src: UdpNetworkEndpoint;
+  /** Destination endpoint observed at the sandbox network boundary. */
+  readonly dst: UdpNetworkEndpoint;
+  /** Accepts this matched UDP flow. */
+  accept(): NetworkGrant;
+}
+
+/**
+ * Capability returned when trusted connection metadata matches an HTTP
+ * authority predicate.
+ *
+ * This match does not trust the HTTP `Host` header. `accept(...)` still routes
+ * the TCP flow through Sandbox's HTTP-family enforcement path, so non-HTTP
+ * traffic fails closed even if its destination metadata matched.
+ */
+export interface HttpConnectionMatch {
+  /** Source endpoint observed at the sandbox network boundary. */
+  readonly src: TcpNetworkEndpoint;
+  /** Destination endpoint observed at the sandbox network boundary. */
+  readonly dst: TcpNetworkEndpoint;
+  /** Trusted hostname for the HTTP authority. */
+  readonly hostname: string;
+  /** Destination port for the HTTP authority. */
+  readonly port: number;
+  /** Accepts this matched HTTP-family flow with optional request middleware. */
+  accept(middleware?: HttpRequestMiddleware): HttpNetworkGrant;
 }
 
 /** TCP endpoint for a TCP network policy event. */
@@ -268,6 +350,14 @@ export interface NetworkConnectionRequestBase<TTransport extends NetworkTranspor
    * semantics.
    */
   accept(): NetworkGrant;
+  /**
+   * Returns a DNS capability when this policy event is DNS traffic matching the
+   * resolver predicate. The predicate is synchronous by design; perform async
+   * policy decisions after acquiring the returned capability.
+   */
+  matchDns(
+    matcher: DnsResolverSpec | NetworkMatchPredicate<DnsConnectionMatch>,
+  ): DnsConnectionMatch | undefined;
 }
 
 /**
@@ -278,8 +368,6 @@ export interface NetworkConnectionRequestBase<TTransport extends NetworkTranspor
 export interface TcpNetworkConnectionRequest extends NetworkConnectionRequestBase<"tcp"> {
   readonly src: TcpNetworkEndpoint;
   readonly dst: TcpNetworkEndpoint;
-  /** Explicit application-layer signals observed for this TCP flow. */
-  readonly signals?: NetworkApplicationSignals;
   /**
    * Accepts this TCP flow only through Sandbox's HTTP-family enforcement path.
    *
@@ -287,6 +375,24 @@ export interface TcpNetworkConnectionRequest extends NetworkConnectionRequestBas
    * `accept()` leaves bytes untouched and never enters HTTP middleware or MITM.
    */
   acceptHttp(middleware?: HttpRequestMiddleware): HttpNetworkGrant;
+  /**
+   * Returns a raw TCP capability when this connection matches the endpoint
+   * predicate.
+   */
+  matchTcp(
+    matcher: NetworkEndpointSpec | NetworkMatchPredicate<TcpConnectionMatch>,
+  ): TcpConnectionMatch | undefined;
+  /**
+   * Returns an HTTP capability when trusted destination metadata matches the
+   * authority predicate.
+   *
+   * This helper does not classify arbitrary bytes as HTTP and does not inspect
+   * the HTTP `Host` header. Use the returned capability's `accept(...)` method
+   * to enter HTTP-family enforcement.
+   */
+  matchHttp(
+    matcher: HttpAuthoritySpec | NetworkMatchPredicate<HttpConnectionMatch>,
+  ): HttpConnectionMatch | undefined;
 }
 
 /**
@@ -298,6 +404,13 @@ export interface TcpNetworkConnectionRequest extends NetworkConnectionRequestBas
 export interface UdpNetworkConnectionRequest extends NetworkConnectionRequestBase<"udp"> {
   readonly src: UdpNetworkEndpoint;
   readonly dst: UdpNetworkEndpoint;
+  /**
+   * Returns a raw UDP capability when this datagram flow matches the endpoint
+   * predicate.
+   */
+  matchUdp(
+    matcher: NetworkEndpointSpec | NetworkMatchPredicate<UdpConnectionMatch>,
+  ): UdpConnectionMatch | undefined;
 }
 
 /**
