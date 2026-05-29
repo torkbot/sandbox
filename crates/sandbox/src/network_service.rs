@@ -2725,6 +2725,10 @@ impl Ipv4UdpPacket {
         if frame[ip_start + 9] != 17 {
             return None;
         }
+        let fragment = u16::from_be_bytes([frame[ip_start + 6], frame[ip_start + 7]]);
+        if fragment & 0x3fff != 0 {
+            return None;
+        }
         let total_len = usize::from(u16::from_be_bytes([
             frame[ip_start + 2],
             frame[ip_start + 3],
@@ -3111,6 +3115,17 @@ mod tests {
         let response_packet = Ipv4UdpPacket::parse(&response).unwrap();
         assert_eq!(response_packet.source_ip(&response), [1, 1, 1, 1]);
         assert_eq!(response_packet.source_port(&response), 53);
+    }
+
+    #[test]
+    fn ipv4_udp_parser_rejects_fragments() {
+        let mut first_fragment = udp_frame([10, 0, 2, 15], [8, 8, 8, 8], 50_000, 53);
+        first_fragment[14 + 6..14 + 8].copy_from_slice(&0x2000u16.to_be_bytes());
+        assert!(Ipv4UdpPacket::parse(&first_fragment).is_none());
+
+        let mut later_fragment = udp_frame([10, 0, 2, 15], [8, 8, 8, 8], 50_000, 53);
+        later_fragment[14 + 6..14 + 8].copy_from_slice(&0x0001u16.to_be_bytes());
+        assert!(Ipv4UdpPacket::parse(&later_fragment).is_none());
     }
 
     #[test]
