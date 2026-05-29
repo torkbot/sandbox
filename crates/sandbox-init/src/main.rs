@@ -656,26 +656,43 @@ fn install_http_ca_into_guest_trust(certificate: &[u8]) -> Result<(), InitError>
     if std::path::Path::new("/usr/local/share/ca-certificates").is_dir()
         && command_exists("/usr/sbin/update-ca-certificates")
     {
-        std::fs::write(
+        if try_install_http_ca(
             "/usr/local/share/ca-certificates/sandbox-http-interception-ca.crt",
             certificate,
-        )
-        .map_err(|error| InitError(format!("write Alpine/Debian CA certificate: {error}")))?;
-        run_setup_command("/usr/sbin/update-ca-certificates", &[])?;
-        return Ok(());
+            "/usr/sbin/update-ca-certificates",
+            &[],
+        ) {
+            return Ok(());
+        }
     }
 
     if std::path::Path::new("/etc/pki/ca-trust/source/anchors").is_dir()
         && command_exists("/usr/bin/update-ca-trust")
     {
-        std::fs::write(
+        let _ = try_install_http_ca(
             "/etc/pki/ca-trust/source/anchors/sandbox-http-interception-ca.pem",
             certificate,
-        )
-        .map_err(|error| InitError(format!("write pki CA certificate: {error}")))?;
-        run_setup_command("/usr/bin/update-ca-trust", &["extract"])?;
+            "/usr/bin/update-ca-trust",
+            &["extract"],
+        );
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn try_install_http_ca(
+    destination: &str,
+    certificate: &[u8],
+    command: &str,
+    args: &[&str],
+) -> bool {
+    if std::fs::write(destination, certificate).is_err() {
+        return false;
+    }
+    if run_setup_command(command, args).is_err() {
+        return false;
+    }
+    true
 }
 
 #[cfg(target_os = "linux")]
