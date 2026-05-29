@@ -208,16 +208,6 @@ export type NetworkEndpointSpec =
     readonly port: number;
   };
 
-/** Upstream DNS resolver accepted by DNS match helpers. */
-export type DnsResolverSpec =
-  | string
-  | {
-    /** Numeric upstream resolver IP address. */
-    readonly ip: string;
-    /** Upstream resolver port. Defaults to 53. */
-    readonly port?: number;
-  };
-
 /** Upstream DNS resolver used to answer an accepted DNS flow. */
 export type DnsUpstreamResolver =
   | string
@@ -283,9 +273,7 @@ export interface NetworkEndpoint {
  * Capability returned when a DNS flow matches a policy predicate.
  *
  * DNS matching normalizes DNS over UDP and DNS over TCP. `accept()` permits the
- * matched DNS flow using the transport semantics observed by the runtime. When
- * `matchDns(...)` is called with a resolver spec, `accept()` uses that resolver
- * as the upstream DNS server by default.
+ * matched DNS flow using the transport semantics observed by the runtime.
  */
 export interface DnsConnectionMatch {
   /** Source endpoint observed at the sandbox network boundary. */
@@ -372,15 +360,9 @@ export interface NetworkConnectionRequestBase<TTransport extends NetworkTranspor
    */
   accept(): NetworkGrant;
   /**
-   * Returns a DNS capability when this policy event is DNS traffic. Passing a
-   * resolver spec also selects the upstream resolver used by `accept()`.
-   *
-   * Predicate matchers are synchronous by design; perform async policy
-   * decisions after acquiring the returned capability.
+   * Returns a DNS capability when this policy event is DNS traffic.
    */
-  matchDns(
-    matcher: DnsResolverSpec | NetworkMatchPredicate<DnsConnectionMatch>,
-  ): DnsConnectionMatch | undefined;
+  matchDns(): DnsConnectionMatch | undefined;
   /**
    * Returns an HTTP capability when this TCP connection has trusted destination
    * metadata matching the authority predicate. Returns `undefined` for non-TCP

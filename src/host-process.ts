@@ -19,7 +19,7 @@ import type {
 import type {
   NetworkConnectionRequest,
   DnsConnectionMatch,
-  DnsResolverSpec,
+  DnsUpstreamResolver,
   HttpAuthoritySpec,
   HttpConnectionMatch,
   NetworkEndpoint,
@@ -348,25 +348,20 @@ export class HostProcessSandboxVm implements HostControlChannel {
         src,
         dst,
         accept,
-        matchDns(matcher: DnsResolverSpec | NetworkMatchPredicate<DnsConnectionMatch>) {
+        matchDns() {
           if (protocol !== "dns") {
             return undefined;
           }
-          const defaultResolvers = typeof matcher === "function"
-            ? undefined
-            : [normalizeDnsResolver(matcher)];
-          const candidate = {
+          return {
             src,
             dst,
             transport,
-            accept(options?: { readonly resolvers?: readonly DnsResolverSpec[] }) {
+            accept(options?: { readonly resolvers?: readonly DnsUpstreamResolver[] }) {
               decision.action = "accept";
-              decision.dnsResolvers = options?.resolvers?.map(normalizeDnsResolver)
-                ?? defaultResolvers;
+              decision.dnsResolvers = options?.resolvers?.map(normalizeDnsResolver);
               return {};
             },
           };
-          return dnsMatcherMatches(matcher, candidate) ? candidate : undefined;
         },
         matchHttp(matcher: HttpAuthoritySpec | NetworkMatchPredicate<HttpConnectionMatch>) {
           if (transport !== "tcp" || hostname === undefined) {
@@ -1011,17 +1006,7 @@ function createNetworkEndpoint(ip: string, port: number): NetworkEndpoint {
   };
 }
 
-function dnsMatcherMatches(
-  matcher: DnsResolverSpec | NetworkMatchPredicate<DnsConnectionMatch>,
-  candidate: DnsConnectionMatch,
-): boolean {
-  if (typeof matcher === "function") {
-    return matcher(candidate);
-  }
-  return true;
-}
-
-function normalizeDnsResolver(resolver: DnsResolverSpec): { readonly ip: string; readonly port: number } {
+function normalizeDnsResolver(resolver: DnsUpstreamResolver): { readonly ip: string; readonly port: number } {
   const spec = typeof resolver === "string" ? { ip: resolver, port: 53 } : resolver;
   return {
     ip: spec.ip,
