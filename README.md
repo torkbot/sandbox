@@ -61,7 +61,7 @@ const sandbox = defineSandbox({
   },
   network: network.policy(async (conn) => {
     // Let the guest resolve names, but answer DNS via an explicit resolver.
-    if (conn.matchDns("1.1.1.1")?.accept()) return;
+    if (conn.matchDns()?.accept({ resolvers: ["1.1.1.1"] })) return;
 
     // Only GitHub API HTTP(S) traffic gets HTTP middleware.
     const github = conn.matchHttp("api.github.com");
@@ -167,7 +167,7 @@ Networking is default-deny. Policy callbacks grant only the flows they accept:
 const sandbox = defineSandbox({
   rootfs: rootfs.builtIn("alpine:3.23"),
   network: network.policy((conn) => {
-    if (conn.matchDns("1.1.1.1")?.accept()) return;
+    if (conn.matchDns()?.accept({ resolvers: ["1.1.1.1"] })) return;
 
     conn.matchHttp("api.example.com")?.accept((request) => {
       request.headers.set("authorization", `Bearer ${apiToken}`);
@@ -218,7 +218,7 @@ const sandbox = defineSandbox({
     memoryMiB: 4096,
   },
   network: network.policy((conn) => {
-    conn.matchDns("1.1.1.1")?.accept();
+    conn.matchDns()?.accept({ resolvers: ["1.1.1.1"] });
   }),
 });
 ```
@@ -319,7 +319,7 @@ const result = await lane.exec("npm", ["test"], {
 
 ```ts
 const policy = network.policy(async (conn) => {
-  if (conn.matchDns("1.1.1.1")?.accept()) return;
+  if (conn.matchDns()?.accept({ resolvers: ["1.1.1.1"] })) return;
 
   const api = conn.matchHttp("api.example.com");
   if (!api) return;
@@ -359,18 +359,18 @@ Transport and protocol helpers:
 
 ```ts
 conn.accept();                  // accept raw TCP or UDP transport
-conn.matchDns("1.1.1.1");       // DNS over UDP or TCP, using 1.1.1.1 upstream
+conn.matchDns();                // DNS over UDP or TCP
 conn.matchTcp("203.0.113.10:5432");
 conn.matchUdp("203.0.113.10:8125");
 conn.matchHttp("api.example.com");
 ```
 
-`conn.matchDns(...)` normalizes DNS over UDP and TCP. Passing a resolver spec
-selects the upstream resolver used by `accept()`. Advanced policies can pass a
-synchronous predicate and then provide explicit resolvers to `accept(...)`.
+`conn.matchDns()` normalizes DNS over UDP and TCP. The guest is configured to
+use Sandbox's internal resolver; policy code decides whether to accept that DNS
+flow and can choose explicit upstream resolvers in `accept(...)`.
 
 ```ts
-const dns = conn.matchDns((candidate) => candidate.transport === "udp");
+const dns = conn.matchDns();
 if (dns) {
   dns.accept({ resolvers: ["1.1.1.1", "8.8.8.8"] });
 }

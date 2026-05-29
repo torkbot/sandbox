@@ -241,9 +241,10 @@ test("defineSandbox rejects invalid COW rootfs block store", () => {
 test("network.policy creates an opaque connection policy", () => {
   const policy = network.policy(async (conn) => {
     conn.accept();
-    conn.matchDns("1.1.1.1")?.accept();
-    conn.matchDns("1.1.1.1")?.accept({ resolvers: ["8.8.8.8", { ip: "8.8.4.4", port: 53 }] });
-    conn.matchDns((dns) => dns.dst.port === 53)?.accept();
+    conn.matchDns()?.accept();
+    conn.matchDns()?.accept({ resolvers: ["8.8.8.8", { ip: "8.8.4.4", port: 53 }] });
+    // @ts-expect-error DNS matching is argumentless.
+    conn.matchDns("1.1.1.1");
     conn.matchHttp("api.example.com")?.accept();
     conn.matchHttp((http) => http.hostname === "api.example.com")?.accept();
 
