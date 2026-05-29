@@ -18,10 +18,7 @@ use rama_http::{Body, Request as RamaRequest, Response as RamaResponse, Version 
 use rama_http_backend::client::http_connect;
 use rama_http_backend::server::HttpServer;
 use rama_tcp::stream::TcpStream as RamaTcpStream;
-use rustls::DigitallySignedStruct;
-use rustls::SignatureScheme;
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::UnixTime;
+use rustls::RootCertStore;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::{tcp, udp};
@@ -47,10 +44,10 @@ const TLS_READ_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_INTERCEPT_HEAD_BYTES: usize = 64 * 1024;
 const DNS_PACKET_BUFFER_BYTES: usize = 4096;
 const UDP_RELAY_BUFFER_BYTES: usize = 64 * 1024;
-const UDP_NAT_PORT_START: u16 = 40_000;
-const UDP_NAT_PORT_END: u16 = 60_999;
-const NAT_FLOW_IDLE_TTL: Duration = Duration::from_secs(300);
-const NAT_FLOW_CLOSING_TTL: Duration = Duration::from_secs(30);
+const UDP_INTERCEPT_PORT_START: u16 = 40_000;
+const UDP_INTERCEPT_PORT_END: u16 = 60_999;
+const INTERCEPT_FLOW_IDLE_TTL: Duration = Duration::from_secs(300);
+const INTERCEPT_FLOW_CLOSING_TTL: Duration = Duration::from_secs(30);
 const NETWORK_IDLE_WAKE_INTERVAL: Duration = Duration::from_millis(100);
 const HOST_HTTP_PROBE_RESPONSE: &[u8] =
     b"HTTP/1.1 200 OK\r\ncontent-length: 25\r\nconnection: close\r\n\r\nsandbox explicit network\n";
@@ -200,9 +197,18 @@ impl MitmTlsAuthority {
         server_name: &str,
         alpn_protocol: Option<&str>,
     ) -> io::Result<rustls::ClientConnection> {
+        let mut roots = RootCertStore::empty();
+        let certs = rustls_native_certs::load_native_certs();
+        if let Some(error) = certs.errors.into_iter().next() {
+            return Err(io::Error::new(ErrorKind::InvalidData, error));
+        }
+        for cert in certs.certs {
+            roots
+                .add(cert)
+                .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
+        }
         let mut config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(TransparentUpstreamVerifier))
+            .with_root_certificates(roots)
             .with_no_client_auth();
         if let Some(alpn_protocol) = alpn_protocol {
             config.alpn_protocols = vec![alpn_protocol.as_bytes().to_vec()];
@@ -211,54 +217,6 @@ impl MitmTlsAuthority {
             .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
         rustls::ClientConnection::new(Arc::new(config), server_name)
             .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))
-    }
-}
-
-#[derive(Debug)]
-struct TransparentUpstreamVerifier;
-
-impl ServerCertVerifier for TransparentUpstreamVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::ED25519,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-        ]
     }
 }
 
@@ -376,22 +334,24 @@ fn run_network_service(
                 &mut tcp_dns_connections,
             );
         }
-        device.nat.prune_expired_flows();
-        let active_tcp_nat_ports = device.nat.tcp_host_ports().collect::<HashSet<_>>();
-        for port in &active_tcp_nat_ports {
+        device.interception.prune_expired_flows();
+        let active_tcp_intercept_ports =
+            device.interception.tcp_host_ports().collect::<HashSet<_>>();
+        for port in &active_tcp_intercept_ports {
             add_http_listener(&mut sockets, &mut http_sockets, *port);
         }
         prune_dynamic_http_listeners(
             &mut sockets,
             &mut http_sockets,
-            &active_tcp_nat_ports,
+            &active_tcp_intercept_ports,
             &http_connections,
         );
-        let active_udp_nat_ports = device.nat.udp_host_ports().collect::<HashSet<_>>();
-        for port in &active_udp_nat_ports {
+        let active_udp_intercept_ports =
+            device.interception.udp_host_ports().collect::<HashSet<_>>();
+        for port in &active_udp_intercept_ports {
             add_udp_relay_socket(&mut sockets, &mut udp_sockets, *port);
         }
-        prune_dynamic_udp_relays(&mut sockets, &mut udp_sockets, &active_udp_nat_ports);
+        prune_dynamic_udp_relays(&mut sockets, &mut udp_sockets, &active_udp_intercept_ports);
         for (port, handle) in udp_sockets
             .iter()
             .map(|(port, handle)| (*port, *handle))
@@ -401,7 +361,7 @@ fn run_network_service(
                 &mut sockets,
                 handle,
                 port,
-                &device.nat,
+                &device.interception,
                 outbound_rules.as_deref(),
                 policy.as_deref(),
                 &mut udp_relays,
@@ -416,7 +376,7 @@ fn run_network_service(
                 &mut sockets,
                 handle,
                 port,
-                &device.nat,
+                &device.interception,
                 outbound_rules.as_deref(),
                 http.clone(),
                 policy.clone(),
@@ -552,12 +512,12 @@ fn add_udp_relay_socket(
 fn prune_dynamic_udp_relays(
     sockets: &mut SocketSet<'_>,
     udp_sockets: &mut HashMap<u16, SocketHandle>,
-    active_nat_ports: &HashSet<u16>,
+    active_intercept_ports: &HashSet<u16>,
 ) {
     let stale_ports = udp_sockets
         .keys()
         .copied()
-        .filter(|port| !active_nat_ports.contains(port))
+        .filter(|port| !active_intercept_ports.contains(port))
         .collect::<Vec<_>>();
     for port in stale_ports {
         if let Some(handle) = udp_sockets.remove(&port) {
@@ -570,7 +530,7 @@ fn poll_udp_relay_socket(
     sockets: &mut SocketSet<'_>,
     handle: SocketHandle,
     host_port: u16,
-    nat: &TransparentNat,
+    interception: &TransparentInterception,
     outbound_rules: Option<&[OutboundRulePlan]>,
     policy: Option<&dyn NetworkPolicyRuntime>,
     relays: &mut HashMap<UdpFlow, UdpRelay>,
@@ -580,9 +540,11 @@ fn poll_udp_relay_socket(
         let Ok((payload, remote)) = socket.recv() else {
             break;
         };
-        let Some(destination) =
-            nat.udp_original_destination(remote.endpoint.addr, remote.endpoint.port, host_port)
-        else {
+        let Some(destination) = interception.udp_original_destination(
+            remote.endpoint.addr,
+            remote.endpoint.port,
+            host_port,
+        ) else {
             continue;
         };
         let decision = decide_transport(
@@ -683,7 +645,7 @@ impl UdpRelay {
     }
 
     fn is_expired(&self) -> bool {
-        StdInstant::now().duration_since(self.last_seen) > NAT_FLOW_IDLE_TTL
+        StdInstant::now().duration_since(self.last_seen) > INTERCEPT_FLOW_IDLE_TTL
     }
 }
 
@@ -796,14 +758,14 @@ fn add_http_listener(
 fn prune_dynamic_http_listeners(
     sockets: &mut SocketSet<'_>,
     http_sockets: &mut HashMap<u16, Vec<SocketHandle>>,
-    active_nat_ports: &HashSet<u16>,
+    active_intercept_ports: &HashSet<u16>,
     http_connections: &HashMap<SocketHandle, HttpConnection>,
 ) {
     let stale_ports = http_sockets
         .iter()
         .filter_map(|(port, handles)| {
             (!is_static_listener_port(*port)
-                && !active_nat_ports.contains(port)
+                && !active_intercept_ports.contains(port)
                 && handles.iter().all(|handle| {
                     !http_connections.contains_key(handle)
                         && !sockets.get::<tcp::Socket>(*handle).is_active()
@@ -832,7 +794,7 @@ fn poll_http_socket(
     sockets: &mut SocketSet<'_>,
     handle: SocketHandle,
     port: u16,
-    nat: &TransparentNat,
+    interception: &TransparentInterception,
     outbound_rules: Option<&[OutboundRulePlan]>,
     http: Option<Arc<dyn HttpInterceptRuntime>>,
     policy: Option<Arc<dyn NetworkPolicyRuntime>>,
@@ -858,7 +820,7 @@ fn poll_http_socket(
     poll_plain_http_socket(
         socket,
         handle,
-        nat,
+        interception,
         outbound_rules,
         http,
         policy,
@@ -928,11 +890,11 @@ struct HttpDestination {
 
 fn original_http_destination(
     socket: &tcp::Socket<'_>,
-    nat: &TransparentNat,
+    interception: &TransparentInterception,
 ) -> Option<HttpDestination> {
     let remote = socket.remote_endpoint()?;
     let local = socket.local_endpoint()?;
-    let ip = nat.original_destination(remote.addr, remote.port, local.port)?;
+    let ip = interception.original_destination(remote.addr, remote.port, local.port)?;
     Some(HttpDestination {
         source_ip: remote.addr.to_string(),
         source_port: remote.port,
@@ -944,14 +906,14 @@ fn original_http_destination(
 fn poll_plain_http_socket(
     socket: &mut tcp::Socket<'_>,
     handle: SocketHandle,
-    nat: &TransparentNat,
+    interception: &TransparentInterception,
     outbound_rules: Option<&[OutboundRulePlan]>,
     http: Option<Arc<dyn HttpInterceptRuntime>>,
     policy: Option<Arc<dyn NetworkPolicyRuntime>>,
     tls_authority: Option<Arc<MitmTlsAuthority>>,
     http_connections: &mut HashMap<SocketHandle, HttpConnection>,
 ) {
-    let Some(destination) = original_http_destination(socket, nat) else {
+    let Some(destination) = original_http_destination(socket, interception) else {
         socket.abort();
         return;
     };
@@ -1690,7 +1652,7 @@ fn dns_address(name: &str) -> Option<[u8; 4]> {
 struct LibkrunNetDevice {
     rx: UnixStream,
     tx: UnixStream,
-    nat: TransparentNat,
+    interception: TransparentInterception,
     outbound_rules: Option<Vec<OutboundRulePlan>>,
     policy: Option<Arc<dyn NetworkPolicyRuntime>>,
     rx_buffer: Vec<u8>,
@@ -1709,7 +1671,7 @@ impl LibkrunNetDevice {
         Self {
             rx,
             tx,
-            nat: TransparentNat::new(host_ip),
+            interception: TransparentInterception::new(host_ip),
             outbound_rules,
             policy,
             rx_buffer: Vec::new(),
@@ -1773,7 +1735,7 @@ impl LibkrunNetDevice {
         let Some(packet) = Ipv4TcpPacket::parse(frame) else {
             return false;
         };
-        if packet.destination_ip(frame) == self.nat.host_ip {
+        if packet.destination_ip(frame) == self.interception.host_ip {
             return false;
         }
         let flags = packet.tcp_flags(frame);
@@ -1829,7 +1791,7 @@ impl Device for LibkrunNetDevice {
                 LibkrunRxToken { frame },
                 LibkrunTxToken {
                     pending_tx: &mut self.pending_tx,
-                    nat: &mut self.nat,
+                    interception: &mut self.interception,
                 },
             ));
         }
@@ -1839,7 +1801,7 @@ impl Device for LibkrunNetDevice {
                 if self.reject_denied_tcp_syn(&frame) {
                     return None;
                 }
-                if self.nat.rewrite_guest_frame(&mut frame) {
+                if self.interception.rewrite_guest_frame(&mut frame) {
                     self.staged_rx = Some(frame);
                     return None;
                 }
@@ -1847,7 +1809,7 @@ impl Device for LibkrunNetDevice {
                     LibkrunRxToken { frame },
                     LibkrunTxToken {
                         pending_tx: &mut self.pending_tx,
-                        nat: &mut self.nat,
+                        interception: &mut self.interception,
                     },
                 ))
             }
@@ -1860,7 +1822,7 @@ impl Device for LibkrunNetDevice {
         self.flush_pending_tx();
         Some(LibkrunTxToken {
             pending_tx: &mut self.pending_tx,
-            nat: &mut self.nat,
+            interception: &mut self.interception,
         })
     }
 
@@ -1888,7 +1850,7 @@ impl phy::RxToken for LibkrunRxToken {
 
 struct LibkrunTxToken<'a> {
     pending_tx: &'a mut Vec<u8>,
-    nat: &'a mut TransparentNat,
+    interception: &'a mut TransparentInterception,
 }
 
 impl phy::TxToken for LibkrunTxToken<'_> {
@@ -1898,7 +1860,7 @@ impl phy::TxToken for LibkrunTxToken<'_> {
     {
         let mut frame = vec![0; len];
         let result = f(&mut frame);
-        self.nat.rewrite_host_frame(&mut frame);
+        self.interception.rewrite_host_frame(&mut frame);
         if let Ok(frame_len) = u32::try_from(frame.len()) {
             self.pending_tx.extend_from_slice(&frame_len.to_be_bytes());
             self.pending_tx.extend_from_slice(&frame);
@@ -2715,10 +2677,10 @@ impl InterceptConnection {
 }
 
 #[derive(Debug)]
-struct TransparentNat {
+struct TransparentInterception {
     host_ip: [u8; 4],
-    tcp_flows: HashMap<TcpFlow, NatFlow>,
-    udp_flows: HashMap<UdpNatFlow, NatFlow>,
+    tcp_flows: HashMap<TcpFlow, InterceptedFlow>,
+    udp_flows: HashMap<UdpInterceptedFlow, InterceptedFlow>,
     next_udp_host_port: u16,
 }
 
@@ -2730,7 +2692,7 @@ struct TcpFlow {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct NatFlow {
+struct InterceptedFlow {
     destination_ip: [u8; 4],
     destination_port: u16,
     last_seen: StdInstant,
@@ -2738,7 +2700,7 @@ struct NatFlow {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct UdpNatFlow {
+struct UdpInterceptedFlow {
     guest_ip: [u8; 4],
     guest_port: u16,
     host_port: u16,
@@ -2750,13 +2712,13 @@ struct UdpDestination {
     port: u16,
 }
 
-impl TransparentNat {
+impl TransparentInterception {
     fn new(host_ip: Ipv4Address) -> Self {
         Self {
             host_ip: host_ip.octets(),
             tcp_flows: HashMap::new(),
             udp_flows: HashMap::new(),
-            next_udp_host_port: UDP_NAT_PORT_START,
+            next_udp_host_port: UDP_INTERCEPT_PORT_START,
         }
     }
 
@@ -2779,7 +2741,7 @@ impl TransparentNat {
             } else {
                 self.tcp_flows.insert(
                     flow,
-                    NatFlow {
+                    InterceptedFlow {
                         destination_ip: packet.destination_ip(frame),
                         destination_port: packet.destination_port(frame),
                         last_seen: StdInstant::now(),
@@ -2810,7 +2772,7 @@ impl TransparentNat {
         ) else {
             return false;
         };
-        let flow = UdpNatFlow {
+        let flow = UdpInterceptedFlow {
             guest_ip,
             guest_port,
             host_port,
@@ -2818,7 +2780,7 @@ impl TransparentNat {
         let new_host_port = !self.udp_flows.contains_key(&flow);
         self.udp_flows.insert(
             flow,
-            NatFlow {
+            InterceptedFlow {
                 destination_ip,
                 destination_port,
                 last_seen: StdInstant::now(),
@@ -2843,11 +2805,11 @@ impl TransparentNat {
                 guest_port: packet.destination_port(frame),
                 host_port: packet.source_port(frame),
             };
-            let Some(nat_flow) = self.tcp_flows.get_mut(&flow) else {
+            let Some(intercepted_flow) = self.tcp_flows.get_mut(&flow) else {
                 return;
             };
-            nat_flow.last_seen = StdInstant::now();
-            let original_destination = nat_flow.destination_ip;
+            intercepted_flow.last_seen = StdInstant::now();
+            let original_destination = intercepted_flow.destination_ip;
             let flags = packet.tcp_flags(frame);
             packet.set_source_ip(frame, original_destination);
             packet.recompute_checksums(frame);
@@ -2863,15 +2825,15 @@ impl TransparentNat {
         if packet.source_ip(frame) != self.host_ip {
             return;
         }
-        let flow = UdpNatFlow {
+        let flow = UdpInterceptedFlow {
             guest_ip: packet.destination_ip(frame),
             guest_port: packet.destination_port(frame),
             host_port: packet.source_port(frame),
         };
-        if let Some(nat_flow) = self.udp_flows.get_mut(&flow) {
-            nat_flow.last_seen = StdInstant::now();
-            packet.set_source_ip(frame, nat_flow.destination_ip);
-            packet.set_source_port(frame, nat_flow.destination_port);
+        if let Some(intercepted_flow) = self.udp_flows.get_mut(&flow) {
+            intercepted_flow.last_seen = StdInstant::now();
+            packet.set_source_ip(frame, intercepted_flow.destination_ip);
+            packet.set_source_port(frame, intercepted_flow.destination_port);
             packet.recompute_checksums(frame);
         }
     }
@@ -2905,7 +2867,7 @@ impl TransparentNat {
         let guest_ip = match guest_ip {
             IpAddress::Ipv4(guest_ip) => guest_ip.octets(),
         };
-        let flow = UdpNatFlow {
+        let flow = UdpInterceptedFlow {
             guest_ip,
             guest_port,
             host_port,
@@ -2932,13 +2894,13 @@ impl TransparentNat {
         self.tcp_flows.retain(|_, flow| {
             now.duration_since(flow.last_seen)
                 < if flow.closing {
-                    NAT_FLOW_CLOSING_TTL
+                    INTERCEPT_FLOW_CLOSING_TTL
                 } else {
-                    NAT_FLOW_IDLE_TTL
+                    INTERCEPT_FLOW_IDLE_TTL
                 }
         });
         self.udp_flows
-            .retain(|_, flow| now.duration_since(flow.last_seen) < NAT_FLOW_IDLE_TTL);
+            .retain(|_, flow| now.duration_since(flow.last_seen) < INTERCEPT_FLOW_IDLE_TTL);
     }
 
     fn udp_host_port_for_destination(
@@ -2948,19 +2910,19 @@ impl TransparentNat {
         destination_ip: [u8; 4],
         destination_port: u16,
     ) -> Option<u16> {
-        if let Some((flow, _)) = self.udp_flows.iter().find(|(flow, nat_flow)| {
+        if let Some((flow, _)) = self.udp_flows.iter().find(|(flow, intercepted_flow)| {
             flow.guest_ip == guest_ip
                 && flow.guest_port == guest_port
-                && nat_flow.destination_ip == destination_ip
-                && nat_flow.destination_port == destination_port
+                && intercepted_flow.destination_ip == destination_ip
+                && intercepted_flow.destination_port == destination_port
         }) {
             return Some(flow.host_port);
         }
 
-        for _ in UDP_NAT_PORT_START..=UDP_NAT_PORT_END {
+        for _ in UDP_INTERCEPT_PORT_START..=UDP_INTERCEPT_PORT_END {
             let candidate = self.next_udp_host_port;
-            self.next_udp_host_port = if self.next_udp_host_port == UDP_NAT_PORT_END {
-                UDP_NAT_PORT_START
+            self.next_udp_host_port = if self.next_udp_host_port == UDP_INTERCEPT_PORT_END {
+                UDP_INTERCEPT_PORT_START
             } else {
                 self.next_udp_host_port + 1
             };
@@ -3421,34 +3383,34 @@ mod tests {
     }
 
     #[test]
-    fn transparent_nat_prunes_flow_after_host_fin() {
-        let mut nat = TransparentNat::new(Ipv4Address::new(10, 0, 2, 1));
+    fn transparent_interception_prunes_flow_after_host_fin() {
+        let mut interception = TransparentInterception::new(Ipv4Address::new(10, 0, 2, 1));
         let mut guest_frame = tcp_frame([10, 0, 2, 15], [93, 184, 216, 34], 50_000, 443, 0x02);
 
-        nat.rewrite_guest_frame(&mut guest_frame);
+        interception.rewrite_guest_frame(&mut guest_frame);
         assert_eq!(
-            nat.original_destination(IpAddress::v4(10, 0, 2, 15), 50_000, 443),
+            interception.original_destination(IpAddress::v4(10, 0, 2, 15), 50_000, 443),
             Some("93.184.216.34".to_string()),
         );
 
         let mut host_frame = tcp_frame([10, 0, 2, 1], [10, 0, 2, 15], 443, 50_000, 0x01);
-        nat.rewrite_host_frame(&mut host_frame);
+        interception.rewrite_host_frame(&mut host_frame);
 
         assert_eq!(
-            nat.original_destination(IpAddress::v4(10, 0, 2, 15), 50_000, 443),
+            interception.original_destination(IpAddress::v4(10, 0, 2, 15), 50_000, 443),
             None
         );
-        assert_eq!(nat.tcp_host_ports().count(), 0);
+        assert_eq!(interception.tcp_host_ports().count(), 0);
     }
 
     #[test]
-    fn transparent_nat_assigns_distinct_udp_ports_for_distinct_destinations() {
-        let mut nat = TransparentNat::new(Ipv4Address::new(10, 0, 2, 1));
+    fn transparent_interception_assigns_distinct_udp_ports_for_distinct_destinations() {
+        let mut interception = TransparentInterception::new(Ipv4Address::new(10, 0, 2, 1));
         let mut first = udp_frame([10, 0, 2, 15], [1, 1, 1, 1], 50_000, 53);
         let mut second = udp_frame([10, 0, 2, 15], [8, 8, 8, 8], 50_000, 53);
 
-        nat.rewrite_guest_frame(&mut first);
-        nat.rewrite_guest_frame(&mut second);
+        interception.rewrite_guest_frame(&mut first);
+        interception.rewrite_guest_frame(&mut second);
 
         let first_packet = Ipv4UdpPacket::parse(&first).unwrap();
         let second_packet = Ipv4UdpPacket::parse(&second).unwrap();
@@ -3456,14 +3418,22 @@ mod tests {
         let second_host_port = second_packet.destination_port(&second);
         assert_ne!(first_host_port, second_host_port);
         assert_eq!(
-            nat.udp_original_destination(IpAddress::v4(10, 0, 2, 15), 50_000, first_host_port),
+            interception.udp_original_destination(
+                IpAddress::v4(10, 0, 2, 15),
+                50_000,
+                first_host_port
+            ),
             Some(UdpDestination {
                 ip: "1.1.1.1".to_string(),
                 port: 53,
             }),
         );
         assert_eq!(
-            nat.udp_original_destination(IpAddress::v4(10, 0, 2, 15), 50_000, second_host_port),
+            interception.udp_original_destination(
+                IpAddress::v4(10, 0, 2, 15),
+                50_000,
+                second_host_port
+            ),
             Some(UdpDestination {
                 ip: "8.8.8.8".to_string(),
                 port: 53,
@@ -3471,23 +3441,23 @@ mod tests {
         );
 
         let mut response = udp_frame([10, 0, 2, 1], [10, 0, 2, 15], first_host_port, 50_000);
-        nat.rewrite_host_frame(&mut response);
+        interception.rewrite_host_frame(&mut response);
         let response_packet = Ipv4UdpPacket::parse(&response).unwrap();
         assert_eq!(response_packet.source_ip(&response), [1, 1, 1, 1]);
         assert_eq!(response_packet.source_port(&response), 53);
     }
 
     #[test]
-    fn transparent_nat_reports_udp_port_exhaustion() {
-        let mut nat = TransparentNat::new(Ipv4Address::new(10, 0, 2, 1));
-        for host_port in UDP_NAT_PORT_START..=UDP_NAT_PORT_END {
-            nat.udp_flows.insert(
-                UdpNatFlow {
+    fn transparent_interception_reports_udp_port_exhaustion() {
+        let mut interception = TransparentInterception::new(Ipv4Address::new(10, 0, 2, 1));
+        for host_port in UDP_INTERCEPT_PORT_START..=UDP_INTERCEPT_PORT_END {
+            interception.udp_flows.insert(
+                UdpInterceptedFlow {
                     guest_ip: [10, 0, 2, 15],
                     guest_port: host_port,
                     host_port,
                 },
-                NatFlow {
+                InterceptedFlow {
                     destination_ip: [192, 0, 2, 1],
                     destination_port: 53,
                     last_seen: StdInstant::now(),
@@ -3497,7 +3467,7 @@ mod tests {
         }
 
         assert_eq!(
-            nat.udp_host_port_for_destination([10, 0, 2, 16], 50_000, [192, 0, 2, 2], 53),
+            interception.udp_host_port_for_destination([10, 0, 2, 16], 50_000, [192, 0, 2, 2], 53),
             None,
         );
     }

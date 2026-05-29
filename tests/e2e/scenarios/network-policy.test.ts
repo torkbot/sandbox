@@ -21,14 +21,28 @@ const execFileAsync = promisify(execFile);
 
 test("network.policy allows plain HTTP over TCP", async (t) => {
   if (!requireVmLaunchSupport(t)) return;
+  const observedHeaders: string[] = [];
   const origin = await startTcpServer((socket) => {
-    socket.once("data", () => {
+    socket.once("data", (chunk) => {
+      const request = chunk.toString("utf8");
+      observedHeaders.push(request.match(/^x-sandbox-policy: (.+)$/im)?.[1] ?? "");
       socket.end("HTTP/1.1 200 OK\r\ncontent-length: 7\r\nconnection: close\r\n\r\nhttp-ok");
     });
   });
   t.after(() => void origin.close());
 
-  await using sandbox = await bootAllowingNetwork();
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      if (conn.protocol === "http") {
+        conn.allowHttp((request) => {
+          request.headers.set("x-sandbox-policy", "allowed");
+        });
+      } else {
+        conn.allow();
+      }
+    }),
+  }).boot();
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "http-allow",
     script: `curl -fsS --max-time 5 http://${hostOriginAddress()}:${origin.port}/`,
@@ -36,15 +50,15 @@ test("network.policy allows plain HTTP over TCP", async (t) => {
 
   assert.equal(result.exitCode, 0, commandOutput(result));
   assert.equal(result.stdout, "http-ok");
+  assert.deepEqual(observedHeaders, ["allowed"]);
   assert.ok(origin.connections.length >= 1);
 });
 
-test("network.policy allows HTTPS HTTP middleware", async (t) => {
+test("network.policy rejects untrusted HTTPS upstream certificates", async (t) => {
   if (!requireVmLaunchSupport(t)) return;
   const origin = await startTlsHttpServer();
   t.after(() => void origin.close());
 
-  const observedHeaders: string[] = [];
   await using sandbox = await defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.23"),
     network: network.policy(async (conn) => {
@@ -69,10 +83,8 @@ test("network.policy allows HTTPS HTTP middleware", async (t) => {
     script: `curl -kfsS --max-time 5 https://${hostOriginAddress()}:${origin.port}/`,
   }), 10_000, "HTTPS middleware request");
 
-  assert.equal(result.exitCode, 0, commandOutput(result));
-  observedHeaders.push(...origin.requests);
-  assert.deepEqual(observedHeaders, ["allowed"]);
-  assert.equal(result.stdout, "https-ok");
+  assert.notEqual(result.exitCode, 0, commandOutput(result));
+  assert.deepEqual(origin.requests, []);
 });
 
 test("network.policy denies private HTTP by destination range before origin access", async (t) => {
