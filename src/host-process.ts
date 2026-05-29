@@ -17,11 +17,10 @@ import type {
   RegisteredNetworkConnectionHook,
 } from "./launch-options.ts";
 import type {
-  DnsResolver,
-  DnsResponse,
   NetworkConnectionRequest,
   NetworkEndpoint,
   NetworkTransport,
+  HttpRequestMiddleware,
 } from "./index.ts";
 
 const DEFAULT_LAUNCH_TIMEOUT_MS = 60_000;
@@ -40,6 +39,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
   readonly #rootBlockStoreContext?: SandboxBlockStoreContext;
   readonly #requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook>;
   readonly #networkConnectionHook?: RegisteredNetworkConnectionHook;
+  readonly #httpMiddlewareByFlow = new Map<string, HttpRequestMiddleware | undefined>();
   #buffer = new Uint8Array();
   #stderr = "";
   #closed = false;
@@ -313,71 +313,47 @@ export class HostProcessSandboxVm implements HostControlChannel {
   async #handleNetworkConnection(document: Record<string, unknown>): Promise<void> {
     const id = typeof document.id === "string" ? document.id : "";
     try {
-      const protocol = assertNetworkProtocol(document.protocol);
       const transport = assertNetworkTransport(document.transport);
       const srcIp = assertString(document.srcIp, "srcIp");
       const srcPort = assertNumber(document.srcPort, "srcPort");
       const dstIp = assertString(document.dstIp, "dstIp");
       const dstPort = assertNumber(document.dstPort, "dstPort");
-      let allowed = false;
-      let dnsResponse: DnsResponse | undefined;
-      let dnsResponsePromise: Promise<DnsResponse | undefined> | undefined;
       const src = createNetworkEndpoint(srcIp, srcPort);
       const dst = createNetworkEndpoint(dstIp, dstPort);
-      const allow = () => {
-        allowed = true;
+      const decision: { action: "deny" | "accept" | "acceptHttp" } = { action: "deny" };
+      let httpMiddleware: HttpRequestMiddleware | undefined;
+      const accept = () => {
+        decision.action = "accept";
         return {};
       };
-      const connection: NetworkConnectionRequest = protocol === "dns"
-        ? {
-            protocol: "dns",
-            transport,
-            src,
-            dst,
-            application: { protocol: "dns" },
-            questions: assertDnsQuestions(document.questions),
-            allow,
-            allowDns(resolver?: DnsResolver) {
-              allowed = true;
-              if (resolver !== undefined) {
-                dnsResponse = undefined;
-                const request = {
-                  transport,
-                  src,
-                  dst,
-                  questions: assertDnsQuestions(document.questions),
-                };
-                const resolved = resolver(request);
-                if (resolved instanceof Promise) {
-                  dnsResponsePromise = resolved;
-                } else {
-                  dnsResponse = resolved;
-                }
-              }
-              return {};
-            },
-          } as NetworkConnectionRequest
-        : {
-            protocol,
-            transport,
-            src,
-            dst,
-            allow,
-          } as NetworkConnectionRequest;
+      const connection: NetworkConnectionRequest = {
+        transport,
+        src,
+        dst,
+        accept,
+        ...(transport === "tcp"
+          ? {
+              acceptHttp(middleware?: HttpRequestMiddleware) {
+                decision.action = "acceptHttp";
+                httpMiddleware = middleware;
+                return {};
+              },
+            }
+          : {}),
+      } as NetworkConnectionRequest;
 
       if (this.#networkConnectionHook?.active === true) {
         await this.#networkConnectionHook.hook(connection);
       }
-      if (dnsResponsePromise !== undefined) {
-        dnsResponse = await dnsResponsePromise;
+      if (decision.action === "acceptHttp") {
+        this.#httpMiddlewareByFlow.set(networkFlowKey(src, dst), httpMiddleware);
       }
 
       this.#tryWriteToHost(encodePacket({
         type: "host.network.response",
         id,
         ok: true,
-        allowed,
-        dnsResponse,
+        action: decision.action,
       }));
     } catch (error) {
       this.#tryWriteToHost(encodePacket({
@@ -409,6 +385,11 @@ export class HostProcessSandboxVm implements HostControlChannel {
         },
         tls: optionalTlsMetadata(document.tls),
       };
+
+      await this.#httpMiddlewareByFlow.get(networkFlowKey(
+        createNetworkEndpoint(request.destination.sourceIp, request.destination.sourcePort),
+        createNetworkEndpoint(request.destination.originalIp, request.destination.originalPort),
+      ))?.(request);
 
       for (const hookId of hookIds) {
         const registration = this.#requestHeaderHooks.get(hookId);
@@ -869,39 +850,6 @@ function assertDocumentArray(value: unknown, field: string): Record<string, unkn
   return value as Record<string, unknown>[];
 }
 
-function assertDnsQuestions(value: unknown): Array<{
-  readonly name: string;
-  readonly type: "A" | "AAAA" | "CAA" | "CNAME" | "HTTPS" | "MX" | "NS" | "PTR" | "SOA" | "SRV" | "SVCB" | "TXT" | "UNKNOWN";
-  readonly class: "IN" | "UNKNOWN";
-}> {
-  return assertDocumentArray(value, "questions").map((question) => {
-    const type = assertString(question.type, "question.type");
-    const recordType = isDnsRecordType(type) ? type : "UNKNOWN";
-    const klass = assertString(question.class, "question.class");
-    return {
-      name: assertString(question.name, "question.name"),
-      type: recordType,
-      class: klass === "IN" ? "IN" : "UNKNOWN",
-    };
-  });
-}
-
-function isDnsRecordType(value: string): value is ReturnType<typeof assertDnsQuestions>[number]["type"] {
-  return value === "A"
-    || value === "AAAA"
-    || value === "CAA"
-    || value === "CNAME"
-    || value === "HTTPS"
-    || value === "MX"
-    || value === "NS"
-    || value === "PTR"
-    || value === "SOA"
-    || value === "SRV"
-    || value === "SVCB"
-    || value === "TXT"
-    || value === "UNKNOWN";
-}
-
 function trackHeaderMutations(headers: Headers): () => boolean {
   let mutated = false;
   const set = headers.set.bind(headers);
@@ -937,13 +885,6 @@ function assertProtocol(value: unknown): "http/1.1" | "h2" {
   throw new Error("host request protocol must be http/1.1 or h2");
 }
 
-function assertNetworkProtocol(value: unknown): "tcp" | "udp" | "dns" {
-  if (value === "tcp" || value === "udp" || value === "dns") {
-    return value;
-  }
-  throw new Error("host network request protocol must be tcp, udp, or dns");
-}
-
 function assertNetworkTransport(value: unknown): NetworkTransport {
   if (value === "tcp" || value === "udp") {
     return value;
@@ -964,6 +905,10 @@ function createNetworkEndpoint(ip: string, port: number): NetworkEndpoint {
     isReserved: () => isReservedIp(ip),
     isPublicInternet: () => isPublicInternetIp(ip),
   };
+}
+
+function networkFlowKey(src: NetworkEndpoint, dst: NetworkEndpoint): string {
+  return `${src.ip}:${src.port}->${dst.ip}:${dst.port}`;
 }
 
 function isLoopbackIp(ip: string): boolean {

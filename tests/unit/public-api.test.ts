@@ -240,32 +240,14 @@ test("defineSandbox rejects invalid COW rootfs block store", () => {
 
 test("network.policy creates an opaque connection policy", () => {
   const policy = network.policy(async (conn) => {
-    // Protocol-specific grants are absent on non-matching connection shapes, so
-    // optional chaining is the ergonomic "allow it if this is that protocol" API.
-    conn.allowHttp?.();
-    conn.allowDns?.();
+    conn.accept();
 
-    if (conn.protocol === "http" && conn.host === "registry.npmjs.org") {
-      conn.allowHttp();
-      // @ts-expect-error DNS grants are not exposed on HTTP events.
-      conn.allowDns?.();
+    if (conn.transport === "tcp") {
+      conn.acceptHttp();
     }
-    if (conn.protocol === "dns") {
-      conn.allowDns();
-      // @ts-expect-error HTTP grants are not exposed on DNS events.
-      conn.allowHttp?.();
-    }
-    if (conn.protocol === "udp") {
-      // @ts-expect-error HTTP grants are not exposed on generic UDP events.
-      conn.allowHttp?.();
-      // @ts-expect-error DNS grants are not exposed on generic UDP events.
-      conn.allowDns?.();
-    }
-    if (conn.protocol === "tcp") {
-      // @ts-expect-error HTTP grants are not exposed on generic TCP events.
-      conn.allowHttp?.();
-      // @ts-expect-error DNS grants are not exposed on generic TCP events.
-      conn.allowDns?.();
+    if (conn.transport === "udp") {
+      // @ts-expect-error HTTP enforcement is TCP-only.
+      conn.acceptHttp();
     }
   });
 

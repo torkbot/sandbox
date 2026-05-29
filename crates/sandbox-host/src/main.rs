@@ -16,8 +16,8 @@ use sandbox::http_flow::{
     HookBackedHttpInterceptRuntime, HttpHookExecutor, InterceptedHttpRequest,
 };
 use sandbox::network_service::{
-    DnsPolicyAnswer, DnsPolicyResponse, NetworkConnectionAttempt, NetworkPolicyDecision,
-    NetworkPolicyRuntime, NetworkProtocol,
+    NetworkConnectionAttempt, NetworkPolicyAction, NetworkPolicyDecision, NetworkPolicyRuntime,
+    NetworkProtocol,
 };
 use sandbox::runtime::{ControlSocket, HostServices, StartStatusObserver, VirtualFsDevice};
 
@@ -381,65 +381,20 @@ impl NetworkPolicyRuntime for NodeNetworkPolicyRuntime {
             "srcPort": i32::from(connection.src.port),
             "dstIp": connection.dst.ip,
             "dstPort": i32::from(connection.dst.port),
-            "questions": connection.questions.into_iter().map(|question| {
-                Bson::Document(doc! {
-                    "name": question.name,
-                    "type": question.type_name,
-                    "class": question.class_name,
-                })
-            }).collect::<Vec<_>>(),
         })?;
-        let allowed = response
-            .get_bool("allowed")
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let dns_response = response
-            .get_document("dnsResponse")
-            .ok()
-            .map(parse_dns_policy_response)
-            .transpose()?;
-        Ok(NetworkPolicyDecision {
-            allowed,
-            dns_response,
-        })
+        let action = match response.get_str("action").unwrap_or("deny") {
+            "accept" => NetworkPolicyAction::Accept,
+            "acceptHttp" => NetworkPolicyAction::AcceptHttp,
+            "deny" => NetworkPolicyAction::Deny,
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported network policy action: {other}"),
+                ));
+            }
+        };
+        Ok(NetworkPolicyDecision { action })
     }
-}
-
-fn parse_dns_policy_response(document: &Document) -> io::Result<DnsPolicyResponse> {
-    let code = document.get_str("code").unwrap_or("NOERROR").to_string();
-    let answers = match document.get_array("answers") {
-        Ok(answers) => answers
-            .iter()
-            .map(|answer| {
-                let answer = answer.as_document().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "DNS answer must be a document")
-                })?;
-                Ok(DnsPolicyAnswer {
-                    answer_type: answer.get_str("type").unwrap_or("UNKNOWN").to_string(),
-                    name: answer.get_str("name").ok().map(str::to_string),
-                    address: answer.get_str("address").ok().map(str::to_string),
-                    target: answer.get_str("target").ok().map(str::to_string),
-                    values: answer
-                        .get_array("values")
-                        .ok()
-                        .map(|values| {
-                            values
-                                .iter()
-                                .filter_map(Bson::as_str)
-                                .map(str::to_string)
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default(),
-                    ttl: answer
-                        .get_i32("ttl")
-                        .ok()
-                        .and_then(|ttl| u32::try_from(ttl).ok())
-                        .unwrap_or(60),
-                })
-            })
-            .collect::<io::Result<Vec<_>>>()?,
-        Err(_) => Vec::new(),
-    };
-    Ok(DnsPolicyResponse { code, answers })
 }
 
 #[derive(Debug)]

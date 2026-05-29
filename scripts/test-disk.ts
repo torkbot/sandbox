@@ -29,7 +29,7 @@ const sandbox = defineSandbox({
   }),
   network: network.policy((connection) => {
     networkStats.observe(connection);
-    connection.allow();
+    connection.accept();
   }),
   resources: {
     cpus: 2,
@@ -211,12 +211,9 @@ function createNetworkStats(): {
   return {
     observe(connection) {
       policyCalls += 1;
-      const destinationHost = connection.protocol === "http"
-        ? connection.host
-        : connection.dst.ip;
       const destination = [
         connection.transport,
-        destinationHost,
+        connection.dst.ip,
         connection.dst.port,
       ].join(":");
       byDestination.set(destination, (byDestination.get(destination) ?? 0) + 1);

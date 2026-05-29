@@ -34,12 +34,10 @@ test("network.policy allows plain HTTP over TCP", async (t) => {
   await using sandbox = await defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.23"),
     network: network.policy((conn) => {
-      if (conn.protocol === "http") {
-        conn.allowHttp((request) => {
+      if (conn.transport === "tcp") {
+        conn.acceptHttp((request) => {
           request.headers.set("x-sandbox-policy", "allowed");
         });
-      } else {
-        conn.allow();
       }
     }),
   }).boot();
@@ -62,16 +60,12 @@ test("network.policy rejects untrusted HTTPS upstream certificates", async (t) =
   await using sandbox = await defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.23"),
     network: network.policy(async (conn) => {
-      if (conn.transport === "tcp" && conn.protocol !== "http") {
-        conn.allow();
-        return;
-      }
       if (conn.transport === "udp" && conn.dst.port === 53) {
-        conn.allow();
+        conn.accept();
         return;
       }
-      if (conn.protocol === "http") {
-        conn.allowHttp((request) => {
+      if (conn.transport === "tcp") {
+        conn.acceptHttp((request) => {
           request.headers.set("x-sandbox-policy", "allowed");
         });
       }
@@ -98,7 +92,7 @@ test("network.policy denies private HTTP by destination range before origin acce
     rootfs: rootfs.builtIn("alpine:3.23"),
     network: network.policy((conn) => {
       if (conn.dst.isLoopback() || conn.dst.isPrivate() || conn.dst.isLinkLocal()) return;
-      conn.allow();
+      conn.accept();
     }),
   }).boot();
   const result = await withTimeout(execGuestShell(sandbox, {
@@ -315,7 +309,7 @@ test("network.policy allows generic UDP echo traffic", async (t) => {
   assert.equal(udp.messages.length, 1);
 });
 
-test("network.policy allows default DNS over UDP with the DNS hook", async (t) => {
+test("network.policy allows default DNS over UDP as accepted UDP", async (t) => {
   if (!requireVmLaunchSupport(t)) return;
 
   await using sandbox = await bootAllowingDns();
@@ -328,20 +322,7 @@ test("network.policy allows default DNS over UDP with the DNS hook", async (t) =
   assert.equal(result.stdout, "127.0.0.1");
 });
 
-test("network.policy supports a custom DNS resolver over UDP", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
-
-  await using sandbox = await bootWithCustomDns("203.0.113.10");
-  const result = await withTimeout(execGuestShell(sandbox, {
-    id: "dns-udp-custom",
-    script: pythonDnsQuery({ transport: "udp", name: "custom.sandbox.test" }),
-  }), 8_000, "custom UDP DNS query");
-
-  assert.equal(result.exitCode, 0, commandOutput(result));
-  assert.equal(result.stdout, "203.0.113.10");
-});
-
-test("network.policy allows default DNS over TCP with the DNS hook", async (t) => {
+test("network.policy allows default DNS over TCP as accepted TCP", async (t) => {
   if (!requireVmLaunchSupport(t)) return;
 
   await using sandbox = await bootAllowingDns();
@@ -367,39 +348,6 @@ test("network.policy keeps DNS over TCP sessions reusable", async (t) => {
   assert.equal(result.stdout, "127.0.0.1,127.0.0.1");
 });
 
-test("network.policy supports a custom DNS resolver over TCP", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
-
-  await using sandbox = await bootWithCustomDns("203.0.113.20");
-  const result = await withTimeout(execGuestShell(sandbox, {
-    id: "dns-tcp-custom",
-    script: pythonDnsQuery({ transport: "tcp", name: "custom.sandbox.test" }),
-  }), 8_000, "custom TCP DNS query");
-
-  assert.equal(result.exitCode, 0, commandOutput(result));
-  assert.equal(result.stdout, "203.0.113.20");
-});
-
-test("network.policy fails closed when the DNS hook throws", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
-
-  await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
-    network: network.policy((conn) => {
-      if (conn.protocol === "dns") {
-        throw new Error("dns policy failed");
-      }
-      conn.allow();
-    }),
-  }).boot();
-  const result = await withTimeout(execGuestShell(sandbox, {
-    id: "dns-policy-error-deny",
-    script: pythonDnsQuery({ transport: "udp", name: "localhost" }),
-  }), 8_000, "DNS policy error");
-
-  assert.notEqual(result.exitCode, 0, commandOutput(result));
-});
-
 test("network.policy denies generic UDP before upstream receives datagrams", async (t) => {
   if (!requireVmLaunchSupport(t)) return;
   const udp = await startUdpEchoServer();
@@ -419,7 +367,6 @@ test("network.policy exposes source and destination endpoint helpers for transpo
   if (!requireVmLaunchSupport(t)) return;
   const observations: Array<{
     readonly transport: string;
-    readonly protocol: string;
     readonly srcIp: string;
     readonly srcPort: number;
     readonly dstIp: string;
@@ -432,29 +379,18 @@ test("network.policy exposes source and destination endpoint helpers for transpo
     rootfs: rootfs.builtIn("alpine:3.23"),
     network: network.policy((conn) => {
       observations.push(observation(conn));
-      if (conn.protocol === "dns") {
-        conn.allowDns(() => ({
-          answers: [
-            {
-              type: "A",
-              address: "203.0.113.30",
-              ttl: 60,
-            },
-          ],
-        }));
-      }
+      conn.accept();
     }),
   }).boot();
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "endpoint-observations",
-    script: pythonDnsQuery({ transport: "udp", name: "custom.sandbox.test" }),
+    script: pythonDnsQuery({ transport: "udp", name: "localhost" }),
   }), 8_000, "endpoint helper observation");
 
   assert.equal(result.exitCode, 0, commandOutput(result));
-  assert.equal(result.stdout, "203.0.113.30");
+  assert.equal(result.stdout, "127.0.0.1");
   assert.ok(observations.some((entry) => {
     return entry.transport === "udp"
-      && entry.protocol === "dns"
       && entry.dstIp === "10.0.2.1"
       && entry.dstPort === 53
       && entry.dstPrivate === true;
@@ -465,7 +401,7 @@ async function bootAllowingNetwork() {
   return await defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.23"),
     network: network.policy((conn) => {
-      conn.allow();
+      conn.accept();
     }),
   }).boot();
 }
@@ -481,32 +417,7 @@ async function bootAllowingDns() {
   return await defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.23"),
     network: network.policy((conn) => {
-      if (conn.protocol === "dns") {
-        assert.equal(conn.questions[0]?.name, "localhost");
-        conn.allowDns();
-      }
-    }),
-  }).boot();
-}
-
-async function bootWithCustomDns(address: string) {
-  return await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
-    network: network.policy((conn) => {
-      if (conn.protocol === "dns") {
-        conn.allowDns((request) => {
-          assert.equal(request.questions[0]?.name, "custom.sandbox.test");
-          return {
-            answers: [
-              {
-                type: "A",
-                address,
-                ttl: 60,
-              },
-            ],
-          };
-        });
-      }
+      conn.accept();
     }),
   }).boot();
 }
@@ -514,7 +425,6 @@ async function bootWithCustomDns(address: string) {
 function observation(conn: NetworkConnectionRequest) {
   return {
     transport: conn.transport,
-    protocol: conn.protocol,
     srcIp: conn.src.ip,
     srcPort: conn.src.port,
     dstIp: conn.dst.ip,

@@ -111,36 +111,18 @@ pub struct NetworkConnectionAttempt {
     pub transport: NetworkProtocol,
     pub src: NetworkEndpoint,
     pub dst: NetworkEndpoint,
-    pub questions: Vec<DnsQuestion>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DnsQuestion {
-    pub name: String,
-    pub type_name: String,
-    pub class_name: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DnsPolicyAnswer {
-    pub answer_type: String,
-    pub name: Option<String>,
-    pub address: Option<String>,
-    pub target: Option<String>,
-    pub values: Vec<String>,
-    pub ttl: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DnsPolicyResponse {
-    pub code: String,
-    pub answers: Vec<DnsPolicyAnswer>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkPolicyDecision {
-    pub allowed: bool,
-    pub dns_response: Option<DnsPolicyResponse>,
+    pub action: NetworkPolicyAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkPolicyAction {
+    Deny,
+    Accept,
+    AcceptHttp,
 }
 
 pub trait NetworkPolicyRuntime: Send + Sync + std::fmt::Debug {
@@ -454,12 +436,11 @@ fn poll_dns_socket(
             ip: "10.0.2.1".to_string(),
             port: HOST_DNS_PORT,
         };
-        let decision = match decide_dns(policy, NetworkProtocol::Udp, src, dst, request) {
-            Ok(decision) if decision.allowed => decision,
+        match decide_dns(policy, NetworkProtocol::Udp, src, dst) {
+            Ok(decision) if decision.action != NetworkPolicyAction::Deny => {}
             _ => continue,
         };
-        let Some(response) = dns_response_with_decision(request, decision.dns_response.as_ref())
-        else {
+        let Some(response) = dns_response(request) else {
             continue;
         };
         let _ = socket.send_slice(
@@ -542,7 +523,7 @@ fn poll_udp_relay_socket(
                 port: destination.port,
             },
         );
-        if !decision.allowed {
+        if decision.action == NetworkPolicyAction::Deny {
             continue;
         }
         let flow = UdpFlow {
@@ -706,11 +687,11 @@ fn handle_tcp_dns_request(
         ip: "10.0.2.1".to_string(),
         port: HOST_DNS_PORT,
     };
-    let decision = match decide_dns(policy, NetworkProtocol::Tcp, src, dst, request) {
-        Ok(decision) if decision.allowed => decision,
+    match decide_dns(policy, NetworkProtocol::Tcp, src, dst) {
+        Ok(decision) if decision.action != NetworkPolicyAction::Deny => {}
         _ => return None,
     };
-    dns_response_with_decision(request, decision.dns_response.as_ref())
+    dns_response(request)
 }
 
 #[derive(Default)]
@@ -881,16 +862,21 @@ fn poll_plain_http_socket(
             port: destination.port,
         },
     );
-    if !decision.allowed {
+    if decision.action == NetworkPolicyAction::Deny {
         http_connections.remove(&handle);
         socket.abort();
         return;
     }
 
-    let connection = if port_is_probe(destination.port) {
-        HttpConnection::response(HOST_HTTP_PROBE_RESPONSE)
-    } else {
-        HttpConnection::intercept(destination, http, tls_authority)
+    let connection = match (port_is_probe(destination.port), decision.action) {
+        (true, _) => HttpConnection::response(HOST_HTTP_PROBE_RESPONSE),
+        (_, NetworkPolicyAction::Accept) => HttpConnection::raw_relay(destination),
+        (_, NetworkPolicyAction::AcceptHttp) => {
+            HttpConnection::intercept(destination, http, tls_authority)
+        }
+        (_, NetworkPolicyAction::Deny) => {
+            unreachable!("deny decision returned before connection creation")
+        }
     };
     let connection = http_connections.entry(handle).or_insert(connection);
     poll_http_connection(socket, connection);
@@ -1077,7 +1063,6 @@ fn policy_decision(
                 transport: protocol,
                 src,
                 dst,
-                questions: Vec::new(),
             })
         })
         .transpose()
@@ -1088,7 +1073,6 @@ fn dns_policy_decision(
     transport: NetworkProtocol,
     src: NetworkEndpoint,
     dst: NetworkEndpoint,
-    request: &[u8],
 ) -> io::Result<Option<NetworkPolicyDecision>> {
     policy
         .map(|policy| {
@@ -1097,7 +1081,6 @@ fn dns_policy_decision(
                 transport,
                 src,
                 dst,
-                questions: dns_questions(request).unwrap_or_default(),
             })
         })
         .transpose()
@@ -1105,15 +1088,13 @@ fn dns_policy_decision(
 
 fn default_allowed_decision() -> NetworkPolicyDecision {
     NetworkPolicyDecision {
-        allowed: true,
-        dns_response: None,
+        action: NetworkPolicyAction::Accept,
     }
 }
 
 fn denied_decision() -> NetworkPolicyDecision {
     NetworkPolicyDecision {
-        allowed: false,
-        dns_response: None,
+        action: NetworkPolicyAction::Deny,
     }
 }
 
@@ -1138,11 +1119,14 @@ fn decide_transport(
             NetworkProtocol::Dns => true,
         };
         return NetworkPolicyDecision {
-            allowed,
-            dns_response: None,
+            action: if allowed {
+                NetworkPolicyAction::Accept
+            } else {
+                NetworkPolicyAction::Deny
+            },
         };
     };
-    if decision.allowed {
+    if decision.action != NetworkPolicyAction::Deny {
         return decision;
     }
     decision
@@ -1153,9 +1137,8 @@ fn decide_dns(
     transport: NetworkProtocol,
     src: NetworkEndpoint,
     dst: NetworkEndpoint,
-    request: &[u8],
 ) -> io::Result<NetworkPolicyDecision> {
-    dns_policy_decision(policy, transport, src, dst, request)
+    dns_policy_decision(policy, transport, src, dst)
         .map(|decision| decision.unwrap_or_else(default_allowed_decision))
         .or_else(|_| Ok(denied_decision()))
 }
@@ -1223,15 +1206,7 @@ fn tcp_reset_frame_for_syn(frame: &[u8], packet: Ipv4TcpPacket) -> Option<Vec<u8
     Some(reset)
 }
 
-#[cfg(test)]
 fn dns_response(request: &[u8]) -> Option<Vec<u8>> {
-    dns_response_with_decision(request, None)
-}
-
-fn dns_response_with_decision(
-    request: &[u8],
-    policy_response: Option<&DnsPolicyResponse>,
-) -> Option<Vec<u8>> {
     if request.len() < 12 {
         return None;
     }
@@ -1247,10 +1222,6 @@ fn dns_response_with_decision(
     }
     let qtype = u16::from_be_bytes([request[question_end], request[question_end + 1]]);
     let qclass = u16::from_be_bytes([request[question_end + 2], request[question_end + 3]]);
-
-    if let Some(policy_response) = policy_response {
-        return dns_policy_response(request, question_end, &name, policy_response);
-    }
 
     let supported_question = qclass == 1 && qtype == 1;
     let answer = if supported_question {
@@ -1286,141 +1257,6 @@ fn dns_response_with_decision(
     }
 
     Some(response)
-}
-
-fn dns_policy_response(
-    request: &[u8],
-    question_end: usize,
-    question_name: &str,
-    policy_response: &DnsPolicyResponse,
-) -> Option<Vec<u8>> {
-    let mut answers = Vec::new();
-    for answer in &policy_response.answers {
-        let name = answer.name.as_deref().unwrap_or(question_name);
-        let encoded_name = encode_dns_answer_name(name, question_name)?;
-        let record = match answer.answer_type.as_str() {
-            "A" => {
-                let address = answer
-                    .address
-                    .as_deref()
-                    .and_then(|address| address.parse::<std::net::Ipv4Addr>().ok())?;
-                Some((encoded_name, 1u16, address.octets().to_vec()))
-            }
-            "AAAA" => {
-                let address = answer
-                    .address
-                    .as_deref()
-                    .and_then(|address| address.parse::<std::net::Ipv6Addr>().ok())?;
-                Some((encoded_name, 28u16, address.octets().to_vec()))
-            }
-            "CNAME" => {
-                let target = answer.target.as_deref()?;
-                Some((encoded_name, 5u16, encode_dns_name(target)?))
-            }
-            "TXT" => {
-                let mut rdata = Vec::new();
-                for value in &answer.values {
-                    let bytes = value.as_bytes();
-                    if bytes.len() > u8::MAX as usize {
-                        return None;
-                    }
-                    rdata.push(bytes.len() as u8);
-                    rdata.extend_from_slice(bytes);
-                }
-                Some((encoded_name, 16u16, rdata))
-            }
-            _ => None,
-        };
-        if let Some((name, record_type, rdata)) = record {
-            answers.push((name, answer.ttl, record_type, rdata));
-        }
-    }
-    let rcode = match policy_response.code.as_str() {
-        "NXDOMAIN" => 3,
-        "SERVFAIL" => 2,
-        "REFUSED" => 5,
-        _ => 0,
-    };
-    let mut response = Vec::new();
-    response.extend_from_slice(&request[0..2]);
-    response.extend_from_slice(&[0x81, 0x80 | rcode]);
-    response.extend_from_slice(&request[4..6]);
-    response.extend_from_slice(&(answers.len() as u16).to_be_bytes());
-    response.extend_from_slice(&[0, 0, 0, 0]);
-    response.extend_from_slice(&request[12..question_end + 4]);
-    for (name, ttl, record_type, rdata) in answers {
-        response.extend_from_slice(&name);
-        response.extend_from_slice(&record_type.to_be_bytes());
-        response.extend_from_slice(&1u16.to_be_bytes());
-        response.extend_from_slice(&ttl.to_be_bytes());
-        response.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
-        response.extend_from_slice(&rdata);
-    }
-    Some(response)
-}
-
-fn encode_dns_answer_name(name: &str, question_name: &str) -> Option<Vec<u8>> {
-    if name.eq_ignore_ascii_case(question_name) {
-        Some(vec![0xc0, 0x0c])
-    } else {
-        encode_dns_name(name)
-    }
-}
-
-fn encode_dns_name(name: &str) -> Option<Vec<u8>> {
-    let mut encoded = Vec::new();
-    for label in name.trim_end_matches('.').split('.') {
-        let bytes = label.as_bytes();
-        if bytes.is_empty() || bytes.len() > 63 {
-            return None;
-        }
-        encoded.push(bytes.len() as u8);
-        encoded.extend_from_slice(bytes);
-    }
-    encoded.push(0);
-    Some(encoded)
-}
-
-fn dns_questions(request: &[u8]) -> Option<Vec<DnsQuestion>> {
-    if request.len() < 12 {
-        return None;
-    }
-    let query_count = u16::from_be_bytes([request[4], request[5]]);
-    let mut questions = Vec::new();
-    let mut offset = 12;
-    for _ in 0..query_count {
-        let (name, question_end) = parse_dns_name(request, offset)?;
-        if request.len() < question_end + 4 {
-            return None;
-        }
-        let qtype = u16::from_be_bytes([request[question_end], request[question_end + 1]]);
-        let qclass = u16::from_be_bytes([request[question_end + 2], request[question_end + 3]]);
-        questions.push(DnsQuestion {
-            name,
-            type_name: dns_type_name(qtype).to_string(),
-            class_name: if qclass == 1 { "IN" } else { "UNKNOWN" }.to_string(),
-        });
-        offset = question_end + 4;
-    }
-    Some(questions)
-}
-
-fn dns_type_name(qtype: u16) -> &'static str {
-    match qtype {
-        1 => "A",
-        2 => "NS",
-        5 => "CNAME",
-        6 => "SOA",
-        12 => "PTR",
-        15 => "MX",
-        16 => "TXT",
-        28 => "AAAA",
-        33 => "SRV",
-        64 => "SVCB",
-        65 => "HTTPS",
-        257 => "CAA",
-        _ => "UNKNOWN",
-    }
 }
 
 fn parse_dns_name(packet: &[u8], mut offset: usize) -> Option<(String, usize)> {
@@ -1567,7 +1403,10 @@ impl LibkrunNetDevice {
             src,
             dst,
         );
-        if decision.allowed {
+        if decision.action == NetworkPolicyAction::Accept
+            || (decision.action == NetworkPolicyAction::AcceptHttp
+                && is_static_listener_port(packet.destination_port(frame)))
+        {
             return false;
         }
         let Some(reset) = tcp_reset_frame_for_syn(frame, packet) else {
@@ -1700,6 +1539,23 @@ impl HttpConnection {
             to_upstream: Vec::new(),
             close_after_flush: false,
         })
+    }
+
+    fn raw_relay(destination: HttpDestination) -> Self {
+        let mut connection = InterceptConnection {
+            destination,
+            runtime: None,
+            tls_authority: None,
+            state: InterceptState::ReadingHead {
+                guest_head: Vec::new(),
+            },
+            upstream: None,
+            to_guest: Vec::new(),
+            to_upstream: Vec::new(),
+            close_after_flush: false,
+        };
+        connection.start_raw_relay(Vec::new());
+        Self::Intercept(connection)
     }
 
     fn is_finished(&self) -> bool {
@@ -3091,7 +2947,7 @@ mod tests {
             },
         );
 
-        assert!(!decision.allowed);
+        assert_eq!(decision.action, NetworkPolicyAction::Deny);
     }
 
     #[test]
@@ -3107,11 +2963,10 @@ mod tests {
                 ip: "10.0.2.1".to_string(),
                 port: 53,
             },
-            &dns_query("localhost", 1),
         )
         .unwrap();
 
-        assert!(!decision.allowed);
+        assert_eq!(decision.action, NetworkPolicyAction::Deny);
     }
 
     #[test]
@@ -3231,74 +3086,6 @@ mod tests {
         assert_eq!(&response[6..8], &[0, 0]);
     }
 
-    #[test]
-    fn dns_policy_response_emits_supported_answer_types() {
-        let query = dns_query("policy.sandbox.test", 1);
-        let response = dns_response_with_decision(
-            &query,
-            Some(&DnsPolicyResponse {
-                code: "NOERROR".to_string(),
-                answers: vec![
-                    DnsPolicyAnswer {
-                        answer_type: "A".to_string(),
-                        name: None,
-                        address: Some("192.0.2.10".to_string()),
-                        target: None,
-                        values: Vec::new(),
-                        ttl: 60,
-                    },
-                    DnsPolicyAnswer {
-                        answer_type: "AAAA".to_string(),
-                        name: None,
-                        address: Some("2001:db8::10".to_string()),
-                        target: None,
-                        values: Vec::new(),
-                        ttl: 60,
-                    },
-                    DnsPolicyAnswer {
-                        answer_type: "CNAME".to_string(),
-                        name: None,
-                        address: None,
-                        target: Some("target.sandbox.test".to_string()),
-                        values: Vec::new(),
-                        ttl: 60,
-                    },
-                    DnsPolicyAnswer {
-                        answer_type: "TXT".to_string(),
-                        name: None,
-                        address: None,
-                        target: None,
-                        values: vec!["sandbox".to_string()],
-                        ttl: 60,
-                    },
-                ],
-            }),
-        )
-        .unwrap();
-
-        assert_eq!(&response[6..8], &4u16.to_be_bytes());
-        assert!(dns_response_answer_types(&response).contains(&1));
-        assert!(dns_response_answer_types(&response).contains(&28));
-        assert!(dns_response_answer_types(&response).contains(&5));
-        assert!(dns_response_answer_types(&response).contains(&16));
-    }
-
-    #[test]
-    fn dns_policy_response_can_return_nxdomain() {
-        let query = dns_query("missing.sandbox.test", 1);
-        let response = dns_response_with_decision(
-            &query,
-            Some(&DnsPolicyResponse {
-                code: "NXDOMAIN".to_string(),
-                answers: Vec::new(),
-            }),
-        )
-        .unwrap();
-
-        assert_eq!(&response[2..4], &[0x81, 0x83]);
-        assert_eq!(&response[6..8], &[0, 0]);
-    }
-
     fn dns_query(name: &str, qtype: u16) -> Vec<u8> {
         let mut query = Vec::new();
         query.extend_from_slice(&0x1234u16.to_be_bytes());
@@ -3315,44 +3102,6 @@ mod tests {
         query.extend_from_slice(&qtype.to_be_bytes());
         query.extend_from_slice(&1u16.to_be_bytes());
         query
-    }
-
-    fn dns_response_answer_types(response: &[u8]) -> Vec<u16> {
-        let question_count = u16::from_be_bytes([response[4], response[5]]) as usize;
-        let answer_count = u16::from_be_bytes([response[6], response[7]]) as usize;
-        let mut offset = 12;
-        for _ in 0..question_count {
-            let (_, question_end) = parse_dns_name(response, offset).unwrap();
-            offset = question_end + 4;
-        }
-        let mut answer_types = Vec::new();
-        for _ in 0..answer_count {
-            let name_end = skip_dns_name(response, offset).unwrap();
-            let answer_type = u16::from_be_bytes([response[name_end], response[name_end + 1]]);
-            let data_len =
-                u16::from_be_bytes([response[name_end + 8], response[name_end + 9]]) as usize;
-            answer_types.push(answer_type);
-            offset = name_end + 10 + data_len;
-        }
-        answer_types
-    }
-
-    fn skip_dns_name(packet: &[u8], mut offset: usize) -> Option<usize> {
-        loop {
-            let len = *packet.get(offset)?;
-            offset += 1;
-            if len == 0 {
-                return Some(offset);
-            }
-            if len & 0xc0 == 0xc0 {
-                packet.get(offset)?;
-                return Some(offset + 1);
-            }
-            if len > 63 || packet.len() < offset + usize::from(len) {
-                return None;
-            }
-            offset += usize::from(len);
-        }
     }
 
     fn tcp_frame(
