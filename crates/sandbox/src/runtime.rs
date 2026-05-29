@@ -19,7 +19,7 @@ use crate::config::{KernelFormat, RootfsFormat, RootfsStorageSpec};
 use crate::control::INIT_CONTROL_PORT;
 use crate::http_flow::HttpInterceptRuntime;
 use crate::network::OutboundRulePlan;
-use crate::network_service::{HostNetwork, MitmTlsConfig};
+use crate::network_service::{HostNetwork, MitmTlsConfig, NetworkPolicyRuntime};
 use crate::vfs::VirtioVirtualFsBackend;
 
 #[derive(Debug)]
@@ -31,6 +31,7 @@ pub struct KrunContext {
 #[derive(Default, Clone)]
 pub struct HostServices {
     pub http: Option<Arc<dyn HttpInterceptRuntime>>,
+    pub network_policy: Option<Arc<dyn NetworkPolicyRuntime>>,
     pub root_storage: Option<Arc<dyn CowBlockStore>>,
 }
 
@@ -143,8 +144,27 @@ impl KrunContext {
                     .map_err(|_| KrunError::new("NetworkPlan::from_spec", -libc::EINVAL))
             })
             .transpose()?;
-        let network = HostNetwork::new(tls_config, outbound_rules, _services.http.clone())
-            .map_err(|_| KrunError::new("HostNetwork::new", -libc::EIO))?;
+        let network_policy = if network
+            .policy
+            .as_ref()
+            .is_some_and(|policy| policy.connection_hook)
+        {
+            Some(
+                _services
+                    .network_policy
+                    .clone()
+                    .ok_or_else(|| KrunError::new("HostNetwork::new", -libc::EINVAL))?,
+            )
+        } else {
+            None
+        };
+        let network = HostNetwork::new(
+            tls_config,
+            outbound_rules,
+            _services.http.clone(),
+            network_policy,
+        )
+        .map_err(|_| KrunError::new("HostNetwork::new", -libc::EIO))?;
         let guest_fd = network.guest_fd();
         let mac = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xef];
         let features = 0;
@@ -309,27 +329,11 @@ impl KrunContext {
         let network_enabled = spec.network.is_some();
         let mount_env = CString::new(format!("SANDBOX_VIRTIOFS_MOUNTS={encoded_mounts}")).unwrap();
         let http_network_env = CString::new("SANDBOX_HTTP_NETWORK=1").unwrap();
-        let ca_env = spec
-            .network
-            .as_ref()
-            .and_then(|network| network.http.as_ref())
-            .and_then(|http| http.ca_certificate_pem.as_ref())
-            .map(|certificate| {
-                CString::new(format!(
-                    "SANDBOX_HTTP_CA_PEM_B64={}",
-                    base64::engine::general_purpose::STANDARD.encode(certificate)
-                ))
-            })
-            .transpose()
-            .map_err(|_| KrunError::new("krun_set_exec", -libc::EINVAL))?;
         let mut argv = vec![exec_path.as_ptr(), mount_arg.as_ptr()];
         let mut envp = vec![mount_env.as_ptr()];
         if network_enabled {
             argv.push(http_network_arg.as_ptr());
             envp.push(http_network_env.as_ptr());
-        }
-        if let Some(ca_env) = ca_env.as_ref() {
-            envp.push(ca_env.as_ptr());
         }
         argv.push(std::ptr::null());
         envp.push(std::ptr::null());
@@ -738,6 +742,7 @@ mod tests {
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
+            network_policy: None,
         })
         .unwrap();
 
@@ -760,10 +765,43 @@ mod tests {
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
+            network_policy: None,
         })
         .unwrap_err();
 
         assert_eq!(err.to_string(), "unsupported rootfs.format: raw");
+    }
+
+    #[test]
+    fn rejects_connection_hook_without_policy_runtime() {
+        let spec = MicroVmSpec::build(MicroVmSpecInput {
+            name: Some("network-policy-without-runtime".to_string()),
+            vcpus: Some(1),
+            memory_mib: Some(128),
+            kernel_format: None,
+            init_crate: "sandbox-init".to_string(),
+            rootfs_path: "rootfs.qcow2".to_string(),
+            rootfs_readonly: Some(true),
+            rootfs_format: "qcow2".to_string(),
+            rootfs_storage: None,
+            mounts: Vec::new(),
+            network_outbound: None,
+            network_http: None,
+            network_policy: Some(crate::config::NetworkPolicySpec {
+                connection_hook: true,
+            }),
+        })
+        .unwrap();
+        let mut context = KrunContext {
+            id: 0,
+            _networks: Vec::new(),
+        };
+
+        let error = context
+            .apply_network(&spec, &HostServices::default())
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "HostNetwork::new failed with -22");
     }
 
     #[test]
@@ -785,6 +823,7 @@ mod tests {
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
+            network_policy: None,
         })
         .unwrap();
 
@@ -821,6 +860,7 @@ mod tests {
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
+            network_policy: None,
         })
         .unwrap();
 
@@ -1027,6 +1067,7 @@ mod tests {
             mounts: Vec::new(),
             network_outbound: None,
             network_http: None,
+            network_policy: None,
         })
         .unwrap();
 

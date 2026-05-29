@@ -62,7 +62,14 @@ The Node/Rust boundary uses the signed `sandbox-host` helper process. Keep the T
 The guest init is a first-class binary in this repo. It should:
 
 1. Establish the host control channel.
-2. Install host-provided CA material into the guest trust store.
+2. Install host-provided CA material into the guest trust store. The guest has
+   minimal participation: init does not generate or manage certificates, it only
+   exposes the contract for installing a supplied public CA certificate. The
+   host exposes the CA through an internal read-only virtiofs mount, then init
+   installs it through the supplied rootfs' native trust-store mechanism.
+   Built-in rootfs launches that enable HTTP interception receive an ephemeral
+   writable COW view so this update is deterministic. If no supported native
+   installer is present, init fails closed.
 3. Configure networking for the chosen mode.
 4. Mount required virtual filesystems.
 5. Report readiness to the host.
@@ -157,7 +164,7 @@ await using vm = await sandbox.run();
 
 `network.outbound` decides reachability. HTTP hooks are default-allow request-header transforms. The origin selector is a host-side interest declaration: requests outside registered origins never cross into JavaScript. Matching hook mutations are applied only to the upstream request after the Rust data plane verifies the original destination and final upstream dial target are still allowed for that authority.
 
-The HTTP interception CA is Sandbox infrastructure, not public API. Guest init should receive Sandbox-generated CA material and update the guest trust store before starting the workload. Callers should only provide request-header hooks. If a future caller needs bring-your-own CA, that should be designed as a separate explicit capability rather than leaking certificate plumbing into the first API.
+The HTTP interception CA is Sandbox infrastructure, not public API. The host should generate CA material and pass only the public CA certificate to guest init, which installs it before starting the workload using the rootfs-discovered installer contract above. Callers should only provide request-header hooks. If a future caller needs bring-your-own CA, that should be designed as a separate explicit capability rather than leaking certificate plumbing into the first API.
 
 Host networking must cover:
 

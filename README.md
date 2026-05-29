@@ -116,8 +116,13 @@ const sandbox = defineSandbox({
     memoryMiB: 4096,
   },
   network: network.policy(async (conn) => {
-    if (conn.host === "api.github.com") {
-      conn.allowHttp(async (request) => {
+    if (conn.transport === "udp" && conn.dst.port === 53) {
+      conn.accept();
+      return;
+    }
+    if (conn.transport === "tcp" && conn.dst.port === 443) {
+      conn.acceptHttp(async (request) => {
+        if (request.destination.hostname !== "api.github.com") return;
         request.headers.set(
           "authorization",
           `Bearer ${await githubTokens.tokenForRequest(request)}`,
@@ -125,8 +130,6 @@ const sandbox = defineSandbox({
       });
       return;
     }
-
-    conn.allowHttp();
   }),
 });
 
@@ -225,33 +228,65 @@ connection requests and grants only the traffic it explicitly allows:
 
 ```ts
 const policy = network.policy(async (conn) => {
-  if (conn.host === "registry.npmjs.org") {
-    conn.allowHttp();
+  if (conn.transport === "tcp" && conn.dst.isPublicInternet() && conn.dst.port === 443) {
+    conn.accept();
   }
 });
 ```
 
-`conn.allow()` grants HTTP(S)-classified traffic without request middleware.
-`conn.allowHttp(...)` grants HTTP(S)-classified traffic and can apply request
-middleware:
+`conn.accept()` grants the observed connection or flow at the transport layer.
+It does not classify the application protocol, does not enter HTTP middleware,
+and does not MITM TLS. `conn.acceptHttp(...)` is TCP-only and explicitly opts
+the flow into Sandbox's HTTP-family enforcement path. If the accepted flow is
+not actually HTTP or HTTPS, it fails closed.
 
 ```ts
 const policy = network.policy(async (conn) => {
-  if (conn.host !== "api.example.com") return;
-
-  conn.allowHttp(async (request) => {
-    request.headers.set(
-      "authorization",
-      `Bearer ${await credentialBroker.authorizationFor(request)}`,
-    );
-  });
+  if (
+    conn.transport === "tcp" &&
+    conn.dst.isPublicInternet() &&
+    conn.dst.port === 443
+  ) {
+    conn.acceptHttp(async (request) => {
+      if (request.destination.hostname !== "api.example.com") return;
+      request.headers.set(
+        "authorization",
+        `Bearer ${await credentialBroker.authorizationFor(request)}`,
+      );
+    });
+  }
 });
 ```
 
+Every TCP and UDP policy request carries source and destination IP-layer
+endpoints:
+
+```ts
+conn.src.ip;
+conn.src.port;
+conn.dst.ip;
+conn.dst.port;
+```
+
+Endpoint helpers classify logical address ranges without relying on hostnames:
+`isLoopback()`, `isPrivate()`, `isLinkLocal()`, `isMulticast()`,
+`isBroadcast()`, `isDocumentation()`, `isReserved()`, and
+`isPublicInternet()`. `transport` is the TCP/UDP discriminator. TCP callbacks
+may also include `conn.signals` metadata such as TLS SNI or ALPN when the
+runtime has explicitly observed it, but Sandbox does not expose a best-effort
+`conn.protocol` classifier.
+
+HTTP middleware receives trusted destination metadata separately from the
+request URL. `request.destination.hostname` is populated only when Sandbox can
+pin the destination IP to trusted connection metadata, such as its own DNS
+answer cache. IP-addressed requests still work under `acceptHttp(...)`, but they
+do not advertise a hostname. Do not use the HTTP `Host` header as authority for
+policy decisions.
+
 Deny remains the default. If the policy callback does not create a grant, the
-connection is blocked. The `NetworkGrant` returned by `allow()` and
-`allowHttp()` is reserved as the future extension point for instance-local
-state, such as remembering a grant for a time window.
+connection is blocked. The grants returned by `accept()` and `acceptHttp()` are
+reserved as future extension points for instance-local state, such as
+remembering a grant for a time window.
 
 The runtime uses this policy shape to keep the JavaScript boundary explicit.
 Native rules can be added under the same model later without changing the
@@ -330,6 +365,14 @@ TypeScript API:
   decisions and delegate to JavaScript only when a policy callback is required.
 - HTTP request middleware is caller-provided JavaScript, but Sandbox owns the
   interception machinery and certificate plumbing.
+- When HTTP interception is enabled, the host generates the CA material and
+  passes only the public CA certificate to Sandbox init. Init does not generate
+  or manage certificates; the host exposes the supplied CA through an internal
+  read-only virtiofs mount, then init installs it using the selected rootfs'
+  native trust-store mechanism. Built-in rootfs launches use an ephemeral
+  writable COW view for HTTP interception so init can update the guest trust
+  store deterministically. If a rootfs does not provide a supported native
+  trust-store installer, init fails closed.
 
 The intended boundary is that Sandbox knows how to launch, isolate, mount,
 intercept, and enforce. User-space owns artifact selection, filesystem

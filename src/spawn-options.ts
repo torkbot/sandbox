@@ -41,5 +41,8 @@ export type HostSpawnSandboxOptions = {
         readonly origin: string;
       }[];
     };
+    readonly policy?: {
+      readonly connectionHook: true;
+    };
   };
 };

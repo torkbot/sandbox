@@ -74,6 +74,7 @@ impl HostIoBridge {
         let response_type = document.get_str("type").ok();
         if response_type != Some("host.vfs.response")
             && response_type != Some("host.http.response")
+            && response_type != Some("host.network.response")
             && response_type != Some("host.block.response")
         {
             return false;
@@ -144,6 +145,71 @@ impl NodeVirtualFs {
             .get(&u64::from(inode))
             .cloned()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown virtual inode"))
+    }
+}
+
+pub struct StaticFileVirtualFs {
+    name: String,
+    contents: Vec<u8>,
+}
+
+impl StaticFileVirtualFs {
+    pub fn new(
+        name: impl Into<String>,
+        contents: impl Into<Vec<u8>>,
+    ) -> Arc<dyn VirtioVirtualFsBackend> {
+        Arc::new(VirtualFsAdapter::new(Arc::new(Self {
+            name: name.into(),
+            contents: contents.into(),
+        })))
+    }
+}
+
+impl sandbox::vfs::HostVirtualFileSystem for StaticFileVirtualFs {
+    fn lookup(&self, parent: VirtualInode, name: &CStr) -> io::Result<VirtioFsEntry> {
+        let name = name.to_str().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "virtual path is not utf-8")
+        })?;
+        if u64::from(parent) == 1 && name == self.name {
+            return Ok(virtual_file_entry(2, self.contents.len() as u64));
+        }
+        Err(io::Error::from_raw_os_error(libc::ENOENT))
+    }
+
+    fn getattr(&self, inode: VirtualInode) -> io::Result<(bindings::stat64, Duration)> {
+        match u64::from(inode) {
+            1 => Ok((virtual_directory_entry(1).attr, Duration::from_secs(1))),
+            2 => Ok((
+                virtual_file_entry(2, self.contents.len() as u64).attr,
+                Duration::from_secs(1),
+            )),
+            _ => Err(io::Error::from_raw_os_error(libc::ENOENT)),
+        }
+    }
+
+    fn readdir(&self, inode: VirtualInode) -> io::Result<Vec<VirtioFsDirEntry>> {
+        if u64::from(inode) != 1 {
+            return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+        }
+        Ok(vec![VirtioFsDirEntry {
+            inode: 2,
+            type_: libc::DT_REG as u32,
+            name: self.name.as_bytes().to_vec(),
+        }])
+    }
+
+    fn read(&self, inode: VirtualInode, offset: u64, size: u32) -> io::Result<Vec<u8>> {
+        if u64::from(inode) != 2 {
+            return Err(io::Error::from_raw_os_error(libc::EISDIR));
+        }
+        let offset = usize::try_from(offset).unwrap_or(usize::MAX);
+        if offset >= self.contents.len() {
+            return Ok(Vec::new());
+        }
+        let end = offset
+            .saturating_add(size as usize)
+            .min(self.contents.len());
+        Ok(self.contents[offset..end].to_vec())
     }
 }
 

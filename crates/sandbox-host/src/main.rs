@@ -9,17 +9,21 @@ use bson::{Bson, Document, doc};
 use sandbox::block_storage::CowBlockStore;
 use sandbox::config::MountSpec;
 use sandbox::config::{
-    HttpRequestHeaderHookSpec, HttpSpecInput, MicroVmSpecInput, MountSpecInput, OutboundPolicy,
-    OutboundRuleSpec, OutboundSpec, RootfsStorageSpecInput,
+    HttpRequestHeaderHookSpec, HttpSpecInput, MicroVmSpecInput, MountSpecInput, NetworkPolicySpec,
+    OutboundPolicy, OutboundRuleSpec, OutboundSpec, RootfsStorageSpecInput,
 };
 use sandbox::http_flow::{
     HookBackedHttpInterceptRuntime, HttpHookExecutor, InterceptedHttpRequest,
+};
+use sandbox::network_service::{
+    NetworkConnectionAttempt, NetworkPolicyAction, NetworkPolicyDecision, NetworkPolicyRuntime,
+    NetworkProtocol,
 };
 use sandbox::runtime::{ControlSocket, HostServices, StartStatusObserver, VirtualFsDevice};
 
 mod host_vfs;
 
-use host_vfs::{HostIoBridge, NodeVirtualFs};
+use host_vfs::{HostIoBridge, NodeVirtualFs, StaticFileVirtualFs};
 
 const USAGE: &str = "usage: sandbox-host --capabilities | --stdio";
 
@@ -116,6 +120,7 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
     let virtual_fs = virtual_fs_devices(&spec, bridge.clone());
     let services = HostServices {
         http: http_intercept_runtime(&spec, bridge.clone())?,
+        network_policy: network_policy_runtime(&spec, bridge.clone()),
         root_storage: spec.rootfs.storage.as_ref().map(|storage| {
             Arc::new(NodeCowBlockStore::new(
                 bridge.clone(),
@@ -171,6 +176,17 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(error) => Err(format!("control bridge stopped: {error}").into()),
     }
+}
+
+fn network_policy_runtime(
+    spec: &sandbox::MicroVmSpec,
+    bridge: Arc<HostIoBridge>,
+) -> Option<Arc<dyn NetworkPolicyRuntime>> {
+    spec.network
+        .as_ref()
+        .and_then(|network| network.policy.as_ref())
+        .and_then(|policy| policy.connection_hook.then_some(()))
+        .map(|()| Arc::new(NodeNetworkPolicyRuntime { bridge }) as Arc<dyn NetworkPolicyRuntime>)
 }
 
 fn http_intercept_runtime(
@@ -236,25 +252,17 @@ impl RequestHookSelector {
             && canonical_authority(parts.scheme, parts.authority)
                 .is_ok_and(|authority| authority == self.authority)
     }
-
-    fn matches_rebound_authority(&self, scheme: &str, authority: &str) -> bool {
-        if self.scheme != scheme {
-            return false;
-        }
-        let Ok(authority) = canonical_authority(scheme, authority) else {
-            return false;
-        };
-        if self.authority == "*" {
-            return is_hostname(&authority);
-        }
-        authority == self.authority && is_hostname(&self.authority)
-    }
 }
 
 #[derive(Debug)]
 struct NodeHttpHookExecutor {
     bridge: Arc<HostIoBridge>,
     hooks: Vec<NodeRequestHeaderHook>,
+}
+
+#[derive(Debug)]
+struct NodeNetworkPolicyRuntime {
+    bridge: Arc<HostIoBridge>,
 }
 
 #[derive(Debug)]
@@ -352,6 +360,64 @@ impl CowBlockStore for NodeCowBlockStore {
     }
 }
 
+impl NetworkPolicyRuntime for NodeNetworkPolicyRuntime {
+    fn decide_connection(
+        &self,
+        connection: NetworkConnectionAttempt,
+    ) -> io::Result<NetworkPolicyDecision> {
+        let response = self.bridge.request(doc! {
+            "type": "host.network.connection",
+            "protocol": match connection.protocol {
+                NetworkProtocol::Tcp => "tcp",
+                NetworkProtocol::Udp => "udp",
+                NetworkProtocol::Dns => "dns",
+            },
+            "transport": match connection.transport {
+                NetworkProtocol::Tcp => "tcp",
+                NetworkProtocol::Udp => "udp",
+                NetworkProtocol::Dns => "dns",
+            },
+            "srcIp": connection.src.ip,
+            "srcPort": i32::from(connection.src.port),
+            "dstIp": connection.dst.ip,
+            "dstPort": i32::from(connection.dst.port),
+        })?;
+        let action = match response.get_str("action").unwrap_or("deny") {
+            "accept" => NetworkPolicyAction::Accept,
+            "acceptHttp" => NetworkPolicyAction::AcceptHttp,
+            "deny" => NetworkPolicyAction::Deny,
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported network policy action: {other}"),
+                ));
+            }
+        };
+        Ok(NetworkPolicyDecision { action })
+    }
+
+    fn connection_closed(&self, connection: NetworkConnectionAttempt) -> io::Result<()> {
+        self.bridge.request(doc! {
+            "type": "host.network.closed",
+            "protocol": match connection.protocol {
+                NetworkProtocol::Tcp => "tcp",
+                NetworkProtocol::Udp => "udp",
+                NetworkProtocol::Dns => "dns",
+            },
+            "transport": match connection.transport {
+                NetworkProtocol::Tcp => "tcp",
+                NetworkProtocol::Udp => "udp",
+                NetworkProtocol::Dns => "dns",
+            },
+            "srcIp": connection.src.ip,
+            "srcPort": i32::from(connection.src.port),
+            "dstIp": connection.dst.ip,
+            "dstPort": i32::from(connection.dst.port),
+        })?;
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct NodeRequestHeaderHook {
     id: String,
@@ -383,10 +449,11 @@ impl HttpHookExecutor for NodeHttpHookExecutor {
             },
             "method": request.method,
             "url": request.url,
+            "sourceIp": request.source.ip,
+            "sourcePort": i32::from(request.source.port),
             "originalDestinationIp": request.original_destination.ip,
             "originalDestinationPort": i32::from(request.original_destination.port),
-            "upstreamDialIp": request.upstream_dial.ip,
-            "upstreamDialPort": i32::from(request.upstream_dial.port),
+            "originalDestinationHostname": request.original_destination.hostname,
             "headers": request.headers.into_iter().map(|(name, value)| {
                 Bson::Array(vec![Bson::String(name), Bson::String(value)])
             }).collect::<Vec<_>>(),
@@ -396,30 +463,6 @@ impl HttpHookExecutor for NodeHttpHookExecutor {
             }),
         })?;
         response_header_pairs(&response)
-    }
-
-    fn rejects_rebound_authority(
-        &self,
-        scheme: &str,
-        authority: &str,
-        original_destination: &sandbox::http_flow::InterceptedDestination,
-        upstream_dial: &sandbox::http_flow::InterceptedDestination,
-    ) -> bool {
-        let candidate_hook_ids = self
-            .hooks
-            .iter()
-            .filter(|hook| hook.selector.matches_rebound_authority(scheme, authority))
-            .map(|hook| hook.id.clone())
-            .collect::<Vec<_>>();
-        if candidate_hook_ids.is_empty()
-            || !is_rebound_authority(authority, original_destination, upstream_dial)
-        {
-            return false;
-        }
-        match self.active_hook_ids(candidate_hook_ids) {
-            Ok(active_hook_ids) => !active_hook_ids.is_empty(),
-            Err(_) => true,
-        }
     }
 }
 
@@ -443,21 +486,6 @@ impl NodeHttpHookExecutor {
             })
             .collect()
     }
-}
-
-fn is_rebound_authority(
-    authority: &str,
-    original_destination: &sandbox::http_flow::InterceptedDestination,
-    upstream_dial: &sandbox::http_flow::InterceptedDestination,
-) -> bool {
-    let Some(host) = authority_host(authority) else {
-        return false;
-    };
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return false;
-    }
-    original_destination.ip != upstream_dial.ip
-        && (is_special_use_ip(&original_destination.ip) || is_special_use_ip(&upstream_dial.ip))
 }
 
 struct RequestUrlOrigin<'a> {
@@ -488,24 +516,6 @@ fn canonical_authority(scheme: &str, authority: &str) -> Result<String, String> 
     }
 }
 
-fn is_hostname(authority: &str) -> bool {
-    authority_host(authority)
-        .map(|host| host.parse::<std::net::IpAddr>().is_err())
-        .unwrap_or(false)
-}
-
-fn authority_host(authority: &str) -> Option<&str> {
-    let without_userinfo = authority.rsplit('@').next().unwrap_or(authority);
-    if let Some(rest) = without_userinfo.strip_prefix('[') {
-        return rest.split_once(']').map(|(host, _)| host);
-    }
-    Some(
-        without_userinfo
-            .split_once(':')
-            .map_or(without_userinfo, |(host, _)| host),
-    )
-}
-
 fn split_authority(authority: &str) -> (&str, Option<u16>) {
     if authority.starts_with('[') {
         let Some(end) = authority.find(']') else {
@@ -521,35 +531,6 @@ fn split_authority(authority: &str) -> (&str, Option<u16>) {
     match authority.rsplit_once(':') {
         Some((host, port)) if !host.contains(':') => (host, port.parse().ok()),
         _ => (authority, None),
-    }
-}
-
-fn is_special_use_ip(value: &str) -> bool {
-    match value.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(ip)) => {
-            let octets = ip.octets();
-            ip.is_private()
-                || ip.is_loopback()
-                || ip.is_link_local()
-                || ip.is_broadcast()
-                || ip.is_documentation()
-                || ip.is_unspecified()
-                || ip.is_multicast()
-                || octets[0] == 0
-                || octets[0] == 100 && (octets[1] & 0b1100_0000) == 0b0100_0000
-                || octets[0] == 192 && octets[1] == 0 && octets[2] == 0
-                || octets[0] == 192 && octets[1] == 88 && octets[2] == 99
-                || octets[0] == 198 && (octets[1] == 18 || octets[1] == 19)
-                || octets[0] >= 240
-        }
-        Ok(std::net::IpAddr::V6(ip)) => {
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_unique_local()
-                || ip.is_unicast_link_local()
-                || ip.is_multicast()
-        }
-        Err(_) => true,
     }
 }
 
@@ -595,21 +576,38 @@ fn virtual_fs_devices(
     spec: &sandbox::MicroVmSpec,
     bridge: std::sync::Arc<HostIoBridge>,
 ) -> Vec<VirtualFsDevice> {
-    spec.mounts
-        .iter()
-        .enumerate()
-        .filter_map(|(index, mount)| match mount {
-            MountSpec::VirtualFs { path, writable } => {
-                let tag = format!("vfs{index}");
-                Some(VirtualFsDevice {
-                    tag,
-                    path: path.clone(),
-                    readonly: !writable,
-                    backend: NodeVirtualFs::new(path.clone(), bridge.clone()),
-                })
-            }
+    let mut devices: Vec<VirtualFsDevice> = spec
+        .network
+        .as_ref()
+        .and_then(|network| network.http.as_ref())
+        .and_then(|http| http.ca_certificate_pem.as_ref())
+        .map(|certificate| {
+            vec![VirtualFsDevice {
+                tag: "sandbox-http-ca".to_string(),
+                path: "/run/sandbox/http-ca".to_string(),
+                readonly: true,
+                backend: StaticFileVirtualFs::new("http-ca.pem", certificate.as_bytes().to_vec()),
+            }]
         })
-        .collect()
+        .unwrap_or_default();
+
+    devices.extend(
+        spec.mounts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, mount)| match mount {
+                MountSpec::VirtualFs { path, writable } => {
+                    let tag = format!("vfs{index}");
+                    Some(VirtualFsDevice {
+                        tag,
+                        path: path.clone(),
+                        readonly: !writable,
+                        backend: NodeVirtualFs::new(path.clone(), bridge.clone()),
+                    })
+                }
+            }),
+    );
+    devices
 }
 
 fn parse_spawn(document: Document) -> Result<MicroVmSpecInput, Box<dyn std::error::Error>> {
@@ -635,7 +633,19 @@ fn parse_spawn(document: Document) -> Result<MicroVmSpecInput, Box<dyn std::erro
         mounts: parse_mounts(document.get_array("mounts")?)?,
         network_outbound: parse_network_outbound(document.get_document("networkOutbound").ok())?,
         network_http: parse_network_http(document.get_document("networkHttp").ok())?,
+        network_policy: parse_network_policy(document.get_document("networkPolicy").ok())?,
     })
+}
+
+fn parse_network_policy(
+    document: Option<&Document>,
+) -> Result<Option<NetworkPolicySpec>, Box<dyn std::error::Error>> {
+    let Some(document) = document else {
+        return Ok(None);
+    };
+    Ok(Some(NetworkPolicySpec {
+        connection_hook: document.get_bool("connectionHook")?,
+    }))
 }
 
 fn parse_rootfs_storage(
@@ -780,28 +790,4 @@ fn optional_i32(document: &Document, key: &str) -> Option<i32> {
 
 fn optional_bool(document: &Document, key: &str) -> Option<bool> {
     document.get_bool(key).ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::RequestHookSelector;
-
-    #[test]
-    fn wildcard_hook_selector_participates_in_rebind_checks_for_hostnames() {
-        let selector = RequestHookSelector::parse("https://*").unwrap();
-
-        assert!(selector.matches_rebound_authority("https", "registry.npmjs.org"));
-        assert!(selector.matches_rebound_authority("https", "registry.npmjs.org:443"));
-        assert!(!selector.matches_rebound_authority("https", "10.0.0.1"));
-        assert!(!selector.matches_rebound_authority("http", "registry.npmjs.org"));
-    }
-
-    #[test]
-    fn exact_hook_selector_still_checks_only_matching_hostname_authorities() {
-        let selector = RequestHookSelector::parse("https://registry.npmjs.org").unwrap();
-
-        assert!(selector.matches_rebound_authority("https", "registry.npmjs.org:443"));
-        assert!(!selector.matches_rebound_authority("https", "example.com"));
-        assert!(!selector.matches_rebound_authority("https", "104.16.0.1"));
-    }
 }

@@ -1,6 +1,7 @@
 import type {
   SandboxFileSystem,
   HttpRequestMiddleware,
+  NetworkConnectionRequestHandler,
   SandboxBlockStore,
   SandboxBlockStoreContext,
 } from "./index.ts";
@@ -41,6 +42,9 @@ export interface InternalNetworkConfig {
       readonly origin: string;
     }[];
   };
+  readonly policy?: {
+    readonly connectionHook: true;
+  };
 }
 
 export interface InternalMount {
@@ -73,5 +77,10 @@ export type RegisteredHttpRequestHeadersHook = {
   readonly id: string;
   readonly selector: SandboxHttpRequestSelector;
   readonly hook: HttpRequestMiddleware;
+  active: boolean;
+};
+
+export type RegisteredNetworkConnectionHook = {
+  readonly hook: NetworkConnectionRequestHandler;
   active: boolean;
 };

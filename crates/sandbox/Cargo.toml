@@ -7,19 +7,23 @@ repository.workspace = true
 
 [dependencies]
 base64 = "0.22"
-httparse = "1.10"
 imago = { version = "0.2.2", features = ["sync-wrappers", "vm-memory"] }
 rcgen = { version = "0.14.8", features = ["x509-parser"] }
 krun-devices = { path = "../../deps/libkrun/src/devices", default-features = false, features = ["blk", "net"] }
 krun = { package = "libkrun", path = "../../deps/libkrun/src/libkrun", default-features = false, features = ["blk", "net"] }
 libc = "0.2"
 ipnet = "2.11"
+rama-core = { git = "https://github.com/plabayo/rama", rev = "09ea1a0ff0cd5941ba65421ff5b0f263f6cf5211", version = "0.3.0-rc1" }
+rama-http-backend = { git = "https://github.com/plabayo/rama", rev = "09ea1a0ff0cd5941ba65421ff5b0f263f6cf5211", version = "0.3.0-rc1" }
+rama-tcp = { git = "https://github.com/plabayo/rama", rev = "09ea1a0ff0cd5941ba65421ff5b0f263f6cf5211", version = "0.3.0-rc1" }
+rama-net = { git = "https://github.com/plabayo/rama", rev = "09ea1a0ff0cd5941ba65421ff5b0f263f6cf5211", version = "0.3.0-rc1" }
+rama-tls-rustls = { git = "https://github.com/plabayo/rama", rev = "09ea1a0ff0cd5941ba65421ff5b0f263f6cf5211", version = "0.3.0-rc1", features = ["http", "ring"] }
 sandbox-protocol = { path = "../sandbox-protocol" }
 smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-raw", "socket-tcp", "socket-udp"] }
 rustls = "0.23.40"
 rustls-native-certs = "0.8"
-rama-core = { git = "https://github.com/plabayo/rama", rev = "09ea1a0ff0cd5941ba65421ff5b0f263f6cf5211", version = "0.3.0-rc1" }
 rama-http = { git = "https://github.com/plabayo/rama", rev = "09ea1a0ff0cd5941ba65421ff5b0f263f6cf5211", version = "0.3.0-rc1" }
+tokio = { version = "1.52", features = ["io-util", "rt-multi-thread", "sync"] }
 
 [build-dependencies]
 cc = "1.2"

@@ -183,6 +183,7 @@ mod tests {
                 ],
             }),
             http: None,
+            policy: None,
         }))
         .unwrap()
         .unwrap();

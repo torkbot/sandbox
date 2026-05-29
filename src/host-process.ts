@@ -14,7 +14,14 @@ import type {
 import type {
   InternalSandboxOptions,
   RegisteredHttpRequestHeadersHook,
+  RegisteredNetworkConnectionHook,
 } from "./launch-options.ts";
+import type {
+  NetworkConnectionRequest,
+  NetworkEndpoint,
+  NetworkTransport,
+  HttpRequestMiddleware,
+} from "./index.ts";
 
 const DEFAULT_LAUNCH_TIMEOUT_MS = 60_000;
 
@@ -31,6 +38,8 @@ export class HostProcessSandboxVm implements HostControlChannel {
   readonly #rootBlockStore?: SandboxBlockStore;
   readonly #rootBlockStoreContext?: SandboxBlockStoreContext;
   readonly #requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook>;
+  readonly #networkConnectionHook?: RegisteredNetworkConnectionHook;
+  readonly #httpMiddlewareByFlow = new Map<string, HttpRequestMiddleware | undefined>();
   #buffer = new Uint8Array();
   #stderr = "";
   #closed = false;
@@ -41,11 +50,13 @@ export class HostProcessSandboxVm implements HostControlChannel {
     child: ChildProcessWithoutNullStreams,
     options: InternalSandboxOptions,
     requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook>,
+    networkConnectionHook?: RegisteredNetworkConnectionHook,
   ) {
     this.#child = child;
     this.#options = options;
     this.packets = this.#packets;
     this.#requestHeaderHooks = requestHeaderHooks;
+    this.#networkConnectionHook = networkConnectionHook;
     this.#rootBlockStore = options.rootfs.storage?.blockStore;
     this.#rootBlockStoreContext = options.rootfs.storage?.context;
     for (const mount of options.mounts ?? []) {
@@ -91,6 +102,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
     options: InternalSandboxOptions,
     hostOptions: HostSpawnSandboxOptions,
     requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook> = new Map(),
+    networkConnectionHook?: RegisteredNetworkConnectionHook,
   ): Promise<HostProcessSandboxVm> {
     let vm: HostProcessSandboxVm | undefined;
     const hostPath = hostBinaryPath();
@@ -98,7 +110,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
       const child = spawn(hostPath, ["--stdio"], {
         stdio: ["pipe", "pipe", "pipe"],
       });
-      vm = new HostProcessSandboxVm(child, options, requestHeaderHooks);
+      vm = new HostProcessSandboxVm(child, options, requestHeaderHooks, networkConnectionHook);
       await Promise.race([
         once(child, "spawn"),
         once(child, "error").then(([error]) => {
@@ -270,6 +282,8 @@ export class HostProcessSandboxVm implements HostControlChannel {
       && type !== "host.vfs.removexattr"
       && type !== "host.http.requestHeaders"
       && type !== "host.http.activeRequestHeaderHooks"
+      && type !== "host.network.connection"
+      && type !== "host.network.closed"
       && type !== "host.block.list"
       && type !== "host.block.read"
       && type !== "host.block.write"
@@ -282,6 +296,10 @@ export class HostProcessSandboxVm implements HostControlChannel {
       void this.#handleHttpRequestHeaders(document);
     } else if (type === "host.http.activeRequestHeaderHooks") {
       void this.#handleActiveRequestHeaderHooks(document);
+    } else if (type === "host.network.connection") {
+      void this.#handleNetworkConnection(document);
+    } else if (type === "host.network.closed") {
+      this.#handleNetworkClosed(document);
     } else if (
       type === "host.block.list"
       || type === "host.block.read"
@@ -293,6 +311,90 @@ export class HostProcessSandboxVm implements HostControlChannel {
       void this.#handleVirtualFsRequest(document);
     }
     return true;
+  }
+
+  async #handleNetworkConnection(document: Record<string, unknown>): Promise<void> {
+    const id = typeof document.id === "string" ? document.id : "";
+    try {
+      const transport = assertNetworkTransport(document.transport);
+      const srcIp = assertString(document.srcIp, "srcIp");
+      const srcPort = assertNumber(document.srcPort, "srcPort");
+      const dstIp = assertString(document.dstIp, "dstIp");
+      const dstPort = assertNumber(document.dstPort, "dstPort");
+      const src = createNetworkEndpoint(srcIp, srcPort);
+      const dst = createNetworkEndpoint(dstIp, dstPort);
+      const decision: { action: "deny" | "accept" | "acceptHttp" } = { action: "deny" };
+      let httpMiddleware: HttpRequestMiddleware | undefined;
+      const accept = () => {
+        decision.action = "accept";
+        return {};
+      };
+      const connection: NetworkConnectionRequest = {
+        transport,
+        src,
+        dst,
+        accept,
+        ...(transport === "tcp"
+          ? {
+              acceptHttp(middleware?: HttpRequestMiddleware) {
+                decision.action = "acceptHttp";
+                httpMiddleware = middleware;
+                return {};
+              },
+            }
+          : {}),
+      } as NetworkConnectionRequest;
+
+      if (this.#networkConnectionHook?.active === true) {
+        await this.#networkConnectionHook.hook(connection);
+      }
+      if (decision.action === "acceptHttp") {
+        this.#httpMiddlewareByFlow.set(networkFlowKey(src, dst), httpMiddleware);
+      }
+
+      this.#tryWriteToHost(encodePacket({
+        type: "host.network.response",
+        id,
+        ok: true,
+        action: decision.action,
+      }));
+    } catch (error) {
+      this.#tryWriteToHost(encodePacket({
+        type: "host.network.response",
+        id,
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    }
+  }
+
+  #handleNetworkClosed(document: Record<string, unknown>): void {
+    const id = typeof document.id === "string" ? document.id : "";
+    try {
+      const transport = assertNetworkTransport(document.transport);
+      const srcIp = assertString(document.srcIp, "srcIp");
+      const srcPort = assertNumber(document.srcPort, "srcPort");
+      const dstIp = assertString(document.dstIp, "dstIp");
+      const dstPort = assertNumber(document.dstPort, "dstPort");
+      if (transport === "tcp") {
+        this.#httpMiddlewareByFlow.delete(networkFlowKey(
+          createNetworkEndpoint(srcIp, srcPort),
+          createNetworkEndpoint(dstIp, dstPort),
+        ));
+      }
+      this.#tryWriteToHost(encodePacket({
+        type: "host.network.response",
+        id,
+        ok: true,
+      }));
+    } catch (error) {
+      this.#tryWriteToHost(encodePacket({
+        type: "host.network.response",
+        id,
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    }
   }
 
   async #handleHttpRequestHeaders(document: Record<string, unknown>): Promise<void> {
@@ -308,13 +410,19 @@ export class HostProcessSandboxVm implements HostControlChannel {
         method: assertString(document.method, "method"),
         headers,
         destination: {
+          sourceIp: assertString(document.sourceIp, "sourceIp"),
+          sourcePort: assertNumber(document.sourcePort, "sourcePort"),
           originalIp: assertString(document.originalDestinationIp, "originalDestinationIp"),
           originalPort: assertNumber(document.originalDestinationPort, "originalDestinationPort"),
-          upstreamIp: assertString(document.upstreamDialIp, "upstreamDialIp"),
-          upstreamPort: assertNumber(document.upstreamDialPort, "upstreamDialPort"),
+          hostname: optionalString(document.originalDestinationHostname, "originalDestinationHostname"),
         },
         tls: optionalTlsMetadata(document.tls),
       };
+
+      await this.#httpMiddlewareByFlow.get(networkFlowKey(
+        createNetworkEndpoint(request.destination.sourceIp, request.destination.sourcePort),
+        createNetworkEndpoint(request.destination.originalIp, request.destination.originalPort),
+      ))?.(request);
 
       for (const hookId of hookIds) {
         const registration = this.#requestHeaderHooks.get(hookId);
@@ -810,6 +918,119 @@ function assertProtocol(value: unknown): "http/1.1" | "h2" {
   throw new Error("host request protocol must be http/1.1 or h2");
 }
 
+function assertNetworkTransport(value: unknown): NetworkTransport {
+  if (value === "tcp" || value === "udp") {
+    return value;
+  }
+  throw new Error("host network request transport must be tcp or udp");
+}
+
+function createNetworkEndpoint(ip: string, port: number): NetworkEndpoint {
+  return {
+    ip,
+    port,
+    isLoopback: () => isLoopbackIp(ip),
+    isPrivate: () => isPrivateIp(ip),
+    isLinkLocal: () => isLinkLocalIp(ip),
+    isMulticast: () => isMulticastIp(ip),
+    isBroadcast: () => ip === "255.255.255.255",
+    isDocumentation: () => isDocumentationIp(ip),
+    isReserved: () => isReservedIp(ip),
+    isPublicInternet: () => isPublicInternetIp(ip),
+  };
+}
+
+function networkFlowKey(src: NetworkEndpoint, dst: NetworkEndpoint): string {
+  return `${src.ip}:${src.port}->${dst.ip}:${dst.port}`;
+}
+
+function isLoopbackIp(ip: string): boolean {
+  const ipv4 = parseIpv4(ip);
+  if (ipv4 !== undefined) {
+    return ipv4[0] === 127;
+  }
+  return ip.toLowerCase() === "::1";
+}
+
+function isPrivateIp(ip: string): boolean {
+  const ipv4 = parseIpv4(ip);
+  if (ipv4 !== undefined) {
+    return ipv4[0] === 10
+      || (ipv4[0] === 172 && ipv4[1] >= 16 && ipv4[1] <= 31)
+      || (ipv4[0] === 192 && ipv4[1] === 168);
+  }
+  const lower = ip.toLowerCase();
+  return lower.startsWith("fc") || lower.startsWith("fd");
+}
+
+function isLinkLocalIp(ip: string): boolean {
+  const ipv4 = parseIpv4(ip);
+  if (ipv4 !== undefined) {
+    return ipv4[0] === 169 && ipv4[1] === 254;
+  }
+  return /^fe[89ab]/i.test(ip);
+}
+
+function isMulticastIp(ip: string): boolean {
+  const ipv4 = parseIpv4(ip);
+  if (ipv4 !== undefined) {
+    return ipv4[0] >= 224 && ipv4[0] <= 239;
+  }
+  return ip.toLowerCase().startsWith("ff");
+}
+
+function isDocumentationIp(ip: string): boolean {
+  const ipv4 = parseIpv4(ip);
+  if (ipv4 !== undefined) {
+    return (ipv4[0] === 192 && ipv4[1] === 0 && ipv4[2] === 2)
+      || (ipv4[0] === 198 && ipv4[1] === 51 && ipv4[2] === 100)
+      || (ipv4[0] === 203 && ipv4[1] === 0 && ipv4[2] === 113);
+  }
+  return ip.toLowerCase().startsWith("2001:db8:");
+}
+
+function isReservedIp(ip: string): boolean {
+  const ipv4 = parseIpv4(ip);
+  if (ipv4 !== undefined) {
+    return ipv4[0] === 0
+      || (ipv4[0] === 100 && ipv4[1] >= 64 && ipv4[1] <= 127)
+      || (ipv4[0] === 192 && ipv4[1] === 0 && ipv4[2] === 0)
+      || (ipv4[0] === 192 && ipv4[1] === 88 && ipv4[2] === 99)
+      || (ipv4[0] === 198 && (ipv4[1] === 18 || ipv4[1] === 19))
+      || ipv4[0] >= 240
+      || isDocumentationIp(ip);
+  }
+  return ip.toLowerCase().startsWith("2001:db8:");
+}
+
+function isPublicInternetIp(ip: string): boolean {
+  return parseIpv4(ip) !== undefined
+    && !isLoopbackIp(ip)
+    && !isPrivateIp(ip)
+    && !isLinkLocalIp(ip)
+    && !isMulticastIp(ip)
+    && !isReservedIp(ip)
+    && !isDocumentationIp(ip)
+    && ip !== "255.255.255.255";
+}
+
+function parseIpv4(ip: string): [number, number, number, number] | undefined {
+  const parts = ip.split(".");
+  if (parts.length !== 4) {
+    return undefined;
+  }
+  const octets = parts.map((part) => {
+    if (!/^(0|[1-9][0-9]{0,2})$/.test(part)) {
+      return undefined;
+    }
+    const value = Number(part);
+    return value <= 255 ? value : undefined;
+  });
+  return octets.every((part) => part !== undefined)
+    ? octets as [number, number, number, number]
+    : undefined;
+}
+
 function optionalTlsMetadata(value: unknown): { readonly sni?: string; readonly alpn?: string } | undefined {
   if (value === undefined || value === null) {
     return undefined;
@@ -826,6 +1047,10 @@ function optionalTlsMetadata(value: unknown): { readonly sni?: string; readonly 
       ? undefined
       : assertString(document.alpn, "tls.alpn"),
   };
+}
+
+function optionalString(value: unknown, field: string): string | undefined {
+  return value === undefined || value === null ? undefined : assertString(value, field);
 }
 
 function binaryField(value: unknown, field: string): Uint8Array {
@@ -1017,6 +1242,7 @@ function encodeHostSpawn(options: HostSpawnSandboxOptions): Uint8Array {
     mounts: options.mounts ?? [],
     networkOutbound: options.network?.outbound,
     networkHttp: options.network?.http === undefined ? undefined : options.network.http,
+    networkPolicy: options.network?.policy === undefined ? undefined : options.network.policy,
   });
 }
 

@@ -3,6 +3,7 @@
 //! The public Node.js API will live above this crate. This crate owns the
 //! libkrun boundary, host services, and guest-control protocol types.
 
+mod async_bridge;
 pub mod block_storage;
 pub mod config;
 pub mod control;

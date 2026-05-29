@@ -16,6 +16,7 @@ import type {
   InternalNetworkConfig,
   InternalSandboxOptions,
   RegisteredHttpRequestHeadersHook,
+  RegisteredNetworkConnectionHook,
   SandboxHttpRequestSelector,
 } from "./launch-options.ts";
 
@@ -75,19 +76,46 @@ export interface MemoryFileSystemOptions {
   readonly files?: Readonly<Record<string, string | Uint8Array>>;
 }
 
+/**
+ * HTTP request metadata exposed to HTTP network policy middleware.
+ *
+ * The request is already classified as HTTP or HTTPS and can be inspected or
+ * mutated before it is forwarded upstream.
+ */
 export interface SandboxHttpRequest {
+  /** HTTP version used by the intercepted request. */
   readonly protocol: "http/1.1" | "h2";
+  /** Absolute URL reconstructed from the request target and destination metadata. */
   readonly url: URL;
+  /** HTTP method exactly as received from the guest. */
   readonly method: string;
+  /** Mutable request headers. Changes are applied before forwarding upstream. */
   readonly headers: Headers;
+  /** IP-layer addressing observed for the connection carrying this request. */
   readonly destination: {
+    /** Guest source IP address for the connection carrying this request. */
+    readonly sourceIp: string;
+    /** Guest source port for the connection carrying this request. */
+    readonly sourcePort: number;
+    /** Original destination IP address before host-side routing or proxying. */
     readonly originalIp: string;
+    /** Original destination port before host-side routing or proxying. */
     readonly originalPort: number;
-    readonly upstreamIp: string;
-    readonly upstreamPort: number;
+    /**
+     * Hostname pinned by trusted connection metadata, when known.
+     *
+     * For cleartext HTTP this is populated only from the sandbox DNS answer
+     * that resolved the destination IP. For HTTPS, use `tls.sni` for the
+     * client-provided server name. The HTTP `Host` header is not trusted for
+     * this field.
+     */
+    readonly hostname?: string;
   };
+  /** TLS metadata when the request was carried over HTTPS. */
   readonly tls?: {
+    /** Server Name Indication sent by the guest, when present. */
     readonly sni?: string;
+    /** Negotiated ALPN protocol, when present. */
     readonly alpn?: string;
   };
 }
@@ -139,29 +167,150 @@ export interface SandboxBlockStore {
   flush?(context: SandboxBlockStoreContext): Promise<void>;
 }
 
+/**
+ * Middleware invoked for an HTTP request allowed by a network policy.
+ *
+ * Middleware may mutate `request.headers` to add, replace, or remove outbound
+ * request headers before the request leaves the sandbox boundary.
+ */
 export type HttpRequestMiddleware = (
   request: SandboxHttpRequest,
 ) => void | Promise<void>;
 
+/**
+ * Opaque grant returned by `conn.accept()`.
+ *
+ * Grants intentionally carry no public fields today. They reserve a stable
+ * extension point for future instance-local grant state.
+ */
 export interface NetworkGrant {
 }
 
+/**
+ * Opaque grant returned by `conn.acceptHttp(...)`.
+ *
+ * HTTP grants are distinct from generic network grants so future HTTP-specific
+ * policy state can remain type-safe.
+ */
 export interface HttpNetworkGrant extends NetworkGrant {
 }
 
-export interface NetworkConnectionRequest {
-  readonly transport: "tcp" | "udp";
-  readonly host?: string;
-  readonly ip?: string;
+/** IP transport observed by the network policy hook. */
+export type NetworkTransport = "tcp" | "udp";
+
+/**
+ * Source or destination endpoint for a network policy event.
+ *
+ * Endpoint helpers classify the IP address only. They do not use DNS names,
+ * HTTP host headers, TLS SNI, or any other application-layer metadata.
+ */
+export interface NetworkEndpoint {
+  /** Numeric IP address observed at the sandbox network boundary. */
+  readonly ip: string;
+  /** Transport-layer port observed at the sandbox network boundary. */
   readonly port: number;
-  /**
-   * Allows HTTP(S)-classified traffic for this connection without request middleware.
-   * Raw non-HTTP egress is not exposed by the first public policy API.
-   */
-  allow(): NetworkGrant;
-  allowHttp(middleware?: HttpRequestMiddleware): HttpNetworkGrant;
+  /** True for IPv4 and IPv6 loopback addresses. */
+  isLoopback(): boolean;
+  /** True for private-use address ranges such as RFC 1918 and IPv6 ULA. */
+  isPrivate(): boolean;
+  /** True for link-local address ranges. */
+  isLinkLocal(): boolean;
+  /** True for multicast address ranges. */
+  isMulticast(): boolean;
+  /** True for the IPv4 limited broadcast address. */
+  isBroadcast(): boolean;
+  /** True for documentation and example address ranges. */
+  isDocumentation(): boolean;
+  /** True for reserved or otherwise non-public address ranges. */
+  isReserved(): boolean;
+  /** True when the address is not classified as local, private, reserved, or documentation. */
+  isPublicInternet(): boolean;
 }
 
+/**
+ * Explicit application-layer signals observed for a policy event.
+ *
+ * This object intentionally does not classify the protocol. It only exposes
+ * protocol signals the runtime actually observed, such as TLS SNI or ALPN.
+ */
+export interface NetworkApplicationSignals {
+  /** ALPN protocol names offered or negotiated for the flow, when observed. */
+  readonly alpn?: readonly string[];
+  /** TLS Server Name Indication, when observed. */
+  readonly sni?: string;
+}
+
+/** TCP endpoint for a TCP network policy event. */
+export interface TcpNetworkEndpoint extends NetworkEndpoint {
+  readonly port: number;
+}
+
+/** UDP endpoint for a UDP network policy event. */
+export interface UdpNetworkEndpoint extends NetworkEndpoint {
+  readonly port: number;
+}
+
+/**
+ * Common fields shared by all network policy events.
+ *
+ * `transport` is the only stable discriminant. Higher-level protocol semantics
+ * are opt-in through protocol-specific accept helpers.
+ */
+export interface NetworkConnectionRequestBase<TTransport extends NetworkTransport> {
+  /** IP transport that carried this event. Narrows TCP vs UDP request shapes. */
+  readonly transport: TTransport;
+  /** Source endpoint observed at the sandbox network boundary. */
+  readonly src: NetworkEndpoint;
+  /** Destination endpoint observed at the sandbox network boundary. */
+  readonly dst: NetworkEndpoint;
+  /**
+   * Accepts this observed connection, request, or flow using transport-level
+   * semantics.
+   */
+  accept(): NetworkGrant;
+}
+
+/**
+ * TCP transport policy event.
+ *
+ * This event grants or denies TCP reachability for the observed flow.
+ */
+export interface TcpNetworkConnectionRequest extends NetworkConnectionRequestBase<"tcp"> {
+  readonly src: TcpNetworkEndpoint;
+  readonly dst: TcpNetworkEndpoint;
+  /** Explicit application-layer signals observed for this TCP flow. */
+  readonly signals?: NetworkApplicationSignals;
+  /**
+   * Accepts this TCP flow only through Sandbox's HTTP-family enforcement path.
+   *
+   * If the flow is not HTTP or HTTPS, the connection fails closed. Plain
+   * `accept()` leaves bytes untouched and never enters HTTP middleware or MITM.
+   */
+  acceptHttp(middleware?: HttpRequestMiddleware): HttpNetworkGrant;
+}
+
+/**
+ * UDP transport policy event.
+ *
+ * UDP is connectionless, so `accept()` permits the observed UDP flow according
+ * to the runtime's flow-tracking semantics rather than establishing a stream.
+ */
+export interface UdpNetworkConnectionRequest extends NetworkConnectionRequestBase<"udp"> {
+  readonly src: UdpNetworkEndpoint;
+  readonly dst: UdpNetworkEndpoint;
+}
+
+/**
+ * Network policy event passed to `network.policy(...)`.
+ *
+ * Use `transport` to branch on TCP vs UDP. Protocol-specific behavior is only
+ * entered through explicit helpers such as `acceptHttp(...)`.
+ */
+export type NetworkConnectionRequest =
+  | TcpNetworkConnectionRequest
+  | UdpNetworkConnectionRequest;
+
+/** Callback invoked whenever the sandbox asks user policy to allow network egress. */
 export type NetworkConnectionRequestHandler = (
   connection: NetworkConnectionRequest,
 ) => void | Promise<void>;
@@ -169,12 +318,14 @@ export type NetworkConnectionRequestHandler = (
 const networkPolicyHandler: unique symbol = Symbol("networkPolicyHandler");
 
 export type NetworkPolicy = {
+  /** Identifies this value as a network policy definition. */
   readonly kind: "network-policy";
   readonly [networkPolicyHandler]: NetworkConnectionRequestHandler;
 };
 
 type NetworkPolicyHookRegistration = {
   readonly hooks: readonly RegisteredHttpRequestHeadersHook[];
+  readonly connectionHook: RegisteredNetworkConnectionHook;
   readonly network: InternalNetworkConfig;
 };
 
@@ -302,7 +453,12 @@ class DefinedSandbox implements SandboxDefinition {
     const networkPolicy = this.#options.network === undefined
       ? undefined
       : createNetworkPolicyHookRegistration(this.#options.network);
-    const launchOptions = await toInternalSandboxOptions(this.#options, options, networkPolicy?.network);
+    const launchOptions = await toInternalSandboxOptions(
+      this.#options,
+      options,
+      networkPolicy?.network,
+      (networkPolicy?.hooks.length ?? 0) > 0,
+    );
     try {
       validateInternalSandboxOptions(launchOptions);
       const hostOptions = toHostSpawnOptions(launchOptions, networkPolicy?.hooks ?? []);
@@ -310,6 +466,7 @@ class DefinedSandbox implements SandboxDefinition {
         launchOptions,
         hostOptions,
         new Map((networkPolicy?.hooks ?? []).map((hook) => [hook.id, hook])),
+        networkPolicy?.connectionHook,
       );
       return new HostBackedSandboxVm(hostVm, launchOptions);
     } catch (error) {
@@ -508,6 +665,7 @@ function toHostSpawnOptions(
             origin: hook.selector.origin,
           })),
         },
+      policy: options.network?.policy,
     };
 
   return {
@@ -539,8 +697,9 @@ async function toInternalSandboxOptions(
   config: SandboxDefinitionOptions,
   boot: SandboxBootOptions,
   network?: InternalNetworkConfig,
+  httpInterception = false,
 ): Promise<InternalSandboxOptions> {
-  const rootfs = await lowerRootfs(config.rootfs);
+  const rootfs = await lowerRootfs(config.rootfs, { httpInterception });
   return {
     resources: config.resources,
     rootfs,
@@ -557,36 +716,7 @@ async function toInternalSandboxOptions(
 
 function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPolicyHookRegistration {
   const hook: HttpRequestMiddleware = async (request) => {
-    const grants: Array<{
-      readonly kind: "http";
-      readonly middleware?: HttpRequestMiddleware;
-    }> = [];
-    const connection: NetworkConnectionRequest = {
-      transport: "tcp",
-      host: request.url.hostname,
-      ip: request.destination.upstreamIp,
-      port: request.destination.upstreamPort,
-      allow() {
-        grants.push({ kind: "http" });
-        return {};
-      },
-      allowHttp(middleware?: HttpRequestMiddleware) {
-        grants.push({ kind: "http", middleware });
-        return {};
-      },
-    };
-
-    await policy[networkPolicyHandler](connection);
-
-    if (grants.length === 0) {
-      throw new Error(`network connection denied: ${request.url.origin}`);
-    }
-
-    for (const grant of grants) {
-      if (grant.kind === "http") {
-        await grant.middleware?.(request);
-      }
-    }
+    void request;
   };
   const hooks: RegisteredHttpRequestHeadersHook[] = [
     {
@@ -604,11 +734,19 @@ function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPoli
   ];
   return {
     hooks,
+    connectionHook: {
+      hook: policy[networkPolicyHandler],
+      active: true,
+    },
     network: {
+      policy: {
+        connectionHook: true,
+      },
       outbound: {
         policy: "deny",
         rules: [
           { action: "accept", scope: "public-internet", ports: [] },
+          { action: "accept", protocol: "tcp", cidr: "10.0.2.1/32", ports: [53] },
           { action: "accept", protocol: "udp", cidr: "10.0.2.1/32", ports: [53] },
         ],
       },
@@ -616,31 +754,183 @@ function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPoli
   };
 }
 
+function createNetworkEndpoint(ip: string, port: number): NetworkEndpoint {
+  return {
+    ip,
+    port,
+    isLoopback: () => isLoopbackIp(ip),
+    isPrivate: () => isPrivateIp(ip),
+    isLinkLocal: () => isLinkLocalIp(ip),
+    isMulticast: () => isMulticastIp(ip),
+    isBroadcast: () => ip === "255.255.255.255",
+    isDocumentation: () => isDocumentationIp(ip),
+    isReserved: () => isReservedIp(ip),
+    isPublicInternet: () => isPublicInternetIp(ip),
+  };
+}
+
+function isLoopbackIp(ip: string): boolean {
+  const ipv4 = parseIpv4(ip);
+  if (ipv4 !== undefined) {
+    return ipv4[0] === 127;
+  }
+  return normalizeIpv6(ip) === "::1";
+}
+
+function isPrivateIp(ip: string): boolean {
+  const ipv4 = parseIpv4(ip);
+  if (ipv4 !== undefined) {
+    return ipv4[0] === 10
+      || (ipv4[0] === 172 && ipv4[1] >= 16 && ipv4[1] <= 31)
+      || (ipv4[0] === 192 && ipv4[1] === 168);
+  }
+  return ipv6StartsWith(ip, "fc") || ipv6StartsWith(ip, "fd");
+}
+
+function isLinkLocalIp(ip: string): boolean {
+  const ipv4 = parseIpv4(ip);
+  if (ipv4 !== undefined) {
+    return ipv4[0] === 169 && ipv4[1] === 254;
+  }
+  return ipv6StartsWith(ip, "fe8")
+    || ipv6StartsWith(ip, "fe9")
+    || ipv6StartsWith(ip, "fea")
+    || ipv6StartsWith(ip, "feb");
+}
+
+function isMulticastIp(ip: string): boolean {
+  const ipv4 = parseIpv4(ip);
+  if (ipv4 !== undefined) {
+    return ipv4[0] >= 224 && ipv4[0] <= 239;
+  }
+  return ipv6StartsWith(ip, "ff");
+}
+
+function isDocumentationIp(ip: string): boolean {
+  const ipv4 = parseIpv4(ip);
+  if (ipv4 !== undefined) {
+    return (ipv4[0] === 192 && ipv4[1] === 0 && ipv4[2] === 2)
+      || (ipv4[0] === 198 && ipv4[1] === 51 && ipv4[2] === 100)
+      || (ipv4[0] === 203 && ipv4[1] === 0 && ipv4[2] === 113);
+  }
+  return normalizeIpv6(ip).startsWith("2001:db8:");
+}
+
+function isReservedIp(ip: string): boolean {
+  const ipv4 = parseIpv4(ip);
+  if (ipv4 !== undefined) {
+    return ipv4[0] === 0
+      || (ipv4[0] === 100 && ipv4[1] >= 64 && ipv4[1] <= 127)
+      || (ipv4[0] === 192 && ipv4[1] === 0 && ipv4[2] === 0)
+      || (ipv4[0] === 192 && ipv4[1] === 88 && ipv4[2] === 99)
+      || (ipv4[0] === 198 && (ipv4[1] === 18 || ipv4[1] === 19))
+      || ipv4[0] >= 240
+      || isDocumentationIp(ip);
+  }
+  return normalizeIpv6(ip).startsWith("2001:db8:");
+}
+
+function isPublicInternetIp(ip: string): boolean {
+  return parseIpv4(ip) !== undefined
+    && !isLoopbackIp(ip)
+    && !isPrivateIp(ip)
+    && !isLinkLocalIp(ip)
+    && !isMulticastIp(ip)
+    && !isReservedIp(ip)
+    && !isDocumentationIp(ip)
+    && ip !== "255.255.255.255";
+}
+
+function parseIpv4(ip: string): [number, number, number, number] | undefined {
+  const parts = ip.split(".");
+  if (parts.length !== 4) {
+    return undefined;
+  }
+  const octets = parts.map((part) => {
+    if (!/^(0|[1-9][0-9]{0,2})$/.test(part)) {
+      return undefined;
+    }
+    const value = Number(part);
+    return value <= 255 ? value : undefined;
+  });
+  return octets.every((part) => part !== undefined)
+    ? octets as [number, number, number, number]
+    : undefined;
+}
+
+function normalizeIpv6(ip: string): string {
+  return ip.toLowerCase();
+}
+
+function ipv6StartsWith(ip: string, prefix: string): boolean {
+  return parseIpv4(ip) === undefined && normalizeIpv6(ip).startsWith(prefix);
+}
+
 async function lowerRootfs(
   rootfs: Rootfs,
+  options: {
+    readonly httpInterception?: boolean;
+  } = {},
 ): Promise<InternalSandboxOptions["rootfs"]> {
   switch (rootfs.kind) {
-    case "built-in-rootfs":
+    case "built-in-rootfs": {
+      if (options.httpInterception === true) {
+        return lowerCowRootfs(rootfs, createEphemeralCowBlockStore());
+      }
       return {
         path: builtInRootfsPath(rootfs.name),
         readonly: true,
         format: "qcow2",
       };
+    }
     case "cow-rootfs":
-      return {
-        path: builtInRootfsPath(rootfs.base.name),
-        readonly: false,
-        format: "qcow2",
-        storage: {
-          kind: "cow-block-store",
-          blockSize: rootfs.writable.blockSize,
-          blockStore: rootfs.writable,
-          context: {
-            base: builtInRootfsIdentity(rootfs.base.name),
-          },
-        },
-      };
+      return lowerCowRootfs(rootfs.base, rootfs.writable);
   }
+}
+
+function lowerCowRootfs(
+  base: BuiltInRootfsConfig,
+  writable: SandboxBlockStore,
+): InternalSandboxOptions["rootfs"] {
+  return {
+    path: builtInRootfsPath(base.name),
+    readonly: false,
+    format: "qcow2",
+    storage: {
+      kind: "cow-block-store",
+      blockSize: writable.blockSize,
+      blockStore: writable,
+      context: {
+        base: builtInRootfsIdentity(base.name),
+      },
+    },
+  };
+}
+
+function createEphemeralCowBlockStore(): SandboxBlockStore {
+  const blocks = new Map<bigint, Uint8Array>();
+  return {
+    blockSize: 65536,
+    async list() {
+      return Array.from(blocks.keys());
+    },
+    async read(range) {
+      const chunks: SandboxBlockChunk[] = [];
+      for (let offset = 0; offset < range.count; offset += 1) {
+        const start = range.start + BigInt(offset);
+        const data = blocks.get(start);
+        if (data !== undefined) {
+          chunks.push({ start, data: data.slice() });
+        }
+      }
+      return chunks;
+    },
+    async write(chunks) {
+      for (const chunk of chunks) {
+        blocks.set(chunk.start, chunk.data.slice());
+      }
+    },
+  };
 }
 
 function validateRootfs(rootfs: Rootfs): void {
