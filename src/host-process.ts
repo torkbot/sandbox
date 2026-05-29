@@ -333,10 +333,14 @@ export class HostProcessSandboxVm implements HostControlChannel {
       const hostname = optionalString(document.hostname, "hostname");
       const src = createNetworkEndpoint(srcIp, srcPort);
       const dst = createNetworkEndpoint(dstIp, dstPort);
-      const decision: { action: "deny" | "accept" | "acceptHttp" } = { action: "deny" };
+      const decision: {
+        action: "deny" | "accept" | "acceptHttp";
+        dnsResolvers?: readonly { readonly ip: string; readonly port: number }[];
+      } = { action: "deny" };
       let httpMiddleware: HttpRequestMiddleware | undefined;
       const accept = () => {
         decision.action = "accept";
+        decision.dnsResolvers = undefined;
         return {};
       };
       const connection: NetworkConnectionRequest = {
@@ -352,7 +356,11 @@ export class HostProcessSandboxVm implements HostControlChannel {
             src,
             dst,
             transport,
-            accept,
+            accept(options?: { readonly resolvers?: readonly DnsResolverSpec[] }) {
+              decision.action = "accept";
+              decision.dnsResolvers = options?.resolvers?.map(normalizeDnsResolver);
+              return {};
+            },
           };
           return dnsMatcherMatches(matcher, candidate) ? candidate : undefined;
         },
@@ -360,6 +368,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
           ? {
               acceptHttp(middleware?: HttpRequestMiddleware) {
                 decision.action = "acceptHttp";
+                decision.dnsResolvers = undefined;
                 httpMiddleware = middleware;
                 return {};
               },
@@ -382,6 +391,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
                   port: dst.port,
                   accept(middleware?: HttpRequestMiddleware) {
                     decision.action = "acceptHttp";
+                    decision.dnsResolvers = undefined;
                     httpMiddleware = middleware;
                     return {};
                   },
@@ -413,6 +423,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
         id,
         ok: true,
         action: decision.action,
+        dnsResolvers: decision.dnsResolvers,
       }));
     } catch (error) {
       this.#tryWriteToHost(encodePacket({
@@ -1005,6 +1016,14 @@ function dnsMatcherMatches(
   }
   const spec = typeof matcher === "string" ? { ip: matcher, port: 53 } : matcher;
   return candidate.dst.ip === spec.ip && candidate.dst.port === (spec.port ?? 53);
+}
+
+function normalizeDnsResolver(resolver: DnsResolverSpec): { readonly ip: string; readonly port: number } {
+  const spec = typeof resolver === "string" ? { ip: resolver, port: 53 } : resolver;
+  return {
+    ip: spec.ip,
+    port: spec.port ?? 53,
+  };
 }
 
 function endpointMatcherMatches<TMatch extends { readonly dst: NetworkEndpoint }>(

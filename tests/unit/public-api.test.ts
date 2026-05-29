@@ -242,6 +242,7 @@ test("network.policy creates an opaque connection policy", () => {
   const policy = network.policy(async (conn) => {
     conn.accept();
     conn.matchDns("10.0.2.1")?.accept();
+    conn.matchDns("10.0.2.1")?.accept({ resolvers: ["1.1.1.1", { ip: "8.8.8.8", port: 53 }] });
     conn.matchDns((dns) => dns.dst.port === 53)?.accept();
 
     if (conn.transport === "tcp") {
