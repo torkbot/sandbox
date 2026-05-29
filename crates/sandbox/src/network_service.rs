@@ -17,8 +17,9 @@ use rama_http::header::HOST;
 use rama_http::{Body, Request as RamaRequest, Response as RamaResponse, Version as RamaVersion};
 use rama_http_backend::client::http_connect;
 use rama_http_backend::server::HttpServer;
+use rama_net::client::EstablishedClientConnection;
 use rama_tcp::stream::TcpStream as RamaTcpStream;
-use rustls::RootCertStore;
+use rama_tls_rustls::client::{TlsConnector, TlsConnectorData};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::{tcp, udp};
@@ -31,7 +32,6 @@ use crate::http_interception::HttpRequestProtocol;
 use crate::network::{CidrRange, OutboundRulePlan};
 use rustls::pki_types::pem::PemObject;
 
-const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const HOST_HTTP_PROBE_PORT: u16 = 8080;
 const HOST_HTTP_PORT: u16 = 80;
 const HOST_ALT_HTTP_PORT: u16 = 8000;
@@ -188,35 +188,8 @@ impl MitmTlsAuthority {
             .with_no_client_auth()
             .with_single_cert(vec![certificate.der().clone()], private_key)
             .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         rustls::ServerConnection::new(Arc::new(config))
-            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))
-    }
-
-    fn client_connection(
-        &self,
-        server_name: &str,
-        alpn_protocol: Option<&str>,
-    ) -> io::Result<rustls::ClientConnection> {
-        let mut roots = RootCertStore::empty();
-        let certs = rustls_native_certs::load_native_certs();
-        if let Some(error) = certs.errors.into_iter().next() {
-            return Err(io::Error::new(ErrorKind::InvalidData, error));
-        }
-        for cert in certs.certs {
-            roots
-                .add(cert)
-                .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
-        }
-        let mut config = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        if let Some(alpn_protocol) = alpn_protocol {
-            config.alpn_protocols = vec![alpn_protocol.as_bytes().to_vec()];
-        }
-        let server_name = rustls::pki_types::ServerName::try_from(server_name.to_string())
-            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
-        rustls::ClientConnection::new(Arc::new(config), server_name)
             .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))
     }
 }
@@ -854,7 +827,7 @@ fn is_https_port(port: u16) -> bool {
     port == HOST_HTTPS_PORT || port == HOST_ALT_HTTPS_PORT
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct HttpDestination {
     source_ip: String,
     source_port: u16,
@@ -946,125 +919,6 @@ fn flush_http_response(socket: &mut tcp::Socket<'_>, response: &mut HttpResponse
         }
         response.to_guest.drain(..sent);
     }
-}
-
-struct RewrittenHead {
-    bytes: Vec<u8>,
-    upstream_server_name: String,
-}
-
-fn rewrite_intercepted_head(
-    guest_head: &[u8],
-    destination: &HttpDestination,
-    scheme: &str,
-    tls: Option<HostTlsMetadata>,
-    runtime: Option<&dyn HttpInterceptRuntime>,
-) -> io::Result<Option<RewrittenHead>> {
-    if guest_head.starts_with(H2_PREFACE) {
-        return Err(io::Error::new(
-            ErrorKind::Unsupported,
-            "HTTP/2 interception requires the Rama HTTP proxy pipeline",
-        ));
-    }
-    rewrite_h1_head(guest_head, destination, scheme, tls, runtime)
-}
-
-fn rewrite_h1_head(
-    guest_head: &[u8],
-    destination: &HttpDestination,
-    scheme: &str,
-    tls: Option<HostTlsMetadata>,
-    runtime: Option<&dyn HttpInterceptRuntime>,
-) -> io::Result<Option<RewrittenHead>> {
-    let Some(head_end) = find_header_end(guest_head) else {
-        return Ok(None);
-    };
-    let mut headers = [httparse::EMPTY_HEADER; 128];
-    let mut request = httparse::Request::new(&mut headers);
-    let status = request
-        .parse(&guest_head[..head_end])
-        .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
-    if !status.is_complete() {
-        return Ok(None);
-    }
-    let method = request.method.unwrap_or("GET").to_string();
-    let path = request.path.unwrap_or("/").to_string();
-    let host_headers = request
-        .headers
-        .iter()
-        .filter(|header| header.name.eq_ignore_ascii_case("host"))
-        .collect::<Vec<_>>();
-    if host_headers.len() != 1 {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "HTTP/1.1 request must contain exactly one host header",
-        ));
-    }
-    let authority = std::str::from_utf8(host_headers[0].value)
-        .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?
-        .to_string();
-    let (upstream_server_name, _) = split_authority(&authority, default_port_for_scheme(scheme))?;
-    let mut pairs = request
-        .headers
-        .iter()
-        .filter(|header| !header.name.eq_ignore_ascii_case("connection"))
-        .map(|header| {
-            Ok((
-                header.name.to_ascii_lowercase(),
-                std::str::from_utf8(header.value)
-                    .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?
-                    .to_string(),
-            ))
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-    pairs.push(("connection".to_string(), "close".to_string()));
-    let request = InterceptedHttpRequest {
-        protocol: HttpRequestProtocol::Http1,
-        method,
-        url: format!("{scheme}://{authority}{path}"),
-        original_destination: InterceptedDestination {
-            ip: destination.ip.clone(),
-            port: destination.port,
-        },
-        source: InterceptedDestination {
-            ip: destination.source_ip.clone(),
-            port: destination.source_port,
-        },
-        headers: std::mem::take(&mut pairs),
-        tls,
-    };
-    let request = match runtime {
-        Some(runtime) => runtime.handle_request_head(request)?,
-        None => request,
-    };
-    let mut rewritten = Vec::new();
-    rewritten.extend_from_slice(&guest_head[..request_line_end(guest_head).unwrap_or(0)]);
-    for (name, value) in request.headers {
-        rewritten.extend_from_slice(name.as_bytes());
-        rewritten.extend_from_slice(b": ");
-        rewritten.extend_from_slice(value.as_bytes());
-        rewritten.extend_from_slice(b"\r\n");
-    }
-    rewritten.extend_from_slice(b"\r\n");
-    rewritten.extend_from_slice(&guest_head[head_end..]);
-    Ok(Some(RewrittenHead {
-        bytes: rewritten,
-        upstream_server_name,
-    }))
-}
-
-fn find_header_end(bytes: &[u8]) -> Option<usize> {
-    bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|position| position + 4)
-}
-
-fn request_line_end(bytes: &[u8]) -> Option<usize> {
-    bytes
-        .windows(2)
-        .position(|window| window == b"\r\n")
-        .map(|position| position + 2)
 }
 
 fn split_authority(authority: &str, default_port: u16) -> io::Result<(String, u16)> {
@@ -1886,15 +1740,9 @@ struct InterceptConnection {
 }
 
 struct TlsInterceptConnection {
-    authority: Arc<MitmTlsAuthority>,
-    sni: Option<String>,
     server: rustls::ServerConnection,
-    client: Option<rustls::ClientConnection>,
-    upstream: Option<TcpStream>,
-    plaintext_head: Vec<u8>,
-    pending_upstream_plaintext: Vec<u8>,
+    bridge: SyncAsyncBridge,
     to_guest: Vec<u8>,
-    to_upstream: Vec<u8>,
     close_after_flush: bool,
 }
 
@@ -1904,27 +1752,85 @@ struct RamaHttpConnection {
     close_after_flush: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpScheme {
+    Http,
+    Https,
+}
+
+impl HttpScheme {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+        }
+    }
+
+    fn default_port(self) -> u16 {
+        default_port_for_scheme(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HttpFlowContext {
+    scheme: HttpScheme,
+    destination: HttpDestination,
+    tls: Option<HostTlsMetadata>,
+}
+
+#[derive(Debug, Clone)]
+struct FixedDestinationConnector {
+    destination: HttpDestination,
+}
+
+impl<B> Service<RamaRequest<B>> for FixedDestinationConnector
+where
+    B: Send + 'static,
+{
+    type Output = EstablishedClientConnection<RamaTcpStream, RamaRequest<B>>;
+    type Error = io::Error;
+
+    async fn serve(&self, _request: RamaRequest<B>) -> Result<Self::Output, Self::Error> {
+        let request = _request;
+        let upstream = TcpStream::connect(upstream_socket_addr(
+            &self.destination.ip,
+            self.destination.port,
+        ))?;
+        upstream.set_nonblocking(true)?;
+        let conn = RamaTcpStream::try_from_std_tcp_stream(upstream, Extensions::new())?;
+        Ok(EstablishedClientConnection {
+            input: request,
+            conn,
+        })
+    }
+}
+
 fn apply_rama_http_policy(
     mut request: RamaRequest<Body>,
-    destination: &HttpDestination,
+    context: &HttpFlowContext,
     runtime: Option<&dyn HttpInterceptRuntime>,
 ) -> io::Result<RamaRequest<Body>> {
-    let authority = request_authority(&request, default_port_for_scheme("http"))?;
-    let _ = split_authority(&authority, default_port_for_scheme("http"))?;
+    let authority = request_authority(&request, context.scheme.default_port())?;
+    let _ = split_authority(&authority, context.scheme.default_port())?;
     let mut intercepted = InterceptedHttpRequest {
         protocol: match request.version() {
             RamaVersion::HTTP_2 => HttpRequestProtocol::Http2,
             _ => HttpRequestProtocol::Http1,
         },
         method: request.method().as_str().to_string(),
-        url: format!("http://{}{}", authority, request_path(&request)),
+        url: format!(
+            "{}://{}{}",
+            context.scheme.as_str(),
+            authority,
+            request_path(&request)
+        ),
         original_destination: InterceptedDestination {
-            ip: destination.ip.clone(),
-            port: destination.port,
+            ip: context.destination.ip.clone(),
+            port: context.destination.port,
         },
         source: InterceptedDestination {
-            ip: destination.source_ip.clone(),
-            port: destination.source_port,
+            ip: context.destination.source_ip.clone(),
+            port: context.destination.source_port,
         },
         headers: request
             .headers()
@@ -1936,7 +1842,7 @@ fn apply_rama_http_policy(
                 ))
             })
             .collect(),
-        tls: None,
+        tls: context.tls.clone(),
     };
     if !intercepted
         .headers
@@ -1971,33 +1877,86 @@ fn apply_rama_http_policy(
 
 async fn serve_rama_http_request(
     request: RamaRequest<Body>,
-    destination: &HttpDestination,
+    context: &HttpFlowContext,
     runtime: Option<&dyn HttpInterceptRuntime>,
 ) -> RamaResponse {
-    let request = match apply_rama_http_policy(request, destination, runtime) {
+    let mut request = match apply_rama_http_policy(request, context, runtime) {
         Ok(request) => request,
         Err(_) => return rama_response(403, "network policy denied"),
     };
-    let upstream = match TcpStream::connect(upstream_socket_addr(&destination.ip, destination.port))
-    {
-        Ok(upstream) => upstream,
-        Err(_) => return rama_response(502, "upstream connect failed"),
-    };
-    if upstream.set_nonblocking(true).is_err() {
-        return rama_response(502, "upstream connect failed");
+
+    if normalize_rama_request_uri(&mut request, context.scheme).is_err() {
+        return rama_response(403, "network policy denied");
     }
-    let upstream = match RamaTcpStream::try_from_std_tcp_stream(upstream, Extensions::new()) {
-        Ok(upstream) => upstream,
+
+    let connector = FixedDestinationConnector {
+        destination: context.destination.clone(),
+    };
+    match context.scheme {
+        HttpScheme::Http => serve_rama_upstream(connector, request).await,
+        HttpScheme::Https => {
+            let Ok(tls) = TlsConnectorData::try_new_http_auto() else {
+                return rama_response(502, "upstream tls connect failed");
+            };
+            let connector = TlsConnector::auto(connector).with_connector_data(tls);
+            serve_rama_upstream(connector, request).await
+        }
+    }
+}
+
+async fn serve_rama_upstream<C>(connector: C, request: RamaRequest<Body>) -> RamaResponse
+where
+    C: Service<RamaRequest<Body>, Error: Into<rama_core::error::BoxError>>,
+    C::Output: IntoRamaEstablishedConnection<RamaRequest<Body>>,
+{
+    let established = match connector.serve(request).await {
+        Ok(established) => established.into_established_connection(),
         Err(_) => return rama_response(502, "upstream connect failed"),
     };
-    let connection = match http_connect(upstream, request, Executor::default()).await {
-        Ok(connection) => connection,
-        Err(_) => return rama_response(502, "upstream http connect failed"),
-    };
+    let connection =
+        match http_connect(established.conn, established.input, Executor::default()).await {
+            Ok(connection) => connection,
+            Err(_) => return rama_response(502, "upstream http connect failed"),
+        };
     match connection.conn.serve(connection.input).await {
         Ok(response) => response,
         Err(_) => rama_response(502, "upstream request failed"),
     }
+}
+
+trait IntoRamaEstablishedConnection<Input> {
+    type Connection: rama_core::io::Io + Unpin + rama_core::extensions::ExtensionsRef;
+
+    fn into_established_connection(self) -> EstablishedClientConnection<Self::Connection, Input>;
+}
+
+impl<Connection, Input> IntoRamaEstablishedConnection<Input>
+    for EstablishedClientConnection<Connection, Input>
+where
+    Connection: rama_core::io::Io + Unpin + rama_core::extensions::ExtensionsRef,
+{
+    type Connection = Connection;
+
+    fn into_established_connection(self) -> EstablishedClientConnection<Self::Connection, Input> {
+        self
+    }
+}
+
+fn normalize_rama_request_uri(
+    request: &mut RamaRequest<Body>,
+    scheme: HttpScheme,
+) -> io::Result<()> {
+    let authority = request_authority(request, scheme.default_port())?;
+    let uri = format!(
+        "{}://{}{}",
+        scheme.as_str(),
+        authority,
+        request_path(request)
+    )
+    .parse()
+    .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
+    *request.uri_mut() = uri;
+    Ok(())
 }
 
 fn rama_response(status: u16, body: &'static str) -> RamaResponse {
@@ -2036,7 +1995,7 @@ fn request_path(request: &RamaRequest<Body>) -> &str {
 
 impl RamaHttpConnection {
     fn start(
-        destination: HttpDestination,
+        context: HttpFlowContext,
         initial_guest_bytes: Vec<u8>,
         runtime: Option<Arc<dyn HttpInterceptRuntime>>,
     ) -> io::Result<Self> {
@@ -2050,14 +2009,13 @@ impl RamaHttpConnection {
             };
             tokio_runtime.block_on(async move {
                 let server = HttpServer::auto(Executor::default());
-                let destination = Arc::new(destination);
+                let context = Arc::new(context);
                 let service = rama_core::service::service_fn(move |request: RamaRequest<Body>| {
-                    let destination = destination.clone();
+                    let context = context.clone();
                     let runtime = runtime.clone();
                     async move {
                         Ok::<_, std::convert::Infallible>(
-                            serve_rama_http_request(request, &destination, runtime.as_deref())
-                                .await,
+                            serve_rama_http_request(request, &context, runtime.as_deref()).await,
                         )
                     }
                 });
@@ -2120,29 +2078,49 @@ impl TlsInterceptConnection {
         server_name: &str,
         sni: Option<String>,
         initial_guest_tls: &[u8],
+        destination: HttpDestination,
+        runtime: Option<Arc<dyn HttpInterceptRuntime>>,
     ) -> io::Result<Self> {
+        let (bridge, async_io) = SyncAsyncBridge::new(HTTP_BRIDGE_BUFFER_BYTES);
+        let metadata = HostTlsMetadata {
+            server_name: sni,
+            alpn_protocol: None,
+            protocol: Some("tls".to_string()),
+        };
+        thread::spawn(move || {
+            let Ok(tokio_runtime) = tokio::runtime::Runtime::new() else {
+                return;
+            };
+            tokio_runtime.block_on(async move {
+                let server = HttpServer::auto(Executor::default());
+                let context = Arc::new(HttpFlowContext {
+                    scheme: HttpScheme::Https,
+                    destination,
+                    tls: Some(metadata),
+                });
+                let service = rama_core::service::service_fn(move |request: RamaRequest<Body>| {
+                    let context = context.clone();
+                    let runtime = runtime.clone();
+                    async move {
+                        Ok::<_, std::convert::Infallible>(
+                            serve_rama_http_request(request, &context, runtime.as_deref()).await,
+                        )
+                    }
+                });
+                let _ = server.serve(async_io, service).await;
+            });
+        });
         let mut connection = Self {
             server: authority.server_connection(server_name)?,
-            authority,
-            sni,
-            client: None,
-            upstream: None,
-            plaintext_head: Vec::new(),
-            pending_upstream_plaintext: Vec::new(),
+            bridge,
             to_guest: Vec::new(),
-            to_upstream: Vec::new(),
             close_after_flush: false,
         };
         connection.read_guest_tls(initial_guest_tls);
         Ok(connection)
     }
 
-    fn poll(
-        &mut self,
-        socket: &mut tcp::Socket<'_>,
-        destination: &HttpDestination,
-        runtime: Option<&dyn HttpInterceptRuntime>,
-    ) {
+    fn poll(&mut self, socket: &mut tcp::Socket<'_>) {
         while socket.can_recv() {
             let mut buffer = [0; TLS_READ_BUFFER_BYTES];
             let received = socket.recv_slice(&mut buffer).unwrap_or(0);
@@ -2152,10 +2130,7 @@ impl TlsInterceptConnection {
             self.read_guest_tls(&buffer[..received]);
         }
         self.flush_guest_tls(socket);
-        self.maybe_connect_upstream(destination, runtime);
-        self.flush_upstream_tls();
-        self.read_upstream_tls();
-        self.flush_upstream_tls();
+        self.flush_rama_plaintext();
         self.flush_guest_tls(socket);
     }
 
@@ -2192,176 +2167,8 @@ impl TlsInterceptConnection {
         if plaintext.is_empty() {
             return;
         }
-        if let Some(client) = &mut self.client {
-            if client.is_handshaking() {
-                self.pending_upstream_plaintext
-                    .extend_from_slice(&plaintext);
-            } else {
-                if client.writer().write_all(&plaintext).is_err() {
-                    self.close_after_flush = true;
-                    return;
-                }
-                let _ = client.write_tls(&mut self.to_upstream);
-            }
-        } else {
-            self.plaintext_head.extend_from_slice(&plaintext);
-            if self.plaintext_head.len() > MAX_INTERCEPT_HEAD_BYTES {
-                self.close_after_flush = true;
-            }
-        }
-    }
-
-    fn maybe_connect_upstream(
-        &mut self,
-        destination: &HttpDestination,
-        runtime: Option<&dyn HttpInterceptRuntime>,
-    ) {
-        if self.client.is_some() {
-            return;
-        }
-        let alpn = self
-            .server
-            .alpn_protocol()
-            .and_then(|protocol| std::str::from_utf8(protocol).ok())
-            .unwrap_or("http/1.1")
-            .to_string();
-        let metadata = HostTlsMetadata {
-            server_name: self.sni.clone(),
-            alpn_protocol: Some(alpn.clone()),
-            protocol: Some("tls".to_string()),
-        };
-        let rewrite = match rewrite_intercepted_head(
-            &self.plaintext_head,
-            destination,
-            "https",
-            Some(metadata),
-            runtime,
-        ) {
-            Ok(Some(rewrite)) => rewrite,
-            Ok(None) => return,
-            Err(_) => {
-                self.close_after_flush = true;
-                return;
-            }
-        };
-        let upstream =
-            match TcpStream::connect(upstream_socket_addr(&destination.ip, destination.port)) {
-                Ok(upstream) => upstream,
-                Err(_) => {
-                    self.close_after_flush = true;
-                    return;
-                }
-            };
-        let _ = upstream.set_nonblocking(true);
-        let mut client = match self.authority.client_connection(
-            self.sni
-                .as_deref()
-                .filter(|server_name| server_name.parse::<std::net::IpAddr>().is_err())
-                .unwrap_or(rewrite.upstream_server_name.as_str()),
-            Some(&alpn),
-        ) {
-            Ok(client) => client,
-            Err(_) => {
-                self.close_after_flush = true;
-                return;
-            }
-        };
-        self.pending_upstream_plaintext
-            .extend_from_slice(&rewrite.bytes);
-        let _ = client.write_tls(&mut self.to_upstream);
-        self.client = Some(client);
-        self.upstream = Some(upstream);
-        self.plaintext_head.clear();
-    }
-
-    fn flush_upstream_tls(&mut self) {
-        self.flush_pending_upstream_plaintext();
-        let Some(upstream) = &mut self.upstream else {
-            return;
-        };
-        if let Some(client) = &mut self.client {
-            let _ = client.write_tls(&mut self.to_upstream);
-        }
-        while !self.to_upstream.is_empty() {
-            match upstream.write(&self.to_upstream) {
-                Ok(0) => break,
-                Ok(written) => {
-                    self.to_upstream.drain(..written);
-                }
-                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
-                Err(_) => {
-                    self.close_after_flush = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    fn read_upstream_tls(&mut self) {
-        let (Some(upstream), Some(client)) = (&mut self.upstream, &mut self.client) else {
-            return;
-        };
-        let mut flush_pending = false;
-        loop {
-            let mut buffer = [0; TLS_READ_BUFFER_BYTES];
-            match upstream.read(&mut buffer) {
-                Ok(0) => {
-                    self.close_after_flush = true;
-                    let _ = upstream.shutdown(Shutdown::Both);
-                    break;
-                }
-                Ok(read) => {
-                    let mut cursor = std::io::Cursor::new(&buffer[..read]);
-                    while cursor.position() < read as u64 {
-                        match client.read_tls(&mut cursor) {
-                            Ok(0) => break,
-                            Ok(_) => {}
-                            Err(_) => {
-                                self.close_after_flush = true;
-                                break;
-                            }
-                        }
-                        if client.process_new_packets().is_err() {
-                            self.close_after_flush = true;
-                            break;
-                        }
-                    }
-                    if self.close_after_flush {
-                        break;
-                    }
-                    let mut plaintext = Vec::new();
-                    loop {
-                        let mut buffer = [0; TLS_READ_BUFFER_BYTES];
-                        match client.reader().read(&mut buffer) {
-                            Ok(0) => break,
-                            Ok(read) => plaintext.extend_from_slice(&buffer[..read]),
-                            Err(error) if error.kind() == ErrorKind::WouldBlock => break,
-                            Err(_) => {
-                                self.close_after_flush = true;
-                                break;
-                            }
-                        }
-                    }
-                    if self.close_after_flush {
-                        break;
-                    }
-                    if !plaintext.is_empty() && self.server.writer().write_all(&plaintext).is_err()
-                    {
-                        self.close_after_flush = true;
-                        break;
-                    }
-                    flush_pending = true;
-                    let _ = self.server.write_tls(&mut self.to_guest);
-                }
-                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
-                Err(_) => {
-                    self.close_after_flush = true;
-                    break;
-                }
-            }
-        }
-        if flush_pending {
-            self.flush_pending_upstream_plaintext();
+        if self.bridge.push_from_sync(&plaintext) != plaintext.len() {
+            self.close_after_flush = true;
         }
     }
 
@@ -2369,23 +2176,22 @@ impl TlsInterceptConnection {
         let _ = self.server.write_tls(&mut self.to_guest);
     }
 
-    fn flush_pending_upstream_plaintext(&mut self) {
-        let Some(client) = &mut self.client else {
-            return;
-        };
-        if client.is_handshaking() || self.pending_upstream_plaintext.is_empty() {
-            return;
+    fn flush_rama_plaintext(&mut self) {
+        while self.to_guest.len() < TLS_READ_BUFFER_BYTES {
+            let mut buffer = [0; TLS_READ_BUFFER_BYTES];
+            let read = self.bridge.pull_to_sync(&mut buffer);
+            if read == 0 {
+                break;
+            }
+            if self.server.writer().write_all(&buffer[..read]).is_err() {
+                self.close_after_flush = true;
+                return;
+            }
+            self.drain_server_tls();
         }
-        if client
-            .writer()
-            .write_all(&self.pending_upstream_plaintext)
-            .is_err()
-        {
+        if self.bridge.async_is_closed() {
             self.close_after_flush = true;
-            return;
         }
-        self.pending_upstream_plaintext.clear();
-        let _ = client.write_tls(&mut self.to_upstream);
     }
 
     fn flush_guest_tls(&mut self, socket: &mut tcp::Socket<'_>) {
@@ -2417,7 +2223,7 @@ impl InterceptConnection {
             return;
         }
         if let InterceptState::Tls(tls) = &mut self.state {
-            tls.poll(socket, &self.destination, self.runtime.as_deref());
+            tls.poll(socket);
             if tls.is_finished() {
                 self.close_after_flush = true;
             }
@@ -2437,7 +2243,11 @@ impl InterceptConnection {
     fn read_guest_head(&mut self, socket: &mut tcp::Socket<'_>) {
         if is_plain_http_port(self.destination.port) {
             match RamaHttpConnection::start(
-                self.destination.clone(),
+                HttpFlowContext {
+                    scheme: HttpScheme::Http,
+                    destination: self.destination.clone(),
+                    tls: None,
+                },
                 Vec::new(),
                 self.runtime.clone(),
             ) {
@@ -2491,7 +2301,14 @@ impl InterceptConnection {
                 .tls_authority
                 .as_ref()
                 .expect("HTTPS interception checked TLS authority before reading ClientHello");
-            match TlsInterceptConnection::new(authority.clone(), &server_name, sni, guest_head) {
+            match TlsInterceptConnection::new(
+                authority.clone(),
+                &server_name,
+                sni,
+                guest_head,
+                self.destination.clone(),
+                self.runtime.clone(),
+            ) {
                 Ok(tls) => {
                     self.state = InterceptState::Tls(tls);
                 }
@@ -3295,24 +3112,6 @@ mod tests {
         .unwrap();
 
         assert!(!decision.allowed);
-    }
-
-    #[test]
-    fn h1_rewrite_rejects_duplicate_host_headers() {
-        let destination = HttpDestination {
-            source_ip: "10.0.2.15".to_string(),
-            source_port: 50_000,
-            ip: "93.184.216.34".to_string(),
-            port: 80,
-        };
-        let request = b"GET / HTTP/1.1\r\nHost: example.com\r\nHost: attacker.example\r\n\r\n";
-
-        let error = match rewrite_h1_head(request, &destination, "http", None, None) {
-            Ok(_) => panic!("duplicate Host headers must be rejected"),
-            Err(error) => error,
-        };
-
-        assert_eq!(error.kind(), ErrorKind::InvalidData);
     }
 
     #[test]

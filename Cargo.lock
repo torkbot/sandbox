@@ -2074,6 +2074,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "rama-tls-rustls"
+version = "0.3.0-rc1"
+source = "git+https://github.com/plabayo/rama?rev=09ea1a0ff0cd5941ba65421ff5b0f263f6cf5211#09ea1a0ff0cd5941ba65421ff5b0f263f6cf5211"
+dependencies = [
+ "pin-project-lite",
+ "rama-core",
+ "rama-http-types",
+ "rama-net",
+ "rama-utils",
+ "rcgen",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls",
+ "webpki-roots",
+ "x509-parser",
+]
+
+[[package]]
 name = "rama-unix"
 version = "0.3.0-rc1"
 source = "git+https://github.com/plabayo/rama?rev=09ea1a0ff0cd5941ba65421ff5b0f263f6cf5211#09ea1a0ff0cd5941ba65421ff5b0f263f6cf5211"
@@ -2249,6 +2269,7 @@ dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -2306,7 +2327,6 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "cc",
- "httparse",
  "imago",
  "ipnet",
  "krun-devices",
@@ -2315,7 +2335,9 @@ dependencies = [
  "rama-core",
  "rama-http",
  "rama-http-backend",
+ "rama-net",
  "rama-tcp",
+ "rama-tls-rustls",
  "rcgen",
  "rustls",
  "rustls-native-certs",
@@ -2741,6 +2763,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-rustls"
+version = "0.26.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
+dependencies = [
+ "rustls",
+ "tokio",
+]
+
+[[package]]
 name = "tokio-stream"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3102,6 +3134,15 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
  "semver",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52f5ee44c96cf55f1b349600768e3ece3a8f26010c05265ab73f945bb1a2eb9d"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]
