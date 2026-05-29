@@ -453,6 +453,7 @@ impl HttpHookExecutor for NodeHttpHookExecutor {
             "sourcePort": i32::from(request.source.port),
             "originalDestinationIp": request.original_destination.ip,
             "originalDestinationPort": i32::from(request.original_destination.port),
+            "originalDestinationHostname": request.original_destination.hostname,
             "headers": request.headers.into_iter().map(|(name, value)| {
                 Bson::Array(vec![Bson::String(name), Bson::String(value)])
             }).collect::<Vec<_>>(),

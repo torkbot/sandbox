@@ -101,6 +101,15 @@ export interface SandboxHttpRequest {
     readonly originalIp: string;
     /** Original destination port before host-side routing or proxying. */
     readonly originalPort: number;
+    /**
+     * Hostname pinned by trusted connection metadata, when known.
+     *
+     * For cleartext HTTP this is populated only from the sandbox DNS answer
+     * that resolved the destination IP. For HTTPS, use `tls.sni` for the
+     * client-provided server name. The HTTP `Host` header is not trusted for
+     * this field.
+     */
+    readonly hostname?: string;
   };
   /** TLS metadata when the request was carried over HTTPS. */
   readonly tls?: {

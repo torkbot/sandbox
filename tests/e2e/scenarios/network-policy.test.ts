@@ -84,8 +84,82 @@ test("network.policy allows HTTP middleware on non-standard TCP ports", async (t
   assert.deepEqual(observedHeaders, ["allowed"]);
 });
 
+test("network.policy ignores spoofed Host headers for HTTP identity", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+  const observedDestinations: Array<{ readonly urlHost: string; readonly hostname?: string }> = [];
+  const origin = await startTcpServer((socket) => {
+    socket.once("data", () => {
+      socket.end("HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok");
+    });
+  }, 18081);
+  t.after(() => void origin.close());
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      if (conn.transport === "tcp") {
+        conn.acceptHttp((request) => {
+          observedDestinations.push({
+            urlHost: request.url.hostname,
+            hostname: request.destination.hostname,
+          });
+        });
+      }
+    }),
+  }).boot();
+
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "http-host-spoof",
+    script: `curl -fsS --max-time 5 -H 'Host: attacker.invalid' http://${hostOriginAddress()}:${origin.port}/`,
+  }), 10_000, "spoofed Host HTTP request");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.deepEqual(observedDestinations, [{
+    urlHost: hostOriginAddress(),
+    hostname: undefined,
+  }]);
+});
+
+test("network.policy accepts IP HTTP without advertising a hostname", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+  const observedDestinations: Array<{ readonly urlHost: string; readonly hostname?: string }> = [];
+  const origin = await startTcpServer((socket) => {
+    socket.once("data", () => {
+      socket.end("HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nip-ok");
+    });
+  }, 18082);
+  t.after(() => void origin.close());
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      if (conn.transport === "tcp") {
+        conn.acceptHttp((request) => {
+          observedDestinations.push({
+            urlHost: request.url.hostname,
+            hostname: request.destination.hostname,
+          });
+        });
+      }
+    }),
+  }).boot();
+
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "http-ip-authority",
+    script: `curl -fsS --max-time 5 -H 'Host: attacker.invalid' http://${hostOriginAddress()}:${origin.port}/`,
+  }), 10_000, "IP HTTP request");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "ip-ok");
+  assert.deepEqual(observedDestinations, [{
+    urlHost: hostOriginAddress(),
+    hostname: undefined,
+  }]);
+});
+
 test("network.policy rejects untrusted HTTPS upstream certificates", async (t) => {
   if (!requireVmLaunchSupport(t)) return;
+  const host = "localhost";
   const origin = await startTlsHttpServer(8443);
   t.after(() => void origin.close());
 
@@ -106,7 +180,7 @@ test("network.policy rejects untrusted HTTPS upstream certificates", async (t) =
 
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "https-middleware",
-    script: `curl -kfsS --max-time 5 https://${hostOriginAddress()}:${origin.port}/`,
+    script: `curl -kfsS --max-time 5 --connect-to ${host}:${origin.port}:${hostOriginAddress()}:${origin.port} https://${host}:${origin.port}/`,
   }), 10_000, "HTTPS middleware request");
 
   assert.notEqual(result.exitCode, 0, commandOutput(result));

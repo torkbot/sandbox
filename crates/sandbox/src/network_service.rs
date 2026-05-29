@@ -13,7 +13,6 @@ use std::time::{Duration, Instant as StdInstant};
 use rama_core::extensions::Extensions;
 use rama_core::rt::Executor;
 use rama_core::service::Service;
-use rama_http::header::HOST;
 use rama_http::{Body, Request as RamaRequest, Response as RamaResponse, Version as RamaVersion};
 use rama_http_backend::client::http_connect;
 use rama_http_backend::server::HttpServer;
@@ -285,6 +284,7 @@ fn run_network_service(
             dns_handle,
             outbound_rules.as_deref(),
             policy.as_deref(),
+            &mut device.interception,
         );
         for handle in &tcp_dns_handles {
             poll_tcp_dns_socket(
@@ -293,6 +293,7 @@ fn run_network_service(
                 outbound_rules.as_deref(),
                 policy.as_deref(),
                 &mut tcp_dns_connections,
+                &mut device.interception,
             );
         }
         device.interception.prune_expired_flows();
@@ -421,6 +422,7 @@ fn poll_dns_socket(
     handle: SocketHandle,
     outbound_rules: Option<&[OutboundRulePlan]>,
     policy: Option<&dyn NetworkPolicyRuntime>,
+    interception: &mut TransparentInterception,
 ) {
     let socket = sockets.get_mut::<udp::Socket>(handle);
     while socket.can_recv() && socket.can_send() {
@@ -444,11 +446,14 @@ fn poll_dns_socket(
             Ok(decision) if decision.action != NetworkPolicyAction::Deny => {}
             _ => continue,
         };
-        let Some(response) = dns_response(request) else {
+        let Some(answer) = dns_response(request) else {
             continue;
         };
+        if let Some((name, address)) = answer.resolved_address() {
+            interception.record_dns_answer(name, address);
+        }
         let _ = socket.send_slice(
-            &response,
+            &answer.packet,
             IpEndpoint::new(remote.endpoint.addr, remote.endpoint.port),
         );
     }
@@ -622,6 +627,7 @@ fn poll_tcp_dns_socket(
     outbound_rules: Option<&[OutboundRulePlan]>,
     policy: Option<&dyn NetworkPolicyRuntime>,
     connections: &mut HashMap<SocketHandle, TcpDnsConnection>,
+    interception: &mut TransparentInterception,
 ) {
     let socket = sockets.get_mut::<tcp::Socket>(handle);
     if !socket.is_active() {
@@ -647,12 +653,13 @@ fn poll_tcp_dns_socket(
         }
         let request = connection.from_guest[2..2 + request_len].to_vec();
         connection.from_guest.drain(..2 + request_len);
-        let response = handle_tcp_dns_request(socket, outbound_rules, policy, &request);
+        let response =
+            handle_tcp_dns_request(socket, outbound_rules, policy, interception, &request);
         if let Some(response) = response {
             connection
                 .to_guest
-                .extend_from_slice(&(response.len() as u16).to_be_bytes());
-            connection.to_guest.extend_from_slice(&response);
+                .extend_from_slice(&(response.packet.len() as u16).to_be_bytes());
+            connection.to_guest.extend_from_slice(&response.packet);
         } else {
             connection.close_after_flush = true;
             break;
@@ -675,8 +682,9 @@ fn handle_tcp_dns_request(
     socket: &tcp::Socket<'_>,
     outbound_rules: Option<&[OutboundRulePlan]>,
     policy: Option<&dyn NetworkPolicyRuntime>,
+    interception: &mut TransparentInterception,
     request: &[u8],
-) -> Option<Vec<u8>> {
+) -> Option<DnsResponse> {
     if outbound_rules
         .is_some_and(|rules| !is_allowed_outbound_tcp("10.0.2.1", HOST_DNS_PORT, rules))
     {
@@ -695,7 +703,11 @@ fn handle_tcp_dns_request(
         Ok(decision) if decision.action != NetworkPolicyAction::Deny => {}
         _ => return None,
     };
-    dns_response(request)
+    let response = dns_response(request)?;
+    if let Some((name, address)) = response.resolved_address() {
+        interception.record_dns_answer(name, address);
+    }
+    Some(response)
 }
 
 #[derive(Default)]
@@ -847,6 +859,7 @@ struct HttpDestination {
     source_port: u16,
     ip: String,
     port: u16,
+    hostname: Option<String>,
 }
 
 fn original_http_destination(
@@ -856,11 +869,13 @@ fn original_http_destination(
     let remote = socket.remote_endpoint()?;
     let local = socket.local_endpoint()?;
     let ip = interception.original_destination(remote.addr, remote.port, local.port)?;
+    let hostname = interception.resolved_hostname(&ip);
     Some(HttpDestination {
         source_ip: remote.addr.to_string(),
         source_port: remote.port,
         ip,
         port: local.port,
+        hostname,
     })
 }
 
@@ -938,19 +953,6 @@ fn flush_http_response(socket: &mut tcp::Socket<'_>, response: &mut HttpResponse
         }
         response.to_guest.drain(..sent);
     }
-}
-
-fn split_authority(authority: &str, default_port: u16) -> io::Result<(String, u16)> {
-    if let Some((host, port)) = authority.rsplit_once(':') {
-        if let Ok(port) = port.parse() {
-            return Ok((host.to_string(), port));
-        }
-    }
-    Ok((authority.to_string(), default_port))
-}
-
-fn default_port_for_scheme(scheme: &str) -> u16 {
-    if scheme == "https" { 443 } else { 80 }
 }
 
 fn tls_client_hello_sni(bytes: &[u8]) -> Option<String> {
@@ -1239,7 +1241,20 @@ fn tcp_reset_frame_for_syn(frame: &[u8], packet: Ipv4TcpPacket) -> Option<Vec<u8
     Some(reset)
 }
 
-fn dns_response(request: &[u8]) -> Option<Vec<u8>> {
+#[derive(Debug, Clone)]
+struct DnsResponse {
+    packet: Vec<u8>,
+    name: String,
+    answer: Option<[u8; 4]>,
+}
+
+impl DnsResponse {
+    fn resolved_address(&self) -> Option<(&str, [u8; 4])> {
+        Some((self.name.as_str(), self.answer?))
+    }
+}
+
+fn dns_response(request: &[u8]) -> Option<DnsResponse> {
     if request.len() < 12 {
         return None;
     }
@@ -1289,7 +1304,11 @@ fn dns_response(request: &[u8]) -> Option<Vec<u8>> {
         response.extend_from_slice(&address);
     }
 
-    Some(response)
+    Some(DnsResponse {
+        packet: response,
+        name,
+        answer,
+    })
 }
 
 fn parse_dns_name(packet: &[u8], mut offset: usize) -> Option<(String, usize)> {
@@ -1663,10 +1682,6 @@ impl HttpScheme {
             Self::Https => "https",
         }
     }
-
-    fn default_port(self) -> u16 {
-        default_port_for_scheme(self.as_str())
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1674,6 +1689,18 @@ struct HttpFlowContext {
     scheme: HttpScheme,
     destination: HttpDestination,
     tls: Option<HostTlsMetadata>,
+}
+
+impl HttpFlowContext {
+    fn authority(&self) -> String {
+        let host = self
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.server_name.as_deref())
+            .or(self.destination.hostname.as_deref())
+            .unwrap_or(&self.destination.ip);
+        format!("{}:{}", host, self.destination.port)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1708,8 +1735,7 @@ fn apply_rama_http_policy(
     context: &HttpFlowContext,
     runtime: Option<&dyn HttpInterceptRuntime>,
 ) -> io::Result<RamaRequest<Body>> {
-    let authority = request_authority(&request, context.scheme.default_port())?;
-    let _ = split_authority(&authority, context.scheme.default_port())?;
+    let authority = context.authority();
     let policy_headers = request
         .headers()
         .iter()
@@ -1735,10 +1761,12 @@ fn apply_rama_http_policy(
         original_destination: InterceptedDestination {
             ip: context.destination.ip.clone(),
             port: context.destination.port,
+            hostname: context.destination.hostname.clone(),
         },
         source: InterceptedDestination {
             ip: context.destination.source_ip.clone(),
             port: context.destination.source_port,
+            hostname: None,
         },
         headers: policy_headers.clone(),
         tls: context.tls.clone(),
@@ -1787,7 +1815,7 @@ async fn serve_rama_http_request(
         Err(_) => return rama_response(403, "network policy denied"),
     };
 
-    if normalize_rama_request_uri(&mut request, context.scheme).is_err() {
+    if normalize_rama_request_uri(&mut request, context).is_err() {
         return rama_response(403, "network policy denied");
     }
 
@@ -1846,12 +1874,12 @@ where
 
 fn normalize_rama_request_uri(
     request: &mut RamaRequest<Body>,
-    scheme: HttpScheme,
+    context: &HttpFlowContext,
 ) -> io::Result<()> {
-    let authority = request_authority(request, scheme.default_port())?;
+    let authority = context.authority();
     let uri = format!(
         "{}://{}{}",
-        scheme.as_str(),
+        context.scheme.as_str(),
         authority,
         request_path(request)
     )
@@ -1866,25 +1894,6 @@ fn rama_response(status: u16, body: &'static str) -> RamaResponse {
         .status(status)
         .body(Body::from(body))
         .unwrap()
-}
-
-fn request_authority(request: &RamaRequest<Body>, default_port: u16) -> io::Result<String> {
-    if let Some(authority) = request.uri().authority() {
-        return Ok(authority.as_str().to_string());
-    }
-    if let Some(host) = request.headers().get(HOST) {
-        return host
-            .to_str()
-            .map(str::to_string)
-            .map_err(|error| io::Error::new(ErrorKind::InvalidData, error));
-    }
-    if let Some(host) = request.uri().host() {
-        return Ok(format!("{}:{}", host, default_port));
-    }
-    Err(io::Error::new(
-        ErrorKind::InvalidData,
-        "HTTP request is missing authority",
-    ))
 }
 
 fn request_path(request: &RamaRequest<Body>) -> &str {
@@ -2324,7 +2333,14 @@ struct TransparentInterception {
     host_ip: [u8; 4],
     tcp_flows: HashMap<TcpFlow, InterceptedFlow>,
     udp_flows: HashMap<UdpInterceptedFlow, InterceptedFlow>,
+    dns_pins: DnsPins,
     next_udp_host_port: u16,
+}
+
+#[derive(Debug, Default)]
+struct DnsPins {
+    address_by_hostname: HashMap<String, [u8; 4]>,
+    hostname_by_address: HashMap<[u8; 4], String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2361,6 +2377,7 @@ impl TransparentInterception {
             host_ip: host_ip.octets(),
             tcp_flows: HashMap::new(),
             udp_flows: HashMap::new(),
+            dns_pins: DnsPins::default(),
             next_udp_host_port: UDP_INTERCEPT_PORT_START,
         }
     }
@@ -2499,6 +2516,27 @@ impl TransparentInterception {
             let address = flow.destination_ip;
             Ipv4Address::new(address[0], address[1], address[2], address[3]).to_string()
         })
+    }
+
+    fn record_dns_answer(&mut self, hostname: &str, address: [u8; 4]) {
+        match self.dns_pins.address_by_hostname.get(hostname) {
+            Some(pinned) if *pinned != address => return,
+            Some(_) => {}
+            None => {
+                self.dns_pins
+                    .address_by_hostname
+                    .insert(hostname.to_string(), address);
+            }
+        }
+        self.dns_pins
+            .hostname_by_address
+            .entry(address)
+            .or_insert_with(|| hostname.to_string());
+    }
+
+    fn resolved_hostname(&self, ip: &str) -> Option<String> {
+        let address = ip.parse::<std::net::Ipv4Addr>().ok()?.octets();
+        self.dns_pins.hostname_by_address.get(&address).cloned()
     }
 
     fn udp_original_destination(
@@ -3040,6 +3078,7 @@ mod tests {
             source_port: 50_000,
             ip: "93.184.216.34".to_string(),
             port: 443,
+            hostname: None,
         };
 
         assert_eq!(
@@ -3157,8 +3196,23 @@ mod tests {
     fn dns_unsupported_query_type_returns_nodata_for_known_name() {
         let response = dns_response(&dns_query("localhost", 28)).unwrap();
 
-        assert_eq!(&response[2..4], &[0x81, 0x80]);
-        assert_eq!(&response[6..8], &[0, 0]);
+        assert_eq!(&response.packet[2..4], &[0x81, 0x80]);
+        assert_eq!(&response.packet[6..8], &[0, 0]);
+    }
+
+    #[test]
+    fn dns_pins_keep_first_hostname_mapping_for_address() {
+        let mut interception = TransparentInterception::new(Ipv4Address::new(10, 0, 2, 1));
+
+        interception.record_dns_answer("first.example", [192, 0, 2, 10]);
+        interception.record_dns_answer("second.example", [192, 0, 2, 10]);
+        interception.record_dns_answer("first.example", [192, 0, 2, 11]);
+
+        assert_eq!(
+            interception.resolved_hostname("192.0.2.10"),
+            Some("first.example".to_string()),
+        );
+        assert_eq!(interception.resolved_hostname("192.0.2.11"), None);
     }
 
     fn dns_query(name: &str, qtype: u16) -> Vec<u8> {

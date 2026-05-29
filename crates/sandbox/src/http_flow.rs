@@ -7,6 +7,7 @@ use crate::network_service::HostTlsMetadata;
 pub struct InterceptedDestination {
     pub ip: String,
     pub port: u16,
+    pub hostname: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

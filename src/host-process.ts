@@ -414,6 +414,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
           sourcePort: assertNumber(document.sourcePort, "sourcePort"),
           originalIp: assertString(document.originalDestinationIp, "originalDestinationIp"),
           originalPort: assertNumber(document.originalDestinationPort, "originalDestinationPort"),
+          hostname: optionalString(document.originalDestinationHostname, "originalDestinationHostname"),
         },
         tls: optionalTlsMetadata(document.tls),
       };
@@ -1046,6 +1047,10 @@ function optionalTlsMetadata(value: unknown): { readonly sni?: string; readonly 
       ? undefined
       : assertString(document.alpn, "tls.alpn"),
   };
+}
+
+function optionalString(value: unknown, field: string): string | undefined {
+  return value === undefined || value === null ? undefined : assertString(value, field);
 }
 
 function binaryField(value: unknown, field: string): Uint8Array {
