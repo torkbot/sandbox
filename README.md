@@ -395,11 +395,13 @@ TypeScript API:
   decisions and delegate to JavaScript only when a policy callback is required.
 - HTTP request middleware is caller-provided JavaScript, but Sandbox owns the
   interception machinery and certificate plumbing.
-- When HTTP interception is enabled, Sandbox init receives the generated CA and
-  installs it using the selected rootfs' native trust-store mechanism when one
-  is discoverable. It probes standard `update-ca-certificates` and
-  `update-ca-trust` layouts, while still exporting a runtime CA file for tools
-  that honor `SSL_CERT_FILE` or `CURL_CA_BUNDLE`.
+- When HTTP interception is enabled, the host generates the CA material and
+  passes only the public CA certificate to Sandbox init. Init does not generate
+  or manage certificates; it only installs the supplied CA using the selected
+  rootfs' native trust-store mechanism when one is discoverable. It probes
+  standard `update-ca-certificates` and `update-ca-trust` layouts, while still
+  exporting a runtime CA file for tools that honor `SSL_CERT_FILE` or
+  `CURL_CA_BUNDLE`.
 
 The intended boundary is that Sandbox knows how to launch, isolate, mount,
 intercept, and enforce. User-space owns artifact selection, filesystem
