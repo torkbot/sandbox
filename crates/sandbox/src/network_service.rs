@@ -351,7 +351,12 @@ fn run_network_service(
         for port in &active_udp_intercept_ports {
             add_udp_relay_socket(&mut sockets, &mut udp_sockets, *port);
         }
-        prune_dynamic_udp_relays(&mut sockets, &mut udp_sockets, &active_udp_intercept_ports);
+        prune_dynamic_udp_relays(
+            &mut sockets,
+            &mut udp_sockets,
+            &mut udp_relays,
+            &active_udp_intercept_ports,
+        );
         for (port, handle) in udp_sockets
             .iter()
             .map(|(port, handle)| (*port, *handle))
@@ -512,6 +517,7 @@ fn add_udp_relay_socket(
 fn prune_dynamic_udp_relays(
     sockets: &mut SocketSet<'_>,
     udp_sockets: &mut HashMap<u16, SocketHandle>,
+    relays: &mut HashMap<UdpFlow, UdpRelay>,
     active_intercept_ports: &HashSet<u16>,
 ) {
     let stale_ports = udp_sockets
@@ -524,6 +530,7 @@ fn prune_dynamic_udp_relays(
             sockets.remove(handle);
         }
     }
+    relays.retain(|flow, _| active_intercept_ports.contains(&flow.host_port));
 }
 
 fn poll_udp_relay_socket(
@@ -834,6 +841,12 @@ fn looks_like_tls(bytes: &[u8]) -> bool {
 }
 
 fn should_use_raw_tcp_relay(bytes: &[u8]) -> bool {
+    if let Some(line_end) = bytes.windows(2).position(|window| window == b"\r\n") {
+        let request_line = &bytes[..line_end];
+        if !request_line.windows(5).any(|window| window == b"HTTP/") {
+            return true;
+        }
+    }
     !bytes_could_be_http_request(bytes)
 }
 
@@ -3397,6 +3410,7 @@ mod tests {
         assert!(!bytes_could_be_http_request(H2_PREFACE));
         assert!(!bytes_could_be_http_request(b"hello sandbox\n"));
         assert!(!bytes_could_be_http_request(b"PING\r\n"));
+        assert!(should_use_raw_tcp_relay(b"GET key\r\n"));
     }
 
     #[test]

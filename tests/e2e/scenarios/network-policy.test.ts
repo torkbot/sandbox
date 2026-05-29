@@ -257,6 +257,30 @@ test("network.policy allows a deterministic Redis-style TCP protocol exchange", 
   assert.ok(redis.connections.length >= 1);
 });
 
+test("network.policy raw-relays token-space TCP commands without HTTP framing", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+  const commandServer = await startTcpServer((socket) => {
+    socket.once("data", (chunk) => {
+      if (chunk.toString("utf8") === "GET key\r\n") {
+        socket.end("VALUE key 0 5\r\nvalue\r\nEND\r\n");
+      } else {
+        socket.end("ERROR\r\n");
+      }
+    });
+  });
+  t.after(() => void commandServer.close());
+
+  await using sandbox = await bootAllowingNetwork();
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "token-space-raw-tcp",
+    script: pythonTcpExchange(commandServer.port, "GET key\r\n"),
+  }), 10_000, "token-space raw TCP exchange");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "VALUE key 0 5\r\nvalue\r\nEND\r\n");
+  assert.ok(commandServer.connections.length >= 1);
+});
+
 test("network.policy allows generic UDP echo traffic", async (t) => {
   if (!requireVmLaunchSupport(t)) return;
   const udp = await startUdpEchoServer();
@@ -310,6 +334,19 @@ test("network.policy allows default DNS over TCP with the DNS hook", async (t) =
 
   assert.equal(result.exitCode, 0, commandOutput(result));
   assert.equal(result.stdout, "127.0.0.1");
+});
+
+test("network.policy keeps DNS over TCP sessions reusable", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+
+  await using sandbox = await bootAllowingDns();
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "dns-tcp-reuse",
+    script: pythonTcpDnsTwoQueries("localhost", "localhost"),
+  }), 8_000, "reused TCP DNS queries");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "127.0.0.1,127.0.0.1");
 });
 
 test("network.policy supports a custom DNS resolver over TCP", async (t) => {
@@ -487,6 +524,10 @@ function pythonUdpExchange(port: number, message: string): string {
 
 function pythonDnsQuery(input: { readonly transport: "tcp" | "udp"; readonly name: string }): string {
   return `python3 - <<'PY'\nimport socket, struct\n\ndef query(name):\n    packet = bytearray()\n    packet += b"\\x12\\x34\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00"\n    for label in name.split("."):\n        packet.append(len(label))\n        packet += label.encode()\n    packet += b"\\x00\\x00\\x01\\x00\\x01"\n    return bytes(packet)\n\ndef read_name(packet, offset):\n    labels = []\n    jumped = False\n    original = offset\n    while True:\n        length = packet[offset]\n        if length & 0xc0 == 0xc0:\n            pointer = ((length & 0x3f) << 8) | packet[offset + 1]\n            if not jumped:\n                original = offset + 2\n            offset = pointer\n            jumped = True\n            continue\n        offset += 1\n        if length == 0:\n            return ".".join(labels), (original if jumped else offset)\n        labels.append(packet[offset:offset + length].decode())\n        offset += length\n\ndef answer_address(packet):\n    question_count = struct.unpack("!H", packet[4:6])[0]\n    answer_count = struct.unpack("!H", packet[6:8])[0]\n    offset = 12\n    for _ in range(question_count):\n        _, offset = read_name(packet, offset)\n        offset += 4\n    for _ in range(answer_count):\n        _, offset = read_name(packet, offset)\n        rtype, rclass, ttl, rdlen = struct.unpack("!HHIH", packet[offset:offset + 10])\n        offset += 10\n        data = packet[offset:offset + rdlen]\n        offset += rdlen\n        if rtype == 1 and rclass == 1 and rdlen == 4:\n            return ".".join(str(byte) for byte in data)\n    raise RuntimeError("missing A answer")\n\nrequest = query(${JSON.stringify(input.name)})\nif ${JSON.stringify(input.transport)} == "udp":\n    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n    s.settimeout(3)\n    s.sendto(request, ("10.0.2.1", 53))\n    response = s.recvfrom(4096)[0]\nelse:\n    s = socket.create_connection(("10.0.2.1", 53), timeout=3)\n    s.settimeout(3)\n    s.sendall(struct.pack("!H", len(request)) + request)\n    size = struct.unpack("!H", s.recv(2))[0]\n    response = b""\n    while len(response) < size:\n        response += s.recv(size - len(response))\nprint(answer_address(response), end="")\ns.close()\nPY`;
+}
+
+function pythonTcpDnsTwoQueries(first: string, second: string): string {
+  return `python3 - <<'PY'\nimport socket, struct\n\ndef query(name, ident):\n    packet = bytearray()\n    packet += struct.pack("!H", ident) + b"\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00"\n    for label in name.split("."):\n        packet.append(len(label))\n        packet += label.encode()\n    packet += b"\\x00\\x00\\x01\\x00\\x01"\n    return bytes(packet)\n\ndef read_name(packet, offset):\n    labels = []\n    jumped = False\n    original = offset\n    while True:\n        length = packet[offset]\n        if length & 0xc0 == 0xc0:\n            pointer = ((length & 0x3f) << 8) | packet[offset + 1]\n            if not jumped:\n                original = offset + 2\n            offset = pointer\n            jumped = True\n            continue\n        offset += 1\n        if length == 0:\n            return ".".join(labels), (original if jumped else offset)\n        labels.append(packet[offset:offset + length].decode())\n        offset += length\n\ndef answer_address(packet):\n    question_count = struct.unpack("!H", packet[4:6])[0]\n    answer_count = struct.unpack("!H", packet[6:8])[0]\n    offset = 12\n    for _ in range(question_count):\n        _, offset = read_name(packet, offset)\n        offset += 4\n    for _ in range(answer_count):\n        _, offset = read_name(packet, offset)\n        rtype, rclass, ttl, rdlen = struct.unpack("!HHIH", packet[offset:offset + 10])\n        offset += 10\n        data = packet[offset:offset + rdlen]\n        offset += rdlen\n        if rtype == 1 and rclass == 1 and rdlen == 4:\n            return ".".join(str(byte) for byte in data)\n    raise RuntimeError("missing A answer")\n\ndef read_response(sock):\n    size = struct.unpack("!H", sock.recv(2))[0]\n    response = b""\n    while len(response) < size:\n        response += sock.recv(size - len(response))\n    return response\n\ns = socket.create_connection(("10.0.2.1", 53), timeout=3)\ns.settimeout(3)\nfor request in [query(${JSON.stringify(first)}, 0x1234), query(${JSON.stringify(second)}, 0x1235)]:\n    s.sendall(struct.pack("!H", len(request)) + request)\nanswers = [answer_address(read_response(s)), answer_address(read_response(s))]\nprint(",".join(answers), end="")\ns.close()\nPY`;
 }
 
 async function startTcpServer(onConnection: (socket: net.Socket) => void): Promise<{
