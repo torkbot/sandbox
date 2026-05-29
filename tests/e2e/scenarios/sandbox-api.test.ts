@@ -84,6 +84,64 @@ test("boot options provide instance-specific virtual mounts", async (t) => {
   assert.equal(result.stdout, "lane-private");
 });
 
+test("virtual memory mounts can be used as the boot cwd", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const workspace = fs.memory({
+    files: {
+      "/hello.txt": "hi\n",
+    },
+  });
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot({
+    cwd: "/workspace",
+    mounts: {
+      "/workspace": fs.virtual(workspace),
+    },
+  });
+
+  const result = await sandbox.exec("/bin/sh", [
+    "-lc",
+    "printf 'cwd=%s\\n' \"$PWD\" && cat hello.txt && exit 7",
+  ]);
+
+  assert.equal(result.exitCode, 7, result.stderr);
+  assert.equal(result.stdout, "cwd=/workspace\nhi\n");
+  assert.equal(result.stderr, "");
+});
+
+test("virtual memory mounts support guest directory reads from root cwd", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const mount = fs.memory({
+    files: {
+      "/hello.txt": "hi\n",
+    },
+  });
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot({
+    cwd: "/",
+    mounts: {
+      "/mnt": fs.virtual(mount),
+    },
+  });
+
+  const result = await sandbox.exec("/bin/sh", [
+    "-lc",
+    "echo before && ls -1 /mnt && cat /mnt/hello.txt && exit 7",
+  ]);
+
+  assert.equal(result.exitCode, 7, result.stderr);
+  assert.equal(result.stdout, "before\nhello.txt\nhi\n");
+  assert.equal(result.stderr, "");
+});
+
 test("boot cwd becomes the default process working directory", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;

@@ -2,9 +2,27 @@ import { copyFile, cp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/p
 import { basename, resolve } from "node:path";
 
 type PackageJson = {
-  readonly name: string;
-  readonly version: string;
   readonly dependencies?: Record<string, string>;
+};
+
+type ReleasePackageJson = {
+  readonly name: string;
+  readonly private: false;
+  readonly type: "module";
+  readonly description: string;
+  readonly license: string;
+  readonly repository: {
+    readonly type: string;
+    readonly url: string;
+  };
+  readonly publishConfig: {
+    readonly access: "public";
+  };
+  readonly exports: Record<string, unknown>;
+  readonly types: string;
+  readonly bin: Record<string, string>;
+  readonly files: readonly string[];
+  readonly engines: Record<string, string>;
 };
 
 type PlatformPackage = {
@@ -51,7 +69,11 @@ const platformPackages = [
 const packageJson = JSON.parse(
   await readFile(resolve(repoRoot, "package.json"), "utf8"),
 ) as PackageJson;
+const releasePackageJson = JSON.parse(
+  await readFile(resolve(repoRoot, "release.package.json"), "utf8"),
+) as ReleasePackageJson;
 const modes = new Set(process.argv.slice(2));
+const releaseVersion = parseReleaseVersion(process.argv.slice(2));
 const prepareRoot = modes.size === 0 || modes.has("--root");
 const preparePlatforms = modes.size === 0 || modes.has("--platform");
 const currentOnly = modes.has("--current");
@@ -62,40 +84,15 @@ if (modes.size === 0 || modes.has("--clean")) {
 }
 
 const optionalDependencies = Object.fromEntries(
-  platformPackages.map((pkg) => [pkg.name, packageJson.version]),
+  platformPackages.map((pkg) => [pkg.name, releaseVersion]),
 );
 
 if (prepareRoot) {
   await rm(rootOut, { recursive: true, force: true });
   await mkdir(rootOut, { recursive: true });
   await writeJson(resolve(rootOut, "package.json"), {
-    name: packageJson.name,
-    version: packageJson.version,
-    private: false,
-    type: "module",
-    description: "A TypeScript-first Node.js library for spawning libkrun-backed microVMs.",
-    license: "MIT OR Apache-2.0",
-    repository: {
-      type: "git",
-      url: "https://github.com/torkbot/sandbox",
-    },
-    publishConfig: {
-      access: "public",
-    },
-    exports: {
-      ".": {
-        types: "./dist/index.d.ts",
-        default: "./dist/index.js",
-      },
-    },
-    types: "./dist/index.d.ts",
-    bin: {
-      sandbox: "./dist/cli.js",
-    },
-    files: ["dist", "README.md"],
-    engines: {
-      node: ">=24.0.0",
-    },
+    ...releasePackageJson,
+    version: releaseVersion,
     dependencies: packageJson.dependencies ?? {},
     optionalDependencies,
   });
@@ -120,17 +117,12 @@ for (const platformPackage of preparePlatforms ? selectedPlatformPackages : []) 
   await mkdir(packageRoot, { recursive: true });
   await writeJson(resolve(packageRoot, "package.json"), {
     name: platformPackage.name,
-    version: packageJson.version,
+    version: releaseVersion,
     private: false,
     description: `sandbox-host artifact for @torkbot/sandbox on ${platformPackage.target}.`,
-    license: "MIT OR Apache-2.0",
-    repository: {
-      type: "git",
-      url: "https://github.com/torkbot/sandbox",
-    },
-    publishConfig: {
-      access: "public",
-    },
+    license: releasePackageJson.license,
+    repository: releasePackageJson.repository,
+    publishConfig: releasePackageJson.publishConfig,
     os: platformPackage.os,
     cpu: platformPackage.cpu,
     ...(platformPackage.libc === undefined ? {} : { libc: platformPackage.libc }),
@@ -156,6 +148,19 @@ for (const platformPackage of preparePlatforms ? selectedPlatformPackages : []) 
     await mkdir(resolve(installRoot, ".."), { recursive: true });
     await cp(packageRoot, installRoot, { recursive: true });
   }
+}
+
+function parseReleaseVersion(args: readonly string[]): string {
+  const index = args.indexOf("--version");
+  const version = index === -1 ? process.env.SANDBOX_RELEASE_VERSION : args[index + 1];
+  if (version === undefined || version.length === 0 || version.startsWith("--")) {
+    throw new Error("release version is required: pass --version <semver> or set SANDBOX_RELEASE_VERSION");
+  }
+  const normalized = version.startsWith("v") ? version.slice(1) : version;
+  if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(normalized)) {
+    throw new Error(`invalid release version: ${version}`);
+  }
+  return normalized;
 }
 
 async function copyDist(source: string, destination: string): Promise<void> {

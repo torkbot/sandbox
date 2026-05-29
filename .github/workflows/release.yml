@@ -6,6 +6,10 @@ on:
       - published
   workflow_dispatch:
     inputs:
+      release_version:
+        description: Version to publish, normally passed by the release driver from the npm release tag
+        type: string
+        required: true
       publish:
         description: Publish to npm via GitHub OIDC trusted publishing
         type: boolean
@@ -14,6 +18,9 @@ on:
 
 permissions:
   contents: read
+
+env:
+  SANDBOX_RELEASE_VERSION: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_version }}
 
 jobs:
   verify:
@@ -58,21 +65,16 @@ jobs:
       - name: Check Rust workspace
         run: cargo check --workspace
 
-      - name: Validate release tag matches package version
-        if: github.event_name == 'release'
+      - name: Validate release version
         run: |
           node <<'EOF'
-          const fs = require('node:fs');
-          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-          const tag = process.env.RELEASE_TAG || '';
-          const normalizedTag = tag.startsWith('v') ? tag.slice(1) : tag;
+          const input = process.env.SANDBOX_RELEASE_VERSION || '';
+          const version = input.startsWith('v') ? input.slice(1) : input;
 
-          if (pkg.version !== normalizedTag) {
-            throw new Error(`Release tag ${tag} does not match package.json version ${pkg.version}`);
+          if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version)) {
+            throw new Error(`Invalid release version: ${input}`);
           }
           EOF
-        env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
 
   build-kernel:
     name: Build kernel artifact (${{ matrix.kernel_arch }})
@@ -177,7 +179,7 @@ jobs:
         run: npm run build:host
 
       - name: Prepare platform package
-        run: node ./scripts/prepare-npm-packages.ts --platform --current
+        run: node ./scripts/prepare-npm-packages.ts --version "$SANDBOX_RELEASE_VERSION" --platform --current
 
       - name: Pack platform package
         run: npm pack ./dist/npm/sandbox-* --pack-destination dist/npm
@@ -259,7 +261,7 @@ jobs:
         run: npm run build:ts
 
       - name: Prepare root package
-        run: node ./scripts/prepare-npm-packages.ts --root
+        run: node ./scripts/prepare-npm-packages.ts --version "$SANDBOX_RELEASE_VERSION" --root
 
       - name: Pack root package
         run: npm pack ./dist/npm/sandbox --pack-destination dist/npm
@@ -304,7 +306,7 @@ jobs:
       - name: Publish platform packages
         run: |
           set -euo pipefail
-          version="$(node -p "require('./package.json').version")"
+          version="${SANDBOX_RELEASE_VERSION#v}"
           for tarball in dist/npm/torkbot-sandbox-*-"${version}".tgz; do
             case "$tarball" in
               *torkbot-sandbox-"${version}".tgz) continue ;;
@@ -314,5 +316,5 @@ jobs:
 
       - name: Publish root package
         run: |
-          version="$(node -p "require('./package.json').version")"
+          version="${SANDBOX_RELEASE_VERSION#v}"
           npm publish "dist/npm/torkbot-sandbox-${version}.tgz" --provenance --access public

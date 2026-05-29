@@ -2,9 +2,33 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
+test("release package manifest is the checked-in publish source", async () => {
+  const releasePackageJson = JSON.parse(
+    await readFile(new URL("../../release.package.json", import.meta.url), "utf8"),
+  ) as {
+    name?: string;
+    version?: string;
+    private?: boolean;
+    publishConfig?: { access?: string };
+    bin?: Record<string, string>;
+    optionalDependencies?: Record<string, string>;
+    dependencies?: Record<string, string>;
+  };
+
+  assert.equal(releasePackageJson.name, "@torkbot/sandbox");
+  assert.equal(releasePackageJson.version, undefined);
+  assert.equal(releasePackageJson.private, false);
+  assert.equal(releasePackageJson.publishConfig?.access, "public");
+  assert.deepEqual(releasePackageJson.bin, {
+    sandbox: "./dist/cli.js",
+  });
+  assert.equal(releasePackageJson.dependencies, undefined);
+  assert.equal(releasePackageJson.optionalDependencies, undefined);
+});
+
 test("root package declares public release metadata and platform optional dependencies", async () => {
   const packageJson = JSON.parse(
-    await readFile(new URL("../../package.json", import.meta.url), "utf8"),
+    await readFile(new URL("../../dist/npm/sandbox/package.json", import.meta.url), "utf8"),
   ) as {
     private?: boolean;
     publishConfig?: { access?: string };
@@ -23,16 +47,42 @@ test("root package declares public release metadata and platform optional depend
     "@torkbot/sandbox-darwin-arm64",
     "@torkbot/sandbox-linux-x64-gnu",
   ]);
+  assert.deepEqual(packageJson.optionalDependencies, {
+    "@torkbot/sandbox-darwin-arm64": packageJson.version,
+    "@torkbot/sandbox-linux-x64-gnu": packageJson.version,
+  });
   assert.equal(packageJson.napi, undefined);
 });
 
-test("release packaging aligns generated platform dependency versions", async () => {
+test("development package does not pin generated platform packages", async () => {
+  const packageJson = JSON.parse(
+    await readFile(new URL("../../package.json", import.meta.url), "utf8"),
+  ) as {
+    private?: boolean;
+    version?: string;
+    publishConfig?: { access?: string };
+    exports?: Record<string, unknown>;
+    files?: readonly string[];
+    optionalDependencies?: Record<string, string>;
+  };
+
+  assert.equal(packageJson.private, true);
+  assert.equal(packageJson.version, "0.0.0-dev");
+  assert.equal(packageJson.publishConfig, undefined);
+  assert.equal(packageJson.exports, undefined);
+  assert.equal(packageJson.files, undefined);
+  assert.equal(packageJson.optionalDependencies, undefined);
+});
+
+test("release packaging derives platform dependency versions from the supplied release version", async () => {
   const prepareScript = await readFile(
     new URL("../../scripts/prepare-npm-packages.ts", import.meta.url),
     "utf8",
   );
 
-  assert.match(prepareScript, /platformPackages\.map\(\(pkg\) => \[pkg\.name, packageJson\.version\]\)/);
+  assert.match(prepareScript, /release\.package\.json/);
+  assert.match(prepareScript, /platformPackages\.map\(\(pkg\) => \[pkg\.name, releaseVersion\]\)/);
+  assert.match(prepareScript, /parseReleaseVersion/);
 });
 
 test("release workflow builds platform packages before publishing the root package", async () => {
@@ -52,10 +102,11 @@ test("release workflow builds platform packages before publishing the root packa
   assert.doesNotMatch(workflow, /dist\/rootfs\/alpine-3\.23\.erofs/);
   assert.doesNotMatch(workflow, /dist\/rootfs\/alpine-3\.23\.ext4/);
   assert.doesNotMatch(workflow, /alpine-3\.20/);
-  assert.match(workflow, /prepare-npm-packages\.ts --platform --current/);
+  assert.match(workflow, /prepare-npm-packages\.ts --version "\$SANDBOX_RELEASE_VERSION" --platform --current/);
   assert.match(workflow, /Publish platform packages/);
   assert.match(workflow, /Publish root package/);
-  assert.match(workflow, /require\('\.\/package\.json'\)\.version/);
+  assert.match(workflow, /SANDBOX_RELEASE_VERSION/);
+  assert.doesNotMatch(workflow, /require\('\.\/package\.json'\)\.version/);
   assert.doesNotMatch(workflow, /0\.1\.0\.tgz/);
   assert.match(workflow, /id-token: write/);
 
@@ -74,7 +125,7 @@ test("local release scripts build current rootfs before packaging platform packa
   for (const scriptName of ["release:prepare", "release:pack"]) {
     const script = packageJson.scripts?.[scriptName] ?? "";
     const buildRootfs = script.indexOf("node --run build:rootfs:qcow2");
-    const packageCurrentPlatform = script.indexOf("prepare-npm-packages.ts --platform --current");
+    const packageCurrentPlatform = script.indexOf("prepare-npm-packages.ts --version ${SANDBOX_RELEASE_VERSION:-0.0.0-dev} --platform --current");
 
     assert.notEqual(buildRootfs, -1, `${scriptName} should build the rootfs image`);
     assert.notEqual(packageCurrentPlatform, -1, `${scriptName} should package the current platform`);
