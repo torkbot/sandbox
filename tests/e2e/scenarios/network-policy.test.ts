@@ -434,7 +434,7 @@ test("network.policy matches default DNS over UDP with DNS capability", async (t
   await using sandbox = await defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.23"),
     network: network.policy((conn) => {
-      if (conn.matchDns("10.0.2.1")?.accept()) return;
+      if (conn.matchDns((dns) => dns.dst.port === 53)?.accept()) return;
     }),
   }).boot();
   const result = await withTimeout(execGuestShell(sandbox, {
@@ -457,7 +457,7 @@ test("network.policy can answer DNS with custom accept resolvers", async (t) => 
   await using sandbox = await defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.23"),
     network: network.policy((conn) => {
-      if (conn.matchDns("10.0.2.1")?.accept({
+      if (conn.matchDns("127.0.0.1")?.accept({
         resolvers: [{ ip: "127.0.0.1", port: dnsServer.port }],
       })) return;
     }),
@@ -483,7 +483,7 @@ test("network.policy preserves TCP DNS for custom accept resolvers", async (t) =
   await using sandbox = await defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.23"),
     network: network.policy((conn) => {
-      if (conn.matchDns("10.0.2.1")?.accept({
+      if (conn.matchDns("127.0.0.1")?.accept({
         resolvers: [{ ip: "127.0.0.1", port: dnsServer.port }],
       })) return;
     }),
@@ -593,7 +593,7 @@ async function bootAllowingDns() {
   return await defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.23"),
     network: network.policy((conn) => {
-      conn.matchDns("10.0.2.1")?.accept();
+      conn.matchDns((dns) => dns.dst.port === 53)?.accept();
     }),
   }).boot();
 }
