@@ -110,6 +110,7 @@ pub struct NetworkConnectionAttempt {
     pub transport: NetworkProtocol,
     pub src: NetworkEndpoint,
     pub dst: NetworkEndpoint,
+    pub hostname: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -531,6 +532,7 @@ fn poll_udp_relay_socket(
                 ip: destination.ip.clone(),
                 port: destination.port,
             },
+            None,
         );
         if decision.action == NetworkPolicyAction::Deny {
             continue;
@@ -838,6 +840,7 @@ fn notify_connection_closed(
             ip: destination.ip.clone(),
             port: destination.port,
         },
+        hostname: destination.hostname.clone(),
     });
 }
 
@@ -909,6 +912,7 @@ fn poll_plain_http_socket(
             ip: destination.ip.clone(),
             port: destination.port,
         },
+        destination.hostname.clone(),
     );
     if decision.action == NetworkPolicyAction::Deny {
         http_connections.remove(&handle);
@@ -1090,6 +1094,7 @@ fn policy_decision(
     protocol: NetworkProtocol,
     src: NetworkEndpoint,
     dst: NetworkEndpoint,
+    hostname: Option<String>,
 ) -> io::Result<Option<NetworkPolicyDecision>> {
     policy
         .map(|policy| {
@@ -1098,6 +1103,7 @@ fn policy_decision(
                 transport: protocol,
                 src,
                 dst,
+                hostname,
             })
         })
         .transpose()
@@ -1116,6 +1122,7 @@ fn dns_policy_decision(
                 transport,
                 src,
                 dst,
+                hostname: None,
             })
         })
         .transpose()
@@ -1139,11 +1146,12 @@ fn decide_transport(
     protocol: NetworkProtocol,
     src: NetworkEndpoint,
     dst: NetworkEndpoint,
+    hostname: Option<String>,
 ) -> NetworkPolicyDecision {
     if is_loopback_destination(&dst.ip) {
         return denied_decision();
     }
-    let Some(decision) = policy_decision(policy, protocol, src, dst.clone())
+    let Some(decision) = policy_decision(policy, protocol, src, dst.clone(), hostname)
         .unwrap_or_else(|_| Some(denied_decision()))
     else {
         let allowed = match protocol {
@@ -1454,6 +1462,15 @@ impl LibkrunNetDevice {
             NetworkProtocol::Tcp,
             src,
             dst,
+            self.interception.resolved_hostname(
+                &Ipv4Address::new(
+                    destination_ip[0],
+                    destination_ip[1],
+                    destination_ip[2],
+                    destination_ip[3],
+                )
+                .to_string(),
+            ),
         );
         if decision.action == NetworkPolicyAction::Accept
             || decision.action == NetworkPolicyAction::AcceptHttp
@@ -2914,6 +2931,23 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct CapturePolicyRuntime {
+        attempts: std::sync::Mutex<Vec<NetworkConnectionAttempt>>,
+    }
+
+    impl NetworkPolicyRuntime for CapturePolicyRuntime {
+        fn decide_connection(
+            &self,
+            connection: NetworkConnectionAttempt,
+        ) -> io::Result<NetworkPolicyDecision> {
+            self.attempts.lock().unwrap().push(connection);
+            Ok(NetworkPolicyDecision {
+                action: NetworkPolicyAction::Deny,
+            })
+        }
+    }
+
     #[test]
     fn reads_libkrun_unixstream_ethernet_frame() {
         let ethernet = [
@@ -3047,6 +3081,7 @@ mod tests {
                 ip: "93.184.216.34".to_string(),
                 port: 443,
             },
+            None,
         );
 
         assert_eq!(decision.action, NetworkPolicyAction::Deny);
@@ -3213,6 +3248,31 @@ mod tests {
             Some("first.example".to_string()),
         );
         assert_eq!(interception.resolved_hostname("192.0.2.11"), None);
+    }
+
+    #[test]
+    fn transport_policy_receives_dns_pinned_hostname() {
+        let policy = CapturePolicyRuntime::default();
+
+        let decision = decide_transport(
+            Some(&policy),
+            None,
+            NetworkProtocol::Tcp,
+            NetworkEndpoint {
+                ip: "10.0.2.15".to_string(),
+                port: 50_000,
+            },
+            NetworkEndpoint {
+                ip: "192.0.2.10".to_string(),
+                port: 443,
+            },
+            Some("api.example.com".to_string()),
+        );
+
+        assert_eq!(decision.action, NetworkPolicyAction::Deny);
+        let attempts = policy.attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].hostname.as_deref(), Some("api.example.com"));
     }
 
     fn dns_query(name: &str, qtype: u16) -> Vec<u8> {

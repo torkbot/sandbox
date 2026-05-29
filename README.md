@@ -116,12 +116,13 @@ const sandbox = defineSandbox({
     memoryMiB: 4096,
   },
   network: network.policy(async (conn) => {
-    if (conn.transport === "udp" && conn.dst.port === 53) {
-      conn.accept();
-      return;
-    }
-    if (conn.transport === "tcp" && conn.dst.port === 443) {
-      conn.acceptHttp(async (request) => {
+    if (conn.matchDns("10.0.2.1")?.accept()) return;
+
+    const github = conn.transport === "tcp"
+      ? conn.matchHttp("api.github.com")
+      : undefined;
+    if (github) {
+      github.accept(async (request) => {
         if (request.destination.hostname !== "api.github.com") return;
         request.headers.set(
           "authorization",
@@ -242,19 +243,17 @@ not actually HTTP or HTTPS, it fails closed.
 
 ```ts
 const policy = network.policy(async (conn) => {
-  if (
-    conn.transport === "tcp" &&
-    conn.dst.isPublicInternet() &&
-    conn.dst.port === 443
-  ) {
-    conn.acceptHttp(async (request) => {
-      if (request.destination.hostname !== "api.example.com") return;
-      request.headers.set(
-        "authorization",
-        `Bearer ${await credentialBroker.authorizationFor(request)}`,
-      );
-    });
-  }
+  const api = conn.transport === "tcp"
+    ? conn.matchHttp("api.example.com")
+    : undefined;
+  if (!api) return;
+
+  api.accept(async (request) => {
+    request.headers.set(
+      "authorization",
+      `Bearer ${await credentialBroker.authorizationFor(request)}`,
+    );
+  });
 });
 ```
 
@@ -271,10 +270,8 @@ conn.dst.port;
 Endpoint helpers classify logical address ranges without relying on hostnames:
 `isLoopback()`, `isPrivate()`, `isLinkLocal()`, `isMulticast()`,
 `isBroadcast()`, `isDocumentation()`, `isReserved()`, and
-`isPublicInternet()`. `transport` is the TCP/UDP discriminator. TCP callbacks
-may also include `conn.signals` metadata such as TLS SNI or ALPN when the
-runtime has explicitly observed it, but Sandbox does not expose a best-effort
-`conn.protocol` classifier.
+`isPublicInternet()`. `transport` is the TCP/UDP discriminator. Sandbox does
+not expose a best-effort `conn.protocol` classifier.
 
 HTTP middleware receives trusted destination metadata separately from the
 request URL. `request.destination.hostname` is populated only when Sandbox can
@@ -282,6 +279,25 @@ pin the destination IP to trusted connection metadata, such as its own DNS
 answer cache. IP-addressed requests still work under `acceptHttp(...)`, but they
 do not advertise a hostname. Do not use the HTTP `Host` header as authority for
 policy decisions.
+
+For common policy checks, protocol match helpers acquire a typed capability
+before accepting traffic:
+
+```ts
+network.policy(async (conn) => {
+  if (conn.matchDns("10.0.2.1")?.accept()) return;
+
+  if (conn.transport !== "tcp") return;
+  const http = conn.matchHttp((candidate) =>
+    candidate.hostname === "api.github.com"
+  );
+  if (!http) return;
+
+  if (!(await policyManager.allow(http))) return;
+
+  http.accept((request) => policyManager.handle(request));
+});
+```
 
 Deny remains the default. If the policy callback does not create a grant, the
 connection is blocked. The grants returned by `accept()` and `acceptHttp()` are
