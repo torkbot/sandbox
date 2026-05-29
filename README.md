@@ -122,7 +122,7 @@ const sandbox = defineSandbox({
     }
     if (conn.transport === "tcp" && conn.dst.port === 443) {
       conn.acceptHttp(async (request) => {
-        if (request.url.hostname !== "api.github.com") return;
+        if (request.destination.hostname !== "api.github.com") return;
         request.headers.set(
           "authorization",
           `Bearer ${await githubTokens.tokenForRequest(request)}`,
@@ -248,7 +248,7 @@ const policy = network.policy(async (conn) => {
     conn.dst.port === 443
   ) {
     conn.acceptHttp(async (request) => {
-      if (request.url.hostname !== "api.example.com") return;
+      if (request.destination.hostname !== "api.example.com") return;
       request.headers.set(
         "authorization",
         `Bearer ${await credentialBroker.authorizationFor(request)}`,
@@ -275,6 +275,13 @@ Endpoint helpers classify logical address ranges without relying on hostnames:
 may also include `conn.signals` metadata such as TLS SNI or ALPN when the
 runtime has explicitly observed it, but Sandbox does not expose a best-effort
 `conn.protocol` classifier.
+
+HTTP middleware receives trusted destination metadata separately from the
+request URL. `request.destination.hostname` is populated only when Sandbox can
+pin the destination IP to trusted connection metadata, such as its own DNS
+answer cache. IP-addressed requests still work under `acceptHttp(...)`, but they
+do not advertise a hostname. Do not use the HTTP `Host` header as authority for
+policy decisions.
 
 Deny remains the default. If the policy callback does not create a grant, the
 connection is blocked. The grants returned by `accept()` and `acceptHttp()` are
