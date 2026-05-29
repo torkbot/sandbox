@@ -329,27 +329,11 @@ impl KrunContext {
         let network_enabled = spec.network.is_some();
         let mount_env = CString::new(format!("SANDBOX_VIRTIOFS_MOUNTS={encoded_mounts}")).unwrap();
         let http_network_env = CString::new("SANDBOX_HTTP_NETWORK=1").unwrap();
-        let ca_env = spec
-            .network
-            .as_ref()
-            .and_then(|network| network.http.as_ref())
-            .and_then(|http| http.ca_certificate_pem.as_ref())
-            .map(|certificate| {
-                CString::new(format!(
-                    "SANDBOX_HTTP_CA_PEM_B64={}",
-                    base64::engine::general_purpose::STANDARD.encode(certificate)
-                ))
-            })
-            .transpose()
-            .map_err(|_| KrunError::new("krun_set_exec", -libc::EINVAL))?;
         let mut argv = vec![exec_path.as_ptr(), mount_arg.as_ptr()];
         let mut envp = vec![mount_env.as_ptr()];
         if network_enabled {
             argv.push(http_network_arg.as_ptr());
             envp.push(http_network_env.as_ptr());
-        }
-        if let Some(ca_env) = ca_env.as_ref() {
-            envp.push(ca_env.as_ptr());
         }
         argv.push(std::ptr::null());
         envp.push(std::ptr::null());

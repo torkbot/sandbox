@@ -397,11 +397,12 @@ TypeScript API:
   interception machinery and certificate plumbing.
 - When HTTP interception is enabled, the host generates the CA material and
   passes only the public CA certificate to Sandbox init. Init does not generate
-  or manage certificates; it only installs the supplied CA using the selected
-  rootfs' native trust-store mechanism when one is discoverable. It probes
-  standard `update-ca-certificates` and `update-ca-trust` layouts, while still
-  exporting a runtime CA file for tools that honor `SSL_CERT_FILE` or
-  `CURL_CA_BUNDLE`.
+  or manage certificates; the host exposes the supplied CA through an internal
+  read-only virtiofs mount, then init installs it using the selected rootfs'
+  native trust-store mechanism. Built-in rootfs launches use an ephemeral
+  writable COW view for HTTP interception so init can update the guest trust
+  store deterministically. If a rootfs does not provide a supported native
+  trust-store installer, init fails closed.
 
 The intended boundary is that Sandbox knows how to launch, isolate, mount,
 intercept, and enforce. User-space owns artifact selection, filesystem

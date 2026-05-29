@@ -64,13 +64,12 @@ The guest init is a first-class binary in this repo. It should:
 1. Establish the host control channel.
 2. Install host-provided CA material into the guest trust store. The guest has
    minimal participation: init does not generate or manage certificates, it only
-   exposes the contract for installing a supplied public CA certificate. It
-   writes the CA to a Sandbox runtime path, then probes the supplied rootfs for
-   known trust-store installers such as `update-ca-certificates` with
-   `/usr/local/share/ca-certificates` or `update-ca-trust` with
-   `/etc/pki/ca-trust/source/anchors`. If no installer is present, init still
-   exposes the CA through the runtime file and process environment for clients
-   that honor `SSL_CERT_FILE` or `CURL_CA_BUNDLE`.
+   exposes the contract for installing a supplied public CA certificate. The
+   host exposes the CA through an internal read-only virtiofs mount, then init
+   installs it through the supplied rootfs' native trust-store mechanism.
+   Built-in rootfs launches that enable HTTP interception receive an ephemeral
+   writable COW view so this update is deterministic. If no supported native
+   installer is present, init fails closed.
 3. Configure networking for the chosen mode.
 4. Mount required virtual filesystems.
 5. Report readiness to the host.

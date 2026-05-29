@@ -23,7 +23,7 @@ use sandbox::runtime::{ControlSocket, HostServices, StartStatusObserver, Virtual
 
 mod host_vfs;
 
-use host_vfs::{HostIoBridge, NodeVirtualFs};
+use host_vfs::{HostIoBridge, NodeVirtualFs, StaticFileVirtualFs};
 
 const USAGE: &str = "usage: sandbox-host --capabilities | --stdio";
 
@@ -599,21 +599,38 @@ fn virtual_fs_devices(
     spec: &sandbox::MicroVmSpec,
     bridge: std::sync::Arc<HostIoBridge>,
 ) -> Vec<VirtualFsDevice> {
-    spec.mounts
-        .iter()
-        .enumerate()
-        .filter_map(|(index, mount)| match mount {
-            MountSpec::VirtualFs { path, writable } => {
-                let tag = format!("vfs{index}");
-                Some(VirtualFsDevice {
-                    tag,
-                    path: path.clone(),
-                    readonly: !writable,
-                    backend: NodeVirtualFs::new(path.clone(), bridge.clone()),
-                })
-            }
+    let mut devices: Vec<VirtualFsDevice> = spec
+        .network
+        .as_ref()
+        .and_then(|network| network.http.as_ref())
+        .and_then(|http| http.ca_certificate_pem.as_ref())
+        .map(|certificate| {
+            vec![VirtualFsDevice {
+                tag: "sandbox-http-ca".to_string(),
+                path: "/run/sandbox/http-ca".to_string(),
+                readonly: true,
+                backend: StaticFileVirtualFs::new("http-ca.pem", certificate.as_bytes().to_vec()),
+            }]
         })
-        .collect()
+        .unwrap_or_default();
+
+    devices.extend(
+        spec.mounts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, mount)| match mount {
+                MountSpec::VirtualFs { path, writable } => {
+                    let tag = format!("vfs{index}");
+                    Some(VirtualFsDevice {
+                        tag,
+                        path: path.clone(),
+                        readonly: !writable,
+                        backend: NodeVirtualFs::new(path.clone(), bridge.clone()),
+                    })
+                }
+            }),
+    );
+    devices
 }
 
 fn parse_spawn(document: Document) -> Result<MicroVmSpecInput, Box<dyn std::error::Error>> {

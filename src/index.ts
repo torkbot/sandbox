@@ -632,7 +632,12 @@ class DefinedSandbox implements SandboxDefinition {
     const networkPolicy = this.#options.network === undefined
       ? undefined
       : createNetworkPolicyHookRegistration(this.#options.network);
-    const launchOptions = await toInternalSandboxOptions(this.#options, options, networkPolicy?.network);
+    const launchOptions = await toInternalSandboxOptions(
+      this.#options,
+      options,
+      networkPolicy?.network,
+      (networkPolicy?.hooks.length ?? 0) > 0,
+    );
     try {
       validateInternalSandboxOptions(launchOptions);
       const hostOptions = toHostSpawnOptions(launchOptions, networkPolicy?.hooks ?? []);
@@ -871,8 +876,9 @@ async function toInternalSandboxOptions(
   config: SandboxDefinitionOptions,
   boot: SandboxBootOptions,
   network?: InternalNetworkConfig,
+  httpInterception = false,
 ): Promise<InternalSandboxOptions> {
-  const rootfs = await lowerRootfs(config.rootfs);
+  const rootfs = await lowerRootfs(config.rootfs, { httpInterception });
   return {
     resources: config.resources,
     rootfs,
@@ -1084,29 +1090,69 @@ function ipv6StartsWith(ip: string, prefix: string): boolean {
 
 async function lowerRootfs(
   rootfs: Rootfs,
+  options: {
+    readonly httpInterception?: boolean;
+  } = {},
 ): Promise<InternalSandboxOptions["rootfs"]> {
   switch (rootfs.kind) {
-    case "built-in-rootfs":
+    case "built-in-rootfs": {
+      if (options.httpInterception === true) {
+        return lowerCowRootfs(rootfs, createEphemeralCowBlockStore());
+      }
       return {
         path: builtInRootfsPath(rootfs.name),
         readonly: true,
         format: "qcow2",
       };
+    }
     case "cow-rootfs":
-      return {
-        path: builtInRootfsPath(rootfs.base.name),
-        readonly: false,
-        format: "qcow2",
-        storage: {
-          kind: "cow-block-store",
-          blockSize: rootfs.writable.blockSize,
-          blockStore: rootfs.writable,
-          context: {
-            base: builtInRootfsIdentity(rootfs.base.name),
-          },
-        },
-      };
+      return lowerCowRootfs(rootfs.base, rootfs.writable);
   }
+}
+
+function lowerCowRootfs(
+  base: BuiltInRootfsConfig,
+  writable: SandboxBlockStore,
+): InternalSandboxOptions["rootfs"] {
+  return {
+    path: builtInRootfsPath(base.name),
+    readonly: false,
+    format: "qcow2",
+    storage: {
+      kind: "cow-block-store",
+      blockSize: writable.blockSize,
+      blockStore: writable,
+      context: {
+        base: builtInRootfsIdentity(base.name),
+      },
+    },
+  };
+}
+
+function createEphemeralCowBlockStore(): SandboxBlockStore {
+  const blocks = new Map<bigint, Uint8Array>();
+  return {
+    blockSize: 65536,
+    async list() {
+      return Array.from(blocks.keys());
+    },
+    async read(range) {
+      const chunks: SandboxBlockChunk[] = [];
+      for (let offset = 0; offset < range.count; offset += 1) {
+        const start = range.start + BigInt(offset);
+        const data = blocks.get(start);
+        if (data !== undefined) {
+          chunks.push({ start, data: data.slice() });
+        }
+      }
+      return chunks;
+    },
+    async write(chunks) {
+      for (const chunk of chunks) {
+        blocks.set(chunk.start, chunk.data.slice());
+      }
+    },
+  };
 }
 
 function validateRootfs(rootfs: Rootfs): void {

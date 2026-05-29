@@ -16,11 +16,11 @@ fn main() {
 fn run() -> Result<(), InitError> {
     mount_kernel_filesystems()?;
     configure_http_network(std::env::args().skip(1))?;
-    install_http_ca(std::env::var("SANDBOX_HTTP_CA_PEM_B64").ok())?;
     mount_virtual_filesystems(
         std::env::args().skip(1),
         std::env::var("SANDBOX_VIRTIOFS_MOUNTS").ok(),
     )?;
+    install_http_ca()?;
     let packet = init_ready_packet(true)?;
     let mut control = connect_control()?;
     send_init_ready(&mut control, &packet)?;
@@ -183,7 +183,13 @@ fn mount_virtual_filesystems(
         };
         let tag = decode_mount_field(tag)?;
         let path = decode_mount_field(path)?;
-        if !Path::new(&path).is_dir() {
+        if path.starts_with("/run/sandbox/") {
+            std::fs::create_dir_all(&path).map_err(|error| {
+                InitError(format!(
+                    "create virtual filesystem mount point {path}: {error}"
+                ))
+            })?;
+        } else if !Path::new(&path).is_dir() {
             return Err(InitError(format!(
                 "virtual filesystem mount point does not exist: {path}"
             )));
@@ -403,10 +409,6 @@ fn run_guest_spawn(
 
     let mut command = std::process::Command::new(&argv[0]);
     command.args(&argv[1..]);
-    if std::path::Path::new("/run/sandbox/http-ca.pem").exists() {
-        command.env("SSL_CERT_FILE", "/run/sandbox/http-ca.pem");
-        command.env("CURL_CA_BUNDLE", "/run/sandbox/http-ca.pem");
-    }
 
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::piped());
@@ -566,10 +568,6 @@ fn run_guest_exec(
 
     let mut command = std::process::Command::new(&argv[0]);
     command.args(&argv[1..]);
-    if std::path::Path::new("/run/sandbox/http-ca.pem").exists() {
-        command.env("SSL_CERT_FILE", "/run/sandbox/http-ca.pem");
-        command.env("CURL_CA_BUNDLE", "/run/sandbox/http-ca.pem");
-    }
     let output = match command.envs(env).output() {
         Ok(output) => output,
         Err(error) => {
@@ -618,27 +616,19 @@ fn terminating_signal(_status: std::process::ExitStatus) -> Option<i32> {
     None
 }
 
-fn install_http_ca(certificate: Option<String>) -> Result<(), InitError> {
-    let Some(certificate) = certificate else {
+fn install_http_ca() -> Result<(), InitError> {
+    let certificate_path = std::path::Path::new("/run/sandbox/http-ca/http-ca.pem");
+    if !certificate_path.exists() {
         return Ok(());
-    };
+    }
 
-    let certificate = base64::engine::general_purpose::STANDARD
-        .decode(certificate)
-        .map_err(|error| InitError(format!("decode boot HTTP CA certificate: {error}")))?;
+    let certificate = std::fs::read(certificate_path)
+        .map_err(|error| InitError(format!("read host HTTP CA certificate: {error}")))?;
     write_http_ca(&certificate)
 }
 
 fn prepare_exec_environment(env: &[(String, String)]) -> Result<(), InitError> {
-    let Some((_, certificate)) = env.iter().find(|(key, _)| key == "SANDBOX_HTTP_CA_PEM_B64")
-    else {
-        return Ok(());
-    };
-
-    let certificate = base64::engine::general_purpose::STANDARD
-        .decode(certificate)
-        .map_err(|error| InitError(format!("decode host HTTP CA certificate: {error}")))?;
-    write_http_ca(&certificate)?;
+    let _ = env;
     Ok(())
 }
 
@@ -656,43 +646,50 @@ fn install_http_ca_into_guest_trust(certificate: &[u8]) -> Result<(), InitError>
     if std::path::Path::new("/usr/local/share/ca-certificates").is_dir()
         && command_exists("/usr/sbin/update-ca-certificates")
     {
-        if try_install_http_ca(
+        install_http_ca_using(
             "/usr/local/share/ca-certificates/sandbox-http-interception-ca.crt",
             certificate,
             "/usr/sbin/update-ca-certificates",
             &[],
-        ) {
-            return Ok(());
-        }
+        )?;
+        return Ok(());
     }
 
     if std::path::Path::new("/etc/pki/ca-trust/source/anchors").is_dir()
         && command_exists("/usr/bin/update-ca-trust")
     {
-        let _ = try_install_http_ca(
+        install_http_ca_using(
             "/etc/pki/ca-trust/source/anchors/sandbox-http-interception-ca.pem",
             certificate,
             "/usr/bin/update-ca-trust",
             &["extract"],
-        );
+        )?;
+        return Ok(());
     }
-    Ok(())
+
+    Err(InitError(
+        "install host HTTP CA certificate: guest rootfs does not provide a supported trust-store installer".to_string(),
+    ))
 }
 
 #[cfg(target_os = "linux")]
-fn try_install_http_ca(
+fn install_http_ca_using(
     destination: &str,
     certificate: &[u8],
     command: &str,
     args: &[&str],
-) -> bool {
-    if std::fs::write(destination, certificate).is_err() {
-        return false;
-    }
-    if run_setup_command(command, args).is_err() {
-        return false;
-    }
-    true
+) -> Result<(), InitError> {
+    std::fs::write(destination, certificate).map_err(|error| {
+        InitError(format!(
+            "write HTTP CA certificate to {destination}: {error}"
+        ))
+    })?;
+    run_setup_command(command, args).map_err(|error| {
+        InitError(format!(
+            "install HTTP CA certificate with {command}: {error}"
+        ))
+    })?;
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
