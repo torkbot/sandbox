@@ -406,8 +406,6 @@ export class HostProcessSandboxVm implements HostControlChannel {
           sourcePort: assertNumber(document.sourcePort, "sourcePort"),
           originalIp: assertString(document.originalDestinationIp, "originalDestinationIp"),
           originalPort: assertNumber(document.originalDestinationPort, "originalDestinationPort"),
-          upstreamIp: assertString(document.upstreamDialIp, "upstreamDialIp"),
-          upstreamPort: assertNumber(document.upstreamDialPort, "upstreamDialPort"),
         },
         tls: optionalTlsMetadata(document.tls),
       };

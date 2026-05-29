@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import dgram from "node:dgram";
@@ -31,7 +31,7 @@ test("network.policy allows plain HTTP over TCP", async (t) => {
   await using sandbox = await bootAllowingNetwork();
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "http-allow",
-    script: `curl -fsS --max-time 5 http://public.sandbox.test:${origin.port}/`,
+    script: `curl -fsS --max-time 5 http://${hostOriginAddress()}:${origin.port}/`,
   }), 10_000, "plain HTTP request");
 
   assert.equal(result.exitCode, 0, commandOutput(result));
@@ -66,7 +66,7 @@ test("network.policy allows HTTPS HTTP middleware", async (t) => {
 
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "https-middleware",
-    script: `curl -kfsS --max-time 5 https://public.sandbox.test:${origin.port}/`,
+    script: `curl -kfsS --max-time 5 https://${hostOriginAddress()}:${origin.port}/`,
   }), 10_000, "HTTPS middleware request");
 
   assert.equal(result.exitCode, 0, commandOutput(result));
@@ -75,7 +75,7 @@ test("network.policy allows HTTPS HTTP middleware", async (t) => {
   assert.equal(result.stdout, "https-ok");
 });
 
-test("network.policy denies HTTP by destination range before origin access", async (t) => {
+test("network.policy denies private HTTP by destination range before origin access", async (t) => {
   if (!requireVmLaunchSupport(t)) return;
   const origin = await startTcpServer((socket) => {
     socket.end("HTTP/1.1 200 OK\r\ncontent-length: 11\r\n\r\nunexpected");
@@ -91,7 +91,7 @@ test("network.policy denies HTTP by destination range before origin access", asy
   }).boot();
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "http-deny-range",
-    script: `curl -fsS --max-time 3 http://public.sandbox.test:${origin.port}/`,
+    script: `curl -fsS --max-time 3 http://${hostOriginAddress()}:${origin.port}/`,
   }), 8_000, "denied HTTP request");
 
   assert.notEqual(result.exitCode, 0, commandOutput(result));
@@ -126,10 +126,11 @@ test("network.policy denies raw TCP before upstream receives bytes", async (t) =
   await using sandbox = await bootDenyingNetwork();
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "tcp-echo-deny",
-    script: pythonTcpExchange(echo.port, "tcp-denied"),
+    script: pythonTcpRefused(echo.port),
   }), 8_000, "denied raw TCP echo");
 
-  assert.notEqual(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "ECONNREFUSED");
   assert.equal(echo.connections.length, 0);
 });
 
@@ -148,7 +149,7 @@ test("network.policy allows SSH handshake traffic as raw bidirectional TCP", asy
       "-o BatchMode=yes",
       "-o ConnectTimeout=5",
       `-p ${ssh.port}`,
-      "public.sandbox.test true",
+      `${hostOriginAddress()} true`,
     ].join(" "),
   }), 12_000, "SSH handshake");
 
@@ -172,7 +173,7 @@ test("network.policy denies SSH before the server banner is observed", async (t)
       "-o BatchMode=yes",
       "-o ConnectTimeout=3",
       `-p ${ssh.port}`,
-      "public.sandbox.test true",
+      `${hostOriginAddress()} true`,
     ].join(" "),
   }), 8_000, "denied SSH handshake");
 
@@ -243,11 +244,11 @@ test("network.policy allows default DNS over UDP with the DNS hook", async (t) =
   await using sandbox = await bootAllowingDns();
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "dns-udp-default",
-    script: pythonDnsQuery({ transport: "udp", name: "public.sandbox.test" }),
+    script: pythonDnsQuery({ transport: "udp", name: "localhost" }),
   }), 8_000, "default UDP DNS query");
 
   assert.equal(result.exitCode, 0, commandOutput(result));
-  assert.equal(result.stdout, "93.184.216.34");
+  assert.equal(result.stdout, "127.0.0.1");
 });
 
 test("network.policy supports a custom DNS resolver over UDP", async (t) => {
@@ -269,11 +270,11 @@ test("network.policy allows default DNS over TCP with the DNS hook", async (t) =
   await using sandbox = await bootAllowingDns();
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "dns-tcp-default",
-    script: pythonDnsQuery({ transport: "tcp", name: "public.sandbox.test" }),
+    script: pythonDnsQuery({ transport: "tcp", name: "localhost" }),
   }), 8_000, "default TCP DNS query");
 
   assert.equal(result.exitCode, 0, commandOutput(result));
-  assert.equal(result.stdout, "93.184.216.34");
+  assert.equal(result.stdout, "127.0.0.1");
 });
 
 test("network.policy supports a custom DNS resolver over TCP", async (t) => {
@@ -321,18 +322,26 @@ test("network.policy exposes source and destination endpoint helpers for transpo
     rootfs: rootfs.builtIn("alpine:3.23"),
     network: network.policy((conn) => {
       observations.push(observation(conn));
-      if (conn.transport === "udp" && conn.dst.port === 53) {
-        conn.allow();
+      if (conn.protocol === "dns") {
+        conn.allowDns(() => ({
+          answers: [
+            {
+              type: "A",
+              address: "203.0.113.30",
+              ttl: 60,
+            },
+          ],
+        }));
       }
     }),
   }).boot();
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "endpoint-observations",
-    script: `python3 - <<'PY'\nimport socket\nprint(socket.gethostbyname("public.sandbox.test"))\nPY`,
+    script: pythonDnsQuery({ transport: "udp", name: "custom.sandbox.test" }),
   }), 8_000, "endpoint helper observation");
 
   assert.equal(result.exitCode, 0, commandOutput(result));
-  assert.match(result.stdout, /93\.184\.216\.34/);
+  assert.equal(result.stdout, "203.0.113.30");
   assert.ok(observations.some((entry) => {
     return entry.transport === "udp"
       && entry.protocol === "dns"
@@ -363,7 +372,7 @@ async function bootAllowingDns() {
     rootfs: rootfs.builtIn("alpine:3.23"),
     network: network.policy((conn) => {
       if (conn.protocol === "dns") {
-        assert.equal(conn.questions[0]?.name, "public.sandbox.test");
+        assert.equal(conn.questions[0]?.name, "localhost");
         conn.allowDns();
       }
     }),
@@ -406,15 +415,19 @@ function observation(conn: NetworkConnectionRequest) {
 }
 
 function pythonTcpExchange(port: number, message: string): string {
-  return `python3 - <<'PY'\nimport socket\ns = socket.create_connection(("public.sandbox.test", ${port}), timeout=3)\ns.settimeout(3)\ns.sendall(${JSON.stringify(message)}.encode())\nprint(s.recv(4096).decode(), end="")\ns.close()\nPY`;
+  return `python3 - <<'PY'\nimport socket\ns = socket.create_connection((${JSON.stringify(hostOriginAddress())}, ${port}), timeout=3)\ns.settimeout(3)\ns.sendall(${JSON.stringify(message)}.encode())\nprint(s.recv(4096).decode(), end="")\ns.close()\nPY`;
+}
+
+function pythonTcpRefused(port: number): string {
+  return `python3 - <<'PY'\nimport errno, socket\ntry:\n    socket.create_connection((${JSON.stringify(hostOriginAddress())}, ${port}), timeout=3)\nexcept OSError as error:\n    print(errno.errorcode.get(getattr(error, "errno", None), type(error).__name__), end="")\nPY`;
 }
 
 function pythonTlsExchange(port: number, message: string): string {
-  return `python3 - <<'PY'\nimport socket, ssl\nctx = ssl._create_unverified_context()\nraw = socket.create_connection(("public.sandbox.test", ${port}), timeout=3)\ns = ctx.wrap_socket(raw, server_hostname="localhost")\ns.settimeout(3)\ns.sendall(${JSON.stringify(message)}.encode())\nprint(s.recv(4096).decode(), end="")\ns.close()\nPY`;
+  return `python3 - <<'PY'\nimport socket, ssl\nctx = ssl._create_unverified_context()\nraw = socket.create_connection((${JSON.stringify(hostOriginAddress())}, ${port}), timeout=3)\ns = ctx.wrap_socket(raw, server_hostname="localhost")\ns.settimeout(3)\ns.sendall(${JSON.stringify(message)}.encode())\nprint(s.recv(4096).decode(), end="")\ns.close()\nPY`;
 }
 
 function pythonUdpExchange(port: number, message: string): string {
-  return `python3 - <<'PY'\nimport socket\ns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\ns.settimeout(3)\ns.sendto(${JSON.stringify(message)}.encode(), ("public.sandbox.test", ${port}))\nprint(s.recvfrom(4096)[0].decode(), end="")\ns.close()\nPY`;
+  return `python3 - <<'PY'\nimport socket\ns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\ns.settimeout(3)\ns.sendto(${JSON.stringify(message)}.encode(), (${JSON.stringify(hostOriginAddress())}, ${port}))\nprint(s.recvfrom(4096)[0].decode(), end="")\ns.close()\nPY`;
 }
 
 function pythonDnsQuery(input: { readonly transport: "tcp" | "udp"; readonly name: string }): string {
@@ -544,7 +557,7 @@ async function startUdpEchoServer(): Promise<{
   });
   await new Promise<void>((resolve, reject) => {
     socket.once("error", reject);
-    socket.bind(0, "127.0.0.1", () => {
+      socket.bind(0, "0.0.0.0", () => {
       socket.off("error", reject);
       resolve();
     });
@@ -576,7 +589,7 @@ async function createSelfSignedCertificate(): Promise<{
     "[req_distinguished_name]",
     "CN=localhost",
     "[v3_req]",
-    "subjectAltName=DNS:localhost,DNS:public.sandbox.test",
+    `subjectAltName=DNS:localhost,IP:${hostOriginAddress()}`,
     "",
   ].join("\n"));
   await execFileAsync("openssl", [
@@ -600,11 +613,22 @@ async function createSelfSignedCertificate(): Promise<{
 async function listen(server: net.Server | tls.Server): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
+    server.listen(0, "0.0.0.0", () => {
       server.off("error", reject);
       resolve();
     });
   });
+}
+
+function hostOriginAddress(): string {
+  for (const addresses of Object.values(networkInterfaces())) {
+    for (const address of addresses ?? []) {
+      if (address.family === "IPv4" && !address.internal && !address.address.startsWith("169.254.")) {
+        return address.address;
+      }
+    }
+  }
+  throw new Error("no non-internal IPv4 host address available for e2e origin");
 }
 
 async function closeServer(server: net.Server | tls.Server): Promise<void> {

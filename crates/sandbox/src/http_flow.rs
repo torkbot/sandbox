@@ -16,7 +16,6 @@ pub struct InterceptedHttpRequest {
     pub url: String,
     pub source: InterceptedDestination,
     pub original_destination: InterceptedDestination,
-    pub upstream_dial: InterceptedDestination,
     pub headers: Vec<(String, String)>,
     pub tls: Option<HostTlsMetadata>,
 }
@@ -32,14 +31,6 @@ pub trait HttpHookExecutor: Send + Sync + std::fmt::Debug {
         &self,
         request: InterceptedHttpRequest,
     ) -> io::Result<Vec<(String, String)>>;
-
-    fn rejects_rebound_authority(
-        &self,
-        scheme: &str,
-        authority: &str,
-        original_destination: &InterceptedDestination,
-        upstream_dial: &InterceptedDestination,
-    ) -> bool;
 }
 
 pub trait HttpInterceptRuntime: Send + Sync + std::fmt::Debug {
@@ -47,14 +38,6 @@ pub trait HttpInterceptRuntime: Send + Sync + std::fmt::Debug {
         &self,
         request: InterceptedHttpRequest,
     ) -> io::Result<InterceptedHttpRequest>;
-
-    fn rejects_rebound_authority(
-        &self,
-        scheme: &str,
-        authority: &str,
-        original_destination: &InterceptedDestination,
-        upstream_dial: &InterceptedDestination,
-    ) -> bool;
 }
 
 #[derive(Debug, Clone)]
@@ -78,16 +61,5 @@ where
     ) -> io::Result<InterceptedHttpRequest> {
         request.headers = self.hooks.apply_request_headers(request.clone())?;
         Ok(request)
-    }
-
-    fn rejects_rebound_authority(
-        &self,
-        scheme: &str,
-        authority: &str,
-        original_destination: &InterceptedDestination,
-        upstream_dial: &InterceptedDestination,
-    ) -> bool {
-        self.hooks
-            .rejects_rebound_authority(scheme, authority, original_destination, upstream_dial)
     }
 }

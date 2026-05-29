@@ -49,8 +49,6 @@ const DNS_PACKET_BUFFER_BYTES: usize = 4096;
 const UDP_RELAY_BUFFER_BYTES: usize = 64 * 1024;
 const UDP_NAT_PORT_START: u16 = 40_000;
 const UDP_NAT_PORT_END: u16 = 60_999;
-const DNS_PROTECTED_TEST_IP: [u8; 4] = [10, 1, 2, 3];
-const DNS_PUBLIC_TEST_IP: [u8; 4] = [93, 184, 216, 34];
 const NAT_FLOW_IDLE_TTL: Duration = Duration::from_secs(300);
 const NAT_FLOW_CLOSING_TTL: Duration = Duration::from_secs(30);
 const NETWORK_IDLE_WAKE_INTERVAL: Duration = Duration::from_millis(100);
@@ -330,7 +328,13 @@ fn run_network_service(
         Ok(tx) => tx,
         Err(_) => return,
     };
-    let mut device = LibkrunNetDevice::new(stream, tx, Ipv4Address::new(10, 0, 2, 1));
+    let mut device = LibkrunNetDevice::new(
+        stream,
+        tx,
+        Ipv4Address::new(10, 0, 2, 1),
+        outbound_rules.clone(),
+        policy.clone(),
+    );
     let mut iface = Interface::new(
         Config::new(EthernetAddress([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xf0]).into()),
         &mut device,
@@ -581,25 +585,20 @@ fn poll_udp_relay_socket(
         else {
             continue;
         };
-        if outbound_rules
-            .is_some_and(|rules| !is_allowed_outbound_udp(&destination.ip, destination.port, rules))
-        {
-            continue;
-        }
-        if policy.is_some_and(|policy| {
-            !policy_allows_connection(
-                policy,
-                NetworkProtocol::Udp,
-                NetworkEndpoint {
-                    ip: remote.endpoint.addr.to_string(),
-                    port: remote.endpoint.port,
-                },
-                NetworkEndpoint {
-                    ip: destination.ip.clone(),
-                    port: destination.port,
-                },
-            )
-        }) {
+        let decision = decide_transport(
+            policy,
+            outbound_rules,
+            NetworkProtocol::Udp,
+            NetworkEndpoint {
+                ip: remote.endpoint.addr.to_string(),
+                port: remote.endpoint.port,
+            },
+            NetworkEndpoint {
+                ip: destination.ip.clone(),
+                port: destination.port,
+            },
+        );
+        if !decision.allowed {
             continue;
         }
         let flow = UdpFlow {
@@ -953,52 +952,36 @@ fn poll_plain_http_socket(
     http_connections: &mut HashMap<SocketHandle, HttpConnection>,
 ) {
     let Some(destination) = original_http_destination(socket, nat) else {
-        socket.close();
+        socket.abort();
         return;
     };
-    if outbound_rules
-        .is_some_and(|rules| !is_allowed_outbound_tcp(&destination.ip, destination.port, rules))
-    {
-        let connection = http_connections
-            .entry(handle)
-            .or_insert_with(|| HttpConnection::response(OUTBOUND_DENIED_RESPONSE));
-        poll_http_connection(socket, connection);
-        return;
-    }
     let Some(remote) = socket.remote_endpoint() else {
-        socket.close();
+        socket.abort();
         return;
     };
-    if policy.as_deref().is_some_and(|policy| {
-        !policy_allows_connection(
-            policy,
-            NetworkProtocol::Tcp,
-            NetworkEndpoint {
-                ip: remote.addr.to_string(),
-                port: remote.port,
-            },
-            NetworkEndpoint {
-                ip: destination.ip.clone(),
-                port: destination.port,
-            },
-        )
-    }) {
-        let connection = http_connections
-            .entry(handle)
-            .or_insert_with(|| HttpConnection::response(OUTBOUND_DENIED_RESPONSE));
-        poll_http_connection(socket, connection);
+    let decision = decide_transport(
+        policy.as_deref(),
+        outbound_rules,
+        NetworkProtocol::Tcp,
+        NetworkEndpoint {
+            ip: remote.addr.to_string(),
+            port: remote.port,
+        },
+        NetworkEndpoint {
+            ip: destination.ip.clone(),
+            port: destination.port,
+        },
+    );
+    if !decision.allowed {
+        http_connections.remove(&handle);
+        socket.abort();
         return;
     }
 
     let connection = if port_is_probe(destination.port) {
         HttpConnection::response(HOST_HTTP_PROBE_RESPONSE)
     } else {
-        HttpConnection::intercept(
-            destination,
-            http,
-            tls_authority,
-            outbound_rules.map(<[OutboundRulePlan]>::to_vec),
-        )
+        HttpConnection::intercept(destination, http, tls_authority)
     };
     let connection = http_connections.entry(handle).or_insert(connection);
     poll_http_connection(socket, connection);
@@ -1031,14 +1014,7 @@ fn flush_http_response(socket: &mut tcp::Socket<'_>, response: &mut HttpResponse
 
 struct RewrittenHead {
     bytes: Vec<u8>,
-    upstream_ip: String,
-    upstream_port: u16,
     upstream_server_name: String,
-}
-
-struct UpstreamEndpoint {
-    ip: String,
-    port: u16,
 }
 
 fn rewrite_intercepted_head(
@@ -1046,7 +1022,6 @@ fn rewrite_intercepted_head(
     destination: &HttpDestination,
     scheme: &str,
     tls: Option<HostTlsMetadata>,
-    outbound_rules: Option<&[OutboundRulePlan]>,
     runtime: Option<&dyn HttpInterceptRuntime>,
 ) -> io::Result<Option<RewrittenHead>> {
     if guest_head.starts_with(H2_PREFACE) {
@@ -1055,14 +1030,7 @@ fn rewrite_intercepted_head(
             "HTTP/2 interception requires the Rama HTTP proxy pipeline",
         ));
     }
-    rewrite_h1_head(
-        guest_head,
-        destination,
-        scheme,
-        tls,
-        outbound_rules,
-        runtime,
-    )
+    rewrite_h1_head(guest_head, destination, scheme, tls, runtime)
 }
 
 fn rewrite_h1_head(
@@ -1070,7 +1038,6 @@ fn rewrite_h1_head(
     destination: &HttpDestination,
     scheme: &str,
     tls: Option<HostTlsMetadata>,
-    outbound_rules: Option<&[OutboundRulePlan]>,
     runtime: Option<&dyn HttpInterceptRuntime>,
 ) -> io::Result<Option<RewrittenHead>> {
     let Some(head_end) = find_header_end(guest_head) else {
@@ -1101,11 +1068,6 @@ fn rewrite_h1_head(
         .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?
         .to_string();
     let (upstream_server_name, _) = split_authority(&authority, default_port_for_scheme(scheme))?;
-    let upstream = UpstreamEndpoint {
-        ip: destination.ip.clone(),
-        port: destination.port,
-    };
-    validate_upstream_allowed(&upstream, outbound_rules)?;
     let mut pairs = request
         .headers
         .iter()
@@ -1132,28 +1094,11 @@ fn rewrite_h1_head(
             ip: destination.source_ip.clone(),
             port: destination.source_port,
         },
-        upstream_dial: InterceptedDestination {
-            ip: upstream.ip.clone(),
-            port: upstream.port,
-        },
         headers: std::mem::take(&mut pairs),
         tls,
     };
     let request = match runtime {
-        Some(runtime) => {
-            if runtime.rejects_rebound_authority(
-                scheme,
-                &authority,
-                &request.original_destination,
-                &request.upstream_dial,
-            ) {
-                return Err(io::Error::new(
-                    ErrorKind::PermissionDenied,
-                    "request authority resolved to a rebound destination",
-                ));
-            }
-            runtime.handle_request_head(request)?
-        }
+        Some(runtime) => runtime.handle_request_head(request)?,
         None => request,
     };
     let mut rewritten = Vec::new();
@@ -1168,8 +1113,6 @@ fn rewrite_h1_head(
     rewritten.extend_from_slice(&guest_head[head_end..]);
     Ok(Some(RewrittenHead {
         bytes: rewritten,
-        upstream_ip: upstream.ip,
-        upstream_port: upstream.port,
         upstream_server_name,
     }))
 }
@@ -1195,21 +1138,6 @@ fn split_authority(authority: &str, default_port: u16) -> io::Result<(String, u1
         }
     }
     Ok((authority.to_string(), default_port))
-}
-
-fn validate_upstream_allowed(
-    upstream: &UpstreamEndpoint,
-    outbound_rules: Option<&[OutboundRulePlan]>,
-) -> io::Result<()> {
-    if outbound_rules
-        .is_some_and(|rules| is_allowed_outbound_tcp(&upstream.ip, upstream.port, rules))
-    {
-        return Ok(());
-    }
-    Err(io::Error::new(
-        ErrorKind::PermissionDenied,
-        "rewritten upstream destination is not allowed by outbound policy",
-    ))
 }
 
 fn default_port_for_scheme(scheme: &str) -> u16 {
@@ -1376,22 +1304,84 @@ fn is_allowed_outbound_udp(
     })
 }
 
-fn policy_allows_connection(
-    policy: &dyn NetworkPolicyRuntime,
+fn policy_decision(
+    policy: Option<&dyn NetworkPolicyRuntime>,
     protocol: NetworkProtocol,
     src: NetworkEndpoint,
     dst: NetworkEndpoint,
-) -> bool {
-    policy
-        .decide_connection(NetworkConnectionAttempt {
-            protocol,
-            transport: protocol,
-            src,
-            dst,
-            questions: Vec::new(),
-        })
-        .map(|decision| decision.allowed)
-        .unwrap_or(false)
+) -> Option<NetworkPolicyDecision> {
+    policy.and_then(|policy| {
+        policy
+            .decide_connection(NetworkConnectionAttempt {
+                protocol,
+                transport: protocol,
+                src,
+                dst,
+                questions: Vec::new(),
+            })
+            .ok()
+    })
+}
+
+fn dns_policy_decision(
+    policy: Option<&dyn NetworkPolicyRuntime>,
+    transport: NetworkProtocol,
+    src: NetworkEndpoint,
+    dst: NetworkEndpoint,
+    request: &[u8],
+) -> Option<NetworkPolicyDecision> {
+    policy.and_then(|policy| {
+        policy
+            .decide_connection(NetworkConnectionAttempt {
+                protocol: NetworkProtocol::Dns,
+                transport,
+                src,
+                dst,
+                questions: dns_questions(request).unwrap_or_default(),
+            })
+            .ok()
+    })
+}
+
+fn default_allowed_decision() -> NetworkPolicyDecision {
+    NetworkPolicyDecision {
+        allowed: true,
+        dns_response: None,
+    }
+}
+
+fn denied_decision() -> NetworkPolicyDecision {
+    NetworkPolicyDecision {
+        allowed: false,
+        dns_response: None,
+    }
+}
+
+fn decide_transport(
+    policy: Option<&dyn NetworkPolicyRuntime>,
+    outbound_rules: Option<&[OutboundRulePlan]>,
+    protocol: NetworkProtocol,
+    src: NetworkEndpoint,
+    dst: NetworkEndpoint,
+) -> NetworkPolicyDecision {
+    if is_loopback_destination(&dst.ip) {
+        return denied_decision();
+    }
+    if let Some(decision) = policy_decision(policy, protocol, src, dst.clone()) {
+        return decision;
+    }
+    let allowed =
+        match protocol {
+            NetworkProtocol::Tcp => outbound_rules
+                .is_some_and(|rules| is_allowed_outbound_tcp(&dst.ip, dst.port, rules)),
+            NetworkProtocol::Udp => outbound_rules
+                .is_some_and(|rules| is_allowed_outbound_udp(&dst.ip, dst.port, rules)),
+            NetworkProtocol::Dns => true,
+        };
+    NetworkPolicyDecision {
+        allowed,
+        dns_response: None,
+    }
 }
 
 fn decide_dns(
@@ -1401,19 +1391,10 @@ fn decide_dns(
     dst: NetworkEndpoint,
     request: &[u8],
 ) -> io::Result<NetworkPolicyDecision> {
-    let Some(policy) = policy else {
-        return Ok(NetworkPolicyDecision {
-            allowed: true,
-            dns_response: None,
-        });
-    };
-    policy.decide_connection(NetworkConnectionAttempt {
-        protocol: NetworkProtocol::Dns,
-        transport,
-        src,
-        dst,
-        questions: dns_questions(request).unwrap_or_default(),
-    })
+    if let Some(decision) = dns_policy_decision(policy, transport, src, dst, request) {
+        return Ok(decision);
+    }
+    Ok(default_allowed_decision())
 }
 
 fn port_matches(ports: &[u16], destination_port: u16) -> bool {
@@ -1436,20 +1417,47 @@ fn is_public_ipv4_destination(destination_ip: &str) -> bool {
         })
 }
 
+fn is_loopback_destination(destination_ip: &str) -> bool {
+    destination_ip
+        .parse::<std::net::Ipv4Addr>()
+        .is_ok_and(|destination| destination.is_loopback())
+}
+
 fn upstream_socket_addr(destination_ip: &str, destination_port: u16) -> (String, u16) {
-    let public_test_ip = Ipv4Address::new(
-        DNS_PUBLIC_TEST_IP[0],
-        DNS_PUBLIC_TEST_IP[1],
-        DNS_PUBLIC_TEST_IP[2],
-        DNS_PUBLIC_TEST_IP[3],
-    )
-    .to_string();
-    let upstream_ip = if destination_ip == public_test_ip {
-        "127.0.0.1".to_string()
-    } else {
-        destination_ip.to_string()
+    (destination_ip.to_string(), destination_port)
+}
+
+fn tcp_reset_frame_for_syn(frame: &[u8], packet: Ipv4TcpPacket) -> Option<Vec<u8>> {
+    if frame.len() < 14 {
+        return None;
+    }
+    let mut reset = vec![0; 14 + 20 + 20];
+    reset[0..6].copy_from_slice(&frame[6..12]);
+    reset[6..12].copy_from_slice(&frame[0..6]);
+    reset[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+
+    let ip_start = 14;
+    reset[ip_start] = 0x45;
+    reset[ip_start + 2..ip_start + 4].copy_from_slice(&40u16.to_be_bytes());
+    reset[ip_start + 8] = 64;
+    reset[ip_start + 9] = 6;
+    reset[ip_start + 12..ip_start + 16].copy_from_slice(&packet.destination_ip(frame));
+    reset[ip_start + 16..ip_start + 20].copy_from_slice(&packet.source_ip(frame));
+
+    let tcp_start = ip_start + 20;
+    reset[tcp_start..tcp_start + 2].copy_from_slice(&packet.destination_port(frame).to_be_bytes());
+    reset[tcp_start + 2..tcp_start + 4].copy_from_slice(&packet.source_port(frame).to_be_bytes());
+    reset[tcp_start + 8..tcp_start + 12]
+        .copy_from_slice(&packet.sequence_number(frame).wrapping_add(1).to_be_bytes());
+    reset[tcp_start + 12] = 5 << 4;
+    reset[tcp_start + 13] = 0x14;
+
+    let reset_packet = Ipv4TcpPacket {
+        ip_start,
+        tcp_start,
     };
-    (upstream_ip, destination_port)
+    reset_packet.recompute_checksums(&mut reset);
+    Some(reset)
 }
 
 #[cfg(test)]
@@ -1670,15 +1678,6 @@ fn parse_dns_name(packet: &[u8], mut offset: usize) -> Option<(String, usize)> {
 }
 
 fn dns_address(name: &str) -> Option<[u8; 4]> {
-    if name == "protected.sandbox.test" {
-        return Some(DNS_PROTECTED_TEST_IP);
-    }
-    if name == "public.sandbox.test" {
-        return Some(DNS_PUBLIC_TEST_IP);
-    }
-    if name.ends_with(".sandbox.test") {
-        return None;
-    }
     (name, 0)
         .to_socket_addrs()
         .ok()?
@@ -1692,17 +1691,27 @@ struct LibkrunNetDevice {
     rx: UnixStream,
     tx: UnixStream,
     nat: TransparentNat,
+    outbound_rules: Option<Vec<OutboundRulePlan>>,
+    policy: Option<Arc<dyn NetworkPolicyRuntime>>,
     rx_buffer: Vec<u8>,
     staged_rx: Option<Vec<u8>>,
     pending_tx: Vec<u8>,
 }
 
 impl LibkrunNetDevice {
-    fn new(rx: UnixStream, tx: UnixStream, host_ip: Ipv4Address) -> Self {
+    fn new(
+        rx: UnixStream,
+        tx: UnixStream,
+        host_ip: Ipv4Address,
+        outbound_rules: Option<Vec<OutboundRulePlan>>,
+        policy: Option<Arc<dyn NetworkPolicyRuntime>>,
+    ) -> Self {
         Self {
             rx,
             tx,
             nat: TransparentNat::new(host_ip),
+            outbound_rules,
+            policy,
             rx_buffer: Vec::new(),
             staged_rx: None,
             pending_tx: Vec::new(),
@@ -1759,6 +1768,54 @@ impl LibkrunNetDevice {
             }
         }
     }
+
+    fn reject_denied_tcp_syn(&mut self, frame: &[u8]) -> bool {
+        let Some(packet) = Ipv4TcpPacket::parse(frame) else {
+            return false;
+        };
+        if packet.destination_ip(frame) == self.nat.host_ip {
+            return false;
+        }
+        let flags = packet.tcp_flags(frame);
+        if !flags.syn || flags.ack {
+            return false;
+        }
+        let source_ip = packet.source_ip(frame);
+        let destination_ip = packet.destination_ip(frame);
+        let src = NetworkEndpoint {
+            ip: Ipv4Address::new(source_ip[0], source_ip[1], source_ip[2], source_ip[3])
+                .to_string(),
+            port: packet.source_port(frame),
+        };
+        let dst = NetworkEndpoint {
+            ip: Ipv4Address::new(
+                destination_ip[0],
+                destination_ip[1],
+                destination_ip[2],
+                destination_ip[3],
+            )
+            .to_string(),
+            port: packet.destination_port(frame),
+        };
+        let decision = decide_transport(
+            self.policy.as_deref(),
+            self.outbound_rules.as_deref(),
+            NetworkProtocol::Tcp,
+            src,
+            dst,
+        );
+        if decision.allowed {
+            return false;
+        }
+        let Some(reset) = tcp_reset_frame_for_syn(frame, packet) else {
+            return false;
+        };
+        if let Ok(frame_len) = u32::try_from(reset.len()) {
+            self.pending_tx.extend_from_slice(&frame_len.to_be_bytes());
+            self.pending_tx.extend_from_slice(&reset);
+        }
+        true
+    }
 }
 
 impl Device for LibkrunNetDevice {
@@ -1779,6 +1836,9 @@ impl Device for LibkrunNetDevice {
         match self.read_frame() {
             Ok(frame) => {
                 let mut frame = frame?;
+                if self.reject_denied_tcp_syn(&frame) {
+                    return None;
+                }
                 if self.nat.rewrite_guest_frame(&mut frame) {
                     self.staged_rx = Some(frame);
                     return None;
@@ -1864,13 +1924,11 @@ impl HttpConnection {
         destination: HttpDestination,
         runtime: Option<Arc<dyn HttpInterceptRuntime>>,
         tls_authority: Option<Arc<MitmTlsAuthority>>,
-        outbound_rules: Option<Vec<OutboundRulePlan>>,
     ) -> Self {
         Self::Intercept(InterceptConnection {
             destination,
             runtime,
             tls_authority,
-            outbound_rules,
             state: InterceptState::ReadingHead {
                 guest_head: Vec::new(),
             },
@@ -1911,7 +1969,6 @@ struct InterceptConnection {
     destination: HttpDestination,
     runtime: Option<Arc<dyn HttpInterceptRuntime>>,
     tls_authority: Option<Arc<MitmTlsAuthority>>,
-    outbound_rules: Option<Vec<OutboundRulePlan>>,
     state: InterceptState,
     upstream: Option<TcpStream>,
     to_guest: Vec<u8>,
@@ -1941,16 +1998,10 @@ struct RamaHttpConnection {
 fn apply_rama_http_policy(
     mut request: RamaRequest<Body>,
     destination: &HttpDestination,
-    outbound_rules: Option<&[OutboundRulePlan]>,
     runtime: Option<&dyn HttpInterceptRuntime>,
 ) -> io::Result<RamaRequest<Body>> {
     let authority = request_authority(&request, default_port_for_scheme("http"))?;
     let _ = split_authority(&authority, default_port_for_scheme("http"))?;
-    let upstream = UpstreamEndpoint {
-        ip: destination.ip.clone(),
-        port: destination.port,
-    };
-    validate_upstream_allowed(&upstream, outbound_rules)?;
     let mut intercepted = InterceptedHttpRequest {
         protocol: match request.version() {
             RamaVersion::HTTP_2 => HttpRequestProtocol::Http2,
@@ -1965,10 +2016,6 @@ fn apply_rama_http_policy(
         source: InterceptedDestination {
             ip: destination.source_ip.clone(),
             port: destination.source_port,
-        },
-        upstream_dial: InterceptedDestination {
-            ip: upstream.ip.clone(),
-            port: upstream.port,
         },
         headers: request
             .headers()
@@ -1992,20 +2039,7 @@ fn apply_rama_http_policy(
             .push(("host".to_string(), authority.clone()));
     }
     let intercepted = match runtime {
-        Some(runtime) => {
-            if runtime.rejects_rebound_authority(
-                "http",
-                &authority,
-                &intercepted.original_destination,
-                &intercepted.upstream_dial,
-            ) {
-                return Err(io::Error::new(
-                    ErrorKind::PermissionDenied,
-                    "request authority resolved to a rebound destination",
-                ));
-            }
-            runtime.handle_request_head(intercepted)?
-        }
+        Some(runtime) => runtime.handle_request_head(intercepted)?,
         None => intercepted,
     };
     let is_h2 = request.version() == RamaVersion::HTTP_2;
@@ -2030,9 +2064,8 @@ async fn serve_rama_http_request(
     request: RamaRequest<Body>,
     destination: &HttpDestination,
     runtime: Option<&dyn HttpInterceptRuntime>,
-    outbound_rules: Option<&[OutboundRulePlan]>,
 ) -> RamaResponse {
-    let request = match apply_rama_http_policy(request, destination, outbound_rules, runtime) {
+    let request = match apply_rama_http_policy(request, destination, runtime) {
         Ok(request) => request,
         Err(_) => return rama_response(403, "network policy denied"),
     };
@@ -2097,7 +2130,6 @@ impl RamaHttpConnection {
         destination: HttpDestination,
         initial_guest_bytes: Vec<u8>,
         runtime: Option<Arc<dyn HttpInterceptRuntime>>,
-        outbound_rules: Option<Vec<OutboundRulePlan>>,
     ) -> io::Result<Self> {
         let (bridge, async_io) = SyncAsyncBridge::new(HTTP_BRIDGE_BUFFER_BYTES);
         if !initial_guest_bytes.is_empty() {
@@ -2110,20 +2142,13 @@ impl RamaHttpConnection {
             tokio_runtime.block_on(async move {
                 let server = HttpServer::auto(Executor::default());
                 let destination = Arc::new(destination);
-                let outbound_rules = outbound_rules.map(Arc::new);
                 let service = rama_core::service::service_fn(move |request: RamaRequest<Body>| {
                     let destination = destination.clone();
                     let runtime = runtime.clone();
-                    let outbound_rules = outbound_rules.clone();
                     async move {
                         Ok::<_, std::convert::Infallible>(
-                            serve_rama_http_request(
-                                request,
-                                &destination,
-                                runtime.as_deref(),
-                                outbound_rules.as_deref().map(|rules| rules.as_slice()),
-                            )
-                            .await,
+                            serve_rama_http_request(request, &destination, runtime.as_deref())
+                                .await,
                         )
                     }
                 });
@@ -2208,7 +2233,6 @@ impl TlsInterceptConnection {
         socket: &mut tcp::Socket<'_>,
         destination: &HttpDestination,
         runtime: Option<&dyn HttpInterceptRuntime>,
-        outbound_rules: Option<&[OutboundRulePlan]>,
     ) {
         while socket.can_recv() {
             let mut buffer = [0; TLS_READ_BUFFER_BYTES];
@@ -2219,7 +2243,7 @@ impl TlsInterceptConnection {
             self.read_guest_tls(&buffer[..received]);
         }
         self.flush_guest_tls(socket);
-        self.maybe_connect_upstream(destination, runtime, outbound_rules);
+        self.maybe_connect_upstream(destination, runtime);
         self.flush_upstream_tls();
         self.read_upstream_tls();
         self.flush_upstream_tls();
@@ -2282,7 +2306,6 @@ impl TlsInterceptConnection {
         &mut self,
         destination: &HttpDestination,
         runtime: Option<&dyn HttpInterceptRuntime>,
-        outbound_rules: Option<&[OutboundRulePlan]>,
     ) {
         if self.client.is_some() {
             return;
@@ -2303,7 +2326,6 @@ impl TlsInterceptConnection {
             destination,
             "https",
             Some(metadata),
-            outbound_rules,
             runtime,
         ) {
             Ok(Some(rewrite)) => rewrite,
@@ -2313,16 +2335,14 @@ impl TlsInterceptConnection {
                 return;
             }
         };
-        let upstream = match TcpStream::connect(upstream_socket_addr(
-            &rewrite.upstream_ip,
-            rewrite.upstream_port,
-        )) {
-            Ok(upstream) => upstream,
-            Err(_) => {
-                self.close_after_flush = true;
-                return;
-            }
-        };
+        let upstream =
+            match TcpStream::connect(upstream_socket_addr(&destination.ip, destination.port)) {
+                Ok(upstream) => upstream,
+                Err(_) => {
+                    self.close_after_flush = true;
+                    return;
+                }
+            };
         let _ = upstream.set_nonblocking(true);
         let mut client = match self.authority.client_connection(
             self.sni
@@ -2488,12 +2508,7 @@ impl InterceptConnection {
             return;
         }
         if let InterceptState::Tls(tls) = &mut self.state {
-            tls.poll(
-                socket,
-                &self.destination,
-                self.runtime.as_deref(),
-                self.outbound_rules.as_deref(),
-            );
+            tls.poll(socket, &self.destination, self.runtime.as_deref());
             if tls.is_finished() {
                 self.close_after_flush = true;
             }
@@ -2561,7 +2576,6 @@ impl InterceptConnection {
                     self.destination.clone(),
                     initial_bytes,
                     self.runtime.clone(),
-                    self.outbound_rules.clone(),
                 ) {
                     Ok(relay) => {
                         self.state = InterceptState::RamaHttp(relay);
@@ -2583,13 +2597,12 @@ impl InterceptConnection {
                 &self.destination,
                 "http",
                 None,
-                self.outbound_rules.as_deref(),
                 self.runtime.as_deref(),
             ) {
                 Ok(Some(rewritten)) => {
                     match TcpStream::connect(upstream_socket_addr(
-                        &rewritten.upstream_ip,
-                        rewritten.upstream_port,
+                        &self.destination.ip,
+                        self.destination.port,
                     )) {
                         Ok(upstream) => {
                             let _ = upstream.set_nonblocking(true);
@@ -3033,11 +3046,22 @@ impl Ipv4TcpPacket {
         u16::from_be_bytes([frame[self.tcp_start + 2], frame[self.tcp_start + 3]])
     }
 
+    fn sequence_number(self, frame: &[u8]) -> u32 {
+        u32::from_be_bytes([
+            frame[self.tcp_start + 4],
+            frame[self.tcp_start + 5],
+            frame[self.tcp_start + 6],
+            frame[self.tcp_start + 7],
+        ])
+    }
+
     fn tcp_flags(self, frame: &[u8]) -> TcpFlags {
         let flags = frame[self.tcp_start + 13];
         TcpFlags {
             fin: flags & 0x01 != 0,
+            syn: flags & 0x02 != 0,
             rst: flags & 0x04 != 0,
+            ack: flags & 0x10 != 0,
         }
     }
 
@@ -3068,7 +3092,9 @@ impl Ipv4TcpPacket {
 #[derive(Debug, Clone, Copy)]
 struct TcpFlags {
     fin: bool,
+    syn: bool,
     rst: bool,
+    ack: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3259,7 +3285,7 @@ mod tests {
         let (rx, mut rx_writer) = UnixStream::pair().unwrap();
         let (tx, _tx_reader) = UnixStream::pair().unwrap();
         rx.set_nonblocking(true).unwrap();
-        let mut device = LibkrunNetDevice::new(rx, tx, Ipv4Address::new(10, 0, 2, 1));
+        let mut device = LibkrunNetDevice::new(rx, tx, Ipv4Address::new(10, 0, 2, 1), None, None);
         let ethernet = [0u8; 14];
         let mut packet = Vec::new();
         packet.extend_from_slice(&(ethernet.len() as u32).to_be_bytes());
@@ -3367,7 +3393,7 @@ mod tests {
         };
         let request = b"GET / HTTP/1.1\r\nHost: example.com\r\nHost: attacker.example\r\n\r\n";
 
-        let error = match rewrite_h1_head(request, &destination, "http", None, None, None) {
+        let error = match rewrite_h1_head(request, &destination, "http", None, None) {
             Ok(_) => panic!("duplicate Host headers must be rejected"),
             Err(error) => error,
         };
@@ -3478,7 +3504,7 @@ mod tests {
 
     #[test]
     fn dns_unsupported_query_type_returns_nodata_for_known_name() {
-        let response = dns_response(&dns_query("public.sandbox.test", 28)).unwrap();
+        let response = dns_response(&dns_query("localhost", 28)).unwrap();
 
         assert_eq!(&response[2..4], &[0x81, 0x80]);
         assert_eq!(&response[6..8], &[0, 0]);
@@ -3537,8 +3563,16 @@ mod tests {
     }
 
     #[test]
-    fn dns_unknown_name_returns_nxdomain() {
-        let response = dns_response(&dns_query("missing.sandbox.test", 1)).unwrap();
+    fn dns_policy_response_can_return_nxdomain() {
+        let query = dns_query("missing.sandbox.test", 1);
+        let response = dns_response_with_decision(
+            &query,
+            Some(&DnsPolicyResponse {
+                code: "NXDOMAIN".to_string(),
+                answers: Vec::new(),
+            }),
+        )
+        .unwrap();
 
         assert_eq!(&response[2..4], &[0x81, 0x83]);
         assert_eq!(&response[6..8], &[0, 0]);

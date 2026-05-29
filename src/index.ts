@@ -91,7 +91,7 @@ export interface SandboxHttpRequest {
   readonly method: string;
   /** Mutable request headers. Changes are applied before forwarding upstream. */
   readonly headers: Headers;
-  /** IP-layer addressing observed for this request and the selected upstream. */
+  /** IP-layer addressing observed for the connection carrying this request. */
   readonly destination: {
     /** Guest source IP address for the connection carrying this request. */
     readonly sourceIp: string;
@@ -101,10 +101,6 @@ export interface SandboxHttpRequest {
     readonly originalIp: string;
     /** Original destination port before host-side routing or proxying. */
     readonly originalPort: number;
-    /** Upstream IP address selected by the host proxy. */
-    readonly upstreamIp: string;
-    /** Upstream port selected by the host proxy. */
-    readonly upstreamPort: number;
   };
   /** TLS metadata when the request was carried over HTTPS. */
   readonly tls?: {
@@ -905,8 +901,8 @@ function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPoli
         request.destination.sourcePort,
       ),
       dst: createNetworkEndpoint(
-        request.destination.upstreamIp,
-        request.destination.upstreamPort,
+        request.destination.originalIp,
+        request.destination.originalPort,
       ),
       application: {
         protocol: "http",
@@ -914,8 +910,8 @@ function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPoli
         sni: request.tls?.sni,
       },
       host: request.url.hostname,
-      ip: request.destination.upstreamIp,
-      port: request.destination.upstreamPort,
+      ip: request.destination.originalIp,
+      port: request.destination.originalPort,
       allow() {
         grants.push({ kind: "http" });
         return {};
