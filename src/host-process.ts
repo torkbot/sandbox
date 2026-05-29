@@ -352,17 +352,39 @@ export class HostProcessSandboxVm implements HostControlChannel {
           if (protocol !== "dns") {
             return undefined;
           }
+          const defaultResolvers = typeof matcher === "function"
+            ? undefined
+            : [normalizeDnsResolver(matcher)];
           const candidate = {
             src,
             dst,
             transport,
             accept(options?: { readonly resolvers?: readonly DnsResolverSpec[] }) {
               decision.action = "accept";
-              decision.dnsResolvers = options?.resolvers?.map(normalizeDnsResolver);
+              decision.dnsResolvers = options?.resolvers?.map(normalizeDnsResolver)
+                ?? defaultResolvers;
               return {};
             },
           };
           return dnsMatcherMatches(matcher, candidate) ? candidate : undefined;
+        },
+        matchHttp(matcher: HttpAuthoritySpec | NetworkMatchPredicate<HttpConnectionMatch>) {
+          if (transport !== "tcp" || hostname === undefined) {
+            return undefined;
+          }
+          const candidate = {
+            src,
+            dst,
+            hostname,
+            port: dst.port,
+            accept(middleware?: HttpRequestMiddleware) {
+              decision.action = "acceptHttp";
+              decision.dnsResolvers = undefined;
+              httpMiddleware = middleware;
+              return {};
+            },
+          };
+          return httpMatcherMatches(matcher, candidate) ? candidate : undefined;
         },
         ...(transport === "tcp"
           ? {
@@ -379,24 +401,6 @@ export class HostProcessSandboxVm implements HostControlChannel {
                   accept,
                 };
                 return endpointMatcherMatches(matcher, candidate) ? candidate : undefined;
-              },
-              matchHttp(matcher: HttpAuthoritySpec | NetworkMatchPredicate<HttpConnectionMatch>) {
-                if (hostname === undefined) {
-                  return undefined;
-                }
-                const candidate = {
-                  src,
-                  dst,
-                  hostname,
-                  port: dst.port,
-                  accept(middleware?: HttpRequestMiddleware) {
-                    decision.action = "acceptHttp";
-                    decision.dnsResolvers = undefined;
-                    httpMiddleware = middleware;
-                    return {};
-                  },
-                };
-                return httpMatcherMatches(matcher, candidate) ? candidate : undefined;
               },
             }
           : {
@@ -1014,8 +1018,7 @@ function dnsMatcherMatches(
   if (typeof matcher === "function") {
     return matcher(candidate);
   }
-  const spec = typeof matcher === "string" ? { ip: matcher, port: 53 } : matcher;
-  return candidate.dst.ip === spec.ip && candidate.dst.port === (spec.port ?? 53);
+  return true;
 }
 
 function normalizeDnsResolver(resolver: DnsResolverSpec): { readonly ip: string; readonly port: number } {
