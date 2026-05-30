@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{Ipv4Addr, Shutdown, TcpStream, ToSocketAddrs, UdpSocket};
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant as StdInstant};
 
+use hickory_proto::op::{Message as DnsMessage, MessageType as DnsMessageType, ResponseCode};
+use hickory_proto::rr::rdata::A;
+use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use rama_core::extensions::Extensions;
 use rama_core::rt::Executor;
 use rama_core::service::Service;
@@ -43,6 +46,7 @@ const HTTP_BRIDGE_BUFFER_BYTES: usize = 256 * 1024;
 const TLS_READ_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_INTERCEPT_HEAD_BYTES: usize = 64 * 1024;
 const DNS_PACKET_BUFFER_BYTES: usize = 4096;
+const DNS_DEFAULT_TTL_SECS: u32 = 60;
 const UDP_RELAY_BUFFER_BYTES: usize = 64 * 1024;
 const UDP_INTERCEPT_PORT_START: u16 = 40_000;
 const UDP_INTERCEPT_PORT_END: u16 = 60_999;
@@ -336,7 +340,7 @@ fn run_network_service(
                 &mut sockets,
                 handle,
                 port,
-                &device.interception,
+                &mut device.interception,
                 outbound_rules.as_deref(),
                 policy.as_deref(),
                 &mut udp_relays,
@@ -351,7 +355,7 @@ fn run_network_service(
                 &mut sockets,
                 handle,
                 port,
-                &device.interception,
+                &mut device.interception,
                 outbound_rules.as_deref(),
                 http.clone(),
                 policy.clone(),
@@ -458,8 +462,8 @@ fn poll_dns_socket(
         else {
             continue;
         };
-        for (name, address) in answer.resolved_addresses() {
-            interception.record_dns_answer(name, address);
+        for pin in answer.answer_pins() {
+            interception.record_dns_answer(remote.endpoint.addr, pin);
         }
         let _ = socket.send_slice(
             &answer.packet,
@@ -511,7 +515,7 @@ fn poll_udp_relay_socket(
     sockets: &mut SocketSet<'_>,
     handle: SocketHandle,
     host_port: u16,
-    interception: &TransparentInterception,
+    interception: &mut TransparentInterception,
     outbound_rules: Option<&[OutboundRulePlan]>,
     policy: Option<&dyn NetworkPolicyRuntime>,
     relays: &mut HashMap<UdpFlow, UdpRelay>,
@@ -714,8 +718,8 @@ fn handle_tcp_dns_request(
         _ => return None,
     };
     let response = dns_response(request, NetworkProtocol::Tcp, &decision.dns_resolvers)?;
-    for (name, address) in response.resolved_addresses() {
-        interception.record_dns_answer(name, address);
+    for pin in response.answer_pins() {
+        interception.record_dns_answer(remote.addr, pin);
     }
     Some(response)
 }
@@ -787,7 +791,7 @@ fn poll_http_socket(
     sockets: &mut SocketSet<'_>,
     handle: SocketHandle,
     port: u16,
-    interception: &TransparentInterception,
+    interception: &mut TransparentInterception,
     outbound_rules: Option<&[OutboundRulePlan]>,
     http: Option<Arc<dyn HttpInterceptRuntime>>,
     policy: Option<Arc<dyn NetworkPolicyRuntime>>,
@@ -875,12 +879,12 @@ struct HttpDestination {
 
 fn original_http_destination(
     socket: &tcp::Socket<'_>,
-    interception: &TransparentInterception,
+    interception: &mut TransparentInterception,
 ) -> Option<HttpDestination> {
     let remote = socket.remote_endpoint()?;
     let local = socket.local_endpoint()?;
     let ip = interception.original_destination(remote.addr, remote.port, local.port)?;
-    let hostname = interception.resolved_hostname(&ip);
+    let hostname = interception.resolved_hostname(remote.addr, &ip);
     Some(HttpDestination {
         source_ip: remote.addr.to_string(),
         source_port: remote.port,
@@ -893,7 +897,7 @@ fn original_http_destination(
 fn poll_plain_http_socket(
     socket: &mut tcp::Socket<'_>,
     handle: SocketHandle,
-    interception: &TransparentInterception,
+    interception: &mut TransparentInterception,
     outbound_rules: Option<&[OutboundRulePlan]>,
     http: Option<Arc<dyn HttpInterceptRuntime>>,
     policy: Option<Arc<dyn NetworkPolicyRuntime>>,
@@ -1263,16 +1267,12 @@ fn tcp_reset_frame_for_syn(frame: &[u8], packet: Ipv4TcpPacket) -> Option<Vec<u8
 #[derive(Debug, Clone)]
 struct DnsResponse {
     packet: Vec<u8>,
-    name: String,
-    answers: Vec<[u8; 4]>,
+    pins: Vec<DnsAnswerPin>,
 }
 
 impl DnsResponse {
-    fn resolved_addresses(&self) -> impl Iterator<Item = (&str, [u8; 4])> {
-        self.answers
-            .iter()
-            .copied()
-            .map(|address| (self.name.as_str(), address))
+    fn answer_pins(&self) -> impl Iterator<Item = &DnsAnswerPin> {
+        self.pins.iter()
     }
 }
 
@@ -1282,33 +1282,20 @@ fn dns_response(
     resolvers: &[DnsResolver],
 ) -> Option<DnsResponse> {
     if !resolvers.is_empty() {
-        let (name, _) = request_dns_question_name(request)?;
+        let request_message = DnsMessage::from_vec(request).ok()?;
         let packet = resolve_dns_with_upstreams(request, transport, resolvers)?;
-        let answers = dns_response_addresses(&packet);
+        let response_message = DnsMessage::from_vec(&packet).ok()?;
         return Some(DnsResponse {
             packet,
-            name,
-            answers,
+            pins: dns_answer_pins(&request_message, &response_message),
         });
     }
 
-    if request.len() < 12 {
-        return None;
-    }
-
-    let query_count = u16::from_be_bytes([request[4], request[5]]);
-    if query_count != 1 {
-        return None;
-    }
-
-    let (name, question_end) = request_dns_question_name(request)?;
-    if request.len() < question_end + 4 {
-        return None;
-    }
-    let qtype = u16::from_be_bytes([request[question_end], request[question_end + 1]]);
-    let qclass = u16::from_be_bytes([request[question_end + 2], request[question_end + 3]]);
-
-    let supported_question = qclass == 1 && qtype == 1;
+    let request_message = DnsMessage::from_vec(request).ok()?;
+    let query = single_dns_query(&request_message)?;
+    let name = dns_name_string(query.name());
+    let supported_question =
+        query.query_class() == DNSClass::IN && query.query_type() == RecordType::A;
     let answer = if supported_question {
         dns_address(&name)
     } else {
@@ -1320,39 +1307,39 @@ fn dns_response(
         dns_address(&name).is_some()
     };
 
-    let mut response = Vec::new();
-    response.extend_from_slice(&request[0..2]);
-    response.extend_from_slice(if answer.is_some() || name_exists {
-        &[0x81, 0x80]
-    } else {
-        &[0x81, 0x83]
-    });
-    response.extend_from_slice(&request[4..6]);
-    response.extend_from_slice(&(answer.is_some() as u16).to_be_bytes());
-    response.extend_from_slice(&[0, 0, 0, 0]);
-    response.extend_from_slice(&request[12..question_end + 4]);
+    let mut response_message = DnsMessage::new(
+        request_message.metadata.id,
+        DnsMessageType::Response,
+        request_message.metadata.op_code,
+    );
+    response_message.metadata =
+        hickory_proto::op::Metadata::response_from_request(&request_message.metadata);
+    response_message.metadata.recursion_available = true;
+    if !name_exists {
+        response_message.metadata.response_code = ResponseCode::NXDomain;
+    }
+    response_message.add_query(query.clone());
 
     if let Some(address) = answer {
-        response.extend_from_slice(&[0xc0, 0x0c]);
-        response.extend_from_slice(&1u16.to_be_bytes());
-        response.extend_from_slice(&1u16.to_be_bytes());
-        response.extend_from_slice(&60u32.to_be_bytes());
-        response.extend_from_slice(&4u16.to_be_bytes());
-        response.extend_from_slice(&address);
+        response_message.add_answer(Record::from_rdata(
+            query.name().clone(),
+            DNS_DEFAULT_TTL_SECS,
+            RData::A(A(Ipv4Addr::from(address))),
+        ));
     }
 
+    let packet = response_message.to_vec().ok()?;
     Some(DnsResponse {
-        packet: response,
-        name,
-        answers: answer.into_iter().collect(),
+        packet,
+        pins: dns_answer_pins(&request_message, &response_message),
     })
 }
 
-fn request_dns_question_name(request: &[u8]) -> Option<(String, usize)> {
-    if request.len() < 12 {
-        return None;
+fn single_dns_query(message: &DnsMessage) -> Option<&hickory_proto::op::Query> {
+    match message.queries.as_slice() {
+        [query] => Some(query),
+        _ => None,
     }
-    parse_dns_name(request, 12)
 }
 
 fn resolve_dns_with_upstreams(
@@ -1427,81 +1414,54 @@ fn resolve_dns_with_tcp_upstream(request: &[u8], address: std::net::SocketAddr) 
     Some(response)
 }
 
-fn dns_response_addresses(packet: &[u8]) -> Vec<[u8; 4]> {
-    let mut addresses = Vec::new();
-    if packet.len() < 12 {
-        return addresses;
-    }
-    let question_count = u16::from_be_bytes([packet[4], packet[5]]);
-    let answer_count = u16::from_be_bytes([packet[6], packet[7]]);
-    if question_count != 1 {
-        return addresses;
-    }
-    let Some((_, mut offset)) = parse_dns_name(packet, 12) else {
-        return addresses;
+fn dns_answer_pins(request: &DnsMessage, response: &DnsMessage) -> Vec<DnsAnswerPin> {
+    let Some(query) = single_dns_query(request) else {
+        return Vec::new();
     };
-    if packet.len() < offset + 4 {
-        return addresses;
-    }
-    offset += 4;
-    for _ in 0..answer_count {
-        let Some((_, answer_end)) = parse_dns_name(packet, offset) else {
-            return addresses;
-        };
-        if packet.len() < answer_end + 10 {
-            return addresses;
-        }
-        let rtype = u16::from_be_bytes([packet[answer_end], packet[answer_end + 1]]);
-        let rclass = u16::from_be_bytes([packet[answer_end + 2], packet[answer_end + 3]]);
-        let rdlen = u16::from_be_bytes([packet[answer_end + 8], packet[answer_end + 9]]) as usize;
-        let data_start = answer_end + 10;
-        if packet.len() < data_start + rdlen {
-            return addresses;
-        }
-        if rtype == 1 && rclass == 1 && rdlen == 4 {
-            addresses.push([
-                packet[data_start],
-                packet[data_start + 1],
-                packet[data_start + 2],
-                packet[data_start + 3],
-            ]);
-        }
-        offset = data_start + rdlen;
-    }
-    addresses
+    let name = dns_name_string(query.name());
+    let answer_names = dns_answer_names_for_query(query.name(), response);
+    response
+        .answers
+        .iter()
+        .filter_map(|record| match &record.data {
+            RData::A(address)
+                if record.dns_class == DNSClass::IN && answer_names.contains(&record.name) =>
+            {
+                Some(DnsAnswerPin {
+                    hostname: name.clone(),
+                    address: address.0.octets(),
+                    ttl: Duration::from_secs(record.ttl.into()),
+                })
+            }
+            _ => None,
+        })
+        .collect()
 }
 
-fn parse_dns_name(packet: &[u8], mut offset: usize) -> Option<(String, usize)> {
-    let mut labels = Vec::new();
-    let mut jumped = false;
-    let mut next_offset = offset;
-    let mut jumps = 0;
-    loop {
-        let len = usize::from(*packet.get(offset)?);
-        if len & 0xc0 == 0xc0 {
-            let next = usize::from(*packet.get(offset + 1)?);
-            if !jumped {
-                next_offset = offset + 2;
+fn dns_answer_names_for_query(query_name: &Name, response: &DnsMessage) -> HashSet<Name> {
+    let mut names = HashSet::from([query_name.clone()]);
+    for _ in 0..8 {
+        let mut changed = false;
+        for record in &response.answers {
+            let RData::CNAME(target) = &record.data else {
+                continue;
+            };
+            if record.dns_class == DNSClass::IN
+                && names.contains(&record.name)
+                && names.insert((**target).clone())
+            {
+                changed = true;
             }
-            offset = ((len & 0x3f) << 8) | next;
-            jumped = true;
-            jumps += 1;
-            if jumps > 8 {
-                return None;
-            }
-            continue;
         }
-        offset += 1;
-        if len == 0 {
-            return Some((labels.join("."), if jumped { next_offset } else { offset }));
+        if !changed {
+            break;
         }
-        if len > 63 || packet.len() < offset + len {
-            return None;
-        }
-        let label = std::str::from_utf8(&packet[offset..offset + len]).ok()?;
-        labels.push(label.to_ascii_lowercase());
-        offset += len;
     }
+    names
+}
+
+fn dns_name_string(name: &hickory_proto::rr::Name) -> String {
+    name.to_ascii().trim_end_matches('.').to_ascii_lowercase()
 }
 
 fn dns_address(name: &str) -> Option<[u8; 4]> {
@@ -1631,6 +1591,7 @@ impl LibkrunNetDevice {
             src,
             dst,
             self.interception.resolved_hostname(
+                IpAddress::v4(source_ip[0], source_ip[1], source_ip[2], source_ip[3]),
                 &Ipv4Address::new(
                     destination_ip[0],
                     destination_ip[1],
@@ -2524,8 +2485,23 @@ struct TransparentInterception {
 
 #[derive(Debug, Default)]
 struct DnsPins {
-    address_by_hostname: HashMap<String, [u8; 4]>,
-    hostname_by_address: HashMap<[u8; 4], String>,
+    pins: Vec<DnsPin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DnsAnswerPin {
+    hostname: String,
+    address: [u8; 4],
+    ttl: Duration,
+}
+
+#[derive(Debug, Clone)]
+struct DnsPin {
+    guest_ip: [u8; 4],
+    hostname: String,
+    address: [u8; 4],
+    expires_at: StdInstant,
+    observed_at: StdInstant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2703,25 +2679,37 @@ impl TransparentInterception {
         })
     }
 
-    fn record_dns_answer(&mut self, hostname: &str, address: [u8; 4]) {
-        match self.dns_pins.address_by_hostname.get(hostname) {
-            Some(pinned) if *pinned != address => return,
-            Some(_) => {}
-            None => {
-                self.dns_pins
-                    .address_by_hostname
-                    .insert(hostname.to_string(), address);
-            }
-        }
-        self.dns_pins
-            .hostname_by_address
-            .entry(address)
-            .or_insert_with(|| hostname.to_string());
+    fn record_dns_answer(&mut self, guest_ip: IpAddress, answer: &DnsAnswerPin) {
+        let guest_ip = match guest_ip {
+            IpAddress::Ipv4(guest_ip) => guest_ip.octets(),
+        };
+        let now = StdInstant::now();
+        self.dns_pins.pins.retain(|pin| {
+            !(pin.guest_ip == guest_ip
+                && pin.hostname == answer.hostname
+                && pin.address == answer.address)
+        });
+        self.dns_pins.pins.push(DnsPin {
+            guest_ip,
+            hostname: answer.hostname.clone(),
+            address: answer.address,
+            expires_at: now + answer.ttl,
+            observed_at: now,
+        });
     }
 
-    fn resolved_hostname(&self, ip: &str) -> Option<String> {
+    fn resolved_hostname(&mut self, guest_ip: IpAddress, ip: &str) -> Option<String> {
+        self.prune_expired_dns_pins();
+        let guest_ip = match guest_ip {
+            IpAddress::Ipv4(guest_ip) => guest_ip.octets(),
+        };
         let address = ip.parse::<std::net::Ipv4Addr>().ok()?.octets();
-        self.dns_pins.hostname_by_address.get(&address).cloned()
+        self.dns_pins
+            .pins
+            .iter()
+            .filter(|pin| pin.guest_ip == guest_ip && pin.address == address)
+            .max_by_key(|pin| pin.observed_at)
+            .map(|pin| pin.hostname.clone())
     }
 
     fn udp_original_destination(
@@ -2767,6 +2755,12 @@ impl TransparentInterception {
         });
         self.udp_flows
             .retain(|_, flow| now.duration_since(flow.last_seen) < INTERCEPT_FLOW_IDLE_TTL);
+        self.prune_expired_dns_pins();
+    }
+
+    fn prune_expired_dns_pins(&mut self) {
+        let now = StdInstant::now();
+        self.dns_pins.pins.retain(|pin| pin.expires_at > now);
     }
 
     fn udp_host_port_for_destination(
@@ -3407,30 +3401,84 @@ mod tests {
 
     #[test]
     fn custom_dns_response_records_all_a_answers() {
-        let packet = dns_answer(
-            &dns_query("multi.example", 1),
+        let request = DnsMessage::from_vec(&dns_query("multi.example", 1)).unwrap();
+        let response = DnsMessage::from_vec(&dns_answer(
+            &request,
             &[[203, 0, 113, 44], [203, 0, 113, 45]],
-        );
+        ))
+        .unwrap();
 
         assert_eq!(
-            dns_response_addresses(&packet),
+            dns_answer_pins(&request, &response)
+                .into_iter()
+                .map(|pin| pin.address)
+                .collect::<Vec<_>>(),
             vec![[203, 0, 113, 44], [203, 0, 113, 45]],
         );
     }
 
     #[test]
-    fn dns_pins_keep_first_hostname_mapping_for_address() {
-        let mut interception = TransparentInterception::new(Ipv4Address::new(10, 0, 2, 1));
-
-        interception.record_dns_answer("first.example", [192, 0, 2, 10]);
-        interception.record_dns_answer("second.example", [192, 0, 2, 10]);
-        interception.record_dns_answer("first.example", [192, 0, 2, 11]);
+    fn custom_dns_response_records_cname_backed_a_answers_for_query_name() {
+        let request = DnsMessage::from_vec(&dns_query("alias.example", 1)).unwrap();
+        let query = single_dns_query(&request).unwrap();
+        let canonical_name = Name::from_ascii("target.example").unwrap();
+        let mut response = dns_response_message(&request);
+        response.add_answer(Record::from_rdata(
+            query.name().clone(),
+            DNS_DEFAULT_TTL_SECS,
+            RData::CNAME(hickory_proto::rr::rdata::CNAME(canonical_name.clone())),
+        ));
+        response.add_answer(Record::from_rdata(
+            canonical_name,
+            DNS_DEFAULT_TTL_SECS,
+            RData::A(A(Ipv4Addr::new(203, 0, 113, 46))),
+        ));
 
         assert_eq!(
-            interception.resolved_hostname("192.0.2.10"),
-            Some("first.example".to_string()),
+            dns_answer_pins(&request, &response),
+            vec![DnsAnswerPin {
+                hostname: "alias.example".to_string(),
+                address: [203, 0, 113, 46],
+                ttl: Duration::from_secs(DNS_DEFAULT_TTL_SECS.into()),
+            }],
         );
-        assert_eq!(interception.resolved_hostname("192.0.2.11"), None);
+    }
+
+    #[test]
+    fn custom_dns_response_ignores_non_in_a_answers() {
+        let request = DnsMessage::from_vec(&dns_query("class.example", 1)).unwrap();
+        let query = single_dns_query(&request).unwrap();
+        let mut response = dns_response_message(&request);
+        let mut record = Record::from_rdata(
+            query.name().clone(),
+            DNS_DEFAULT_TTL_SECS,
+            RData::A(A(Ipv4Addr::new(203, 0, 113, 47))),
+        );
+        record.dns_class = DNSClass::CH;
+        response.add_answer(record);
+
+        assert_eq!(dns_answer_pins(&request, &response), Vec::new());
+    }
+
+    #[test]
+    fn dns_pins_keep_latest_guest_scoped_hostname_mapping_for_address() {
+        let mut interception = TransparentInterception::new(Ipv4Address::new(10, 0, 2, 1));
+        let guest = IpAddress::v4(10, 0, 2, 15);
+        let other_guest = IpAddress::v4(10, 0, 2, 16);
+
+        interception.record_dns_answer(guest, &dns_pin("first.example", [192, 0, 2, 10]));
+        interception.record_dns_answer(other_guest, &dns_pin("other.example", [192, 0, 2, 10]));
+        interception.record_dns_answer(guest, &dns_pin("second.example", [192, 0, 2, 10]));
+
+        assert_eq!(
+            interception.resolved_hostname(guest, "192.0.2.10"),
+            Some("second.example".to_string()),
+        );
+        assert_eq!(
+            interception.resolved_hostname(other_guest, "192.0.2.10"),
+            Some("other.example".to_string()),
+        );
+        assert_eq!(interception.resolved_hostname(guest, "192.0.2.11"), None);
     }
 
     #[test]
@@ -3458,41 +3506,56 @@ mod tests {
         assert_eq!(attempts[0].hostname.as_deref(), Some("api.example.com"));
     }
 
-    fn dns_query(name: &str, qtype: u16) -> Vec<u8> {
-        let mut query = Vec::new();
-        query.extend_from_slice(&0x1234u16.to_be_bytes());
-        query.extend_from_slice(&0x0100u16.to_be_bytes());
-        query.extend_from_slice(&1u16.to_be_bytes());
-        query.extend_from_slice(&0u16.to_be_bytes());
-        query.extend_from_slice(&0u16.to_be_bytes());
-        query.extend_from_slice(&0u16.to_be_bytes());
-        for label in name.split('.') {
-            query.push(label.len() as u8);
-            query.extend_from_slice(label.as_bytes());
+    fn dns_pin(hostname: &str, address: [u8; 4]) -> DnsAnswerPin {
+        DnsAnswerPin {
+            hostname: hostname.to_string(),
+            address,
+            ttl: Duration::from_secs(DNS_DEFAULT_TTL_SECS.into()),
         }
-        query.push(0);
-        query.extend_from_slice(&qtype.to_be_bytes());
-        query.extend_from_slice(&1u16.to_be_bytes());
-        query
     }
 
-    fn dns_answer(request: &[u8], addresses: &[[u8; 4]]) -> Vec<u8> {
-        let (_, question_end) = request_dns_question_name(request).unwrap();
-        let mut response = Vec::new();
-        response.extend_from_slice(&request[..2]);
-        response.extend_from_slice(&[0x81, 0x80]);
-        response.extend_from_slice(&request[4..6]);
-        response.extend_from_slice(&(addresses.len() as u16).to_be_bytes());
-        response.extend_from_slice(&[0, 0, 0, 0]);
-        response.extend_from_slice(&request[12..question_end + 4]);
+    fn dns_query(name: &str, qtype: u16) -> Vec<u8> {
+        let query_type = match qtype {
+            1 => RecordType::A,
+            28 => RecordType::AAAA,
+            _ => panic!("unsupported test query type: {qtype}"),
+        };
+        let mut message = DnsMessage::new(
+            0x1234,
+            DnsMessageType::Query,
+            hickory_proto::op::OpCode::Query,
+        );
+        message.metadata.recursion_desired = true;
+        message.add_query(hickory_proto::op::Query::query(
+            hickory_proto::rr::Name::from_ascii(name).unwrap(),
+            query_type,
+        ));
+        message.to_vec().unwrap()
+    }
+
+    fn dns_answer(request: &DnsMessage, addresses: &[[u8; 4]]) -> Vec<u8> {
+        let mut response = dns_response_message(request);
+        let query = single_dns_query(request).unwrap();
         for address in addresses {
-            response.extend_from_slice(&[0xc0, 0x0c]);
-            response.extend_from_slice(&1u16.to_be_bytes());
-            response.extend_from_slice(&1u16.to_be_bytes());
-            response.extend_from_slice(&60u32.to_be_bytes());
-            response.extend_from_slice(&4u16.to_be_bytes());
-            response.extend_from_slice(address);
+            response.add_answer(Record::from_rdata(
+                query.name().clone(),
+                DNS_DEFAULT_TTL_SECS,
+                RData::A(A(Ipv4Addr::from(*address))),
+            ));
         }
+        response.to_vec().unwrap()
+    }
+
+    fn dns_response_message(request: &DnsMessage) -> DnsMessage {
+        let query = single_dns_query(request).unwrap();
+        let mut response = DnsMessage::new(
+            request.metadata.id,
+            DnsMessageType::Response,
+            request.metadata.op_code,
+        );
+        response.metadata = hickory_proto::op::Metadata::response_from_request(&request.metadata);
+        response.metadata.recursion_available = true;
+        response.add_query(query.clone());
         response
     }
 

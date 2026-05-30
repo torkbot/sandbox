@@ -473,6 +473,47 @@ test("network.policy can answer DNS with custom accept resolvers", async (t) => 
   assert.equal(dnsServer.queries, 1);
 });
 
+test("network.policy uses DNS cache hostname as HTTP policy authority", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+
+  const hostname = "policy-cache.test";
+  const dnsServer = await startUdpDnsServer(hostOriginAddress());
+  t.after(() => {
+    void dnsServer.close();
+  });
+  const observedHeaders: string[] = [];
+  const origin = await startTcpServer((socket) => {
+    socket.once("data", (chunk) => {
+      const request = chunk.toString("utf8");
+      observedHeaders.push(request.match(/^x-sandbox-policy: (.+)$/im)?.[1] ?? "");
+      socket.end("HTTP/1.1 200 OK\r\ncontent-length: 12\r\nconnection: close\r\n\r\ndns-cache-ok");
+    });
+  }, 18084);
+  t.after(() => void origin.close());
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      if (conn.matchDns()?.accept({
+        resolvers: [{ ip: "127.0.0.1", port: dnsServer.port }],
+      })) return;
+
+      conn.matchHttp(hostname)?.accept((request) => {
+        request.headers.set("x-sandbox-policy", request.destination.hostname ?? "");
+      });
+    }),
+  }).boot();
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "http-dns-cache-authority",
+    script: `curl -4fsS --max-time 5 http://${hostname}:${origin.port}/`,
+  }), 10_000, "HTTP request matched by DNS cache hostname");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "dns-cache-ok");
+  assert.equal(dnsServer.queries, 1);
+  assert.deepEqual(observedHeaders, [hostname]);
+});
+
 test("network.policy resolver survives synthesized mount directories", async (t) => {
   if (!requireVmLaunchSupport(t)) return;
 
@@ -1066,13 +1107,17 @@ function dnsAnswer(request: Buffer, answer: string | readonly string[]): Buffer 
     offset += (request[offset] ?? 0) + 1;
   }
   const questionEnd = offset + 5;
-  const response = Buffer.alloc(questionEnd + (16 * answers.length));
+  const qtype = request.readUInt16BE(offset + 1);
+  const responseAnswers = qtype === 1 ? answers : [];
+  const response = Buffer.alloc(questionEnd + (16 * responseAnswers.length));
   request.copy(response, 0, 0, questionEnd);
   response[2] = 0x81;
   response[3] = 0x80;
-  response.writeUInt16BE(answers.length, 6);
+  response.writeUInt16BE(responseAnswers.length, 6);
+  response.writeUInt16BE(0, 8);
+  response.writeUInt16BE(0, 10);
   let answerOffset = questionEnd;
-  for (const address of answers) {
+  for (const address of responseAnswers) {
     response[answerOffset++] = 0xc0;
     response[answerOffset++] = 0x0c;
     response.writeUInt16BE(1, answerOffset);
