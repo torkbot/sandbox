@@ -156,8 +156,11 @@ await using lane = await sandbox.boot({
 });
 ```
 
-The built-in Alpine rootfs includes `/workspace`, `/tmp`, and `/mnt`. Mount
-targets must already exist in the selected rootfs.
+Sandbox init creates missing mount target directories immediately before
+attaching each virtual filesystem, matching container runtime behavior when the
+target parent is on init-owned tmpfs or comes from an earlier virtual mount. On
+durable rootfs paths that cannot be created without changing rootfs or COW
+semantics, boot fails with the guest init error surfaced in the host exception.
 
 ### Control network egress
 

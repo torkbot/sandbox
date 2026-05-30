@@ -84,6 +84,141 @@ test("boot options provide instance-specific virtual mounts", async (t) => {
   assert.equal(result.stdout, "lane-private");
 });
 
+test("missing writable mount directories are created before mounting virtual filesystems", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const missingFs = fs.memory({
+    files: {
+      "/note.txt": "mounted\n",
+    },
+  });
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot({
+    mounts: {
+      "/tmp/missing-mount": fs.virtual(missingFs),
+    },
+  });
+
+  const result = await sandbox.exec("/bin/cat", ["/tmp/missing-mount/note.txt"]);
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stdout, "mounted\n");
+});
+
+test("top-level read-only rootfs mount directories fail with actionable init output", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const missingFs = fs.memory({
+    files: {
+      "/note.txt": "mounted\n",
+    },
+  });
+  await assert.rejects(
+    defineSandbox({
+      rootfs: rootfs.builtIn("alpine:3.23"),
+    }).boot({
+      mounts: {
+        "/missing-mount": fs.virtual(missingFs),
+      },
+    }),
+    /virtual filesystem mount point parent is on durable rootfs: \/missing-mount/,
+  );
+});
+
+test("missing COW rootfs mount directories do not persist synthetic rootfs paths", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const blockStore = memoryBlockStore();
+  const missingFs = fs.memory({
+    files: {
+      "/note.txt": "mounted\n",
+    },
+  });
+  const sandboxDefinition = defineSandbox({
+    rootfs: rootfs.cow({
+      base: rootfs.builtIn("alpine:3.23"),
+      writable: blockStore,
+    }),
+  });
+
+  await assert.rejects(
+    sandboxDefinition.boot({
+      mounts: {
+        "/opt/cache": fs.virtual(missingFs),
+      },
+    }),
+    /virtual filesystem mount point parent is on durable rootfs: \/opt\/cache/,
+  );
+
+  await using sandbox = await sandboxDefinition.boot();
+  const result = await sandbox.exec("/bin/sh", ["-lc", "test ! -e /opt/cache"]);
+
+  assert.equal(result.exitCode, 0, result.stderr);
+});
+
+test("ordered nested virtual mounts can use parent mount directories", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const workspace = fs.memory({
+    files: {
+      "/cache/.keep": "",
+      "/note.txt": "workspace\n",
+    },
+  });
+  const cache = fs.memory({
+    files: {
+      "/note.txt": "cache\n",
+    },
+  });
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot({
+    mounts: {
+      "/workspace": fs.virtual(workspace),
+      "/workspace/cache": fs.virtual(cache),
+    },
+  });
+
+  const result = await sandbox.exec("/bin/sh", [
+    "-lc",
+    "cat /workspace/note.txt /workspace/cache/note.txt",
+  ]);
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stdout, "workspace\ncache\n");
+});
+
+test("invalid rootfs mount targets fail with actionable init output", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const mountedFs = fs.memory({
+    files: {
+      "/note.txt": "mounted\n",
+    },
+  });
+  await assert.rejects(
+    defineSandbox({
+      rootfs: rootfs.builtIn("alpine:3.23"),
+    }).boot({
+      mounts: {
+        "/etc/passwd": fs.virtual(mountedFs),
+      },
+    }),
+    /virtual filesystem mount point is not a directory: \/etc\/passwd/,
+  );
+});
+
 test("virtual memory mounts can be used as the boot cwd", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
@@ -152,12 +287,12 @@ test("virtual memory mount paths may contain init delimiters", async (t) => {
   }).boot({
     cwd: "/",
     mounts: {
-      "/run/sandbox/a=b": fs.virtual(fs.memory({
+      "/tmp/a=b": fs.virtual(fs.memory({
         files: {
           "/note.txt": "equals\n",
         },
       })),
-      "/run/sandbox/a;b": fs.virtual(fs.memory({
+      "/tmp/a;b": fs.virtual(fs.memory({
         files: {
           "/note.txt": "semicolon\n",
         },
@@ -167,7 +302,7 @@ test("virtual memory mount paths may contain init delimiters", async (t) => {
 
   const result = await sandbox.exec("/bin/sh", [
     "-lc",
-    "cat '/run/sandbox/a=b/note.txt' '/run/sandbox/a;b/note.txt'",
+    "cat '/tmp/a=b/note.txt' '/tmp/a;b/note.txt'",
   ]);
 
   assert.equal(result.exitCode, 0, result.stderr);
@@ -264,7 +399,10 @@ test("COW rootfs close sync ignores the instance cwd", async (t) => {
   assert.equal(read.stdout, "cwd-independent");
 });
 
-function memoryBlockStore(): SandboxBlockStore & { observedBaseIdentities(): readonly string[] } {
+function memoryBlockStore(): SandboxBlockStore & {
+  observedBaseIdentities(): readonly string[];
+  observedBlocks(): readonly bigint[];
+} {
   const blocks = new Map<bigint, Uint8Array>();
   const baseIdentities = new Set<string>();
   return {
@@ -296,6 +434,9 @@ function memoryBlockStore(): SandboxBlockStore & { observedBaseIdentities(): rea
     },
     observedBaseIdentities() {
       return Array.from(baseIdentities);
+    },
+    observedBlocks() {
+      return Array.from(blocks.keys());
     },
   };
 }

@@ -77,11 +77,7 @@ impl ControlFrame {
                     "value": value,
                 }).collect::<Vec<_>>(),
             },
-            Self::GuestSpawn {
-                id,
-                argv,
-                env,
-            } => bson::doc! {
+            Self::GuestSpawn { id, argv, env } => bson::doc! {
                 "type": "guest.spawn",
                 "id": id,
                 "argv": argv,
@@ -360,16 +356,20 @@ fn read_env_array(
             values
                 .iter()
                 .map(|value| {
-                    let document = value
-                        .as_document()
-                        .ok_or_else(|| ControlFrameError::new(format!("{label} entries must be documents")))?;
+                    let document = value.as_document().ok_or_else(|| {
+                        ControlFrameError::new(format!("{label} entries must be documents"))
+                    })?;
                     let key = document
                         .get_str("key")
-                        .map_err(|_| ControlFrameError::new(format!("{label} key must be a string")))?
+                        .map_err(|_| {
+                            ControlFrameError::new(format!("{label} key must be a string"))
+                        })?
                         .to_string();
                     let value = document
                         .get_str("value")
-                        .map_err(|_| ControlFrameError::new(format!("{label} value must be a string")))?
+                        .map_err(|_| {
+                            ControlFrameError::new(format!("{label} value must be a string"))
+                        })?
                         .to_string();
                     Ok((key, value))
                 })
