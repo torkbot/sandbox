@@ -15,12 +15,15 @@ fn main() {
 
 fn run() -> Result<(), InitError> {
     mount_kernel_filesystems()?;
-    configure_http_network(std::env::args().skip(1))?;
-    mount_virtual_filesystems(
+    let mounts = virtual_fs_mounts(
         std::env::args().skip(1),
         std::env::var("SANDBOX_VIRTIOFS_MOUNTS").ok(),
     )?;
+    configure_http_network(std::env::args().skip(1))?;
+    mount_internal_http_ca(&mounts)?;
+    mount_virtual_filesystems_before_http_ca(&mounts)?;
     install_http_ca()?;
+    mount_virtual_filesystems_after_http_ca(&mounts)?;
     let packet = init_ready_packet(true)?;
     let mut control = connect_control()?;
     send_init_ready(&mut control, &packet)?;
@@ -161,46 +164,185 @@ fn set_directory_mode(path: &str, mode: u32) -> Result<(), InitError> {
 }
 
 #[cfg(target_os = "linux")]
-fn mount_virtual_filesystems(
+fn mount_internal_http_ca(mounts: &[VirtualFsMount]) -> Result<(), InitError> {
+    let Some(mount) = mounts.iter().find(|mount| is_internal_http_ca_mount(mount)) else {
+        return Ok(());
+    };
+    ensure_mount_point(&mount.path)?;
+    mount_virtiofs(&mount.tag, &mount.path, mount.readonly)
+}
+
+#[cfg(target_os = "linux")]
+fn mount_virtual_filesystems_before_http_ca(mounts: &[VirtualFsMount]) -> Result<(), InitError> {
+    for mount in mounts {
+        if is_internal_http_ca_mount(mount) || hides_internal_http_ca_mount(&mount.path) {
+            continue;
+        }
+        ensure_mount_point(&mount.path)?;
+        mount_virtiofs(&mount.tag, &mount.path, mount.readonly)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn mount_virtual_filesystems_after_http_ca(mounts: &[VirtualFsMount]) -> Result<(), InitError> {
+    for mount in mounts {
+        if is_internal_http_ca_mount(mount) || !hides_internal_http_ca_mount(&mount.path) {
+            continue;
+        }
+        ensure_mount_point(&mount.path)?;
+        mount_virtiofs(&mount.tag, &mount.path, mount.readonly)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn is_internal_http_ca_mount(mount: &VirtualFsMount) -> bool {
+    mount.tag == "sandbox-http-ca"
+        && normalized_mount_path(&mount.path).as_deref() == Some("/run/sandbox/http-ca")
+}
+
+#[cfg(target_os = "linux")]
+fn hides_internal_http_ca_mount(path: &str) -> bool {
+    normalized_mount_path(path)
+        .is_some_and(|path| path == "/run" || path.starts_with("/run/"))
+}
+
+#[cfg(target_os = "linux")]
+fn normalized_mount_path(path: &str) -> Option<String> {
+    use std::path::Component;
+
+    let mut components = Vec::new();
+    for component in std::path::Path::new(path).components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => components.push(name.to_str()?),
+            Component::CurDir => {}
+            Component::Prefix(_) | Component::ParentDir => return None,
+        }
+    }
+    Some(format!("/{}", components.join("/")))
+}
+
+#[cfg(target_os = "linux")]
+fn virtual_fs_mounts(
     args: impl Iterator<Item = String>,
     env_mounts: Option<String>,
-) -> Result<(), InitError> {
-    use std::path::Path;
-
+) -> Result<Vec<VirtualFsMount>, InitError> {
     let mounts = args
         .filter_map(|arg| arg.strip_prefix("--virtiofs-mounts=").map(str::to_string))
         .next()
         .or(env_mounts)
         .or_else(read_mounts_from_proc_cmdline);
-    let Some(mounts) = mounts else { return Ok(()) };
+    let Some(mounts) = mounts else {
+        return Ok(Vec::new());
+    };
 
-    for mount in mounts.split(';').filter(|mount| !mount.is_empty()) {
-        let parts = mount.split(':').collect::<Vec<_>>();
-        let [tag, path, mode] = parts.as_slice() else {
-            return Err(InitError(format!(
-                "invalid virtual filesystem mount: {mount}"
-            )));
-        };
-        let tag = decode_mount_field(tag)?;
-        let path = decode_mount_field(path)?;
-        if path.starts_with("/run/sandbox/") {
-            std::fs::create_dir_all(&path).map_err(|error| {
-                InitError(format!(
-                    "create virtual filesystem mount point {path}: {error}"
-                ))
-            })?;
-        } else if !Path::new(&path).is_dir() {
-            return Err(InitError(format!(
-                "virtual filesystem mount point does not exist: {path}"
-            )));
-        }
+    mounts
+        .split(';')
+        .filter(|mount| !mount.is_empty())
+        .map(parse_virtual_fs_mount)
+        .collect::<Result<Vec<_>, _>>()
+}
 
-        let readonly = *mode != "rw";
-        mount_virtiofs(&tag, &path, readonly)?;
+#[cfg(target_os = "linux")]
+struct VirtualFsMount {
+    tag: String,
+    path: String,
+    readonly: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn parse_virtual_fs_mount(mount: &str) -> Result<VirtualFsMount, InitError> {
+    let parts = mount.split(':').collect::<Vec<_>>();
+    let [tag, path, mode] = parts.as_slice() else {
+        return Err(InitError(format!(
+            "invalid virtual filesystem mount: {mount}"
+        )));
+    };
+    Ok(VirtualFsMount {
+        tag: decode_mount_field(tag)?,
+        path: decode_mount_field(path)?,
+        readonly: *mode != "rw",
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_mount_point(path: &str) -> Result<(), InitError> {
+    use std::path::Path;
+
+    if Path::new(path).is_dir() {
+        return Ok(());
+    }
+    if Path::new(path).exists() {
+        return Err(InitError(format!(
+            "virtual filesystem mount point is not a directory: {path}"
+        )));
+    }
+    ensure_mount_point_parent_is_ephemeral(path)?;
+
+    std::fs::create_dir_all(path).map_err(|error| {
+        InitError(format!(
+            "create virtual filesystem mount point {path}: {error}"
+        ))
+    })?;
+
+    if !Path::new(path).is_dir() {
+        return Err(InitError(format!(
+            "virtual filesystem mount point is not a directory: {path}"
+        )));
     }
 
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+fn ensure_mount_point_parent_is_ephemeral(path: &str) -> Result<(), InitError> {
+    let parent = nearest_existing_ancestor(path)?;
+    let fs_type = filesystem_type(&parent)?;
+    if fs_type == TMPFS_MAGIC || fs_type == FUSE_SUPER_MAGIC {
+        return Ok(());
+    }
+    Err(InitError(format!(
+        "virtual filesystem mount point parent is on durable rootfs: {path}"
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn nearest_existing_ancestor(path: &str) -> Result<std::path::PathBuf, InitError> {
+    let mut candidate = std::path::PathBuf::from(path);
+    while !candidate.exists() {
+        if !candidate.pop() {
+            return Err(InitError(format!(
+                "virtual filesystem mount point has no existing ancestor: {path}"
+            )));
+        }
+    }
+    Ok(candidate)
+}
+
+#[cfg(target_os = "linux")]
+fn filesystem_type(path: &std::path::Path) -> Result<i128, InitError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| InitError(format!("statfs path contains nul: {}", path.display())))?;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let result = unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) };
+    if result < 0 {
+        return Err(InitError::last_os(
+            "stat virtual filesystem mount point parent",
+        ));
+    }
+    Ok(unsafe { stat.assume_init().f_type as i128 })
+}
+
+#[cfg(target_os = "linux")]
+const TMPFS_MAGIC: i128 = 0x0102_1994;
+
+#[cfg(target_os = "linux")]
+const FUSE_SUPER_MAGIC: i128 = 0x6573_5546;
 
 #[cfg(target_os = "linux")]
 fn mount_virtiofs(tag: &str, path: &str, readonly: bool) -> Result<(), InitError> {
@@ -247,10 +389,33 @@ fn decode_mount_field(value: &str) -> Result<String, InitError> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn mount_virtual_filesystems(
+fn virtual_fs_mounts(
     _args: impl Iterator<Item = String>,
     _env_mounts: Option<String>,
-) -> Result<(), InitError> {
+) -> Result<Vec<VirtualFsMount>, InitError> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+struct VirtualFsMount {
+    tag: String,
+    path: String,
+    readonly: bool,
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_internal_http_ca(_mounts: &[VirtualFsMount]) -> Result<(), InitError> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_virtual_filesystems_before_http_ca(_mounts: &[VirtualFsMount]) -> Result<(), InitError> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_virtual_filesystems_after_http_ca(_mounts: &[VirtualFsMount]) -> Result<(), InitError> {
     Ok(())
 }
 

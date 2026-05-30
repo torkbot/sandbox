@@ -10,6 +10,7 @@ import test from "node:test";
 import tls from "node:tls";
 import {
   defineSandbox,
+  fs,
   network,
   rootfs,
   type NetworkConnectionRequest,
@@ -470,6 +471,218 @@ test("network.policy can answer DNS with custom accept resolvers", async (t) => 
   assert.equal(result.exitCode, 0, commandOutput(result));
   assert.equal(result.stdout, "203.0.113.44");
   assert.equal(dnsServer.queries, 1);
+});
+
+test("network.policy resolver survives synthesized mount directories", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+
+  const dnsServer = await startUdpDnsServer("203.0.113.45");
+  t.after(() => {
+    void dnsServer.close();
+  });
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      if (conn.matchDns()?.accept({
+        resolvers: [{ ip: "127.0.0.1", port: dnsServer.port }],
+      })) return;
+    }),
+  }).boot({
+    mounts: {
+      "/tmp/missing-network-mount": fs.virtual(fs.memory({ files: { "/note.txt": "mounted\n" } })),
+    },
+  });
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "dns-synthesized-mount",
+    script: "python3 -c 'import socket; print(socket.gethostbyname(\"custom.test\"), end=\"\")'",
+  }), 8_000, "DNS through synthesized mount root");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "203.0.113.45");
+  assert.equal(dnsServer.queries, 1);
+});
+
+test("network.policy resolver setup is isolated from /run/sandbox mounts", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+
+  const dnsServer = await startUdpDnsServer("203.0.113.46");
+  t.after(() => {
+    void dnsServer.close();
+  });
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      if (conn.matchDns()?.accept({
+        resolvers: [{ ip: "127.0.0.1", port: dnsServer.port }],
+      })) return;
+    }),
+  }).boot({
+    mounts: {
+      "/run/sandbox": fs.virtual(fs.memory({ files: { "/note.txt": "mounted\n" } })),
+    },
+  });
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "dns-run-sandbox-mount",
+    script: "python3 -c 'import socket; print(socket.gethostbyname(\"custom.test\"), end=\"\")'",
+  }), 8_000, "DNS through /run/sandbox mount");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "203.0.113.46");
+  assert.equal(dnsServer.queries, 1);
+});
+
+test("network.policy HTTP CA setup survives /run/sandbox mounts", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      conn.accept();
+    }),
+  }).boot({
+    mounts: {
+      "/run/sandbox": fs.virtual(fs.memory({ files: { "/note.txt": "mounted\n" } })),
+    },
+  });
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "http-ca-run-sandbox-mount",
+    script: [
+      "test -s /usr/local/share/ca-certificates/sandbox-http-interception-ca.crt",
+      "test -f /run/sandbox/note.txt",
+    ].join(" && "),
+  }), 8_000, "HTTP CA setup with /run/sandbox mount");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+});
+
+test("network.policy HTTP CA setup survives /run mounts", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      conn.accept();
+    }),
+  }).boot({
+    mounts: {
+      "/run": fs.virtual(fs.memory({ files: { "/note.txt": "mounted\n" } })),
+    },
+  });
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "http-ca-run-mount",
+    script: [
+      "test -s /usr/local/share/ca-certificates/sandbox-http-interception-ca.crt",
+      "cat /run/note.txt",
+    ].join(" && "),
+  }), 8_000, "HTTP CA setup with /run mount");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "mounted\n");
+});
+
+test("network.policy preserves nested mounts below /run/sandbox after HTTP CA setup", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      conn.accept();
+    }),
+  }).boot({
+    mounts: {
+      "/run/sandbox": fs.virtual(fs.memory({
+        files: {
+          "/note.txt": "parent\n",
+          "/cache/.keep": "",
+        },
+      })),
+      "/run/sandbox/cache": fs.virtual(fs.memory({ files: { "/note.txt": "child\n" } })),
+    },
+  });
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "http-ca-run-sandbox-nested-mount",
+    script: [
+      "test -s /usr/local/share/ca-certificates/sandbox-http-interception-ca.crt",
+      "cat /run/sandbox/note.txt",
+      "cat /run/sandbox/cache/note.txt",
+    ].join(" && "),
+  }), 8_000, "HTTP CA setup with nested /run/sandbox mounts");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "parent\nchild\n");
+});
+
+test("network.policy HTTP CA setup populates mounted trust-store directories", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      conn.accept();
+    }),
+  }).boot({
+    mounts: {
+      "/usr/local/share/ca-certificates": fs.virtual(fs.memory({})),
+    },
+  });
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "http-ca-trust-store-mount",
+    script: "test -s /usr/local/share/ca-certificates/sandbox-http-interception-ca.crt",
+  }), 8_000, "HTTP CA setup with mounted trust store");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+});
+
+test("network.policy user mount can replace internal HTTP CA mount after setup", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      conn.accept();
+    }),
+  }).boot({
+    mounts: {
+      "/run/sandbox/http-ca": fs.virtual(fs.memory({ files: { "/note.txt": "mounted\n" } })),
+    },
+  });
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "http-ca-user-mount",
+    script: [
+      "test -s /usr/local/share/ca-certificates/sandbox-http-interception-ca.crt",
+      "cat /run/sandbox/http-ca/note.txt",
+    ].join(" && "),
+  }), 8_000, "HTTP CA setup with user mount at internal CA path");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "mounted\n");
+});
+
+test("network.policy user mount can replace internal HTTP CA mount with normalized path", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      conn.accept();
+    }),
+  }).boot({
+    mounts: {
+      "/run//sandbox/http-ca/": fs.virtual(fs.memory({ files: { "/note.txt": "mounted\n" } })),
+    },
+  });
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "http-ca-user-mount-normalized",
+    script: [
+      "test -s /usr/local/share/ca-certificates/sandbox-http-interception-ca.crt",
+      "cat /run/sandbox/http-ca/note.txt",
+    ].join(" && "),
+  }), 8_000, "HTTP CA setup with normalized user mount at internal CA path");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "mounted\n");
 });
 
 test("network.policy preserves TCP DNS for custom accept resolvers", async (t) => {

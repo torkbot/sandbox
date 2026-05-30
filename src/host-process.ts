@@ -1,5 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
+import { closeSync, mkdtempSync, openSync, readSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Binary, BSON } from "bson";
 import { hostBinaryPath, macosHostSigningError } from "./artifacts.ts";
 import type { HostControlChannel } from "./control.ts";
@@ -48,6 +51,8 @@ export class HostProcessSandboxVm implements HostControlChannel {
   readonly #requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook>;
   readonly #networkConnectionHook?: RegisteredNetworkConnectionHook;
   readonly #httpMiddlewareByFlow = new Map<string, HttpRequestMiddleware | undefined>();
+  readonly #consoleOutputPath?: string;
+  readonly #consoleOutputCleanupPath?: string;
   #buffer = new Uint8Array();
   #stderr = "";
   #closed = false;
@@ -59,12 +64,16 @@ export class HostProcessSandboxVm implements HostControlChannel {
     options: InternalSandboxOptions,
     requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook>,
     networkConnectionHook?: RegisteredNetworkConnectionHook,
+    consoleOutputPath?: string,
+    consoleOutputCleanupPath?: string,
   ) {
     this.#child = child;
     this.#options = options;
     this.packets = this.#packets;
     this.#requestHeaderHooks = requestHeaderHooks;
     this.#networkConnectionHook = networkConnectionHook;
+    this.#consoleOutputPath = consoleOutputPath;
+    this.#consoleOutputCleanupPath = consoleOutputCleanupPath;
     this.#rootBlockStore = options.rootfs.storage?.blockStore;
     this.#rootBlockStoreContext = options.rootfs.storage?.context;
     for (const mount of options.mounts ?? []) {
@@ -98,8 +107,9 @@ export class HostProcessSandboxVm implements HostControlChannel {
           ? `sandbox-host exited with ${code ?? "unknown status"}`
           : `sandbox-host exited from signal ${signal}`;
       this.#exitError = new Error(
-        this.#stderr.length === 0 ? exitText : `${exitText}\n${this.#stderr}`,
+        hostExitMessage(exitText, this.#stderr, this.#consoleOutputPath),
       );
+      this.#cleanupConsoleOutput();
       this.#packets.close(this.#exitError);
       this.#packetActivity.close(this.#exitError);
       this.#launchReady.close(this.#exitError);
@@ -115,10 +125,22 @@ export class HostProcessSandboxVm implements HostControlChannel {
     let vm: HostProcessSandboxVm | undefined;
     const hostPath = hostBinaryPath();
     try {
+      const consoleOutput = launchConsoleOutput();
       const child = spawn(hostPath, ["--stdio"], {
         stdio: ["pipe", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          SANDBOX_CONSOLE_OUTPUT: consoleOutput.path,
+        },
       });
-      vm = new HostProcessSandboxVm(child, options, requestHeaderHooks, networkConnectionHook);
+      vm = new HostProcessSandboxVm(
+        child,
+        options,
+        requestHeaderHooks,
+        networkConnectionHook,
+        consoleOutput.path,
+        consoleOutput.cleanupPath,
+      );
       await Promise.race([
         once(child, "spawn"),
         once(child, "error").then(([error]) => {
@@ -162,15 +184,19 @@ export class HostProcessSandboxVm implements HostControlChannel {
       delay(500),
     ]);
 
-    if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
-      return;
-    }
+    try {
+      if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
+        return;
+      }
 
-    this.#child.kill("SIGKILL");
-    await Promise.race([
-      exited,
-      delay(1_000),
-    ]);
+      this.#child.kill("SIGKILL");
+      await Promise.race([
+        exited,
+        delay(1_000),
+      ]);
+    } finally {
+      this.#cleanupConsoleOutput();
+    }
   }
 
   async terminateHostForTest(): Promise<void> {
@@ -201,6 +227,16 @@ export class HostProcessSandboxVm implements HostControlChannel {
     }
     if (this.#exitError !== null) {
       throw this.#exitError;
+    }
+  }
+
+  #cleanupConsoleOutput(): void {
+    if (this.#consoleOutputCleanupPath === undefined) {
+      return;
+    }
+    try {
+      rmSync(this.#consoleOutputCleanupPath, { recursive: true, force: true });
+    } catch {
     }
   }
 
@@ -889,6 +925,60 @@ function launchTimeoutMs(): number {
     throw new Error(`SANDBOX_LAUNCH_TIMEOUT_MS must be a positive integer, got ${value}`);
   }
   return parsed;
+}
+
+function launchConsoleOutput(): { readonly path: string; readonly cleanupPath?: string } {
+  const configured = process.env.SANDBOX_CONSOLE_OUTPUT;
+  if (configured !== undefined) {
+    try {
+      if (statSync(configured).isDirectory()) {
+        const outputPath = mkdtempSync(join(configured, "sandbox-console-"));
+        return { path: join(outputPath, "console.log") };
+      }
+    } catch {
+      // Non-existent configured paths are treated as explicit output files.
+    }
+    return { path: configured };
+  }
+  const cleanupPath = mkdtempSync(join(tmpdir(), "sandbox-console-"));
+  return { path: join(cleanupPath, "console.log"), cleanupPath };
+}
+
+function hostExitMessage(exitText: string, stderr: string, consoleOutputPath: string | undefined): string {
+  const parts = [exitText];
+  if (stderr.length > 0) {
+    parts.push(stderr);
+  }
+
+  const consoleOutput = consoleOutputPath === undefined ? "" : readConsoleTail(consoleOutputPath);
+  if (consoleOutput.length > 0) {
+    parts.push(`guest console output:\n${consoleOutput}`);
+  }
+  return parts.join("\n");
+}
+
+function readConsoleTail(path: string): string {
+  const maxBytes = 8_000;
+  let fd: number | undefined;
+  try {
+    const stat = statSync(path);
+    const offset = Math.max(0, stat.size - maxBytes);
+    const size = stat.size - offset;
+    if (size <= 0) return "";
+    const buffer = Buffer.alloc(size);
+    fd = openSync(path, "r");
+    readSync(fd, buffer, 0, size, offset);
+    return buffer.toString("utf8").trimEnd();
+  } catch {
+    return "";
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+      }
+    }
+  }
 }
 
 function encodeXattrNameList(names: readonly string[]): Uint8Array {
