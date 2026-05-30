@@ -16,6 +16,7 @@ use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use rama_core::extensions::Extensions;
 use rama_core::rt::Executor;
 use rama_core::service::Service;
+use rama_http::layer::version_adapter::RequestVersionAdapter;
 use rama_http::{Body, Request as RamaRequest, Response as RamaResponse, Version as RamaVersion};
 use rama_http_backend::client::http_connect;
 use rama_http_backend::server::HttpServer;
@@ -1975,6 +1976,7 @@ async fn serve_rama_http_request(
                 return rama_response(502, "upstream tls connect failed");
             };
             let connector = TlsConnector::auto(connector).with_connector_data(tls);
+            let connector = RequestVersionAdapter::new(connector);
             serve_rama_upstream(connector, request).await
         }
     }
@@ -1985,6 +1987,7 @@ where
     C: Service<RamaRequest<Body>, Error: Into<rama_core::error::BoxError>>,
     C::Output: IntoRamaEstablishedConnection<RamaRequest<Body>>,
 {
+    let guest_version = request.version();
     let established = match connector.serve(request).await {
         Ok(established) => established.into_established_connection(),
         Err(_) => return rama_response(502, "upstream connect failed"),
@@ -1995,7 +1998,10 @@ where
             Err(_) => return rama_response(502, "upstream http connect failed"),
         };
     match connection.conn.serve(connection.input).await {
-        Ok(response) => response,
+        Ok(mut response) => {
+            *response.version_mut() = guest_version;
+            response
+        }
         Err(_) => rama_response(502, "upstream request failed"),
     }
 }
@@ -3504,6 +3510,43 @@ mod tests {
         let attempts = policy.attempts.lock().unwrap();
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].hostname.as_deref(), Some("api.example.com"));
+    }
+
+    #[test]
+    fn https_upstream_adapter_uses_negotiated_http_version() {
+        let connector = rama_core::service::service_fn(|request: RamaRequest<Body>| async move {
+            let connection = Extensions::new();
+            connection.insert(rama_http::conn::TargetHttpVersion(RamaVersion::HTTP_2));
+            Ok::<_, std::convert::Infallible>(EstablishedClientConnection {
+                input: request,
+                conn: connection,
+            })
+        });
+        let adapter = RequestVersionAdapter::new(connector);
+        let request = RamaRequest::builder()
+            .version(RamaVersion::HTTP_11)
+            .uri("https://example.test/")
+            .body(Body::empty())
+            .unwrap();
+
+        let established = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(adapter.serve(request))
+            .unwrap();
+
+        assert_eq!(established.input.version(), RamaVersion::HTTP_2);
+    }
+
+    #[test]
+    fn upstream_response_is_adapted_back_to_guest_http_version() {
+        let mut response = RamaResponse::builder()
+            .version(RamaVersion::HTTP_2)
+            .body(Body::empty())
+            .unwrap();
+
+        *response.version_mut() = RamaVersion::HTTP_11;
+
+        assert_eq!(response.version(), RamaVersion::HTTP_11);
     }
 
     fn dns_pin(hostname: &str, address: [u8; 4]) -> DnsAnswerPin {
