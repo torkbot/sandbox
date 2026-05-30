@@ -370,7 +370,9 @@ conn.matchHttp("api.example.com");
 
 `conn.matchDns()` normalizes DNS over UDP and TCP. The guest is configured to
 use Sandbox's internal resolver; policy code decides whether to accept that DNS
-flow and can choose explicit upstream resolvers in `accept(...)`.
+flow and can choose explicit upstream resolvers in `accept(...)`. Accepted DNS
+answers are cached as trusted, guest-scoped hostname metadata for later
+connection policy decisions.
 
 ```ts
 const dns = conn.matchDns();
@@ -380,9 +382,10 @@ if (dns) {
 ```
 
 `conn.matchHttp(...)` acquires an HTTP capability from trusted destination
-metadata. It does not inspect or trust the HTTP `Host` header. IP-addressed HTTP
-requests can still be accepted through lower-level policy, but they do not
-advertise a trusted hostname.
+metadata, including hostnames observed from accepted DNS answers. It does not
+inspect or trust the HTTP `Host` header. IP-addressed HTTP requests can still be
+accepted through lower-level policy, but they do not advertise a trusted
+hostname.
 
 ```ts
 const http = conn.matchHttp((candidate) =>
