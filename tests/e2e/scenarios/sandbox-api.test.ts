@@ -142,6 +142,39 @@ test("virtual memory mounts support guest directory reads from root cwd", async 
   assert.equal(result.stderr, "");
 });
 
+test("virtual memory mount paths may contain init delimiters", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot({
+    cwd: "/",
+    mounts: {
+      "/run/sandbox/a=b": fs.virtual(fs.memory({
+        files: {
+          "/note.txt": "equals\n",
+        },
+      })),
+      "/run/sandbox/a;b": fs.virtual(fs.memory({
+        files: {
+          "/note.txt": "semicolon\n",
+        },
+      })),
+    },
+  });
+
+  const result = await sandbox.exec("/bin/sh", [
+    "-lc",
+    "cat '/run/sandbox/a=b/note.txt' '/run/sandbox/a;b/note.txt'",
+  ]);
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stdout, "equals\nsemicolon\n");
+  assert.equal(result.stderr, "");
+});
+
 test("boot cwd becomes the default process working directory", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
