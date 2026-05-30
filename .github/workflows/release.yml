@@ -102,10 +102,24 @@ jobs:
           node-version: 24
           cache: npm
 
+      - name: Compute fixture cache keys
+        id: fixture-cache-keys
+        run: node ./scripts/fixture-cache-keys.ts --runner-arch "${{ runner.arch }}"
+
+      - name: Restore kernel fixture cache
+        id: kernel-cache
+        uses: actions/cache@v4
+        with:
+          path: dist/kernel
+          key: ${{ steps.fixture-cache-keys.outputs.kernel-key }}
+          enableCrossOsArchive: true
+
       - name: Install dependencies
+        if: steps.kernel-cache.outputs.cache-hit != 'true'
         run: npm ci
 
       - name: Build kernel artifact
+        if: steps.kernel-cache.outputs.cache-hit != 'true'
         run: npm run build:kernel
         env:
           SANDBOX_KERNEL_ARCH: ${{ matrix.kernel_arch }}
@@ -217,16 +231,40 @@ jobs:
           node-version: 24
           cache: npm
 
+      - name: Compute fixture cache keys
+        id: fixture-cache-keys
+        run: node ./scripts/fixture-cache-keys.ts --runner-arch "${{ runner.arch }}"
+
+      - name: Restore init fixture cache
+        id: init-cache
+        uses: actions/cache@v4
+        with:
+          path: dist/init
+          key: ${{ steps.fixture-cache-keys.outputs.init-key }}
+          enableCrossOsArchive: true
+
+      - name: Restore rootfs fixture cache
+        id: rootfs-cache
+        uses: actions/cache@v4
+        with:
+          path: dist/rootfs
+          key: ${{ steps.fixture-cache-keys.outputs.rootfs-key }}
+          enableCrossOsArchive: true
+
       - name: Install dependencies
+        if: steps.init-cache.outputs.cache-hit != 'true' || steps.rootfs-cache.outputs.cache-hit != 'true'
         run: npm ci
 
       - name: Build init binary for built-in rootfs
+        if: steps.init-cache.outputs.cache-hit != 'true'
         run: npm run build:init
 
       - name: Build built-in rootfs
+        if: steps.rootfs-cache.outputs.cache-hit != 'true'
         run: npm run build:rootfs
 
       - name: Build built-in rootfs QCOW2 image
+        if: steps.rootfs-cache.outputs.cache-hit != 'true'
         run: npm run build:rootfs:qcow2
 
       - name: Upload rootfs artifact
