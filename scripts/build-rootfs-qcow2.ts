@@ -6,7 +6,7 @@ const repoRoot = resolve(import.meta.dirname, "..");
 const sourceDir = resolve(repoRoot, process.env.SANDBOX_ROOTFS_SOURCE_DIR ?? "dist/rootfs/alpine-3.23");
 const outPath = resolve(repoRoot, process.env.SANDBOX_ROOTFS_QCOW2_OUT ?? "dist/rootfs/alpine-3.23.qcow2");
 const clusterSize = decimalEnv("SANDBOX_QCOW2_CLUSTER_SIZE", "32768");
-const freeSpaceKiB = decimalEnv("SANDBOX_ROOTFS_FREE_SPACE_KIB", "131072");
+const virtualSizeKiB = sizeEnvKiB("SANDBOX_ROOTFS_VIRTUAL_SIZE", "8gb");
 const filesystemUuid = "00000000-0000-0000-0000-000000000000";
 
 await assertDirectory(sourceDir);
@@ -30,7 +30,8 @@ await run("docker", [
     "tar -C /rootfs -cf - . | tar -C /work/rootfs -xf -",
     "chown -R 0:0 /work/rootfs",
     "size_kb=$(du -sk /work/rootfs | cut -f1)",
-    `image_kb=$((size_kb + ${freeSpaceKiB}))`,
+    `image_kb=${virtualSizeKiB}`,
+    "if [ \"${size_kb}\" -gt \"${image_kb}\" ]; then echo \"rootfs contents exceed virtual image size\" >&2; exit 1; fi",
     "truncate -s \"${image_kb}K\" /work/rootfs.ext4",
     "export E2FSPROGS_FAKE_TIME=0",
     [
@@ -83,6 +84,26 @@ function decimalEnv(name: string, fallback: string): string {
     throw new Error(`${name} must be a positive decimal integer`);
   }
   return value;
+}
+
+function sizeEnvKiB(name: string, fallback: string): string {
+  const value = process.env[name] ?? fallback;
+  const match = /^([1-9][0-9]*)(kb|mb|gb)$/i.exec(value);
+  if (match === null) {
+    throw new Error(`${name} must be a size like 8388608kb, 8192mb, or 8gb`);
+  }
+
+  const amount = BigInt(match[1] ?? "0");
+  const unit = (match[2] ?? "").toLowerCase();
+  const kib = unit === "kb"
+    ? amount
+    : unit === "mb"
+      ? amount * 1024n
+      : amount * 1024n * 1024n;
+  if (kib > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error(`${name} must fit in JavaScript's safe integer range`);
+  }
+  return kib.toString();
 }
 
 async function run(command: string, args: readonly string[]): Promise<void> {

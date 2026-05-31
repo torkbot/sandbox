@@ -23,7 +23,9 @@ test("rootfs fixture produces a QCOW2 image", async () => {
       SANDBOX_ROOTFS_QCOW2_OUT: qcow2,
     });
 
-    assert.deepEqual((await readFile(qcow2)).subarray(0, 4), Buffer.from("QFI\xfb", "binary"));
+    const header = await readFile(qcow2);
+    assert.deepEqual(header.subarray(0, 4), Buffer.from("QFI\xfb", "binary"));
+    assert.equal(header.readBigUInt64BE(24), 8n * 1024n * 1024n * 1024n);
   } finally {
     await rm(workDir, { recursive: true, force: true });
   }

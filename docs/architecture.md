@@ -85,7 +85,7 @@ Build the guest root filesystem before VM instantiation. The runtime API should 
 
 The build-time tooling can use a simple Docker image create/export/extract flow to shape the rootfs. That flow belongs in packaging or fixture-generation tools, not in the hot runtime path.
 
-The target shape is a single compressed QCOW2 artifact containing an ext4 guest filesystem, produced from that extracted rootfs. `rootfs.builtIn(...)` mounts that artifact read-only in the guest. Runtime writable root behavior must be explicit: `rootfs.cow(...)` mounts the same artifact read-write through host-side COW block storage.
+The target shape is a single compressed QCOW2 artifact containing an ext4 guest filesystem, produced from that extracted rootfs with a build-time virtual size large enough for agent workloads. `rootfs.builtIn(...)` mounts that artifact read-only in the guest. Runtime writable root behavior must be explicit: `rootfs.cow(...)` mounts the same artifact read-write through host-side COW block storage.
 
 The first writable-root primitive is host-backed block COW:
 
