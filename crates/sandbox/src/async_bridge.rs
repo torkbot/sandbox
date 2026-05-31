@@ -96,6 +96,10 @@ impl SyncAsyncBridge {
     pub(crate) fn async_is_closed(&self) -> bool {
         self.inner.lock().unwrap().async_closed
     }
+
+    pub(crate) fn async_to_sync_is_empty(&self) -> bool {
+        self.inner.lock().unwrap().async_to_sync.is_empty()
+    }
 }
 
 impl AsyncRead for AsyncBridgeIo {

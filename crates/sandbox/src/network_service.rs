@@ -1808,6 +1808,7 @@ struct TlsInterceptConnection {
     bridge: SyncAsyncBridge,
     to_guest: Vec<u8>,
     close_after_flush: bool,
+    sent_close_notify: bool,
 }
 
 struct RamaHttpConnection {
@@ -2178,6 +2179,7 @@ impl TlsInterceptConnection {
             bridge,
             to_guest: Vec::new(),
             close_after_flush: false,
+            sent_close_notify: false,
         };
         connection.read_guest_tls(initial_guest_tls);
         Ok(connection)
@@ -2252,8 +2254,8 @@ impl TlsInterceptConnection {
             }
             self.drain_server_tls();
         }
-        if self.bridge.async_is_closed() {
-            self.close_after_flush = true;
+        if self.bridge.async_is_closed() && self.bridge.async_to_sync_is_empty() {
+            self.close_after_clean_tls_shutdown();
         }
     }
 
@@ -2266,6 +2268,15 @@ impl TlsInterceptConnection {
             }
             self.to_guest.drain(..sent);
         }
+    }
+
+    fn close_after_clean_tls_shutdown(&mut self) {
+        if !self.sent_close_notify {
+            self.server.send_close_notify();
+            self.sent_close_notify = true;
+            self.drain_server_tls();
+        }
+        self.close_after_flush = true;
     }
 
     fn is_finished(&self) -> bool {
@@ -3549,6 +3560,52 @@ mod tests {
         assert_eq!(response.version(), RamaVersion::HTTP_11);
     }
 
+    #[test]
+    fn tls_intercept_shutdown_sends_close_notify_before_finishing() {
+        let authority = test_mitm_tls_authority();
+        let (bridge, _async_io) = SyncAsyncBridge::new(HTTP_BRIDGE_BUFFER_BYTES);
+        let mut connection = TlsInterceptConnection {
+            server: authority.server_connection("example.test").unwrap(),
+            bridge,
+            to_guest: Vec::new(),
+            close_after_flush: false,
+            sent_close_notify: false,
+        };
+
+        connection.close_after_clean_tls_shutdown();
+
+        assert!(connection.close_after_flush);
+        assert!(connection.sent_close_notify);
+        assert!(!connection.to_guest.is_empty());
+        assert_eq!(connection.to_guest[0], 0x15);
+    }
+
+    #[test]
+    fn tls_intercept_waits_for_pending_plaintext_before_close_notify() {
+        let authority = test_mitm_tls_authority();
+        let (bridge, mut async_io) = SyncAsyncBridge::new(HTTP_BRIDGE_BUFFER_BYTES);
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            tokio::io::AsyncWriteExt::write_all(&mut async_io, b"pending response")
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::shutdown(&mut async_io)
+                .await
+                .unwrap();
+        });
+        let mut connection = TlsInterceptConnection {
+            server: authority.server_connection("example.test").unwrap(),
+            bridge,
+            to_guest: vec![0; TLS_READ_BUFFER_BYTES],
+            close_after_flush: false,
+            sent_close_notify: false,
+        };
+
+        connection.flush_rama_plaintext();
+
+        assert!(!connection.close_after_flush);
+        assert!(!connection.sent_close_notify);
+    }
+
     fn dns_pin(hostname: &str, address: [u8; 4]) -> DnsAnswerPin {
         DnsAnswerPin {
             hostname: hostname.to_string(),
@@ -3574,6 +3631,29 @@ mod tests {
             query_type,
         ));
         message.to_vec().unwrap()
+    }
+
+    fn test_mitm_tls_authority() -> MitmTlsAuthority {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params =
+            rcgen::CertificateParams::new(vec!["Sandbox HTTP Interception CA".to_string()])
+                .unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Sandbox HTTP Interception CA");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let certificate = params.self_signed(&key).unwrap();
+        MitmTlsAuthority::new(MitmTlsConfig {
+            ca_certificate_pem: certificate.pem(),
+            ca_private_key_pem: key.serialize_pem(),
+        })
+        .unwrap()
     }
 
     fn dns_answer(request: &DnsMessage, addresses: &[[u8; 4]]) -> Vec<u8> {
