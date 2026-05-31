@@ -42,6 +42,7 @@ const HOST_HTTPS_PORT: u16 = 443;
 const HOST_ALT_HTTPS_PORT: u16 = 8443;
 const HOST_DNS_PORT: u16 = 53;
 const HTTP_LISTENERS_PER_PORT: usize = 16;
+const HTTP_MAX_SOCKETS_PER_PORT: usize = 256;
 const HTTP_SOCKET_BUFFER_BYTES: usize = 256 * 1024;
 const HTTP_BRIDGE_BUFFER_BYTES: usize = 256 * 1024;
 const TLS_READ_BUFFER_BYTES: usize = 16 * 1024;
@@ -281,16 +282,10 @@ fn run_network_service(
     let mut http_connections = HashMap::new();
     let mut udp_sockets = HashMap::new();
     let mut udp_relays = HashMap::new();
-    add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTP_PORT);
-    add_http_listener(&mut sockets, &mut http_sockets, HOST_ALT_HTTP_PORT);
-    add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTP_PROBE_PORT);
-    if tls_authority.is_some() {
-        add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTPS_PORT);
-        add_http_listener(&mut sockets, &mut http_sockets, HOST_ALT_HTTPS_PORT);
-    }
-
+    add_static_http_listeners(&mut sockets, &mut http_sockets, tls_authority.is_some());
     while !shutdown.load(Ordering::Acquire) {
         let timestamp = Instant::now();
+        add_static_http_listeners(&mut sockets, &mut http_sockets, tls_authority.is_some());
         let _ = iface.poll(timestamp, &mut device, &mut sockets);
         poll_dns_socket(
             &mut sockets,
@@ -737,16 +732,36 @@ fn add_http_listener(
     http_sockets: &mut HashMap<u16, Vec<SocketHandle>>,
     port: u16,
 ) {
-    http_sockets.entry(port).or_insert_with(|| {
-        (0..HTTP_LISTENERS_PER_PORT)
-            .map(|_| {
-                sockets.add(tcp::Socket::new(
-                    tcp::SocketBuffer::new(vec![0; HTTP_SOCKET_BUFFER_BYTES]),
-                    tcp::SocketBuffer::new(vec![0; HTTP_SOCKET_BUFFER_BYTES]),
-                ))
-            })
-            .collect()
-    });
+    let handles = http_sockets.entry(port).or_default();
+    let listening = handles
+        .iter()
+        .filter(|handle| sockets.get::<tcp::Socket>(**handle).is_listening())
+        .count();
+    let needed = HTTP_LISTENERS_PER_PORT
+        .saturating_sub(listening)
+        .min(HTTP_MAX_SOCKETS_PER_PORT.saturating_sub(handles.len()));
+    handles.extend((0..needed).map(|_| {
+        let handle = sockets.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0; HTTP_SOCKET_BUFFER_BYTES]),
+            tcp::SocketBuffer::new(vec![0; HTTP_SOCKET_BUFFER_BYTES]),
+        ));
+        let _ = sockets.get_mut::<tcp::Socket>(handle).listen(port);
+        handle
+    }));
+}
+
+fn add_static_http_listeners(
+    sockets: &mut SocketSet<'_>,
+    http_sockets: &mut HashMap<u16, Vec<SocketHandle>>,
+    tls_enabled: bool,
+) {
+    add_http_listener(sockets, http_sockets, HOST_HTTP_PORT);
+    add_http_listener(sockets, http_sockets, HOST_ALT_HTTP_PORT);
+    add_http_listener(sockets, http_sockets, HOST_HTTP_PROBE_PORT);
+    if tls_enabled {
+        add_http_listener(sockets, http_sockets, HOST_HTTPS_PORT);
+        add_http_listener(sockets, http_sockets, HOST_ALT_HTTPS_PORT);
+    }
 }
 
 fn prune_dynamic_http_listeners(
@@ -3325,6 +3340,53 @@ mod tests {
             None
         );
         assert_eq!(interception.tcp_host_ports().count(), 0);
+    }
+
+    #[test]
+    fn http_listener_pool_replenishes_idle_accept_capacity() {
+        let mut sockets = SocketSet::new(Vec::new());
+        let mut http_sockets = HashMap::new();
+
+        add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTPS_PORT);
+        let handles = http_sockets.get(&HOST_HTTPS_PORT).unwrap().clone();
+        assert_eq!(handles.len(), HTTP_LISTENERS_PER_PORT);
+        for handle in &handles {
+            assert!(sockets.get::<tcp::Socket>(*handle).is_listening());
+        }
+
+        for handle in handles {
+            sockets.get_mut::<tcp::Socket>(handle).close();
+        }
+        add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTPS_PORT);
+
+        let handles = http_sockets.get(&HOST_HTTPS_PORT).unwrap();
+        assert_eq!(handles.len(), HTTP_LISTENERS_PER_PORT * 2);
+        assert_eq!(
+            handles
+                .iter()
+                .filter(|handle| sockets.get::<tcp::Socket>(**handle).is_listening())
+                .count(),
+            HTTP_LISTENERS_PER_PORT,
+        );
+    }
+
+    #[test]
+    fn http_listener_pool_stops_at_total_socket_cap() {
+        let mut sockets = SocketSet::new(Vec::new());
+        let mut http_sockets = HashMap::new();
+
+        for _ in 0..(HTTP_MAX_SOCKETS_PER_PORT / HTTP_LISTENERS_PER_PORT + 2) {
+            add_http_listener(&mut sockets, &mut http_sockets, HOST_HTTPS_PORT);
+            let handles = http_sockets.get(&HOST_HTTPS_PORT).unwrap().clone();
+            for handle in handles {
+                sockets.get_mut::<tcp::Socket>(handle).close();
+            }
+        }
+
+        assert_eq!(
+            http_sockets.get(&HOST_HTTPS_PORT).unwrap().len(),
+            HTTP_MAX_SOCKETS_PER_PORT,
+        );
     }
 
     #[test]
