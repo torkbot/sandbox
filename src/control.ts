@@ -12,6 +12,7 @@ export interface SandboxControl extends Transport<SandboxControlEvent, SandboxCo
     readonly id?: string;
     readonly argv: readonly string[];
     readonly env?: Record<string, string>;
+    readonly timeoutMs?: number;
   }): Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>>;
   spawn(input: {
     readonly id?: string;
@@ -83,6 +84,7 @@ export class HostControlTransport implements SandboxControl {
     readonly id?: string;
     readonly argv: readonly string[];
     readonly env?: Record<string, string>;
+    readonly timeoutMs?: number;
   }): Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>> {
     this.#assertOpen();
     const id = input.id ?? crypto.randomUUID();
@@ -98,6 +100,7 @@ export class HostControlTransport implements SandboxControl {
         id,
         argv: input.argv,
         env: input.env,
+        timeoutMs: input.timeoutMs,
       });
     } catch (error) {
       this.#pendingExec.delete(id);

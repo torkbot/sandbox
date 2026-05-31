@@ -28,6 +28,26 @@ test("new public API boots a built-in rootfs and runs a process", async (t) => {
   assert.equal(result.stderr, "");
 });
 
+test("buffered exec timeout terminates guest process", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot();
+
+  const result = await sandbox.exec("/bin/sh", ["-lc", "sleep 5"], {
+    timeoutMs: 250,
+  });
+
+  assert.equal(result.exitCode, 124);
+  assert.match(result.stderr, /sandbox exec timed out after 250ms/);
+
+  const followup = await sandbox.exec("/bin/sh", ["-lc", "printf ok"]);
+  assert.equal(followup.stdout, "ok");
+});
+
 test("built-in agent rootfs includes common agent runtimes and CLIs", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;

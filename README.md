@@ -322,11 +322,13 @@ mounts.
 const result = await lane.exec("npm", ["test"], {
   cwd: "/workspace",
   env: { CI: "1" },
+  timeoutMs: 120_000,
 });
 ```
 
 `exec(...)` is the buffered process API. It returns after the command exits with
-`exitCode`, `stdout`, and `stderr`.
+`exitCode`, `stdout`, and `stderr`. When `timeoutMs` expires, Sandbox terminates
+the guest process group and returns exit code `124`.
 
 ### Network Policy
 
@@ -395,7 +397,9 @@ if (dns) {
 metadata, including hostnames observed from accepted DNS answers. It does not
 inspect or trust the HTTP `Host` header. IP-addressed HTTP requests can still be
 accepted through lower-level policy, but they do not advertise a trusted
-hostname.
+hostname. Calling `accept()` without middleware authorizes the matched flow
+without rewriting bytes; pass middleware only when Sandbox should inspect and
+mutate HTTP request headers.
 
 ```ts
 const http = conn.matchHttp((candidate) =>

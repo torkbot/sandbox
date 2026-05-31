@@ -36,7 +36,14 @@ export type SandboxControlEvent =
 
 export type SandboxControlCommand =
   | {
-      readonly type: "guest.exec" | "guest.spawn";
+      readonly type: "guest.exec";
+      readonly id: string;
+      readonly argv: readonly string[];
+      readonly env?: Record<string, string>;
+      readonly timeoutMs?: number;
+    }
+  | {
+      readonly type: "guest.spawn";
       readonly id: string;
       readonly argv: readonly string[];
       readonly env?: Record<string, string>;
@@ -51,6 +58,7 @@ export function encodeControlCommand(command: SandboxControlCommand): Uint8Array
         id: command.id,
         argv: [...command.argv],
         env: Object.entries(command.env ?? {}).map(([key, value]) => ({ key, value })),
+        ...(command.timeoutMs === undefined ? {} : { timeoutMs: command.timeoutMs }),
       });
     case "guest.spawn":
       return encodePacket({

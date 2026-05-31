@@ -121,6 +121,59 @@ test("HostControlTransport exec waits for matching completion", async () => {
   await control.close();
 });
 
+test("HostControlTransport sends exec timeout to guest", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const exec = control.exec({ id: "test", argv: ["/bin/sleep", "10"], timeoutMs: 250 });
+
+  assert.deepEqual(BSON.deserialize(channel.writes[0]!.subarray(4)), {
+    type: "guest.exec",
+    id: "test",
+    argv: ["/bin/sleep", "10"],
+    env: [],
+    timeoutMs: 250,
+  });
+
+  channel.packets.push(
+    encodePacket({
+      type: "guest.exec.complete",
+      id: "test",
+      exitCode: 124,
+      stdout: new Binary(new Uint8Array()),
+      stderr: new Binary(new TextEncoder().encode("sandbox exec timed out after 250ms\n")),
+    }),
+  );
+
+  assert.equal((await exec).exitCode, 124);
+  await control.close();
+});
+
+test("HostControlTransport omits exec timeout when not requested", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const exec = control.exec({ id: "test", argv: ["/bin/true"] });
+
+  assert.deepEqual(BSON.deserialize(channel.writes[0]!.subarray(4)), {
+    type: "guest.exec",
+    id: "test",
+    argv: ["/bin/true"],
+    env: [],
+  });
+
+  channel.packets.push(
+    encodePacket({
+      type: "guest.exec.complete",
+      id: "test",
+      exitCode: 0,
+      stdout: new Binary(new Uint8Array()),
+      stderr: new Binary(new Uint8Array()),
+    }),
+  );
+
+  await exec;
+  await control.close();
+});
+
 test("HostControlTransport spawn streams stdio and resolves exit", async () => {
   const channel = new MemoryControlChannel();
   const control = new HostControlTransport({ channel });

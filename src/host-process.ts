@@ -449,7 +449,10 @@ export class HostProcessSandboxVm implements HostControlChannel {
       if (this.#networkConnectionHook?.active === true) {
         await this.#networkConnectionHook.hook(connection);
       }
-      if (decision.action === "acceptHttp") {
+      const action = decision.action === "acceptHttp" && httpMiddleware === undefined
+        ? "accept"
+        : decision.action;
+      if (action === "acceptHttp") {
         this.#httpMiddlewareByFlow.set(networkFlowKey(src, dst), httpMiddleware);
       }
 
@@ -457,7 +460,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
         type: "host.network.response",
         id,
         ok: true,
-        action: decision.action,
+        action,
         dnsResolvers: decision.dnsResolvers,
       }));
     } catch (error) {

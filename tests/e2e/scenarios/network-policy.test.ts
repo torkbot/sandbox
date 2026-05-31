@@ -451,6 +451,35 @@ test("network.policy allows non-HTTP TLS passthrough without MITM", async (t) =>
   assert.equal(tlsEcho.connections.length, 1);
 });
 
+test("network.policy matchHttp accept without middleware preserves raw HTTPS", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+
+  const host = "tls-match.test";
+  const dnsServer = await startUdpDnsServer(hostOriginAddress());
+  const tlsEcho = await startTlsEchoServer();
+  t.after(() => void dnsServer.close());
+  t.after(() => void tlsEcho.close());
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      if (conn.matchDns()?.accept({
+        resolvers: [{ ip: "127.0.0.1", port: dnsServer.port }],
+      })) return;
+
+      conn.matchHttp(host)?.accept();
+    }),
+  }).boot();
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "match-http-raw-https",
+    script: pythonTlsExchange(tlsEcho.port, "matched-http", host),
+  }), 10_000, "matchHttp raw HTTPS passthrough");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "tls:matched-http");
+  assert.equal(tlsEcho.connections.length, 1);
+});
+
 test("network.policy allows a deterministic Redis-style TCP protocol exchange", async (t) => {
   if (!requireVmLaunchSupport(t)) return;
   const redis = await startTcpServer((socket) => {
@@ -993,8 +1022,8 @@ function pythonTcpReadBanner(port: number): string {
   return `python3 - <<'PY'\nimport socket\ns = socket.create_connection((${JSON.stringify(hostOriginAddress())}, ${port}), timeout=3)\ns.settimeout(3)\nprint(s.recv(4096).decode(), end="")\ns.close()\nPY`;
 }
 
-function pythonTlsExchange(port: number, message: string): string {
-  return `python3 - <<'PY'\nimport socket, ssl\nctx = ssl._create_unverified_context()\nraw = socket.create_connection((${JSON.stringify(hostOriginAddress())}, ${port}), timeout=3)\ns = ctx.wrap_socket(raw, server_hostname="localhost")\ns.settimeout(3)\ns.sendall(${JSON.stringify(message)}.encode())\nprint(s.recv(4096).decode(), end="")\ns.close()\nPY`;
+function pythonTlsExchange(port: number, message: string, host = hostOriginAddress()): string {
+  return `python3 - <<'PY'\nimport socket, ssl\nctx = ssl._create_unverified_context()\nraw = socket.create_connection((${JSON.stringify(host)}, ${port}), timeout=3)\ns = ctx.wrap_socket(raw, server_hostname=${JSON.stringify(host)})\ns.settimeout(3)\ns.sendall(${JSON.stringify(message)}.encode())\nprint(s.recv(4096).decode(), end="")\ns.close()\nPY`;
 }
 
 function pythonUdpExchange(port: number, message: string): string {

@@ -993,6 +993,7 @@ mod tests {
             id: "write-after-poll".to_string(),
             argv: vec!["true".to_string()],
             env: Vec::new(),
+            timeout_ms: None,
         }
         .encode_packet()
         .unwrap();
