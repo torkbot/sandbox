@@ -478,9 +478,17 @@ export interface SandboxDefinition {
 export interface SandboxExecOptions {
   readonly cwd?: string;
   readonly env?: Record<string, string>;
+  /**
+   * Maximum wall-clock runtime for the guest process. When the timeout expires,
+   * Sandbox terminates the guest process group and returns exit code 124.
+   */
+  readonly timeoutMs?: number;
 }
 
-export type SandboxSpawnOptions = SandboxExecOptions;
+export interface SandboxSpawnOptions {
+  readonly cwd?: string;
+  readonly env?: Record<string, string>;
+}
 
 export interface SandboxExecResult {
   readonly exitCode: number;
@@ -688,6 +696,7 @@ class HostBackedSandboxVm implements SandboxVm {
     args: readonly string[] = [],
     options: SandboxExecOptions = {},
   ): Promise<SandboxExecResult> {
+    validateSandboxExecOptions(options);
     return await this.#exec.exec(command, args, options);
   }
 
@@ -729,6 +738,7 @@ class ControlBackedSandboxExec {
     const result = await this.#control.exec({
       argv,
       env,
+      timeoutMs: options.timeoutMs,
     });
     return {
       exitCode: result.exitCode,
@@ -1140,6 +1150,15 @@ function validateSandboxDefinitionOptions(options: SandboxDefinitionOptions): vo
   }
   if (options.network !== undefined && options.network.kind !== "network-policy") {
     throw new Error("invalid sandbox definition: network must be created with network.policy(...)");
+  }
+}
+
+function validateSandboxExecOptions(options: SandboxExecOptions): void {
+  if (
+    options.timeoutMs !== undefined
+    && (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs <= 0)
+  ) {
+    throw new Error("invalid sandbox exec options: timeoutMs must be a positive safe integer");
   }
 }
 

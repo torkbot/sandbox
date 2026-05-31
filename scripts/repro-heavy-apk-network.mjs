@@ -10,6 +10,9 @@ const outDir = resolve(repoRoot, "dist", "repros", `heavy-apk-network-${stamp}`)
 const packageName = flagValue("--package") ?? "chromium";
 const keepGoing = !process.argv.includes("--stop-on-failure");
 const install = !process.argv.includes("--no-install");
+const cowBlockSize = optionalIntegerFlag("--cow-block-size");
+const execTimeouts = !process.argv.includes("--host-timeouts");
+const dnsResolver = flagValue("--dns-resolver") ?? "1.1.1.1";
 
 await mkdir(outDir, { recursive: true });
 
@@ -28,9 +31,10 @@ function flagValue(name) {
 async function runStep(sandbox, id, script, timeoutMs = 120_000) {
   record({ type: "step.start", id, timeoutMs });
   const started = Date.now();
+  const hostTimeoutMs = execTimeouts ? timeoutMs + 30_000 : timeoutMs;
   const result = await withTimeout(
-    sandbox.exec("/bin/sh", ["-lc", script], {}),
-    timeoutMs,
+    sandbox.exec("/bin/sh", ["-lc", script], execTimeouts ? { timeoutMs } : {}),
+    hostTimeoutMs,
     id,
   );
   const elapsedMs = Date.now() - started;
@@ -49,6 +53,16 @@ async function runStep(sandbox, id, script, timeoutMs = 120_000) {
     throw new Error(`${id} failed with exit ${result.exitCode}`);
   }
   return result;
+}
+
+function optionalIntegerFlag(name) {
+  const value = flagValue(name);
+  if (value === undefined) return undefined;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return parsed;
 }
 
 async function withTimeout(promise, timeoutMs, id) {
@@ -70,12 +84,80 @@ async function withTimeout(promise, timeoutMs, id) {
   }
 }
 
-record({ type: "repro.start", outDir, packageName, install });
+class InstrumentedMemoryCowStore {
+  blockSize;
+  blocks = new Map();
+  reads = 0;
+  readBlocks = 0;
+  writes = 0;
+  writeBlocks = 0;
+  writeBytes = 0;
+  flushes = 0;
+
+  constructor(blockSize) {
+    this.blockSize = blockSize;
+  }
+
+  snapshot() {
+    return {
+      blockSize: this.blockSize,
+      storedBlocks: this.blocks.size,
+      storedBytes: this.blocks.size * this.blockSize,
+      reads: this.reads,
+      readBlocks: this.readBlocks,
+      writes: this.writes,
+      writeBlocks: this.writeBlocks,
+      writeBytes: this.writeBytes,
+      flushes: this.flushes,
+    };
+  }
+
+  async list() {
+    return [...this.blocks.keys()].map((key) => BigInt(key));
+  }
+
+  async read(range) {
+    this.reads += 1;
+    const chunks = [];
+    const end = range.start + BigInt(range.count);
+    for (let block = range.start; block < end; block += 1n) {
+      const data = this.blocks.get(block.toString());
+      if (data !== undefined) {
+        chunks.push({ start: block, data });
+      }
+    }
+    this.readBlocks += chunks.length;
+    return chunks;
+  }
+
+  async write(chunks) {
+    this.writes += 1;
+    this.writeBlocks += chunks.length;
+    for (const chunk of chunks) {
+      const data = new Uint8Array(chunk.data);
+      this.writeBytes += data.byteLength;
+      this.blocks.set(chunk.start.toString(), data);
+    }
+  }
+
+  async flush() {
+    this.flushes += 1;
+  }
+}
+
+const cowStore = cowBlockSize === undefined ? undefined : new InstrumentedMemoryCowStore(cowBlockSize);
+
+record({ type: "repro.start", outDir, packageName, install, cowBlockSize, execTimeouts, dnsResolver });
 
 const sandbox = await defineSandbox({
-  rootfs: rootfs.builtIn("alpine:3.23"),
+  rootfs: cowStore === undefined
+    ? rootfs.builtIn("alpine:3.23")
+    : rootfs.cow({
+        base: rootfs.builtIn("alpine:3.23"),
+        writable: cowStore,
+      }),
   network: network.policy((conn) => {
-    conn.matchDns()?.accept();
+    if (conn.matchDns()?.accept({ resolvers: [dnsResolver] })) return;
 
     if (conn.transport === "tcp") {
       conn.matchHttp(() => true)?.accept();
@@ -150,7 +232,13 @@ try {
     "chromium-browser --version || chromium --version || true",
   ].join("; "), 120_000);
 } finally {
+  if (cowStore !== undefined) {
+    record({ type: "cow.stats", ...cowStore.snapshot() });
+  }
   await sandbox.close();
+  if (cowStore !== undefined) {
+    record({ type: "cow.stats.after-close", ...cowStore.snapshot() });
+  }
   await writeFile(join(outDir, "events.json"), JSON.stringify(events, null, 2));
   record({ type: "repro.end", outDir });
 }

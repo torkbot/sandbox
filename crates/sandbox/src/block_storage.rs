@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -38,6 +38,8 @@ struct CowBlockStorageState {
     loaded_store_blocks: HashSet<u64>,
     cached_blocks: HashMap<u64, Vec<u8>>,
     modified_blocks: HashSet<u64>,
+    clean_cached_blocks: HashSet<u64>,
+    clean_cache_order: VecDeque<u64>,
     max_dirty_bytes: u64,
 }
 
@@ -97,6 +99,8 @@ impl CowBlockStorage {
                 loaded_store_blocks: HashSet::new(),
                 cached_blocks: HashMap::new(),
                 modified_blocks: HashSet::new(),
+                clean_cached_blocks: HashSet::new(),
+                clean_cache_order: VecDeque::new(),
                 max_dirty_bytes,
             }),
             helper: CommonStorageHelper::default(),
@@ -210,10 +214,10 @@ impl Storage for CowBlockStorage {
                 .is_some_and(|current| current == &flushed)
             {
                 state.modified_blocks.remove(&index);
-                state.cached_blocks.remove(&index);
-                state.loaded_store_blocks.remove(&index);
+                state.mark_clean_cached(index);
             }
         }
+        state.evict_clean_cache();
         Ok(())
     }
 
@@ -332,6 +336,7 @@ impl CowBlockStorageState {
             output[output_start..output_start + len]
                 .copy_from_slice(&block[block_start..block_start + len]);
         }
+        self.evict_clean_cache();
         Ok(())
     }
 
@@ -364,8 +369,10 @@ impl CowBlockStorageState {
             block[block_offset..block_offset + len]
                 .copy_from_slice(&input[input_start..input_start + len]);
             self.modified_blocks.insert(block_index);
+            self.clean_cached_blocks.remove(&block_index);
             self.store_blocks.insert(block_index);
         }
+        self.evict_clean_cache();
         Ok(())
     }
 
@@ -408,6 +415,7 @@ impl CowBlockStorageState {
                 let mut block = vec![0; self.block_size as usize];
                 block[..data.len()].copy_from_slice(&data);
                 self.cached_blocks.insert(index, block);
+                self.mark_clean_cached(index);
                 returned_blocks.insert(index);
             }
             for expected in start..start + count {
@@ -421,6 +429,34 @@ impl CowBlockStorageState {
             self.loaded_store_blocks.extend(start..start + count);
         }
         Ok(())
+    }
+
+    fn mark_clean_cached(&mut self, index: u64) {
+        if !self.modified_blocks.contains(&index) && self.cached_blocks.contains_key(&index) {
+            if self.clean_cached_blocks.insert(index) {
+                self.clean_cache_order.push_back(index);
+            }
+        }
+    }
+
+    fn clean_cached_bytes(&self) -> u64 {
+        self.clean_cached_blocks.len() as u64 * self.block_size
+    }
+
+    fn evict_clean_cache(&mut self) {
+        while self.clean_cached_bytes() > self.max_dirty_bytes {
+            let Some(index) = self.clean_cache_order.pop_front() else {
+                break;
+            };
+            if !self.clean_cached_blocks.remove(&index) {
+                continue;
+            }
+            if self.modified_blocks.contains(&index) {
+                continue;
+            }
+            self.cached_blocks.remove(&index);
+            self.loaded_store_blocks.remove(&index);
+        }
     }
 }
 
@@ -503,6 +539,8 @@ mod tests {
             loaded_store_blocks: HashSet::new(),
             cached_blocks: HashMap::new(),
             modified_blocks: HashSet::new(),
+            clean_cached_blocks: HashSet::new(),
+            clean_cache_order: VecDeque::new(),
             max_dirty_bytes: 4096,
         };
 
@@ -532,6 +570,8 @@ mod tests {
             loaded_store_blocks: HashSet::new(),
             cached_blocks: HashMap::new(),
             modified_blocks: HashSet::new(),
+            clean_cached_blocks: HashSet::new(),
+            clean_cache_order: VecDeque::new(),
             max_dirty_bytes: 4096,
         };
 
@@ -567,7 +607,7 @@ mod tests {
                 .expect("COW block storage lock poisoned")
                 .cached_blocks
                 .len(),
-            0,
+            2,
         );
 
         block_on_ready(storage.write_from(&[3; 4096], 8192)).unwrap();
@@ -578,6 +618,80 @@ mod tests {
         let mut bytes = [0_u8; 4096];
         block_on_ready(storage.read_into(&mut bytes, 0)).unwrap();
         assert_eq!(bytes, [1; 4096]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn flushed_blocks_stay_cached_until_clean_cache_limit() {
+        let path = temp_base_image_path();
+        fs::write(&path, [0_u8; 16384]).unwrap();
+        let store = Arc::new(TestBlockStore {
+            block_size: 4096,
+            blocks: Mutex::new(HashMap::new()),
+            write_calls: Mutex::new(0),
+        });
+        let storage = CowBlockStorage::open(&path, store.clone(), 8192).unwrap();
+
+        block_on_ready(storage.write_from(&[1; 4096], 0)).unwrap();
+        block_on_ready(storage.write_from(&[2; 4096], 4096)).unwrap();
+        let mut bytes = [0_u8; 4096];
+        block_on_ready(storage.read_into(&mut bytes, 0)).unwrap();
+        assert_eq!(bytes, [1; 4096]);
+
+        block_on_ready(storage.write_from(&[3; 4096], 8192)).unwrap();
+        block_on_ready(storage.write_from(&[4; 4096], 12288)).unwrap();
+
+        let state = storage
+            .state
+            .lock()
+            .expect("COW block storage lock poisoned");
+        assert_eq!(state.clean_cached_blocks.len(), 2);
+        assert_eq!(state.cached_blocks.len(), 2);
+        assert!(!state.cached_blocks.contains_key(&0));
+        assert!(!state.cached_blocks.contains_key(&1));
+        assert!(state.cached_blocks.contains_key(&2));
+        assert!(state.cached_blocks.contains_key(&3));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn large_reads_preserve_store_blocks_before_clean_cache_eviction() {
+        let path = temp_base_image_path();
+        fs::write(&path, [0_u8; 16384]).unwrap();
+        let store = Arc::new(TestBlockStore {
+            block_size: 4096,
+            blocks: Mutex::new(HashMap::from([
+                (0, vec![1; 4096]),
+                (1, vec![2; 4096]),
+                (2, vec![3; 4096]),
+                (3, vec![4; 4096]),
+            ])),
+            write_calls: Mutex::new(0),
+        });
+        let storage = CowBlockStorage::open(&path, store, 4096).unwrap();
+        let mut state = storage
+            .state
+            .lock()
+            .expect("COW block storage lock poisoned");
+        state.store_blocks = HashSet::from([0, 1, 2, 3]);
+        drop(state);
+
+        let mut bytes = [0_u8; 16384];
+        block_on_ready(storage.read_into(&mut bytes, 0)).unwrap();
+
+        assert_eq!(bytes[..4096], [1; 4096]);
+        assert_eq!(bytes[4096..8192], [2; 4096]);
+        assert_eq!(bytes[8192..12288], [3; 4096]);
+        assert_eq!(bytes[12288..], [4; 4096]);
+
+        let state = storage
+            .state
+            .lock()
+            .expect("COW block storage lock poisoned");
+        assert_eq!(state.clean_cached_blocks.len(), 1);
+        assert_eq!(state.cached_blocks.len(), 1);
+        assert!(state.cached_blocks.contains_key(&3));
+        assert_eq!(state.loaded_store_blocks, HashSet::from([3]));
         let _ = fs::remove_file(path);
     }
 

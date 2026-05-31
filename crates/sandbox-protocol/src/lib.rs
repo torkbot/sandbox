@@ -20,6 +20,7 @@ pub enum ControlFrame {
         id: String,
         argv: Vec<String>,
         env: Vec<(String, String)>,
+        timeout_ms: Option<u64>,
     },
     GuestSpawn {
         id: String,
@@ -68,15 +69,28 @@ impl ControlFrame {
                 "rootReadonly": *root_readonly,
                 "initName": init_name,
             },
-            Self::GuestExec { id, argv, env } => bson::doc! {
-                "type": "guest.exec",
-                "id": id,
-                "argv": argv,
-                "env": env.iter().map(|(key, value)| bson::doc! {
-                    "key": key,
-                    "value": value,
-                }).collect::<Vec<_>>(),
-            },
+            Self::GuestExec {
+                id,
+                argv,
+                env,
+                timeout_ms,
+            } => {
+                let mut document = bson::doc! {
+                    "type": "guest.exec",
+                    "id": id,
+                    "argv": argv,
+                    "env": env.iter().map(|(key, value)| bson::doc! {
+                        "key": key,
+                        "value": value,
+                    }).collect::<Vec<_>>(),
+                };
+                if let Some(timeout_ms) = timeout_ms {
+                    let timeout_ms = i64::try_from(*timeout_ms)
+                        .map_err(|_| ControlFrameError::new("guest.exec timeoutMs exceeds i64"))?;
+                    document.insert("timeoutMs", timeout_ms);
+                }
+                document
+            }
             Self::GuestSpawn { id, argv, env } => bson::doc! {
                 "type": "guest.spawn",
                 "id": id,
@@ -206,6 +220,7 @@ impl ControlFrame {
                     })
                     .transpose()?
                     .unwrap_or_default(),
+                timeout_ms: read_optional_u64(&document, "timeoutMs", "guest.exec timeoutMs")?,
             }),
             "guest.spawn" => Ok(Self::GuestSpawn {
                 id: document
@@ -379,6 +394,32 @@ fn read_env_array(
         .map(|env| env.unwrap_or_default())
 }
 
+fn read_optional_u64(
+    document: &bson::Document,
+    key: &str,
+    label: &str,
+) -> Result<Option<u64>, ControlFrameError> {
+    let Some(value) = document.get(key) else {
+        return Ok(None);
+    };
+    let value = match value {
+        bson::Bson::Int32(value) => i64::from(*value),
+        bson::Bson::Int64(value) => *value,
+        bson::Bson::Double(value) if value.fract() == 0.0 => *value as i64,
+        _ => {
+            return Err(ControlFrameError::new(format!(
+                "{label} must be an integer"
+            )));
+        }
+    };
+    if value <= 0 {
+        return Err(ControlFrameError::new(format!("{label} must be positive")));
+    }
+    u64::try_from(value)
+        .map(Some)
+        .map_err(|_| ControlFrameError::new(format!("{label} must fit in u64")))
+}
+
 impl ControlFrameError {
     fn new(message: impl Into<String>) -> Self {
         Self {
@@ -413,6 +454,7 @@ mod tests {
             id: "test".to_string(),
             argv: vec!["/bin/true".to_string()],
             env: vec![("FOO".to_string(), "bar".to_string())],
+            timeout_ms: Some(5000),
         };
 
         let encoded = frame.encode().unwrap();
@@ -493,6 +535,7 @@ mod tests {
             id: "test".to_string(),
             argv: vec!["/bin/true".to_string()],
             env: Vec::new(),
+            timeout_ms: None,
         };
         let mut packet = frame.encode_packet().unwrap();
 

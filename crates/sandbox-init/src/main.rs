@@ -513,8 +513,13 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
         };
 
         match frame {
-            ControlFrame::GuestExec { id, argv, env } => {
-                let response = run_guest_exec(id, argv, env)?;
+            ControlFrame::GuestExec {
+                id,
+                argv,
+                env,
+                timeout_ms,
+            } => {
+                let response = run_guest_exec(id, argv, env, timeout_ms)?;
                 let packet = response
                     .encode_packet()
                     .map_err(|error| InitError(format!("encode exec completion: {error}")))?;
@@ -718,6 +723,7 @@ fn run_guest_exec(
     id: String,
     argv: Vec<String>,
     env: Vec<(String, String)>,
+    timeout_ms: Option<u64>,
 ) -> Result<ControlFrame, InitError> {
     if argv.is_empty() {
         return Ok(ControlFrame::GuestExecComplete {
@@ -730,17 +736,29 @@ fn run_guest_exec(
 
     prepare_exec_environment(&env)?;
 
-    let mut command = std::process::Command::new(&argv[0]);
-    command.args(&argv[1..]);
-    let output = match command.envs(env).output() {
+    let output = match run_guest_exec_command(&argv, env, timeout_ms) {
         Ok(output) => output,
-        Err(error) => {
+        Err(ExecCommandError::Spawn(error)) => {
             return Ok(ControlFrame::GuestExecComplete {
                 id,
                 exit_code: 127,
                 stdout: Vec::new(),
                 stderr: format!("spawn guest command {}: {error}", argv[0]).into_bytes(),
             });
+        }
+        Err(ExecCommandError::TimedOut { stdout, stderr }) => {
+            return Ok(ControlFrame::GuestExecComplete {
+                id,
+                exit_code: 124,
+                stdout,
+                stderr: append_timeout_message(stderr, timeout_ms.unwrap()),
+            });
+        }
+        Err(ExecCommandError::Wait(error)) => {
+            return Err(InitError(format!(
+                "wait for guest command {}: {error}",
+                argv[0]
+            )));
         }
     };
     let (exit_code, stderr) = exec_status(output.status, output.stderr);
@@ -751,6 +769,173 @@ fn run_guest_exec(
         stdout: output.stdout,
         stderr,
     })
+}
+
+struct GuestExecOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+enum ExecCommandError {
+    Spawn(std::io::Error),
+    Wait(std::io::Error),
+    TimedOut { stdout: Vec<u8>, stderr: Vec<u8> },
+}
+
+fn run_guest_exec_command(
+    argv: &[String],
+    env: Vec<(String, String)>,
+    timeout_ms: Option<u64>,
+) -> Result<GuestExecOutput, ExecCommandError> {
+    let mut command = std::process::Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    configure_command_process_group(&mut command);
+
+    let mut child = command.envs(env).spawn().map_err(ExecCommandError::Spawn)?;
+    let child_id = child.id();
+    let stdout = child.stdout.take().expect("stdout was configured as piped");
+    let stderr = child.stderr.take().expect("stderr was configured as piped");
+
+    let stdout_reader = read_child_output(stdout);
+    let stderr_reader = read_child_output(stderr);
+
+    match timeout_ms {
+        Some(timeout_ms) => {
+            let deadline = exec_deadline(timeout_ms);
+            loop {
+                if let Some(status) = child.try_wait().map_err(ExecCommandError::Wait)? {
+                    return match join_output_readers_until(stdout_reader, stderr_reader, deadline) {
+                        Some((stdout, stderr)) => Ok(GuestExecOutput {
+                            status,
+                            stdout,
+                            stderr,
+                        }),
+                        None => {
+                            terminate_child_process_group(child_id);
+                            Err(ExecCommandError::TimedOut {
+                                stdout: Vec::new(),
+                                stderr: Vec::new(),
+                            })
+                        }
+                    };
+                }
+                if deadline_expired(deadline) {
+                    terminate_child_process_group(child_id);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let grace_deadline = std::time::Instant::now()
+                        .checked_add(std::time::Duration::from_millis(100));
+                    let (stdout, stderr) =
+                        join_output_readers_until(stdout_reader, stderr_reader, grace_deadline)
+                            .unwrap_or_default();
+                    return Err(ExecCommandError::TimedOut { stdout, stderr });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        None => {
+            let status = child.wait().map_err(ExecCommandError::Wait)?;
+            Ok(GuestExecOutput {
+                status,
+                stdout: join_output_reader(stdout_reader),
+                stderr: join_output_reader(stderr_reader),
+            })
+        }
+    }
+}
+
+#[cfg(unix)]
+fn configure_command_process_group(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_command_process_group(_command: &mut std::process::Command) {}
+
+#[cfg(unix)]
+fn terminate_child_process_group(child_pid: u32) {
+    let pgid = -(child_pid as libc::pid_t);
+    unsafe {
+        libc::kill(pgid, libc::SIGTERM);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    unsafe {
+        libc::kill(pgid, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_child_process_group(_child_pid: u32) {}
+
+fn read_child_output(
+    mut output: impl std::io::Read + Send + 'static,
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut data = Vec::new();
+        let _ = output.read_to_end(&mut data);
+        let _ = sender.send(data);
+    });
+    receiver
+}
+
+fn join_output_reader(reader: std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+    reader.recv().unwrap_or_default()
+}
+
+fn exec_deadline(timeout_ms: u64) -> Option<std::time::Instant> {
+    std::time::Instant::now().checked_add(std::time::Duration::from_millis(timeout_ms))
+}
+
+fn deadline_expired(deadline: Option<std::time::Instant>) -> bool {
+    deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+}
+
+fn join_output_readers_until(
+    stdout_reader: std::sync::mpsc::Receiver<Vec<u8>>,
+    stderr_reader: std::sync::mpsc::Receiver<Vec<u8>>,
+    deadline: Option<std::time::Instant>,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let stdout = join_output_reader_until(stdout_reader, deadline)?;
+    let stderr = join_output_reader_until(stderr_reader, deadline)?;
+    Some((stdout, stderr))
+}
+
+fn join_output_reader_until(
+    reader: std::sync::mpsc::Receiver<Vec<u8>>,
+    deadline: Option<std::time::Instant>,
+) -> Option<Vec<u8>> {
+    match deadline {
+        Some(deadline) => {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return reader.try_recv().ok();
+            }
+            reader.recv_timeout(remaining).ok()
+        }
+        None => Some(reader.recv().unwrap_or_default()),
+    }
+}
+
+fn append_timeout_message(mut stderr: Vec<u8>, timeout_ms: u64) -> Vec<u8> {
+    if !stderr.is_empty() && !stderr.ends_with(b"\n") {
+        stderr.push(b'\n');
+    }
+    stderr.extend_from_slice(format!("sandbox exec timed out after {timeout_ms}ms\n").as_bytes());
+    stderr
 }
 
 fn exec_status(status: std::process::ExitStatus, mut stderr: Vec<u8>) -> (i32, Vec<u8>) {

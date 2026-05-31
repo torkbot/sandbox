@@ -49,6 +49,8 @@ const TLS_READ_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_INTERCEPT_HEAD_BYTES: usize = 64 * 1024;
 const DNS_PACKET_BUFFER_BYTES: usize = 4096;
 const DNS_DEFAULT_TTL_SECS: u32 = 60;
+const DNS_UPSTREAM_ATTEMPTS: usize = 3;
+const DNS_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
 const UDP_RELAY_BUFFER_BYTES: usize = 64 * 1024;
 const UDP_INTERCEPT_PORT_START: u16 = 40_000;
 const UDP_INTERCEPT_PORT_END: u16 = 60_999;
@@ -1363,18 +1365,22 @@ fn resolve_dns_with_upstreams(
     transport: NetworkProtocol,
     resolvers: &[DnsResolver],
 ) -> Option<Vec<u8>> {
-    for resolver in resolvers {
-        let Ok(ip) = resolver.ip.parse::<std::net::IpAddr>() else {
-            continue;
-        };
-        let address = std::net::SocketAddr::new(ip, resolver.port);
-        let response = match transport {
-            NetworkProtocol::Udp => resolve_dns_with_udp_upstream(request, address),
-            NetworkProtocol::Tcp => resolve_dns_with_tcp_upstream(request, address),
-            NetworkProtocol::Dns => None,
-        };
-        if response.is_some() {
-            return response;
+    for _ in 0..DNS_UPSTREAM_ATTEMPTS {
+        for resolver in resolvers {
+            let Ok(ip) = resolver.ip.parse::<std::net::IpAddr>() else {
+                continue;
+            };
+            let address = std::net::SocketAddr::new(ip, resolver.port);
+            let response = match transport {
+                NetworkProtocol::Udp => resolve_dns_with_udp_upstream(request, address)
+                    .or_else(|| resolve_dns_with_tcp_upstream(request, address)),
+                NetworkProtocol::Tcp => resolve_dns_with_tcp_upstream(request, address)
+                    .or_else(|| resolve_dns_with_udp_upstream(request, address)),
+                NetworkProtocol::Dns => None,
+            };
+            if response.is_some() {
+                return response;
+            }
         }
     }
     None
@@ -1386,8 +1392,8 @@ fn resolve_dns_with_udp_upstream(request: &[u8], address: std::net::SocketAddr) 
     let Ok(socket) = UdpSocket::bind(bind_address) else {
         return None;
     };
-    let _ = socket.set_read_timeout(Some(Duration::from_secs(1)));
-    let _ = socket.set_write_timeout(Some(Duration::from_secs(1)));
+    let _ = socket.set_read_timeout(Some(DNS_UPSTREAM_TIMEOUT));
+    let _ = socket.set_write_timeout(Some(DNS_UPSTREAM_TIMEOUT));
     if socket.connect(address).is_err() {
         return None;
     }
@@ -1403,11 +1409,11 @@ fn resolve_dns_with_udp_upstream(request: &[u8], address: std::net::SocketAddr) 
 }
 
 fn resolve_dns_with_tcp_upstream(request: &[u8], address: std::net::SocketAddr) -> Option<Vec<u8>> {
-    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_secs(1)) else {
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, DNS_UPSTREAM_TIMEOUT) else {
         return None;
     };
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+    let _ = stream.set_read_timeout(Some(DNS_UPSTREAM_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(DNS_UPSTREAM_TIMEOUT));
     let request_len = u16::try_from(request.len()).ok()?;
     if stream.write_all(&request_len.to_be_bytes()).is_err() {
         return None;
