@@ -14,6 +14,7 @@ test("rootfs fixture produces a QCOW2 image", async () => {
   try {
     const rootfsDir = join(workDir, "rootfs");
     const qcow2 = join(workDir, "rootfs.qcow2");
+    const virtualSizeBytes = 8n * 1024n * 1024n * 1024n;
 
     await runNpmScript("build:rootfs", {
       SANDBOX_ROOTFS_OUT_DIR: rootfsDir,
@@ -21,11 +22,12 @@ test("rootfs fixture produces a QCOW2 image", async () => {
     await runNpmScript("build:rootfs:qcow2", {
       SANDBOX_ROOTFS_SOURCE_DIR: rootfsDir,
       SANDBOX_ROOTFS_QCOW2_OUT: qcow2,
+      SANDBOX_ROOTFS_VIRTUAL_SIZE: "8gb",
     });
 
     const header = await readFile(qcow2);
     assert.deepEqual(header.subarray(0, 4), Buffer.from("QFI\xfb", "binary"));
-    assert.equal(header.readBigUInt64BE(24), 8n * 1024n * 1024n * 1024n);
+    assert.equal(header.readBigUInt64BE(24), virtualSizeBytes);
   } finally {
     await rm(workDir, { recursive: true, force: true });
   }
