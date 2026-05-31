@@ -790,50 +790,62 @@ fn run_guest_exec_command(
 ) -> Result<GuestExecOutput, ExecCommandError> {
     let mut command = std::process::Command::new(&argv[0]);
     command.args(&argv[1..]);
+    command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
     configure_command_process_group(&mut command);
 
     let mut child = command.envs(env).spawn().map_err(ExecCommandError::Spawn)?;
+    let child_id = child.id();
     let stdout = child.stdout.take().expect("stdout was configured as piped");
     let stderr = child.stderr.take().expect("stderr was configured as piped");
 
     let stdout_reader = read_child_output(stdout);
     let stderr_reader = read_child_output(stderr);
 
-    let status = match timeout_ms {
+    match timeout_ms {
         Some(timeout_ms) => {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+            let deadline = exec_deadline(timeout_ms);
             loop {
                 if let Some(status) = child.try_wait().map_err(ExecCommandError::Wait)? {
-                    break status;
+                    return match join_output_readers_until(stdout_reader, stderr_reader, deadline) {
+                        Some((stdout, stderr)) => Ok(GuestExecOutput {
+                            status,
+                            stdout,
+                            stderr,
+                        }),
+                        None => {
+                            terminate_child_process_group(child_id);
+                            Err(ExecCommandError::TimedOut {
+                                stdout: Vec::new(),
+                                stderr: Vec::new(),
+                            })
+                        }
+                    };
                 }
-                if std::time::Instant::now() >= deadline {
-                    terminate_child_process_group(child.id());
+                if deadline_expired(deadline) {
+                    terminate_child_process_group(child_id);
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(ExecCommandError::TimedOut {
-                        stdout: join_output_reader_with_timeout(
-                            stdout_reader,
-                            std::time::Duration::from_millis(100),
-                        ),
-                        stderr: join_output_reader_with_timeout(
-                            stderr_reader,
-                            std::time::Duration::from_millis(100),
-                        ),
-                    });
+                    let grace_deadline = std::time::Instant::now()
+                        .checked_add(std::time::Duration::from_millis(100));
+                    let (stdout, stderr) =
+                        join_output_readers_until(stdout_reader, stderr_reader, grace_deadline)
+                            .unwrap_or_default();
+                    return Err(ExecCommandError::TimedOut { stdout, stderr });
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
-        None => child.wait().map_err(ExecCommandError::Wait)?,
-    };
-
-    Ok(GuestExecOutput {
-        status,
-        stdout: join_output_reader(stdout_reader),
-        stderr: join_output_reader(stderr_reader),
-    })
+        None => {
+            let status = child.wait().map_err(ExecCommandError::Wait)?;
+            Ok(GuestExecOutput {
+                status,
+                stdout: join_output_reader(stdout_reader),
+                stderr: join_output_reader(stderr_reader),
+            })
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -884,11 +896,38 @@ fn join_output_reader(reader: std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
     reader.recv().unwrap_or_default()
 }
 
-fn join_output_reader_with_timeout(
+fn exec_deadline(timeout_ms: u64) -> Option<std::time::Instant> {
+    std::time::Instant::now().checked_add(std::time::Duration::from_millis(timeout_ms))
+}
+
+fn deadline_expired(deadline: Option<std::time::Instant>) -> bool {
+    deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+}
+
+fn join_output_readers_until(
+    stdout_reader: std::sync::mpsc::Receiver<Vec<u8>>,
+    stderr_reader: std::sync::mpsc::Receiver<Vec<u8>>,
+    deadline: Option<std::time::Instant>,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let stdout = join_output_reader_until(stdout_reader, deadline)?;
+    let stderr = join_output_reader_until(stderr_reader, deadline)?;
+    Some((stdout, stderr))
+}
+
+fn join_output_reader_until(
     reader: std::sync::mpsc::Receiver<Vec<u8>>,
-    timeout: std::time::Duration,
-) -> Vec<u8> {
-    reader.recv_timeout(timeout).unwrap_or_default()
+    deadline: Option<std::time::Instant>,
+) -> Option<Vec<u8>> {
+    match deadline {
+        Some(deadline) => {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return reader.try_recv().ok();
+            }
+            reader.recv_timeout(remaining).ok()
+        }
+        None => Some(reader.recv().unwrap_or_default()),
+    }
 }
 
 fn append_timeout_message(mut stderr: Vec<u8>, timeout_ms: u64) -> Vec<u8> {

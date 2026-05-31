@@ -71,6 +71,45 @@ test("buffered exec timeout returns when descendant keeps output pipes open", as
   assert.ok(elapsedMs < 2_000, `timeout returned after ${elapsedMs}ms`);
 });
 
+test("buffered exec closes stdin for commands that read input", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot();
+
+  const result = await sandbox.exec("/bin/cat");
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, "");
+  assert.equal(result.stderr, "");
+});
+
+test("buffered exec timeout includes output drain time", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot();
+
+  const started = Date.now();
+  const result = await sandbox.exec("/bin/sh", [
+    "-lc",
+    "sleep 5 & exit 0",
+  ], {
+    timeoutMs: 250,
+  });
+  const elapsedMs = Date.now() - started;
+
+  assert.equal(result.exitCode, 124);
+  assert.match(result.stderr, /sandbox exec timed out after 250ms/);
+  assert.ok(elapsedMs < 2_000, `timeout returned after ${elapsedMs}ms`);
+});
+
 test("built-in agent rootfs includes common agent runtimes and CLIs", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;

@@ -336,6 +336,7 @@ impl CowBlockStorageState {
             output[output_start..output_start + len]
                 .copy_from_slice(&block[block_start..block_start + len]);
         }
+        self.evict_clean_cache();
         Ok(())
     }
 
@@ -371,6 +372,7 @@ impl CowBlockStorageState {
             self.clean_cached_blocks.remove(&block_index);
             self.store_blocks.insert(block_index);
         }
+        self.evict_clean_cache();
         Ok(())
     }
 
@@ -425,7 +427,6 @@ impl CowBlockStorageState {
                 }
             }
             self.loaded_store_blocks.extend(start..start + count);
-            self.evict_clean_cache();
         }
         Ok(())
     }
@@ -654,10 +655,9 @@ mod tests {
     }
 
     #[test]
-    fn loaded_store_blocks_evict_clean_cache_over_limit() {
+    fn large_reads_preserve_store_blocks_before_clean_cache_eviction() {
         let path = temp_base_image_path();
         fs::write(&path, [0_u8; 16384]).unwrap();
-        let base = File::open(&path).unwrap();
         let store = Arc::new(TestBlockStore {
             block_size: 4096,
             blocks: Mutex::new(HashMap::from([
@@ -668,22 +668,26 @@ mod tests {
             ])),
             write_calls: Mutex::new(0),
         });
-        let mut state = CowBlockStorageState {
-            base: CowBlockBase::File(base),
-            size: 16384,
-            block_size: 4096,
-            store,
-            store_blocks: HashSet::from([0, 1, 2, 3]),
-            loaded_store_blocks: HashSet::new(),
-            cached_blocks: HashMap::new(),
-            modified_blocks: HashSet::new(),
-            clean_cached_blocks: HashSet::new(),
-            clean_cache_order: VecDeque::new(),
-            max_dirty_bytes: 4096,
-        };
+        let storage = CowBlockStorage::open(&path, store, 4096).unwrap();
+        let mut state = storage
+            .state
+            .lock()
+            .expect("COW block storage lock poisoned");
+        state.store_blocks = HashSet::from([0, 1, 2, 3]);
+        drop(state);
 
-        state.load_store_blocks(0, 3).unwrap();
+        let mut bytes = [0_u8; 16384];
+        block_on_ready(storage.read_into(&mut bytes, 0)).unwrap();
 
+        assert_eq!(bytes[..4096], [1; 4096]);
+        assert_eq!(bytes[4096..8192], [2; 4096]);
+        assert_eq!(bytes[8192..12288], [3; 4096]);
+        assert_eq!(bytes[12288..], [4; 4096]);
+
+        let state = storage
+            .state
+            .lock()
+            .expect("COW block storage lock poisoned");
         assert_eq!(state.clean_cached_blocks.len(), 1);
         assert_eq!(state.cached_blocks.len(), 1);
         assert!(state.cached_blocks.contains_key(&3));
