@@ -425,6 +425,7 @@ impl CowBlockStorageState {
                 }
             }
             self.loaded_store_blocks.extend(start..start + count);
+            self.evict_clean_cache();
         }
         Ok(())
     }
@@ -649,6 +650,44 @@ mod tests {
         assert!(!state.cached_blocks.contains_key(&1));
         assert!(state.cached_blocks.contains_key(&2));
         assert!(state.cached_blocks.contains_key(&3));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn loaded_store_blocks_evict_clean_cache_over_limit() {
+        let path = temp_base_image_path();
+        fs::write(&path, [0_u8; 16384]).unwrap();
+        let base = File::open(&path).unwrap();
+        let store = Arc::new(TestBlockStore {
+            block_size: 4096,
+            blocks: Mutex::new(HashMap::from([
+                (0, vec![1; 4096]),
+                (1, vec![2; 4096]),
+                (2, vec![3; 4096]),
+                (3, vec![4; 4096]),
+            ])),
+            write_calls: Mutex::new(0),
+        });
+        let mut state = CowBlockStorageState {
+            base: CowBlockBase::File(base),
+            size: 16384,
+            block_size: 4096,
+            store,
+            store_blocks: HashSet::from([0, 1, 2, 3]),
+            loaded_store_blocks: HashSet::new(),
+            cached_blocks: HashMap::new(),
+            modified_blocks: HashSet::new(),
+            clean_cached_blocks: HashSet::new(),
+            clean_cache_order: VecDeque::new(),
+            max_dirty_bytes: 4096,
+        };
+
+        state.load_store_blocks(0, 3).unwrap();
+
+        assert_eq!(state.clean_cached_blocks.len(), 1);
+        assert_eq!(state.cached_blocks.len(), 1);
+        assert!(state.cached_blocks.contains_key(&3));
+        assert_eq!(state.loaded_store_blocks, HashSet::from([3]));
         let _ = fs::remove_file(path);
     }
 

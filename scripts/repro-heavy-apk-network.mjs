@@ -31,9 +31,10 @@ function flagValue(name) {
 async function runStep(sandbox, id, script, timeoutMs = 120_000) {
   record({ type: "step.start", id, timeoutMs });
   const started = Date.now();
+  const hostTimeoutMs = execTimeouts ? timeoutMs + 30_000 : timeoutMs;
   const result = await withTimeout(
     sandbox.exec("/bin/sh", ["-lc", script], execTimeouts ? { timeoutMs } : {}),
-    timeoutMs,
+    hostTimeoutMs,
     id,
   );
   const elapsedMs = Date.now() - started;

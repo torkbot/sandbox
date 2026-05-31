@@ -813,8 +813,14 @@ fn run_guest_exec_command(
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(ExecCommandError::TimedOut {
-                        stdout: join_output_reader(stdout_reader),
-                        stderr: join_output_reader(stderr_reader),
+                        stdout: join_output_reader_with_timeout(
+                            stdout_reader,
+                            std::time::Duration::from_millis(100),
+                        ),
+                        stderr: join_output_reader_with_timeout(
+                            stderr_reader,
+                            std::time::Duration::from_millis(100),
+                        ),
                     });
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -864,16 +870,25 @@ fn terminate_child_process_group(_child_pid: u32) {}
 
 fn read_child_output(
     mut output: impl std::io::Read + Send + 'static,
-) -> std::thread::JoinHandle<Vec<u8>> {
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
         let mut data = Vec::new();
         let _ = output.read_to_end(&mut data);
-        data
-    })
+        let _ = sender.send(data);
+    });
+    receiver
 }
 
-fn join_output_reader(reader: std::thread::JoinHandle<Vec<u8>>) -> Vec<u8> {
-    reader.join().unwrap_or_default()
+fn join_output_reader(reader: std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+    reader.recv().unwrap_or_default()
+}
+
+fn join_output_reader_with_timeout(
+    reader: std::sync::mpsc::Receiver<Vec<u8>>,
+    timeout: std::time::Duration,
+) -> Vec<u8> {
+    reader.recv_timeout(timeout).unwrap_or_default()
 }
 
 fn append_timeout_message(mut stderr: Vec<u8>, timeout_ms: u64) -> Vec<u8> {

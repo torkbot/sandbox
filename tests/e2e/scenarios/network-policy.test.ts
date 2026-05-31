@@ -451,6 +451,28 @@ test("network.policy allows non-HTTP TLS passthrough without MITM", async (t) =>
   assert.equal(tlsEcho.connections.length, 1);
 });
 
+test("network.policy acceptHttp without middleware still enforces HTTP", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+  const tlsEcho = await startTlsEchoServer();
+  t.after(() => void tlsEcho.close());
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      if (conn.transport === "tcp") {
+        conn.acceptHttp();
+      }
+    }),
+  }).boot();
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "accept-http-rejects-raw-tls",
+    script: pythonTlsExchange(tlsEcho.port, "raw-tls"),
+  }), 10_000, "acceptHttp rejects raw TLS");
+
+  assert.notEqual(result.exitCode, 0, commandOutput(result));
+  assert.equal(tlsEcho.connections.length, 0);
+});
+
 test("network.policy matchHttp accept without middleware preserves raw HTTPS", async (t) => {
   if (!requireVmLaunchSupport(t)) return;
 

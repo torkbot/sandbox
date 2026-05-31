@@ -374,9 +374,11 @@ export class HostProcessSandboxVm implements HostControlChannel {
         dnsResolvers?: readonly { readonly ip: string; readonly port: number }[];
       } = { action: "deny" };
       let httpMiddleware: HttpRequestMiddleware | undefined;
+      let acceptHttpMode: "matched" | "enforced" | undefined;
       const accept = () => {
         decision.action = "accept";
         decision.dnsResolvers = undefined;
+        acceptHttpMode = undefined;
         return {};
       };
       const connection: NetworkConnectionRequest = {
@@ -412,6 +414,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
               decision.action = "acceptHttp";
               decision.dnsResolvers = undefined;
               httpMiddleware = middleware;
+              acceptHttpMode = "matched";
               return {};
             },
           };
@@ -423,6 +426,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
                 decision.action = "acceptHttp";
                 decision.dnsResolvers = undefined;
                 httpMiddleware = middleware;
+                acceptHttpMode = "enforced";
                 return {};
               },
               matchTcp(matcher: NetworkEndpointSpec | NetworkMatchPredicate<TcpConnectionMatch>) {
@@ -449,7 +453,9 @@ export class HostProcessSandboxVm implements HostControlChannel {
       if (this.#networkConnectionHook?.active === true) {
         await this.#networkConnectionHook.hook(connection);
       }
-      const action = decision.action === "acceptHttp" && httpMiddleware === undefined
+      const action = decision.action === "acceptHttp"
+          && acceptHttpMode === "matched"
+          && httpMiddleware === undefined
         ? "accept"
         : decision.action;
       if (action === "acceptHttp") {
