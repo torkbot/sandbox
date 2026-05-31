@@ -38,6 +38,7 @@ struct CowBlockStorageState {
     loaded_store_blocks: HashSet<u64>,
     cached_blocks: HashMap<u64, Vec<u8>>,
     modified_blocks: HashSet<u64>,
+    max_dirty_bytes: u64,
 }
 
 enum CowBlockBase {
@@ -46,26 +47,42 @@ enum CowBlockBase {
 }
 
 impl CowBlockStorage {
-    pub fn open(base_path: &Path, store: Arc<dyn CowBlockStore>) -> io::Result<Self> {
+    pub fn open(
+        base_path: &Path,
+        store: Arc<dyn CowBlockStore>,
+        max_dirty_bytes: u64,
+    ) -> io::Result<Self> {
         let base = File::open(base_path)?;
         let size = base.metadata()?.len();
-        Self::open_base(CowBlockBase::File(base), size, store)
+        Self::open_base(CowBlockBase::File(base), size, store, max_dirty_bytes)
     }
 
     pub fn open_storage(
         base: FormatAccess<Box<dyn DynStorage>>,
         store: Arc<dyn CowBlockStore>,
+        max_dirty_bytes: u64,
     ) -> io::Result<Self> {
         let size = base.size();
-        Self::open_base(CowBlockBase::Storage(base), size, store)
+        Self::open_base(CowBlockBase::Storage(base), size, store, max_dirty_bytes)
     }
 
-    fn open_base(base: CowBlockBase, size: u64, store: Arc<dyn CowBlockStore>) -> io::Result<Self> {
+    fn open_base(
+        base: CowBlockBase,
+        size: u64,
+        store: Arc<dyn CowBlockStore>,
+        max_dirty_bytes: u64,
+    ) -> io::Result<Self> {
         let block_size = store.block_size();
         if block_size == 0 || block_size % 512 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "COW block size must be a positive multiple of 512 bytes",
+            ));
+        }
+        if max_dirty_bytes < block_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "COW max dirty bytes must be at least the block size",
             ));
         }
 
@@ -80,6 +97,7 @@ impl CowBlockStorage {
                 loaded_store_blocks: HashSet::new(),
                 cached_blocks: HashMap::new(),
                 modified_blocks: HashSet::new(),
+                max_dirty_bytes,
             }),
             helper: CommonStorageHelper::default(),
         })
@@ -139,7 +157,7 @@ impl Storage for CowBlockStorage {
 
     async unsafe fn pure_writev(&self, mut bufv: IoVector<'_>, mut offset: u64) -> io::Result<()> {
         while !bufv.is_empty() {
-            let chunk_len = usize::try_from(bufv.len().min(1024 * 1024))
+            let chunk_len = usize::try_from(bufv.len().min(self.max_write_chunk_len()?))
                 .map_err(|_| io::Error::other("COW write buffer is too large"))?;
             let (head, tail) = bufv.split_at(chunk_len as u64);
             let mut bytes = vec![0; chunk_len];
@@ -192,6 +210,8 @@ impl Storage for CowBlockStorage {
                 .is_some_and(|current| current == &flushed)
             {
                 state.modified_blocks.remove(&index);
+                state.cached_blocks.remove(&index);
+                state.loaded_store_blocks.remove(&index);
             }
         }
         Ok(())
@@ -242,26 +262,41 @@ impl CowBlockStorage {
     }
 
     async fn write_from(&self, input: &[u8], offset: u64) -> io::Result<()> {
-        let mut state = self.state.lock().expect("COW block storage lock poisoned");
-        let end = offset
-            .checked_add(input.len() as u64)
-            .ok_or_else(|| io::Error::other("COW write offset overflow"))?;
-        if end > state.size {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "COW root storage write extends beyond base image",
-            ));
+        let should_flush = {
+            let mut state = self.state.lock().expect("COW block storage lock poisoned");
+            let end = offset
+                .checked_add(input.len() as u64)
+                .ok_or_else(|| io::Error::other("COW write offset overflow"))?;
+            if end > state.size {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "COW root storage write extends beyond base image",
+                ));
+            }
+            state.write_range(input, offset).await?;
+            state.dirty_bytes() >= state.max_dirty_bytes
+        };
+        if should_flush {
+            self.flush().await?;
         }
-        state.write_range(input, offset).await
+        Ok(())
+    }
+
+    fn max_write_chunk_len(&self) -> io::Result<u64> {
+        let state = self.state.lock().expect("COW block storage lock poisoned");
+        let available_dirty_bytes = state
+            .max_dirty_bytes
+            .saturating_sub(state.dirty_bytes())
+            .max(state.block_size);
+        Ok((1024 * 1024).min(available_dirty_bytes))
     }
 
     async fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
-        const ZERO_CHUNK_SIZE: usize = 1024 * 1024;
         let mut remaining = length;
         let mut next_offset = offset;
-        let zeroes = vec![0; ZERO_CHUNK_SIZE];
         while remaining > 0 {
-            let chunk_len = remaining.min(ZERO_CHUNK_SIZE as u64) as usize;
+            let chunk_len = remaining.min(self.max_write_chunk_len()?) as usize;
+            let zeroes = vec![0; chunk_len];
             self.write_from(&zeroes[..chunk_len], next_offset).await?;
             remaining -= chunk_len as u64;
             next_offset = next_offset
@@ -273,6 +308,10 @@ impl CowBlockStorage {
 }
 
 impl CowBlockStorageState {
+    fn dirty_bytes(&self) -> u64 {
+        self.modified_blocks.len() as u64 * self.block_size
+    }
+
     fn overlay_range(&mut self, output: &mut [u8], offset: u64) -> io::Result<()> {
         let first_block = offset / self.block_size;
         let last_block = (offset + output.len() as u64 - 1) / self.block_size;
@@ -412,6 +451,7 @@ mod tests {
     struct TestBlockStore {
         block_size: u64,
         blocks: Mutex<HashMap<u64, Vec<u8>>>,
+        write_calls: Mutex<usize>,
     }
 
     impl CowBlockStore for TestBlockStore {
@@ -431,6 +471,7 @@ mod tests {
         }
 
         fn write_blocks(&self, chunks: Vec<(u64, Vec<u8>)>) -> io::Result<()> {
+            *self.write_calls.lock().unwrap() += 1;
             let mut blocks = self.blocks.lock().unwrap();
             for (index, data) in chunks {
                 blocks.insert(index, data);
@@ -451,6 +492,7 @@ mod tests {
         let store = Arc::new(TestBlockStore {
             block_size: 4096,
             blocks: Mutex::new(HashMap::new()),
+            write_calls: Mutex::new(0),
         });
         let mut state = CowBlockStorageState {
             base: CowBlockBase::File(base),
@@ -461,6 +503,7 @@ mod tests {
             loaded_store_blocks: HashSet::new(),
             cached_blocks: HashMap::new(),
             modified_blocks: HashSet::new(),
+            max_dirty_bytes: 4096,
         };
 
         let error = state.load_store_blocks(1, 1).unwrap_err();
@@ -478,6 +521,7 @@ mod tests {
         let store = Arc::new(TestBlockStore {
             block_size: 4096,
             blocks: Mutex::new(HashMap::new()),
+            write_calls: Mutex::new(0),
         });
         let mut state = CowBlockStorageState {
             base: CowBlockBase::File(base),
@@ -488,6 +532,7 @@ mod tests {
             loaded_store_blocks: HashSet::new(),
             cached_blocks: HashMap::new(),
             modified_blocks: HashSet::new(),
+            max_dirty_bytes: 4096,
         };
 
         block_on_ready(state.write_range(&[1; 4096], 4096)).unwrap();
@@ -495,6 +540,44 @@ mod tests {
 
         assert_eq!(state.cached_blocks.get(&1).unwrap()[..512], [2; 512]);
         assert_eq!(state.cached_blocks.get(&1).unwrap()[512..], [1; 3584]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn write_from_flushes_when_dirty_bytes_reach_threshold() {
+        let path = temp_base_image_path();
+        fs::write(&path, [0_u8; 12288]).unwrap();
+        let store = Arc::new(TestBlockStore {
+            block_size: 4096,
+            blocks: Mutex::new(HashMap::new()),
+            write_calls: Mutex::new(0),
+        });
+        let storage = CowBlockStorage::open(&path, store.clone(), 8192).unwrap();
+
+        block_on_ready(storage.write_from(&[1; 4096], 0)).unwrap();
+        assert_eq!(*store.write_calls.lock().unwrap(), 0);
+
+        block_on_ready(storage.write_from(&[2; 4096], 4096)).unwrap();
+        assert_eq!(*store.write_calls.lock().unwrap(), 1);
+        assert_eq!(store.blocks.lock().unwrap().len(), 2);
+        assert_eq!(
+            storage
+                .state
+                .lock()
+                .expect("COW block storage lock poisoned")
+                .cached_blocks
+                .len(),
+            0,
+        );
+
+        block_on_ready(storage.write_from(&[3; 4096], 8192)).unwrap();
+        assert_eq!(*store.write_calls.lock().unwrap(), 1);
+
+        block_on_ready(storage.flush()).unwrap();
+        assert_eq!(*store.write_calls.lock().unwrap(), 2);
+        let mut bytes = [0_u8; 4096];
+        block_on_ready(storage.read_into(&mut bytes, 0)).unwrap();
+        assert_eq!(bytes, [1; 4096]);
         let _ = fs::remove_file(path);
     }
 

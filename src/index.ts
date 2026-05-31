@@ -131,6 +131,7 @@ export type CowRootfsConfig = {
   readonly kind: "cow-rootfs";
   readonly base: BuiltInRootfsConfig;
   readonly writable: SandboxBlockStore;
+  readonly maxDirtyBytes?: number;
 };
 
 export type Rootfs = BuiltInRootfsConfig | CowRootfsConfig;
@@ -163,9 +164,15 @@ export interface SandboxBlockStore {
   readonly blockSize: number;
   list(context: SandboxBlockStoreContext): Promise<readonly bigint[]>;
   read(range: SandboxBlockRange, context: SandboxBlockStoreContext): Promise<readonly SandboxBlockChunk[]>;
+  /**
+   * Receives block bytes owned by the block store. Sandbox will not mutate
+   * chunk data after calling write(), so stores may retain those arrays.
+   */
   write(chunks: readonly SandboxBlockChunk[], context: SandboxBlockStoreContext): Promise<void>;
   flush?(context: SandboxBlockStoreContext): Promise<void>;
 }
+
+const DEFAULT_COW_MAX_DIRTY_BYTES = 64 * 1024 * 1024;
 
 /**
  * Middleware invoked for an HTTP request allowed by a network policy.
@@ -518,11 +525,16 @@ export const rootfs = {
       name,
     };
   },
-  cow(options: { readonly base: BuiltInRootfsConfig; readonly writable: SandboxBlockStore }): Rootfs {
+  cow(options: {
+    readonly base: BuiltInRootfsConfig;
+    readonly writable: SandboxBlockStore;
+    readonly maxDirtyBytes?: number;
+  }): Rootfs {
     return {
       kind: "cow-rootfs",
       base: options.base,
       writable: options.writable,
+      ...(options.maxDirtyBytes === undefined ? {} : { maxDirtyBytes: options.maxDirtyBytes }),
     };
   },
 };
@@ -994,7 +1006,8 @@ async function lowerRootfs(
   switch (rootfs.kind) {
     case "built-in-rootfs": {
       if (options.httpInterception === true) {
-        return lowerCowRootfs(rootfs, createEphemeralCowBlockStore());
+        const writable = createEphemeralCowBlockStore();
+        return lowerCowRootfs(rootfs, writable, resolveCowMaxDirtyBytes(writable));
       }
       return {
         path: builtInRootfsPath(rootfs.name),
@@ -1003,13 +1016,14 @@ async function lowerRootfs(
       };
     }
     case "cow-rootfs":
-      return lowerCowRootfs(rootfs.base, rootfs.writable);
+      return lowerCowRootfs(rootfs.base, rootfs.writable, resolveCowMaxDirtyBytes(rootfs.writable, rootfs.maxDirtyBytes));
   }
 }
 
 function lowerCowRootfs(
   base: BuiltInRootfsConfig,
   writable: SandboxBlockStore,
+  maxDirtyBytes: number,
 ): InternalSandboxOptions["rootfs"] {
   return {
     path: builtInRootfsPath(base.name),
@@ -1018,6 +1032,7 @@ function lowerCowRootfs(
     storage: {
       kind: "cow-block-store",
       blockSize: writable.blockSize,
+      maxDirtyBytes,
       blockStore: writable,
       context: {
         base: builtInRootfsIdentity(base.name),
@@ -1063,6 +1078,7 @@ function validateRootfs(rootfs: Rootfs): void {
       }
       validateBuiltInRootfsName(rootfs.base.name);
       validateBlockStore(rootfs.writable);
+      validateCowMaxDirtyBytes(rootfs);
       return;
     default:
       throw new Error(
@@ -1087,6 +1103,25 @@ function validateBlockStore(blockStore: SandboxBlockStore): void {
   if (typeof blockStore.write !== "function") {
     throw new Error("invalid sandbox definition: rootfs COW block store must provide write()");
   }
+}
+
+function validateCowMaxDirtyBytes(rootfs: CowRootfsConfig): void {
+  if (rootfs.maxDirtyBytes === undefined) {
+    return;
+  }
+  if (!Number.isSafeInteger(rootfs.maxDirtyBytes) || rootfs.maxDirtyBytes <= 0) {
+    throw new Error("invalid sandbox definition: rootfs COW maxDirtyBytes must be a positive safe integer");
+  }
+  if (rootfs.maxDirtyBytes < rootfs.writable.blockSize) {
+    throw new Error("invalid sandbox definition: rootfs COW maxDirtyBytes must be at least the COW block size");
+  }
+}
+
+function resolveCowMaxDirtyBytes(blockStore: SandboxBlockStore, maxDirtyBytes?: number): number {
+  if (maxDirtyBytes !== undefined) {
+    return maxDirtyBytes;
+  }
+  return Math.ceil(DEFAULT_COW_MAX_DIRTY_BYTES / blockStore.blockSize) * blockStore.blockSize;
 }
 
 function validateSandboxDefinitionOptions(options: SandboxDefinitionOptions): void {

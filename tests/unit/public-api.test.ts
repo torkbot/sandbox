@@ -217,6 +217,7 @@ test("defineSandbox accepts COW rootfs", () => {
     rootfs: rootfs.cow({
       base: rootfs.builtIn("alpine:3.23"),
       writable: memoryBlockStore(),
+      maxDirtyBytes: 64 * 1024,
     }),
   });
 
@@ -235,6 +236,17 @@ test("defineSandbox rejects invalid COW rootfs block store", () => {
       }),
     }),
     /invalid sandbox definition: rootfs COW block size must be a multiple of 512 bytes/,
+  );
+
+  assert.throws(
+    () => defineSandbox({
+      rootfs: rootfs.cow({
+        base: rootfs.builtIn("alpine:3.23"),
+        writable: memoryBlockStore(),
+        maxDirtyBytes: 1024,
+      }),
+    }),
+    /invalid sandbox definition: rootfs COW maxDirtyBytes must be at least the COW block size/,
   );
 });
 

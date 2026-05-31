@@ -871,7 +871,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
         case "host.block.write": {
           const chunks = assertDocumentArray(document.chunks, "chunks").map((chunk) => ({
             start: BigInt(assertString(chunk.start, "chunks.start")),
-            data: binaryField(chunk.data, "chunks.data"),
+            data: binaryField(chunk.data, "chunks.data").slice(),
           }));
           await blockStore.write(chunks, blockStoreContext);
           this.#tryWriteToHost(encodePacket({
@@ -1467,6 +1467,7 @@ function encodeHostSpawn(options: HostSpawnSandboxOptions): Uint8Array {
       : {
         kind: options.rootfs.storage.kind,
         blockSize: options.rootfs.storage.blockSize,
+        maxDirtyBytes: options.rootfs.storage.maxDirtyBytes,
       },
     mounts: options.mounts ?? [],
     networkOutbound: options.network?.outbound,

@@ -125,7 +125,9 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
             Arc::new(NodeCowBlockStore::new(
                 bridge.clone(),
                 match storage {
-                    sandbox::config::RootfsStorageSpec::CowBlockStore { block_size } => *block_size,
+                    sandbox::config::RootfsStorageSpec::CowBlockStore { block_size, .. } => {
+                        *block_size
+                    }
                 },
             )) as Arc<dyn CowBlockStore>
         }),
@@ -699,7 +701,22 @@ fn parse_rootfs_storage(
     Ok(Some(RootfsStorageSpecInput {
         kind: document.get_str("kind")?.to_string(),
         block_size: u64::try_from(document.get_i32("blockSize")?)?,
+        max_dirty_bytes: document_u64(document, "maxDirtyBytes")?,
     }))
+}
+
+fn document_u64(document: &Document, field: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    match document.get(field) {
+        Some(Bson::Int32(value)) => Ok(u64::try_from(*value)?),
+        Some(Bson::Int64(value)) => Ok(u64::try_from(*value)?),
+        Some(Bson::Double(value))
+            if value.fract() == 0.0 && *value >= 0.0 && *value <= u64::MAX as f64 =>
+        {
+            Ok(*value as u64)
+        }
+        Some(_) => Err(format!("{field} must be a non-negative integer").into()),
+        None => Err(format!("{field} is required").into()),
+    }
 }
 
 fn parse_mounts(values: &[bson::Bson]) -> Result<Vec<MountSpecInput>, Box<dyn std::error::Error>> {

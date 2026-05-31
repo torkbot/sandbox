@@ -243,12 +243,16 @@ build root filesystems during `boot()`.
 rootfs.cow({
   base: rootfs.builtIn("alpine:3.23"),
   writable: blockStore,
+  maxDirtyBytes: 64 * 1024 * 1024,
 });
 ```
 
 Mounts a built-in base rootfs through a writable copy-on-write block store.
 Clean base-image blocks are served from the built-in artifact. Dirty blocks are
-read lazily and flushed through your `SandboxBlockStore`.
+read lazily and flushed through your `SandboxBlockStore`. `maxDirtyBytes`
+limits how many dirty COW block bytes the native runtime buffers before forcing
+a write to the block store. When omitted, Sandbox uses a 64 MiB block-aligned
+default.
 
 ```ts
 interface SandboxBlockStore {
@@ -269,6 +273,12 @@ interface SandboxBlockStore {
 The `context.base` value identifies the exact built-in base image for the boot,
 so storage layers can namespace blocks, reject mismatched snapshots, or migrate
 state.
+
+`write()` receives block bytes owned by the block store. The sandbox runtime
+will not mutate those `Uint8Array` values after passing them to `write()`, so a
+store may retain them for delayed persistence. A store that returns bytes from
+`read()` should treat the returned arrays as immutable after the promise
+resolves.
 
 ### `sandbox.boot(options)`
 

@@ -21,6 +21,7 @@ export type HostSpawnSandboxOptions = {
     readonly storage?: {
       readonly kind: "cow-block-store";
       readonly blockSize: number;
+      readonly maxDirtyBytes: number;
     };
   };
   readonly mounts?: readonly {

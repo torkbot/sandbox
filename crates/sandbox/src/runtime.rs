@@ -246,44 +246,46 @@ impl KrunContext {
                 );
                 cstring_path("rootfs.path", &spec.rootfs.path)?;
                 let writable = spec.rootfs.storage.is_some();
-                let disk =
-                    if let Some(RootfsStorageSpec::CowBlockStore { .. }) = spec.rootfs.storage {
-                        let store = services.root_storage.clone().ok_or_else(|| {
-                            KrunError::new("root COW block store missing", -libc::EINVAL)
-                        })?;
-                        let open_start = Instant::now();
-                        let storage = Box::<dyn DynStorage>::open_sync(
-                            StorageOpenOptions::new()
-                                .filename(&spec.rootfs.path)
-                                .write(false),
-                        )
-                        .map_err(|_| KrunError::new("Qcow2 storage open", -libc::EIO))?;
-                        rootfs_trace.stage("open_container", open_start);
-                        let qcow_start = Instant::now();
-                        let qcow2 = open_qcow2_access(storage, false)?;
-                        rootfs_trace.stage("open_qcow2", qcow_start);
-                        let cow_start = Instant::now();
-                        let cow = CowBlockStorage::open_storage(qcow2, store)
-                            .map_err(|_| KrunError::new("CowBlockStorage::open", -libc::EIO))?;
-                        rootfs_trace.stage("open_cow", cow_start);
-                        let raw_start = Instant::now();
-                        let disk = open_raw_disk(Box::new(cow), writable)?;
-                        rootfs_trace.stage("open_raw", raw_start);
-                        disk
-                    } else {
-                        let open_start = Instant::now();
-                        let storage = Box::<dyn DynStorage>::open_sync(
-                            StorageOpenOptions::new()
-                                .filename(&spec.rootfs.path)
-                                .write(false),
-                        )
-                        .map_err(|_| KrunError::new("Qcow2 storage open", -libc::EIO))?;
-                        rootfs_trace.stage("open_container", open_start);
-                        let qcow_start = Instant::now();
-                        let disk = open_qcow2_disk(storage, false)?;
-                        rootfs_trace.stage("open_qcow2", qcow_start);
-                        disk
-                    };
+                let disk = if let Some(RootfsStorageSpec::CowBlockStore {
+                    max_dirty_bytes, ..
+                }) = spec.rootfs.storage
+                {
+                    let store = services.root_storage.clone().ok_or_else(|| {
+                        KrunError::new("root COW block store missing", -libc::EINVAL)
+                    })?;
+                    let open_start = Instant::now();
+                    let storage = Box::<dyn DynStorage>::open_sync(
+                        StorageOpenOptions::new()
+                            .filename(&spec.rootfs.path)
+                            .write(false),
+                    )
+                    .map_err(|_| KrunError::new("Qcow2 storage open", -libc::EIO))?;
+                    rootfs_trace.stage("open_container", open_start);
+                    let qcow_start = Instant::now();
+                    let qcow2 = open_qcow2_access(storage, false)?;
+                    rootfs_trace.stage("open_qcow2", qcow_start);
+                    let cow_start = Instant::now();
+                    let cow = CowBlockStorage::open_storage(qcow2, store, max_dirty_bytes)
+                        .map_err(|_| KrunError::new("CowBlockStorage::open", -libc::EIO))?;
+                    rootfs_trace.stage("open_cow", cow_start);
+                    let raw_start = Instant::now();
+                    let disk = open_raw_disk(Box::new(cow), writable)?;
+                    rootfs_trace.stage("open_raw", raw_start);
+                    disk
+                } else {
+                    let open_start = Instant::now();
+                    let storage = Box::<dyn DynStorage>::open_sync(
+                        StorageOpenOptions::new()
+                            .filename(&spec.rootfs.path)
+                            .write(false),
+                    )
+                    .map_err(|_| KrunError::new("Qcow2 storage open", -libc::EIO))?;
+                    rootfs_trace.stage("open_container", open_start);
+                    let qcow_start = Instant::now();
+                    let disk = open_qcow2_disk(storage, false)?;
+                    rootfs_trace.stage("open_qcow2", qcow_start);
+                    disk
+                };
                 let add_disk_start = Instant::now();
                 check_krun(
                     "krun_add_storage_disk",

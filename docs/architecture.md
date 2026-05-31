@@ -93,10 +93,13 @@ The first writable-root primitive is host-backed block COW:
 rootfs: rootfs.cow({
   base: rootfs.builtIn("alpine:3.23"),
   writable: blockStore,
+  maxDirtyBytes: 64 * 1024 * 1024,
 })
 ```
 
 The JavaScript block store is an opaque fixed-size block overlay. It records mutations to the rootfs image byte space without knowing about QCOW2 internals or the guest filesystem. The native runtime owns the QCOW2 driver and exposes ext4 to the guest.
+The native COW layer batches dirty blocks up to `maxDirtyBytes` before forcing
+a write to the block store; omitted values use a 64 MiB block-aligned default.
 
 ## Networking
 
