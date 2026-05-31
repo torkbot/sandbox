@@ -22,6 +22,9 @@ pub enum ControlFrame {
         env: Vec<(String, String)>,
         timeout_ms: Option<u64>,
     },
+    GuestExecAbort {
+        id: String,
+    },
     GuestSpawn {
         id: String,
         argv: Vec<String>,
@@ -91,6 +94,10 @@ impl ControlFrame {
                 }
                 document
             }
+            Self::GuestExecAbort { id } => bson::doc! {
+                "type": "guest.exec.abort",
+                "id": id,
+            },
             Self::GuestSpawn { id, argv, env } => bson::doc! {
                 "type": "guest.spawn",
                 "id": id,
@@ -221,6 +228,12 @@ impl ControlFrame {
                     .transpose()?
                     .unwrap_or_default(),
                 timeout_ms: read_optional_u64(&document, "timeoutMs", "guest.exec timeoutMs")?,
+            }),
+            "guest.exec.abort" => Ok(Self::GuestExecAbort {
+                id: document
+                    .get_str("id")
+                    .map_err(|_| ControlFrameError::new("guest.exec.abort missing id"))?
+                    .to_string(),
             }),
             "guest.spawn" => Ok(Self::GuestSpawn {
                 id: document
@@ -450,15 +463,22 @@ mod tests {
 
     #[test]
     fn round_trips_guest_exec_frame() {
-        let frame = ControlFrame::GuestExec {
-            id: "test".to_string(),
-            argv: vec!["/bin/true".to_string()],
-            env: vec![("FOO".to_string(), "bar".to_string())],
-            timeout_ms: Some(5000),
-        };
+        let frames = [
+            ControlFrame::GuestExec {
+                id: "test".to_string(),
+                argv: vec!["/bin/true".to_string()],
+                env: vec![("FOO".to_string(), "bar".to_string())],
+                timeout_ms: Some(5000),
+            },
+            ControlFrame::GuestExecAbort {
+                id: "test".to_string(),
+            },
+        ];
 
-        let encoded = frame.encode().unwrap();
-        assert_eq!(ControlFrame::decode(&encoded).unwrap(), frame);
+        for frame in frames {
+            let encoded = frame.encode().unwrap();
+            assert_eq!(ControlFrame::decode(&encoded).unwrap(), frame);
+        }
     }
 
     #[test]

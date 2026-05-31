@@ -40,6 +40,18 @@ test("control command codec encodes guest spawn commands", () => {
   });
 });
 
+test("control command codec encodes guest exec abort commands", () => {
+  const packet = encodeControlCommand({
+    type: "guest.exec.abort",
+    id: "exec",
+  });
+
+  assert.deepEqual(BSON.deserialize(packet.subarray(4)), {
+    type: "guest.exec.abort",
+    id: "exec",
+  });
+});
+
 test("control event codec decodes init ready and binary exec output", () => {
   assert.deepEqual(
     decodeControlEvent(

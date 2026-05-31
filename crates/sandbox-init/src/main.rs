@@ -2,11 +2,13 @@ use base64::Engine;
 use sandbox_protocol::ControlFrame;
 #[cfg(target_os = "linux")]
 use sandbox_protocol::INIT_CONTROL_PORT;
+use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
 use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -904,6 +906,13 @@ fn send_init_ready(control: &mut std::fs::File, packet: &[u8]) -> Result<(), Ini
 
 fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
     let write_lock = Arc::new(Mutex::new(()));
+    let writer = Arc::new(ControlWriter::new(
+        control
+            .try_clone()
+            .map_err(|error| InitError(format!("clone control stream: {error}")))?,
+        write_lock,
+    ));
+    let execs = Arc::new(ActiveExecs::default());
     loop {
         let frame = match ControlFrame::decode_packet_from_reader(control) {
             Ok(frame) => frame,
@@ -918,39 +927,60 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
                 env,
                 timeout_ms,
             } => {
-                let response = run_guest_exec(id, argv, env, timeout_ms)?;
-                let packet = response
-                    .encode_packet()
-                    .map_err(|error| InitError(format!("encode exec completion: {error}")))?;
-                send_locked_packet(&write_lock, control, &packet)?;
+                let writer = writer.clone();
+                let execs = execs.clone();
+                let cancel = execs.insert(id.clone());
+                std::thread::spawn(move || {
+                    let response = run_guest_exec(id.clone(), argv, env, timeout_ms, cancel);
+                    execs.remove(&id);
+                    match response {
+                        Ok(frame) => {
+                            let _ = send_control_frame(&writer, frame);
+                        }
+                        Err(error) => {
+                            let _ = send_control_frame(
+                                &writer,
+                                ControlFrame::GuestExecComplete {
+                                    id,
+                                    exit_code: 127,
+                                    stdout: Vec::new(),
+                                    stderr: format!("guest.exec failed: {error}\n").into_bytes(),
+                                },
+                            );
+                        }
+                    }
+                });
+            }
+            ControlFrame::GuestExecAbort { id } => {
+                execs.abort(&id);
             }
             ControlFrame::GuestSpawn { id, argv, env } => {
-                let writer = Arc::new(ControlWriter::new(
-                    control
-                        .try_clone()
-                        .map_err(|error| InitError(format!("clone control stream: {error}")))?,
-                    write_lock.clone(),
-                ));
-                match run_guest_spawn(id.clone(), argv, env, writer.clone()) {
-                    Ok(()) => {}
-                    Err(error) => {
-                        send_control_frame(
-                            &writer,
-                            ControlFrame::GuestSpawnStderr {
-                                id: id.clone(),
-                                data: format!("spawn guest command: {error}\n").into_bytes(),
-                            },
-                        )?;
-                        send_control_frame(
-                            &writer,
-                            ControlFrame::GuestSpawnExit {
-                                id: id.clone(),
-                                exit_code: 127,
-                            },
-                        )?;
-                        send_control_frame(&writer, ControlFrame::GuestSpawnStreamsClosed { id })?;
+                let writer = writer.clone();
+                std::thread::spawn(move || {
+                    match run_guest_spawn(id.clone(), argv, env, writer.clone()) {
+                        Ok(()) => {}
+                        Err(error) => {
+                            let _ = send_control_frame(
+                                &writer,
+                                ControlFrame::GuestSpawnStderr {
+                                    id: id.clone(),
+                                    data: format!("spawn guest command: {error}\n").into_bytes(),
+                                },
+                            );
+                            let _ = send_control_frame(
+                                &writer,
+                                ControlFrame::GuestSpawnExit {
+                                    id: id.clone(),
+                                    exit_code: 127,
+                                },
+                            );
+                            let _ = send_control_frame(
+                                &writer,
+                                ControlFrame::GuestSpawnStreamsClosed { id },
+                            );
+                        }
                     }
-                }
+                });
             }
             ControlFrame::InitReady { .. }
             | ControlFrame::GuestExecComplete { .. }
@@ -1118,11 +1148,75 @@ enum SpawnOutputEvent {
     Exit(i32),
 }
 
+#[derive(Default)]
+struct ActiveExecs {
+    execs: Mutex<HashMap<String, Arc<ExecCancellation>>>,
+}
+
+impl ActiveExecs {
+    fn insert(&self, id: String) -> Arc<ExecCancellation> {
+        let cancellation = Arc::new(ExecCancellation::default());
+        if let Ok(mut execs) = self.execs.lock() {
+            execs.insert(id, cancellation.clone());
+        }
+        cancellation
+    }
+
+    fn abort(&self, id: &str) {
+        if let Ok(execs) = self.execs.lock() {
+            if let Some(cancellation) = execs.get(id) {
+                cancellation.abort();
+            }
+        }
+    }
+
+    fn remove(&self, id: &str) {
+        if let Ok(mut execs) = self.execs.lock() {
+            execs.remove(id);
+        }
+    }
+}
+
+#[derive(Default)]
+struct ExecCancellation {
+    aborted: AtomicBool,
+    child_id: Mutex<Option<u32>>,
+}
+
+impl ExecCancellation {
+    fn abort(&self) {
+        self.aborted.store(true, Ordering::SeqCst);
+        if let Some(child_id) = self.child_id.lock().ok().and_then(|child_id| *child_id) {
+            terminate_child_process_group(child_id);
+        }
+    }
+
+    fn set_child(&self, child_id: u32) {
+        if let Ok(mut slot) = self.child_id.lock() {
+            *slot = Some(child_id);
+        }
+        if self.is_aborted() {
+            terminate_child_process_group(child_id);
+        }
+    }
+
+    fn clear_child(&self) {
+        if let Ok(mut slot) = self.child_id.lock() {
+            *slot = None;
+        }
+    }
+
+    fn is_aborted(&self) -> bool {
+        self.aborted.load(Ordering::SeqCst)
+    }
+}
+
 fn run_guest_exec(
     id: String,
     argv: Vec<String>,
     env: Vec<(String, String)>,
     timeout_ms: Option<u64>,
+    cancellation: Arc<ExecCancellation>,
 ) -> Result<ControlFrame, InitError> {
     if argv.is_empty() {
         return Ok(ControlFrame::GuestExecComplete {
@@ -1135,7 +1229,7 @@ fn run_guest_exec(
 
     prepare_exec_environment(&env)?;
 
-    let output = match run_guest_exec_command(&argv, env, timeout_ms) {
+    let output = match run_guest_exec_command(&argv, env, timeout_ms, cancellation) {
         Ok(output) => output,
         Err(ExecCommandError::Spawn(error)) => {
             return Ok(ControlFrame::GuestExecComplete {
@@ -1151,6 +1245,14 @@ fn run_guest_exec(
                 exit_code: 124,
                 stdout,
                 stderr: append_timeout_message(stderr, timeout_ms.unwrap()),
+            });
+        }
+        Err(ExecCommandError::Aborted { stdout, stderr }) => {
+            return Ok(ControlFrame::GuestExecComplete {
+                id,
+                exit_code: 130,
+                stdout,
+                stderr: append_abort_message(stderr),
             });
         }
         Err(ExecCommandError::Wait(error)) => {
@@ -1180,12 +1282,14 @@ enum ExecCommandError {
     Spawn(std::io::Error),
     Wait(std::io::Error),
     TimedOut { stdout: Vec<u8>, stderr: Vec<u8> },
+    Aborted { stdout: Vec<u8>, stderr: Vec<u8> },
 }
 
 fn run_guest_exec_command(
     argv: &[String],
     env: Vec<(String, String)>,
     timeout_ms: Option<u64>,
+    cancellation: Arc<ExecCancellation>,
 ) -> Result<GuestExecOutput, ExecCommandError> {
     let mut command = std::process::Command::new(&argv[0]);
     command.args(&argv[1..]);
@@ -1197,57 +1301,63 @@ fn run_guest_exec_command(
     command.envs(env);
     let (mut child, child_id) =
         spawn_active_child(&mut command).map_err(ExecCommandError::Spawn)?;
+    cancellation.set_child(child_id);
     let stdout = child.stdout.take().expect("stdout was configured as piped");
     let stderr = child.stderr.take().expect("stderr was configured as piped");
 
     let stdout_reader = read_child_output(stdout);
     let stderr_reader = read_child_output(stderr);
 
-    match timeout_ms {
-        Some(timeout_ms) => {
-            let deadline = exec_deadline(timeout_ms);
-            loop {
-                if let Some(status) = child.try_wait().map_err(ExecCommandError::Wait)? {
-                    unregister_active_child(child_id);
-                    return match join_output_readers_until(stdout_reader, stderr_reader, deadline) {
-                        Some((stdout, stderr)) => Ok(GuestExecOutput {
-                            status,
-                            stdout,
-                            stderr,
-                        }),
-                        None => {
-                            terminate_child_process_group(child_id);
-                            Err(ExecCommandError::TimedOut {
-                                stdout: Vec::new(),
-                                stderr: Vec::new(),
-                            })
-                        }
-                    };
-                }
-                if deadline_expired(deadline) {
-                    terminate_child_process_group(child_id);
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    unregister_active_child(child_id);
-                    let grace_deadline = std::time::Instant::now()
-                        .checked_add(std::time::Duration::from_millis(100));
-                    let (stdout, stderr) =
-                        join_output_readers_until(stdout_reader, stderr_reader, grace_deadline)
-                            .unwrap_or_default();
-                    return Err(ExecCommandError::TimedOut { stdout, stderr });
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        }
-        None => {
-            let status = child.wait().map_err(ExecCommandError::Wait)?;
+    let deadline = timeout_ms.and_then(exec_deadline);
+    loop {
+        if cancellation.is_aborted() {
+            terminate_child_process_group(child_id);
+            let _ = child.kill();
+            let _ = child.wait();
             unregister_active_child(child_id);
-            Ok(GuestExecOutput {
-                status,
-                stdout: join_output_reader(stdout_reader),
-                stderr: join_output_reader(stderr_reader),
-            })
+            cancellation.clear_child();
+            let grace_deadline =
+                std::time::Instant::now().checked_add(std::time::Duration::from_millis(100));
+            let (stdout, stderr) =
+                join_output_readers_until(stdout_reader, stderr_reader, grace_deadline)
+                    .unwrap_or_default();
+            return Err(ExecCommandError::Aborted { stdout, stderr });
         }
+        if let Some(status) = child.try_wait().map_err(ExecCommandError::Wait)? {
+            unregister_active_child(child_id);
+            return match join_output_readers_until(stdout_reader, stderr_reader, deadline) {
+                Some((stdout, stderr)) => {
+                    cancellation.clear_child();
+                    Ok(GuestExecOutput {
+                        status,
+                        stdout,
+                        stderr,
+                    })
+                }
+                None => {
+                    terminate_child_process_group(child_id);
+                    cancellation.clear_child();
+                    Err(ExecCommandError::TimedOut {
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    })
+                }
+            };
+        }
+        if deadline_expired(deadline) {
+            terminate_child_process_group(child_id);
+            let _ = child.kill();
+            let _ = child.wait();
+            unregister_active_child(child_id);
+            cancellation.clear_child();
+            let grace_deadline =
+                std::time::Instant::now().checked_add(std::time::Duration::from_millis(100));
+            let (stdout, stderr) =
+                join_output_readers_until(stdout_reader, stderr_reader, grace_deadline)
+                    .unwrap_or_default();
+            return Err(ExecCommandError::TimedOut { stdout, stderr });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -1295,10 +1405,6 @@ fn read_child_output(
     receiver
 }
 
-fn join_output_reader(reader: std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
-    reader.recv().unwrap_or_default()
-}
-
 fn exec_deadline(timeout_ms: u64) -> Option<std::time::Instant> {
     std::time::Instant::now().checked_add(std::time::Duration::from_millis(timeout_ms))
 }
@@ -1338,6 +1444,14 @@ fn append_timeout_message(mut stderr: Vec<u8>, timeout_ms: u64) -> Vec<u8> {
         stderr.push(b'\n');
     }
     stderr.extend_from_slice(format!("sandbox exec timed out after {timeout_ms}ms\n").as_bytes());
+    stderr
+}
+
+fn append_abort_message(mut stderr: Vec<u8>) -> Vec<u8> {
+    if !stderr.is_empty() && !stderr.ends_with(b"\n") {
+        stderr.push(b'\n');
+    }
+    stderr.extend_from_slice(b"sandbox exec aborted\n");
     stderr
 }
 
@@ -1437,17 +1551,6 @@ fn send_packet(control: &mut std::fs::File, packet: &[u8]) -> Result<(), InitErr
     control
         .write_all(packet)
         .map_err(|error| InitError(format!("write control packet: {error}")))
-}
-
-fn send_locked_packet(
-    lock: &Arc<Mutex<()>>,
-    control: &mut std::fs::File,
-    packet: &[u8],
-) -> Result<(), InitError> {
-    let _guard = lock
-        .lock()
-        .map_err(|_| InitError("control stream writer lock poisoned".to_string()))?;
-    send_packet(control, packet)
 }
 
 struct ControlWriter {

@@ -148,6 +148,105 @@ test("HostControlTransport sends exec timeout to guest", async () => {
   await control.close();
 });
 
+test("HostControlTransport sends exec abort and rejects aborted call", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const abort = new AbortController();
+  const exec = control.exec({
+    id: "test",
+    argv: ["/bin/sleep", "10"],
+    signal: abort.signal,
+  });
+
+  abort.abort();
+
+  await assert.rejects(exec, { name: "AbortError" });
+  assert.deepEqual(
+    channel.writes.map((packet) => BSON.deserialize(packet.subarray(4))),
+    [
+      {
+        type: "guest.exec",
+        id: "test",
+        argv: ["/bin/sleep", "10"],
+        env: [],
+      },
+      {
+        type: "guest.exec.abort",
+        id: "test",
+      },
+    ],
+  );
+
+  channel.packets.push(
+    encodePacket({
+      type: "guest.exec.complete",
+      id: "test",
+      exitCode: 130,
+      stdout: new Binary(new Uint8Array()),
+      stderr: new Binary(new TextEncoder().encode("sandbox exec aborted\n")),
+    }),
+  );
+
+  const followup = control.exec({ id: "followup", argv: ["/bin/true"] });
+  channel.packets.push(
+    encodePacket({
+      type: "guest.exec.complete",
+      id: "followup",
+      exitCode: 0,
+      stdout: new Binary(new TextEncoder().encode("ok")),
+      stderr: new Binary(new Uint8Array()),
+    }),
+  );
+  assert.equal((await followup).stdout, "ok");
+  await control.close();
+});
+
+test("HostControlTransport keeps aborted exec id reserved until completion arrives", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const abort = new AbortController();
+  const exec = control.exec({
+    id: "reused",
+    argv: ["/bin/sleep", "10"],
+    signal: abort.signal,
+  });
+
+  abort.abort();
+  await assert.rejects(exec, { name: "AbortError" });
+  await assert.rejects(
+    control.exec({ id: "reused", argv: ["/bin/true"] }),
+    /sandbox exec id is already in flight: reused/,
+  );
+
+  channel.packets.push(
+    encodePacket({
+      type: "guest.exec.complete",
+      id: "reused",
+      exitCode: 130,
+      stdout: new Binary(new Uint8Array()),
+      stderr: new Binary(new TextEncoder().encode("sandbox exec aborted\n")),
+    }),
+  );
+  assert.equal(
+    (await control.incoming[Symbol.asyncIterator]().next()).value?.type,
+    "guest.exec.complete",
+  );
+
+  const followup = control.exec({ id: "reused", argv: ["/bin/true"] });
+  channel.packets.push(
+    encodePacket({
+      type: "guest.exec.complete",
+      id: "reused",
+      exitCode: 0,
+      stdout: new Binary(new TextEncoder().encode("ok")),
+      stderr: new Binary(new Uint8Array()),
+    }),
+  );
+
+  assert.equal((await followup).stdout, "ok");
+  await control.close();
+});
+
 test("HostControlTransport omits exec timeout when not requested", async () => {
   const channel = new MemoryControlChannel();
   const control = new HostControlTransport({ channel });
