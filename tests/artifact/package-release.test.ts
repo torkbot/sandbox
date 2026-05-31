@@ -207,7 +207,8 @@ test("rootfs QCOW2 builder uses compressed images", async () => {
 
   assert.match(buildQcow2Script, /SANDBOX_QCOW2_BUILDER_IMAGE \?\? "debian:bookworm"/);
   assert.match(buildQcow2Script, /decimalEnv\("SANDBOX_QCOW2_CLUSTER_SIZE", "32768"\)/);
-  assert.match(buildQcow2Script, /decimalEnv\("SANDBOX_ROOTFS_FREE_SPACE_KIB", "131072"\)/);
+  assert.match(buildQcow2Script, /sizeEnvKiB\("SANDBOX_ROOTFS_VIRTUAL_SIZE", "8gb"\)/);
+  assert.match(buildQcow2Script, /rootfs contents exceed virtual image size/);
   assert.match(buildQcow2Script, /qemu-img/);
   assert.match(buildQcow2Script, /-O qcow2/);
   assert.match(buildQcow2Script, /-c/);
