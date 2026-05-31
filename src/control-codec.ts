@@ -43,6 +43,10 @@ export type SandboxControlCommand =
       readonly timeoutMs?: number;
     }
   | {
+      readonly type: "guest.exec.abort";
+      readonly id: string;
+    }
+  | {
       readonly type: "guest.spawn";
       readonly id: string;
       readonly argv: readonly string[];
@@ -59,6 +63,11 @@ export function encodeControlCommand(command: SandboxControlCommand): Uint8Array
         argv: [...command.argv],
         env: Object.entries(command.env ?? {}).map(([key, value]) => ({ key, value })),
         ...(command.timeoutMs === undefined ? {} : { timeoutMs: command.timeoutMs }),
+      });
+    case "guest.exec.abort":
+      return encodePacket({
+        type: "guest.exec.abort",
+        id: command.id,
       });
     case "guest.spawn":
       return encodePacket({

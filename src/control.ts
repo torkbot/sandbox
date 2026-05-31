@@ -13,6 +13,7 @@ export interface SandboxControl extends Transport<SandboxControlEvent, SandboxCo
     readonly argv: readonly string[];
     readonly env?: Record<string, string>;
     readonly timeoutMs?: number;
+    readonly signal?: AbortSignal;
   }): Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>>;
   spawn(input: {
     readonly id?: string;
@@ -41,6 +42,7 @@ export class HostControlTransport implements SandboxControl {
   readonly #pendingExec = new Map<string, {
     resolve(event: Extract<SandboxControlEvent, { type: "guest.exec.complete" }>): void;
     reject(error: unknown): void;
+    aborted: boolean;
   }>();
   readonly #pendingSpawn = new Map<string, {
     resolve(process: ControlBackedSandboxProcess): void;
@@ -85,15 +87,48 @@ export class HostControlTransport implements SandboxControl {
     readonly argv: readonly string[];
     readonly env?: Record<string, string>;
     readonly timeoutMs?: number;
+    readonly signal?: AbortSignal;
   }): Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>> {
     this.#assertOpen();
+    throwIfAborted(input.signal);
     const id = input.id ?? crypto.randomUUID();
     if (this.#pendingExec.has(id)) {
       throw new Error(`sandbox exec id is already in flight: ${id}`);
     }
+    let abortListener: (() => void) | undefined;
     const completion = new Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>>((resolve, reject) => {
-      this.#pendingExec.set(id, { resolve, reject });
+      this.#pendingExec.set(id, {
+        aborted: false,
+        resolve: (event) => {
+          if (abortListener !== undefined) {
+            input.signal?.removeEventListener("abort", abortListener);
+          }
+          resolve(event);
+        },
+        reject: (error) => {
+          if (abortListener !== undefined) {
+            input.signal?.removeEventListener("abort", abortListener);
+          }
+          reject(error);
+        },
+      });
     });
+    abortListener = () => {
+      if (input.signal?.aborted !== true) {
+        return;
+      }
+      const pending = this.#pendingExec.get(id);
+      if (pending === undefined) {
+        return;
+      }
+      if (pending.aborted) {
+        return;
+      }
+      pending.aborted = true;
+      void this.send({ type: "guest.exec.abort", id }).catch(() => {});
+      pending.reject(abortError(input.signal));
+    };
+    input.signal?.addEventListener("abort", abortListener, { once: true });
     try {
       await this.send({
         type: "guest.exec",
@@ -104,7 +139,13 @@ export class HostControlTransport implements SandboxControl {
       });
     } catch (error) {
       this.#pendingExec.delete(id);
+      if (abortListener !== undefined) {
+        input.signal?.removeEventListener("abort", abortListener);
+      }
       throw error;
+    }
+    if (input.signal?.aborted === true) {
+      abortListener();
     }
     return await completion;
   }
@@ -267,6 +308,22 @@ export class HostControlTransport implements SandboxControl {
     }
     this.#pendingSpawn.clear();
   }
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) {
+    throw abortError(signal);
+  }
+}
+
+function abortError(signal: AbortSignal | undefined): Error {
+  const reason = signal?.reason;
+  if (reason instanceof Error) {
+    return reason;
+  }
+  const error = new Error("sandbox exec aborted");
+  error.name = "AbortError";
+  return error;
 }
 
 export class ControlBackedSandboxProcess {

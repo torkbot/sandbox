@@ -327,12 +327,27 @@ const result = await lane.exec("npm", ["test"], {
   cwd: "/workspace",
   env: { CI: "1" },
   timeoutMs: 120_000,
+  signal: abortController.signal,
 });
 ```
 
 `exec(...)` is the buffered process API. It returns after the command exits with
 `exitCode`, `stdout`, and `stderr`. When `timeoutMs` expires, Sandbox terminates
-the guest process group and returns exit code `124`.
+the guest process group and returns exit code `124`. When `signal` aborts,
+Sandbox terminates that guest process group, rejects the `exec(...)` promise with
+an `AbortError`, and keeps the sandbox usable for subsequent commands.
+
+Use `spawn(...)` for streaming output:
+
+```ts
+const child = await lane.spawn("npm", ["test"], { cwd: "/workspace" });
+
+for await (const chunk of child.stdout) {
+  process.stdout.write(chunk);
+}
+
+const { exitCode } = await child.exit;
+```
 
 ### Network Policy
 

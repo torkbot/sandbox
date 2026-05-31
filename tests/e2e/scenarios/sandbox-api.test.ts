@@ -165,6 +165,70 @@ test("buffered exec timeout terminates guest process", async (t) => {
   assert.equal(followup.stdout, "ok");
 });
 
+test("buffered exec abort terminates guest process and leaves control usable", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot();
+
+  const abort = new AbortController();
+  const exec = sandbox.exec("/bin/sh", ["-lc", "sleep 5"], {
+    signal: abort.signal,
+  });
+
+  abort.abort();
+  await assert.rejects(exec, { name: "AbortError" });
+
+  const followup = await sandbox.exec("/bin/sh", ["-lc", "printf ok"]);
+  assert.equal(followup.stdout, "ok");
+});
+
+test("buffered exec abort terminates descendants holding output pipes open", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot();
+
+  const marker = "/tmp/abort-descendant-survived";
+  const abort = new AbortController();
+  const exec = sandbox.exec("/bin/sh", [
+    "-lc",
+    `rm -f ${marker}; sh -c 'sleep 2; touch ${marker}' &`,
+  ], {
+    signal: abort.signal,
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  abort.abort();
+  await assert.rejects(exec, { name: "AbortError" });
+
+  await sandbox.exec("/bin/sleep", ["3"]);
+  const followup = await sandbox.exec("/bin/sh", ["-lc", `test ! -e ${marker}`]);
+  assert.equal(followup.exitCode, 0, followup.stderr);
+});
+
+test("buffered exec calls overlap without blocking the control plane", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot();
+
+  const slow = sandbox.exec("/bin/sh", ["-lc", "sleep 1; printf slow"]);
+  const fast = sandbox.exec("/bin/sh", ["-lc", "printf fast"]);
+
+  assert.equal((await fast).stdout, "fast");
+  assert.equal((await slow).stdout, "slow");
+});
+
 test("buffered exec timeout returns when descendant keeps output pipes open", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;

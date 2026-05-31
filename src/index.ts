@@ -484,6 +484,7 @@ export interface SandboxExecOptions {
    * Sandbox terminates the guest process group and returns exit code 124.
    */
   readonly timeoutMs?: number;
+  readonly signal?: AbortSignal;
 }
 
 export interface SandboxSpawnOptions {
@@ -740,6 +741,7 @@ class ControlBackedSandboxExec {
       argv,
       env,
       timeoutMs: options.timeoutMs,
+      signal: options.signal,
     });
     return {
       exitCode: result.exitCode,
