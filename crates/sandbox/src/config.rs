@@ -43,7 +43,10 @@ pub struct RootfsSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RootfsStorageSpec {
-    CowBlockStore { block_size: u64 },
+    CowBlockStore {
+        block_size: u64,
+        max_dirty_bytes: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,6 +319,7 @@ pub struct MicroVmSpecInput {
 pub struct RootfsStorageSpecInput {
     pub kind: String,
     pub block_size: u64,
+    pub max_dirty_bytes: u64,
 }
 
 impl RootfsStorageSpec {
@@ -327,8 +331,14 @@ impl RootfsStorageSpec {
                         "rootfs.storage.blockSize must be a positive multiple of 512",
                     ));
                 }
+                if input.max_dirty_bytes < input.block_size {
+                    return Err(SpecError::new(
+                        "rootfs.storage.maxDirtyBytes must be at least rootfs.storage.blockSize",
+                    ));
+                }
                 Ok(Self::CowBlockStore {
                     block_size: input.block_size,
+                    max_dirty_bytes: input.max_dirty_bytes,
                 })
             }
             other => Err(SpecError::new(format!(
@@ -385,6 +395,43 @@ mod tests {
         assert_eq!(spec.init.crate_name, "sandbox-init");
         assert_eq!(spec.rootfs.readonly, true);
         assert_eq!(spec.rootfs.format, RootfsFormat::Qcow2);
+    }
+
+    #[test]
+    fn parses_cow_rootfs_storage_limits() {
+        let mut input = valid_input();
+        input.rootfs_storage = Some(RootfsStorageSpecInput {
+            kind: "cow-block-store".to_string(),
+            block_size: 4096,
+            max_dirty_bytes: 65536,
+        });
+
+        let spec = MicroVmSpec::build(input).unwrap();
+
+        assert_eq!(
+            spec.rootfs.storage,
+            Some(RootfsStorageSpec::CowBlockStore {
+                block_size: 4096,
+                max_dirty_bytes: 65536,
+            }),
+        );
+    }
+
+    #[test]
+    fn rejects_cow_rootfs_storage_limit_below_block_size() {
+        let mut input = valid_input();
+        input.rootfs_storage = Some(RootfsStorageSpecInput {
+            kind: "cow-block-store".to_string(),
+            block_size: 4096,
+            max_dirty_bytes: 1024,
+        });
+
+        let error = MicroVmSpec::build(input).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "rootfs.storage.maxDirtyBytes must be at least rootfs.storage.blockSize",
+        );
     }
 
     #[test]

@@ -145,6 +145,7 @@ test("missing COW rootfs mount directories do not persist synthetic rootfs paths
     rootfs: rootfs.cow({
       base: rootfs.builtIn("alpine:3.23"),
       writable: blockStore,
+      maxDirtyBytes: 128 * 1024,
     }),
   });
 

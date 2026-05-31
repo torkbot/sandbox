@@ -64,6 +64,7 @@ export interface InternalSandboxOptions {
     readonly storage?: {
       readonly kind: "cow-block-store";
       readonly blockSize: number;
+      readonly maxDirtyBytes: number;
       readonly blockStore: SandboxBlockStore;
       readonly context: SandboxBlockStoreContext;
     };
