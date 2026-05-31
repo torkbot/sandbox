@@ -2111,7 +2111,7 @@ impl RamaHttpConnection {
                 break;
             }
         }
-        while self.to_guest.len() < TLS_READ_BUFFER_BYTES {
+        while self.to_guest.len() < HTTP_BRIDGE_BUFFER_BYTES {
             let mut buffer = [0; TLS_READ_BUFFER_BYTES];
             let read = self.bridge.pull_to_sync(&mut buffer);
             if read == 0 {
@@ -2126,7 +2126,7 @@ impl RamaHttpConnection {
             }
             self.to_guest.drain(..sent);
         }
-        if self.bridge.async_is_closed() {
+        if self.bridge.async_is_closed() && self.bridge.async_to_sync_is_empty() {
             self.close_after_flush = true;
         }
     }

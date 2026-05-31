@@ -53,6 +53,123 @@ test("network.policy allows plain HTTP over TCP", async (t) => {
   assert.ok(origin.connections.length >= 1);
 });
 
+test("network.policy HTTP proxy handles real client framing variants", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+
+  const largeBody = "x".repeat(40_000);
+  const observedRequests: Array<{ readonly method: string; readonly path: string }> = [];
+  const origin = await startTcpServer((socket) => {
+    socket.once("data", (chunk) => {
+      const request = chunk.toString("utf8");
+      const [requestLine = ""] = request.split("\r\n", 1);
+      const [method = "", path = ""] = requestLine.split(" ");
+      observedRequests.push({ method, path });
+
+      switch (path) {
+        case "/content-length":
+          socket.end("HTTP/1.1 200 OK\r\ncontent-length: 17\r\nconnection: close\r\n\r\ncontent-length-ok");
+          break;
+        case "/chunked":
+          socket.end([
+            "HTTP/1.1 200 OK",
+            "transfer-encoding: chunked",
+            "connection: close",
+            "",
+            "8",
+            "chunked-",
+            "2",
+            "ok",
+            "0",
+            "",
+            "",
+          ].join("\r\n"));
+          break;
+        case "/close-delimited":
+          socket.end("HTTP/1.1 200 OK\r\nconnection: close\r\n\r\nclose-delimited-ok");
+          break;
+        case "/large":
+          socket.end(`HTTP/1.1 200 OK\r\ncontent-length: ${largeBody.length}\r\nconnection: close\r\n\r\n${largeBody}`);
+          break;
+        case "/slow":
+          socket.write("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n5\r\nslow-\r\n");
+          setTimeout(() => socket.end("2\r\nok\r\n0\r\n\r\n"), 50);
+          break;
+        case "/head":
+          socket.end("HTTP/1.1 200 OK\r\ncontent-length: 7\r\nconnection: close\r\n\r\n");
+          break;
+        case "/no-content":
+          socket.end("HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n");
+          break;
+        case "/not-modified":
+          socket.end("HTTP/1.1 304 Not Modified\r\nconnection: close\r\n\r\n");
+          break;
+        default:
+          socket.end("HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\nconnection: close\r\n\r\nnot-found");
+          break;
+      }
+    });
+  }, 8000);
+  t.after(() => void origin.close());
+
+  const observedPolicy: Array<{ readonly protocol: string; readonly method: string; readonly path: string }> = [];
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      if (conn.transport === "tcp") {
+        conn.acceptHttp((request) => {
+          observedPolicy.push({
+            protocol: request.protocol,
+            method: request.method,
+            path: request.url.pathname,
+          });
+        });
+      }
+    }),
+  }).boot();
+
+  const baseUrl = `http://${hostOriginAddress()}:${origin.port}`;
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "http-client-framing-compat",
+    script: [
+      "set -eux",
+      `base=${JSON.stringify(baseUrl)}`,
+      "curl -fsS --http1.1 --max-time 5 \"$base/content-length\" > /tmp/curl-content-length",
+      "test \"$(cat /tmp/curl-content-length)\" = content-length-ok",
+      "curl -fsS --http1.1 --max-time 5 \"$base/chunked\" > /tmp/curl-chunked",
+      "test \"$(cat /tmp/curl-chunked)\" = chunked-ok",
+      "curl -fsS --http1.1 --max-time 5 \"$base/close-delimited\" > /tmp/curl-close-delimited",
+      "test \"$(cat /tmp/curl-close-delimited)\" = close-delimited-ok",
+      "curl -fsS --http1.1 --max-time 5 \"$base/slow\" > /tmp/curl-slow",
+      "test \"$(cat /tmp/curl-slow)\" = slow-ok",
+      "curl -fsS --http1.1 --max-time 5 \"$base/large\" > /tmp/curl-large",
+      "test \"$(wc -c < /tmp/curl-large)\" = 40000",
+      "curl -fsSI --http1.1 --max-time 5 \"$base/head\" | grep -iq '^content-length: 7'",
+      "test \"$(curl -fsS --http1.1 --max-time 5 -o /tmp/curl-no-content -w '%{http_code}' \"$base/no-content\")\" = 204",
+      "test ! -s /tmp/curl-no-content",
+      "test \"$(curl -fsS --http1.1 --max-time 5 -o /tmp/curl-not-modified -w '%{http_code}' \"$base/not-modified\")\" = 304",
+      "test ! -s /tmp/curl-not-modified",
+      "wget -q -O /tmp/wget-content-length \"$base/content-length\"",
+      "test \"$(cat /tmp/wget-content-length)\" = content-length-ok",
+      "wget -q -O /tmp/wget-chunked \"$base/chunked\"",
+      "test \"$(cat /tmp/wget-chunked)\" = chunked-ok",
+      "wget -q -O /tmp/wget-close-delimited \"$base/close-delimited\"",
+      "test \"$(cat /tmp/wget-close-delimited)\" = close-delimited-ok",
+      "wget -q -O /tmp/wget-slow \"$base/slow\"",
+      "test \"$(cat /tmp/wget-slow)\" = slow-ok",
+      "wget -q -O /tmp/wget-large \"$base/large\"",
+      "test \"$(wc -c < /tmp/wget-large)\" = 40000",
+      "printf compat-ok",
+    ].join("; "),
+  }), 20_000, "HTTP client framing compatibility matrix");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "compat-ok");
+  assert.ok(observedRequests.some((request) => request.method === "HEAD" && request.path === "/head"));
+  assert.ok(observedPolicy.every((request) => request.protocol === "http/1.1"));
+  assert.ok(observedPolicy.some((request) => request.path === "/close-delimited"));
+  assert.ok(observedPolicy.some((request) => request.path === "/large"));
+});
+
 test("network.policy allows HTTP middleware on non-standard TCP ports", async (t) => {
   if (!requireVmLaunchSupport(t)) return;
   const observedHeaders: string[] = [];
