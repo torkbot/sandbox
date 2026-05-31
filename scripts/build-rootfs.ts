@@ -61,6 +61,20 @@ await run("docker", [
 await assertExists(initPath);
 await copyFile(initPath, resolve(outDir, "sandbox-init"));
 await rm(resolve(outDir, ".dockerenv"), { force: true });
+await mkdir(resolve(outDir, "usr/lib/sandbox"), { recursive: true });
+await writeFile(
+  resolve(outDir, "usr/lib/sandbox/install-http-ca"),
+  [
+    "#!/bin/sh",
+    "set -eu",
+    "certificate_path=$1",
+    "install -D -m 0644 \"$certificate_path\" /usr/local/share/ca-certificates/sandbox-http-interception-ca.crt",
+    "update-ca-certificates",
+    "",
+  ].join("\n"),
+  { mode: 0o755 },
+);
+await chmod(resolve(outDir, "usr/lib/sandbox/install-http-ca"), 0o755);
 await writeFile(resolve(outDir, "etc/hostname"), "sandbox\n");
 await writeFile(
   resolve(outDir, "etc/hosts"),

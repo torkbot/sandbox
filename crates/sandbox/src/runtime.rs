@@ -327,12 +327,18 @@ impl KrunContext {
         let exec_path = CString::new("/sandbox-init").unwrap();
         let encoded_mounts = encode_virtual_fs_mounts(virtual_fs);
         let mount_arg = CString::new(format!("--virtiofs-mounts={encoded_mounts}")).unwrap();
+        let hostname_arg = CString::new(format!("--hostname={}", spec.hostname)).unwrap();
         let http_network_arg = CString::new("--http-network").unwrap();
         let network_enabled = spec.network.is_some();
         let mount_env = CString::new(format!("SANDBOX_VIRTIOFS_MOUNTS={encoded_mounts}")).unwrap();
+        let hostname_env = CString::new(format!("SANDBOX_HOSTNAME={}", spec.hostname)).unwrap();
         let http_network_env = CString::new("SANDBOX_HTTP_NETWORK=1").unwrap();
-        let mut argv = vec![exec_path.as_ptr(), mount_arg.as_ptr()];
-        let mut envp = vec![mount_env.as_ptr()];
+        let mut argv = vec![
+            exec_path.as_ptr(),
+            mount_arg.as_ptr(),
+            hostname_arg.as_ptr(),
+        ];
+        let mut envp = vec![mount_env.as_ptr(), hostname_env.as_ptr()];
         if network_enabled {
             argv.push(http_network_arg.as_ptr());
             envp.push(http_network_env.as_ptr());
@@ -733,6 +739,7 @@ mod tests {
 
         let spec = MicroVmSpec::build(MicroVmSpecInput {
             name: Some("runtime-test".to_string()),
+            hostname: "sandbox".to_string(),
             vcpus: Some(1),
             memory_mib: Some(128),
             kernel_format: None,
@@ -756,6 +763,7 @@ mod tests {
     fn rejects_non_qcow2_rootfs() {
         let err = MicroVmSpec::build(MicroVmSpecInput {
             name: Some("raw-root".to_string()),
+            hostname: "sandbox".to_string(),
             vcpus: Some(1),
             memory_mib: Some(128),
             kernel_format: None,
@@ -778,6 +786,7 @@ mod tests {
     fn rejects_connection_hook_without_policy_runtime() {
         let spec = MicroVmSpec::build(MicroVmSpecInput {
             name: Some("network-policy-without-runtime".to_string()),
+            hostname: "sandbox".to_string(),
             vcpus: Some(1),
             memory_mib: Some(128),
             kernel_format: None,
@@ -814,6 +823,7 @@ mod tests {
 
         let spec = MicroVmSpec::build(MicroVmSpecInput {
             name: Some("control-fd".to_string()),
+            hostname: "sandbox".to_string(),
             vcpus: Some(1),
             memory_mib: Some(128),
             kernel_format: None,
@@ -851,6 +861,7 @@ mod tests {
 
         let spec = MicroVmSpec::build(MicroVmSpecInput {
             name: Some("control-socket".to_string()),
+            hostname: "sandbox".to_string(),
             vcpus: Some(1),
             memory_mib: Some(128),
             kernel_format: None,
@@ -1059,6 +1070,7 @@ mod tests {
     fn rejects_rootfs_paths_with_nul_bytes() {
         let spec = MicroVmSpec::build(MicroVmSpecInput {
             name: Some("bad-root".to_string()),
+            hostname: "sandbox".to_string(),
             vcpus: Some(1),
             memory_mib: Some(128),
             kernel_format: None,

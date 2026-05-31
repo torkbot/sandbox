@@ -4,6 +4,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MicroVmSpec {
     pub name: Option<String>,
+    pub hostname: String,
     pub vcpus: u8,
     pub memory_mib: u32,
     pub kernel: KernelSpec,
@@ -179,6 +180,7 @@ impl MicroVmSpec {
         if input.rootfs_path.is_empty() {
             return Err(SpecError::new("rootfs.path must not be empty"));
         }
+        validate_hostname(&input.hostname)?;
 
         let kernel = KernelSpec {
             format: KernelFormat::parse(input.kernel_format.as_deref().unwrap_or("auto"))?,
@@ -232,6 +234,7 @@ impl MicroVmSpec {
 
         Ok(Self {
             name: input.name,
+            hostname: input.hostname,
             vcpus,
             memory_mib,
             kernel,
@@ -301,6 +304,7 @@ impl MountSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MicroVmSpecInput {
     pub name: Option<String>,
+    pub hostname: String,
     pub vcpus: Option<u32>,
     pub memory_mib: Option<u32>,
     pub kernel_format: Option<String>,
@@ -313,6 +317,35 @@ pub struct MicroVmSpecInput {
     pub network_outbound: Option<OutboundSpec>,
     pub network_http: Option<HttpSpecInput>,
     pub network_policy: Option<NetworkPolicySpec>,
+}
+
+fn validate_hostname(hostname: &str) -> Result<(), SpecError> {
+    if hostname.is_empty() {
+        return Err(SpecError::new("hostname must not be empty"));
+    }
+    if hostname.len() > 64 {
+        return Err(SpecError::new("hostname must be at most 64 characters"));
+    }
+    if !hostname
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.')
+    {
+        return Err(SpecError::new("hostname must be a valid hostname"));
+    }
+    for label in hostname.split('.') {
+        if label.is_empty() {
+            return Err(SpecError::new("hostname must be a valid hostname"));
+        }
+        if label.len() > 63 {
+            return Err(SpecError::new(
+                "hostname labels must be at most 63 characters",
+            ));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(SpecError::new("hostname must be a valid hostname"));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -370,6 +403,7 @@ mod tests {
     fn valid_input() -> MicroVmSpecInput {
         MicroVmSpecInput {
             name: Some("test".to_string()),
+            hostname: "sandbox".to_string(),
             vcpus: None,
             memory_mib: None,
             kernel_format: None,
@@ -507,6 +541,15 @@ mod tests {
 
         let err = MicroVmSpec::build(input).unwrap_err();
         assert_eq!(err.to_string(), "unsupported init crate: other-init");
+    }
+
+    #[test]
+    fn rejects_hostname_above_linux_uts_limit() {
+        let mut input = valid_input();
+        input.hostname = "a".repeat(65);
+
+        let err = MicroVmSpec::build(input).unwrap_err();
+        assert_eq!(err.to_string(), "hostname must be at most 64 characters");
     }
 
     #[test]

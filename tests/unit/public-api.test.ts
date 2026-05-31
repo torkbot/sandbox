@@ -212,6 +212,33 @@ test("defineSandbox accepts resource limits", () => {
   assert.equal(typeof sandbox.boot, "function");
 });
 
+test("boot rejects invalid hostnames before runtime launch", async () => {
+  const sandbox = defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  });
+
+  await assert.rejects(
+    sandbox.boot({ hostname: "" }),
+    /invalid sandbox boot options: hostname must not be empty/,
+  );
+  await assert.rejects(
+    sandbox.boot({ hostname: "a".repeat(65) }),
+    /invalid sandbox boot options: hostname must be at most 64 characters/,
+  );
+  await assert.rejects(
+    sandbox.boot({ hostname: "-agent" }),
+    /invalid sandbox boot options: hostname must be a valid hostname/,
+  );
+  await assert.rejects(
+    sandbox.boot({ hostname: "agent..example" }),
+    /invalid sandbox boot options: hostname must be a valid hostname/,
+  );
+  await assert.rejects(
+    sandbox.boot({ hostname: "agent.-bad" }),
+    /invalid sandbox boot options: hostname must be a valid hostname/,
+  );
+});
+
 test("defineSandbox accepts COW rootfs", () => {
   const sandbox = defineSandbox({
     rootfs: rootfs.cow({

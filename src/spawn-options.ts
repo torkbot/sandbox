@@ -2,6 +2,7 @@ import type { InternalOutboundNetworkRule } from "./launch-options.ts";
 
 export type HostSpawnSandboxOptions = {
   readonly name?: string;
+  readonly hostname: string;
   readonly cpu?: {
     readonly vcpus?: number;
   };

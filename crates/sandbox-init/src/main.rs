@@ -2,7 +2,11 @@ use base64::Engine;
 use sandbox_protocol::ControlFrame;
 #[cfg(target_os = "linux")]
 use sandbox_protocol::INIT_CONTROL_PORT;
+#[cfg(target_os = "linux")]
+use std::collections::HashSet;
 use std::io::Write;
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -15,11 +19,22 @@ fn main() {
 
 fn run() -> Result<(), InitError> {
     mount_kernel_filesystems()?;
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let hostname_env = std::env::var("SANDBOX_HOSTNAME").ok();
+    let http_network_enabled = http_network_enabled(args.iter().map(String::as_str));
+    run_setup_tasks(vec![
+        setup_task(move || configure_hostname(args.iter().map(String::as_str), hostname_env)),
+        setup_task(configure_loopback),
+        setup_task(move || configure_http_network(http_network_enabled)),
+        setup_task(|| {
+            start_orphan_reaper();
+            Ok(())
+        }),
+    ])?;
     let mounts = virtual_fs_mounts(
         std::env::args().skip(1),
         std::env::var("SANDBOX_VIRTIOFS_MOUNTS").ok(),
     )?;
-    configure_http_network(std::env::args().skip(1))?;
     mount_internal_http_ca(&mounts)?;
     mount_virtual_filesystems_before_http_ca(&mounts)?;
     install_http_ca()?;
@@ -31,40 +46,395 @@ fn run() -> Result<(), InitError> {
     Ok(())
 }
 
+type SetupTask = Box<dyn FnOnce() -> Result<(), InitError> + Send>;
+
+fn setup_task(task: impl FnOnce() -> Result<(), InitError> + Send + 'static) -> SetupTask {
+    Box::new(task)
+}
+
+fn run_setup_tasks(tasks: Vec<SetupTask>) -> Result<(), InitError> {
+    let handles = tasks
+        .into_iter()
+        .map(std::thread::spawn)
+        .collect::<Vec<_>>();
+    for handle in handles {
+        match handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err(InitError("init setup task panicked".to_string())),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
-fn configure_http_network(args: impl Iterator<Item = String>) -> Result<(), InitError> {
-    let enabled = args.into_iter().any(|arg| arg == "--http-network")
-        || read_flag_from_proc_cmdline("SANDBOX_HTTP_NETWORK");
+static ACTIVE_CHILDREN: OnceLock<Mutex<HashSet<libc::pid_t>>> = OnceLock::new();
+
+#[cfg(target_os = "linux")]
+fn active_children() -> &'static Mutex<HashSet<libc::pid_t>> {
+    ACTIVE_CHILDREN.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+#[cfg(target_os = "linux")]
+fn start_orphan_reaper() {
+    let _ = active_children();
+    std::thread::spawn(|| {
+        loop {
+            reap_orphaned_children();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
+}
+
+#[cfg(not(target_os = "linux"))]
+fn start_orphan_reaper() {}
+
+#[cfg(target_os = "linux")]
+fn spawn_active_child(
+    command: &mut std::process::Command,
+) -> std::io::Result<(std::process::Child, u32)> {
+    let mut children = active_children()
+        .lock()
+        .map_err(|_| std::io::Error::other("active child registry lock poisoned"))?;
+    let child = command.spawn()?;
+    let child_id = child.id();
+    children.insert(child_id as libc::pid_t);
+    Ok((child, child_id))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn spawn_active_child(
+    command: &mut std::process::Command,
+) -> std::io::Result<(std::process::Child, u32)> {
+    let child = command.spawn()?;
+    let child_id = child.id();
+    Ok((child, child_id))
+}
+
+#[cfg(target_os = "linux")]
+fn unregister_active_child(pid: u32) {
+    if let Ok(mut children) = active_children().lock() {
+        children.remove(&(pid as libc::pid_t));
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn unregister_active_child(_pid: u32) {}
+
+#[cfg(target_os = "linux")]
+fn reap_orphaned_children() {
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        let result = unsafe {
+            libc::waitid(
+                libc::P_ALL,
+                0,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result < 0 {
+            return;
+        }
+        let info = unsafe { info.assume_init() };
+        let pid = unsafe { info.si_pid() };
+        if pid <= 0 {
+            return;
+        }
+        if active_children()
+            .lock()
+            .is_ok_and(|children| children.contains(&pid))
+        {
+            return;
+        }
+        unsafe {
+            libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn configure_hostname<'a>(
+    args: impl Iterator<Item = &'a str>,
+    env_hostname: Option<String>,
+) -> Result<(), InitError> {
+    use std::ffi::CString;
+
+    let hostname = args
+        .filter_map(|arg| arg.strip_prefix("--hostname=").map(str::to_string))
+        .next()
+        .or(env_hostname)
+        .unwrap_or_else(|| "sandbox".to_string());
+    let hostname_cstr = CString::new(hostname.as_str())
+        .map_err(|_| InitError("hostname contains nul".to_string()))?;
+    let result = unsafe { libc::sethostname(hostname_cstr.as_ptr(), hostname.len()) };
+    if result < 0 {
+        return Err(InitError::last_os("set hostname"));
+    }
+    std::fs::create_dir_all("/run/sandbox")
+        .map_err(|error| InitError(format!("create /run/sandbox: {error}")))?;
+    std::fs::write("/run/sandbox/hostname", format!("{hostname}\n"))
+        .map_err(|error| InitError(format!("write /run/sandbox/hostname: {error}")))?;
+    configure_hosts(&hostname)?;
+    if !std::path::Path::new("/etc/hostname").exists() {
+        std::fs::write("/etc/hostname", format!("{hostname}\n"))
+            .map_err(|error| InitError(format!("write /etc/hostname: {error}")))?;
+        return Ok(());
+    }
+    bind_mount_file("/run/sandbox/hostname", "/etc/hostname")?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn configure_hosts(hostname: &str) -> Result<(), InitError> {
+    let hosts =
+        format!("127.0.0.1 localhost {hostname}\n::1 localhost ip6-localhost ip6-loopback\n");
+    std::fs::write("/run/sandbox/hosts", hosts.as_bytes())
+        .map_err(|error| InitError(format!("write /run/sandbox/hosts: {error}")))?;
+    if !std::path::Path::new("/etc/hosts").exists() {
+        std::fs::write("/etc/hosts", hosts)
+            .map_err(|error| InitError(format!("write /etc/hosts: {error}")))?;
+        return Ok(());
+    }
+    bind_mount_file("/run/sandbox/hosts", "/etc/hosts")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_hostname<'a>(
+    _args: impl Iterator<Item = &'a str>,
+    _env_hostname: Option<String>,
+) -> Result<(), InitError> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn configure_loopback() -> Result<(), InitError> {
+    configure_ipv4_address("lo", "127.0.0.1", "255.0.0.0")?;
+    set_interface_up("lo")?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn bind_mount_file(source: &str, target: &str) -> Result<(), InitError> {
+    use std::ffi::CString;
+
+    let source = CString::new(source)
+        .map_err(|_| InitError(format!("bind mount source contains nul: {source}")))?;
+    let target = CString::new(target)
+        .map_err(|_| InitError(format!("bind mount target contains nul: {target}")))?;
+    let result = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    };
+    if result < 0 {
+        return Err(InitError::last_os("bind mount hostname"));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_loopback() -> Result<(), InitError> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn configure_http_network(enabled: bool) -> Result<(), InitError> {
     if !enabled {
         return Ok(());
     }
 
-    run_setup_command("/sbin/ip", &["link", "set", "eth0", "up"])?;
-    run_setup_command("/sbin/ip", &["addr", "add", "10.0.2.2/24", "dev", "eth0"])?;
-    run_setup_command("/sbin/ip", &["route", "add", "default", "via", "10.0.2.1"])?;
+    configure_ipv4_address("eth0", "10.0.2.2", "255.255.255.0")?;
+    set_interface_up("eth0")?;
+    add_default_ipv4_route("eth0", "10.0.2.1")?;
     install_resolver_config()?;
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn configure_http_network(_args: impl Iterator<Item = String>) -> Result<(), InitError> {
+fn configure_http_network(_enabled: bool) -> Result<(), InitError> {
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn run_setup_command(program: &str, args: &[&str]) -> Result<(), InitError> {
-    let output = std::process::Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|error| InitError(format!("run setup command {program}: {error}")))?;
-    if output.status.success() {
-        return Ok(());
+fn http_network_enabled<'a>(args: impl Iterator<Item = &'a str>) -> bool {
+    args.into_iter().any(|arg| arg == "--http-network")
+        || read_flag_from_proc_cmdline("SANDBOX_HTTP_NETWORK")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn http_network_enabled<'a>(_args: impl Iterator<Item = &'a str>) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn configure_ipv4_address(iface: &str, address: &str, netmask: &str) -> Result<(), InitError> {
+    let socket = NetworkControlSocket::open()?;
+    let address = ipv4_sockaddr(address)?;
+    let netmask = ipv4_sockaddr(netmask)?;
+    let mut request = ifreq_with_sockaddr(iface, address)?;
+    socket.ioctl(
+        libc::SIOCSIFADDR as libc::Ioctl,
+        &mut request,
+        "set interface IPv4 address",
+    )?;
+    let mut request = ifreq_with_sockaddr(iface, netmask)?;
+    socket.ioctl(
+        libc::SIOCSIFNETMASK as libc::Ioctl,
+        &mut request,
+        "set interface IPv4 netmask",
+    )?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn set_interface_up(iface: &str) -> Result<(), InitError> {
+    let socket = NetworkControlSocket::open()?;
+    let mut request = ifreq_with_flags(iface, 0)?;
+    socket.ioctl(
+        libc::SIOCGIFFLAGS as libc::Ioctl,
+        &mut request,
+        "get interface flags",
+    )?;
+    let flags = unsafe { request.ifr_ifru.ifru_flags };
+    let mut request = ifreq_with_flags(iface, flags | libc::IFF_UP as libc::c_short)?;
+    socket.ioctl(
+        libc::SIOCSIFFLAGS as libc::Ioctl,
+        &mut request,
+        "set interface up",
+    )?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn add_default_ipv4_route(iface: &str, gateway: &str) -> Result<(), InitError> {
+    use std::ffi::CString;
+
+    let socket = NetworkControlSocket::open()?;
+    let iface =
+        CString::new(iface).map_err(|_| InitError("route interface contains nul".to_string()))?;
+    let mut route = libc::rtentry {
+        rt_pad1: 0,
+        rt_dst: ipv4_sockaddr("0.0.0.0")?,
+        rt_gateway: ipv4_sockaddr(gateway)?,
+        rt_genmask: ipv4_sockaddr("0.0.0.0")?,
+        rt_flags: (libc::RTF_UP | libc::RTF_GATEWAY) as libc::c_ushort,
+        rt_pad2: 0,
+        rt_pad3: 0,
+        rt_tos: 0,
+        rt_class: 0,
+        rt_pad4: [0; 3],
+        rt_metric: 0,
+        rt_dev: iface.as_ptr().cast_mut(),
+        rt_mtu: 0,
+        rt_window: 0,
+        rt_irtt: 0,
+    };
+    socket.ioctl_allow_errno(
+        libc::SIOCADDRT as libc::Ioctl,
+        &mut route,
+        "add default route",
+        libc::EEXIST,
+    )
+}
+
+#[cfg(target_os = "linux")]
+struct NetworkControlSocket(libc::c_int);
+
+#[cfg(target_os = "linux")]
+impl NetworkControlSocket {
+    fn open() -> Result<Self, InitError> {
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+        if fd < 0 {
+            return Err(InitError::last_os("socket(AF_INET)"));
+        }
+        Ok(Self(fd))
     }
-    Err(InitError(format!(
-        "setup command failed: {program} {}: {}",
-        args.join(" "),
-        String::from_utf8_lossy(&output.stderr)
-    )))
+
+    fn ioctl<T>(
+        &self,
+        request: libc::Ioctl,
+        value: &mut T,
+        operation: &str,
+    ) -> Result<(), InitError> {
+        self.ioctl_allow_errno(request, value, operation, 0)
+    }
+
+    fn ioctl_allow_errno<T>(
+        &self,
+        request: libc::Ioctl,
+        value: &mut T,
+        operation: &str,
+        allowed_errno: libc::c_int,
+    ) -> Result<(), InitError> {
+        let result = unsafe { libc::ioctl(self.0, request, value as *mut T) };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if allowed_errno != 0 && error.raw_os_error() == Some(allowed_errno) {
+                return Ok(());
+            }
+            return Err(InitError(format!("{operation}: {error}")));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for NetworkControlSocket {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.0);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ifreq_with_sockaddr(iface: &str, address: libc::sockaddr) -> Result<libc::ifreq, InitError> {
+    let mut request = ifreq_with_name(iface)?;
+    request.ifr_ifru.ifru_addr = address;
+    Ok(request)
+}
+
+#[cfg(target_os = "linux")]
+fn ifreq_with_flags(iface: &str, flags: libc::c_short) -> Result<libc::ifreq, InitError> {
+    let mut request = ifreq_with_name(iface)?;
+    request.ifr_ifru.ifru_flags = flags;
+    Ok(request)
+}
+
+#[cfg(target_os = "linux")]
+fn ifreq_with_name(iface: &str) -> Result<libc::ifreq, InitError> {
+    let mut request = unsafe { std::mem::zeroed::<libc::ifreq>() };
+    let bytes = iface.as_bytes();
+    if bytes.is_empty() || bytes.len() >= libc::IFNAMSIZ {
+        return Err(InitError(format!(
+            "invalid network interface name: {iface}"
+        )));
+    }
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        request.ifr_name[index] = byte as libc::c_char;
+    }
+    Ok(request)
+}
+
+#[cfg(target_os = "linux")]
+fn ipv4_sockaddr(address: &str) -> Result<libc::sockaddr, InitError> {
+    let address = address
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|error| InitError(format!("invalid IPv4 address {address}: {error}")))?;
+    let sockaddr = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: u32::from(address).to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+    Ok(unsafe { std::mem::transmute::<libc::sockaddr_in, libc::sockaddr>(sockaddr) })
 }
 
 #[cfg(target_os = "linux")]
@@ -106,6 +476,11 @@ fn mount_kernel_filesystems() -> Result<(), InitError> {
     mount_fs("proc", "/proc", "proc", 0)?;
     mount_fs("sysfs", "/sys", "sysfs", 0)?;
     mount_fs("devtmpfs", "/dev", "devtmpfs", 0)?;
+    mount_fs("devpts", "/dev/pts", "devpts", 0)?;
+    mount_fs("tmpfs", "/dev/shm", "tmpfs", 0)?;
+    set_directory_mode("/dev/shm", 0o1777)?;
+    mount_fs_if_supported("mqueue", "/dev/mqueue", "mqueue", 0)?;
+    mount_fs("cgroup2", "/sys/fs/cgroup", "cgroup2", 0)?;
     mount_fs("tmpfs", "/run", "tmpfs", 0)?;
     mount_fs("tmpfs", "/tmp", "tmpfs", 0)?;
     set_directory_mode("/tmp", 0o1777)?;
@@ -118,11 +493,32 @@ fn mount_kernel_filesystems() -> Result<(), InitError> {
 }
 
 #[cfg(target_os = "linux")]
+fn mount_fs_if_supported(
+    source: &str,
+    target: &str,
+    fstype: &str,
+    flags: libc::c_ulong,
+) -> Result<(), InitError> {
+    mount_fs_with_allowed_errors(source, target, fstype, flags, &[libc::ENODEV])
+}
+
+#[cfg(target_os = "linux")]
 fn mount_fs(
     source: &str,
     target: &str,
     fstype: &str,
     flags: libc::c_ulong,
+) -> Result<(), InitError> {
+    mount_fs_with_allowed_errors(source, target, fstype, flags, &[])
+}
+
+#[cfg(target_os = "linux")]
+fn mount_fs_with_allowed_errors(
+    source: &str,
+    target: &str,
+    fstype: &str,
+    flags: libc::c_ulong,
+    allowed_errors: &[i32],
 ) -> Result<(), InitError> {
     use std::ffi::CString;
     use std::path::Path;
@@ -147,7 +543,10 @@ fn mount_fs(
         )
     };
     if result < 0 {
-        if std::io::Error::last_os_error().raw_os_error() == Some(libc::EBUSY) {
+        let raw_os_error = std::io::Error::last_os_error().raw_os_error();
+        if raw_os_error == Some(libc::EBUSY)
+            || raw_os_error.is_some_and(|error| allowed_errors.contains(&error))
+        {
             return Ok(());
         }
         return Err(InitError::last_os(&format!("mount {target}")));
@@ -583,9 +982,8 @@ fn run_guest_spawn(
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
 
-    let mut child = command
-        .envs(env)
-        .spawn()
+    command.envs(env);
+    let (mut child, child_id) = spawn_active_child(&mut command)
         .map_err(|error| InitError(format!("{}: {error}", argv[0])))?;
 
     let stdout = child
@@ -613,6 +1011,7 @@ fn run_guest_spawn(
     );
     std::thread::spawn(move || {
         let status = child.wait();
+        unregister_active_child(child_id);
         let exit_code = match status {
             Ok(status) => exec_status(status, Vec::new()).0,
             Err(_) => 128,
@@ -795,8 +1194,9 @@ fn run_guest_exec_command(
     command.stderr(std::process::Stdio::piped());
     configure_command_process_group(&mut command);
 
-    let mut child = command.envs(env).spawn().map_err(ExecCommandError::Spawn)?;
-    let child_id = child.id();
+    command.envs(env);
+    let (mut child, child_id) =
+        spawn_active_child(&mut command).map_err(ExecCommandError::Spawn)?;
     let stdout = child.stdout.take().expect("stdout was configured as piped");
     let stderr = child.stderr.take().expect("stderr was configured as piped");
 
@@ -808,6 +1208,7 @@ fn run_guest_exec_command(
             let deadline = exec_deadline(timeout_ms);
             loop {
                 if let Some(status) = child.try_wait().map_err(ExecCommandError::Wait)? {
+                    unregister_active_child(child_id);
                     return match join_output_readers_until(stdout_reader, stderr_reader, deadline) {
                         Some((stdout, stderr)) => Ok(GuestExecOutput {
                             status,
@@ -827,6 +1228,7 @@ fn run_guest_exec_command(
                     terminate_child_process_group(child_id);
                     let _ = child.kill();
                     let _ = child.wait();
+                    unregister_active_child(child_id);
                     let grace_deadline = std::time::Instant::now()
                         .checked_add(std::time::Duration::from_millis(100));
                     let (stdout, stderr) =
@@ -839,6 +1241,7 @@ fn run_guest_exec_command(
         }
         None => {
             let status = child.wait().map_err(ExecCommandError::Wait)?;
+            unregister_active_child(child_id);
             Ok(GuestExecOutput {
                 status,
                 stdout: join_output_reader(stdout_reader),
@@ -984,71 +1387,50 @@ fn prepare_exec_environment(env: &[(String, String)]) -> Result<(), InitError> {
 fn write_http_ca(certificate: &[u8]) -> Result<(), InitError> {
     std::fs::create_dir_all("/run/sandbox")
         .map_err(|error| InitError(format!("create /run/sandbox: {error}")))?;
-    std::fs::write("/run/sandbox/http-ca.pem", certificate)
+    let certificate_path = "/run/sandbox/http-ca.pem";
+    std::fs::write(certificate_path, certificate)
         .map_err(|error| InitError(format!("write host HTTP CA certificate: {error}")))?;
-    install_http_ca_into_guest_trust(certificate)?;
+    install_http_ca_into_guest_trust(certificate_path)?;
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn install_http_ca_into_guest_trust(certificate: &[u8]) -> Result<(), InitError> {
-    if std::path::Path::new("/usr/local/share/ca-certificates").is_dir()
-        && command_exists("/usr/sbin/update-ca-certificates")
-    {
-        install_http_ca_using(
-            "/usr/local/share/ca-certificates/sandbox-http-interception-ca.crt",
-            certificate,
-            "/usr/sbin/update-ca-certificates",
-            &[],
-        )?;
+fn install_http_ca_into_guest_trust(certificate_path: &str) -> Result<(), InitError> {
+    let installer = "/usr/lib/sandbox/install-http-ca";
+    if !std::path::Path::new(installer).is_file() {
+        return Err(InitError(format!(
+            "install host HTTP CA certificate: guest rootfs must provide {installer}"
+        )));
+    }
+    let mut command = std::process::Command::new(installer);
+    command.arg(certificate_path);
+    let output = run_init_command_output(&mut command)
+        .map_err(|error| InitError(format!("run {installer}: {error}")))?;
+    if output.status.success() {
         return Ok(());
     }
-
-    if std::path::Path::new("/etc/pki/ca-trust/source/anchors").is_dir()
-        && command_exists("/usr/bin/update-ca-trust")
-    {
-        install_http_ca_using(
-            "/etc/pki/ca-trust/source/anchors/sandbox-http-interception-ca.pem",
-            certificate,
-            "/usr/bin/update-ca-trust",
-            &["extract"],
-        )?;
-        return Ok(());
-    }
-
-    Err(InitError(
-        "install host HTTP CA certificate: guest rootfs does not provide a supported trust-store installer".to_string(),
-    ))
-}
-
-#[cfg(target_os = "linux")]
-fn install_http_ca_using(
-    destination: &str,
-    certificate: &[u8],
-    command: &str,
-    args: &[&str],
-) -> Result<(), InitError> {
-    std::fs::write(destination, certificate).map_err(|error| {
-        InitError(format!(
-            "write HTTP CA certificate to {destination}: {error}"
-        ))
-    })?;
-    run_setup_command(command, args).map_err(|error| {
-        InitError(format!(
-            "install HTTP CA certificate with {command}: {error}"
-        ))
-    })?;
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn command_exists(path: &str) -> bool {
-    std::path::Path::new(path).is_file()
+    Err(InitError(format!(
+        "install host HTTP CA certificate with {installer}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    )))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn install_http_ca_into_guest_trust(_certificate: &[u8]) -> Result<(), InitError> {
+fn install_http_ca_into_guest_trust(_certificate_path: &str) -> Result<(), InitError> {
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn run_init_command_output(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::Output> {
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    let (child, child_id) = spawn_active_child(command)?;
+    let output = child.wait_with_output();
+    unregister_active_child(child_id);
+    output
 }
 
 fn send_packet(control: &mut std::fs::File, packet: &[u8]) -> Result<(), InitError> {

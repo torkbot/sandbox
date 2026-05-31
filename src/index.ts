@@ -469,6 +469,7 @@ export interface SandboxResourceLimits {
 export interface SandboxBootOptions {
   readonly mounts?: Readonly<Record<string, SandboxFileSystemSource>>;
   readonly cwd?: string;
+  readonly hostname?: string;
 }
 
 export interface SandboxDefinition {
@@ -822,6 +823,7 @@ function toHostSpawnOptions(
     init: {
       crateName: "sandbox-init",
     },
+    hostname: options.hostname,
     rootfs: options.rootfs,
     mounts: options.mounts?.map((mount) => {
       return {
@@ -845,6 +847,7 @@ async function toInternalSandboxOptions(
     resources: config.resources,
     rootfs,
     cwd: boot.cwd,
+    hostname: boot.hostname ?? "sandbox",
     mounts: Object.entries(boot.mounts ?? {}).map(([path, source]) => {
       return {
         path,
@@ -1169,6 +1172,9 @@ function validateBuiltInRootfsName(name: string): void {
 }
 
 function validateSandboxBootOptions(options: SandboxBootOptions): void {
+  if (options.hostname !== undefined) {
+    validateHostname(options.hostname, "hostname");
+  }
   const mountPaths = new Set<string>();
   for (const [path, source] of Object.entries(options.mounts ?? {})) {
     validateGuestPath(path, "mount.path");
@@ -1185,6 +1191,29 @@ function validateSandboxBootOptions(options: SandboxBootOptions): void {
   }
   if (options.cwd !== undefined && !options.cwd.startsWith("/")) {
     throw new Error("invalid sandbox boot options: cwd must be absolute");
+  }
+}
+
+function validateHostname(hostname: string, field: string): void {
+  if (hostname.length === 0) {
+    throw new Error(`invalid sandbox boot options: ${field} must not be empty`);
+  }
+  if (hostname.length > 64) {
+    throw new Error(`invalid sandbox boot options: ${field} must be at most 64 characters`);
+  }
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/.test(hostname)) {
+    throw new Error(`invalid sandbox boot options: ${field} must be a valid hostname`);
+  }
+  for (const label of hostname.split(".")) {
+    if (label.length === 0) {
+      throw new Error(`invalid sandbox boot options: ${field} must be a valid hostname`);
+    }
+    if (label.length > 63) {
+      throw new Error(`invalid sandbox boot options: ${field} labels must be at most 63 characters`);
+    }
+    if (label.startsWith("-") || label.endsWith("-")) {
+      throw new Error(`invalid sandbox boot options: ${field} must be a valid hostname`);
+    }
   }
 }
 
