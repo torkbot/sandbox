@@ -72,6 +72,7 @@ export interface InternalSandboxOptions {
   readonly mounts?: readonly InternalMount[];
   readonly network?: InternalNetworkConfig;
   readonly cwd?: string;
+  readonly hostname: string;
 }
 
 export type RegisteredHttpRequestHeadersHook = {

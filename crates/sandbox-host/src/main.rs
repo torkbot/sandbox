@@ -662,6 +662,7 @@ fn parse_spawn(document: Document) -> Result<MicroVmSpecInput, Box<dyn std::erro
 
     Ok(MicroVmSpecInput {
         name: optional_string(&document, "name"),
+        hostname: document.get_str("hostname")?.to_string(),
         vcpus: optional_i32(&document, "vcpus")
             .map(u32::try_from)
             .transpose()?,

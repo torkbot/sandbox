@@ -1464,6 +1464,7 @@ function encodeHostSpawn(options: HostSpawnSandboxOptions): Uint8Array {
   return encodePacket({
     type: "host.spawn",
     name: options.name,
+    hostname: options.hostname,
     vcpus: options.cpu?.vcpus,
     memoryMib: options.memory?.mib,
     kernelFormat: options.kernel.format,

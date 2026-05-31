@@ -148,6 +148,7 @@ filesystem implementations, not host path passthrough.
 
 ```ts
 await using lane = await sandbox.boot({
+  hostname: "agent-42",
   mounts: {
     "/workspace": fs.virtual(workspaceFs),
     "/mnt/shared": fs.virtual(sharedFs),
@@ -155,6 +156,9 @@ await using lane = await sandbox.boot({
   cwd: "/workspace",
 });
 ```
+
+Sandbox configures the kernel hostname during boot. Omit `hostname` to use the
+built-in default `sandbox`.
 
 Sandbox init creates missing mount target directories immediately before
 attaching each virtual filesystem, matching container runtime behavior when the

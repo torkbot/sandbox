@@ -28,6 +28,123 @@ test("new public API boots a built-in rootfs and runs a process", async (t) => {
   assert.equal(result.stderr, "");
 });
 
+test("boot configures the default guest hostname", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot();
+
+  const result = await sandbox.exec("/bin/sh", ["-lc", "hostname && cat /etc/hostname"]);
+
+  assert.equal(
+    result.exitCode,
+    0,
+    `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+  );
+  assert.equal(result.stdout, "sandbox\nsandbox\n");
+  assert.equal(result.stderr, "");
+});
+
+test("boot accepts an instance-specific guest hostname", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot({
+    hostname: "agent-42",
+  });
+
+  const result = await sandbox.exec("/bin/sh", [
+    "-lc",
+    [
+      "hostname",
+      "cat /etc/hostname",
+      "python3 - <<'PY'",
+      "import socket",
+      "print(socket.gethostbyname(socket.gethostname()))",
+      "PY",
+    ].join("\n"),
+  ]);
+
+  assert.equal(
+    result.exitCode,
+    0,
+    `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+  );
+  assert.equal(result.stdout, "agent-42\nagent-42\n127.0.0.1\n");
+  assert.equal(result.stderr, "");
+});
+
+test("guest init provides baseline Linux facilities", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot();
+
+  const result = await sandbox.exec("/bin/sh", ["-lc", [
+    "ip addr show lo | grep -q '127.0.0.1/8'",
+    "python3 - <<'PY'",
+    "import socket",
+    "listener = socket.socket()",
+    "listener.bind(('127.0.0.1', 0))",
+    "listener.listen(1)",
+    "client = socket.create_connection(('127.0.0.1', listener.getsockname()[1]), timeout=3)",
+    "accepted, _ = listener.accept()",
+    "client.sendall(b'ok')",
+    "print(accepted.recv(2).decode())",
+    "accepted.close()",
+    "client.close()",
+    "listener.close()",
+    "PY",
+    "grep -q 'devpts /dev/pts devpts' /proc/mounts",
+    "python3 - <<'PY'",
+    "import os, pty",
+    "master, slave = pty.openpty()",
+    "os.close(master)",
+    "os.close(slave)",
+    "PY",
+    "grep -q 'tmpfs /dev/shm tmpfs' /proc/mounts",
+    "printf shm >/dev/shm/sandbox-init-probe",
+    "test \"$(cat /dev/shm/sandbox-init-probe)\" = shm",
+    "if grep -qw mqueue /proc/filesystems; then grep -q 'mqueue /dev/mqueue mqueue' /proc/mounts; fi",
+    "grep -q 'cgroup2 /sys/fs/cgroup cgroup2' /proc/mounts",
+    "python3 - <<'PY'",
+    "import os, subprocess, time",
+    "subprocess.run(['/bin/sh', '-c', 'sleep 0.1 &'], check=True)",
+    "time.sleep(0.5)",
+    "zombies = []",
+    "for name in os.listdir('/proc'):",
+    "    if not name.isdigit():",
+    "        continue",
+    "    try:",
+    "        stat = open(f'/proc/{name}/stat').read()",
+    "    except FileNotFoundError:",
+    "        continue",
+    "    suffix = stat.rsplit(')', 1)[1].strip().split()",
+    "    state, ppid = suffix[0], suffix[1]",
+    "    if state == 'Z' and ppid == '1':",
+    "        zombies.append(name)",
+    "assert not zombies, zombies",
+    "PY",
+  ].join("\n")]);
+
+  assert.equal(
+    result.exitCode,
+    0,
+    `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+  );
+  assert.match(result.stdout, /^ok\n/);
+  assert.equal(result.stderr, "");
+});
+
 test("buffered exec timeout terminates guest process", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
@@ -127,6 +244,7 @@ test("built-in agent rootfs includes common agent runtimes and CLIs", async (t) 
       "npm --version",
       "python3 --version",
       "python3 -m pip --version",
+      "test -x /usr/lib/sandbox/install-http-ca",
     ].join(" && "),
   ]);
 
