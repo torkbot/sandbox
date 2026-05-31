@@ -327,6 +327,24 @@ test("boot cwd becomes the default process working directory", async (t) => {
   assert.equal(result.stdout.trim(), "/tmp");
 });
 
+test("built-in rootfs exposes enough guest disk space for agent workloads", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot();
+
+  const result = await sandbox.exec("/bin/sh", [
+    "-lc",
+    "df -Pk / | awk 'NR == 2 { print $2 }'",
+  ]);
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.ok(Number(result.stdout.trim()) >= 6 * 1024 * 1024, result.stdout);
+});
+
 test("COW rootfs round-trips rootfs mutations across instances", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;

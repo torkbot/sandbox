@@ -204,8 +204,7 @@ fn is_internal_http_ca_mount(mount: &VirtualFsMount) -> bool {
 
 #[cfg(target_os = "linux")]
 fn hides_internal_http_ca_mount(path: &str) -> bool {
-    normalized_mount_path(path)
-        .is_some_and(|path| path == "/run" || path.starts_with("/run/"))
+    normalized_mount_path(path).is_some_and(|path| path == "/run" || path.starts_with("/run/"))
 }
 
 #[cfg(target_os = "linux")]
