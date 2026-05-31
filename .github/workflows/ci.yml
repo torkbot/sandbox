@@ -304,3 +304,105 @@ jobs:
           name: e2e-diagnostics-${{ runner.os }}-${{ runner.arch }}
           path: test-results/e2e
           if-no-files-found: ignore
+
+  release-platform-artifacts:
+    name: Build release platform artifact (${{ matrix.platform }})
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs:
+      - e2e-fixtures
+      - e2e-fixtures-arm64
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            os: macos-15
+          - platform: linux-x64-gnu
+            os: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-platform-main-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install Linux host dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm pkg-config build-essential
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Compute fixture cache keys
+        id: fixture-cache-keys
+        run: node ./scripts/fixture-cache-keys.ts --runner-arch "${{ runner.arch }}"
+
+      - name: Restore kernel fixture cache
+        uses: actions/cache/restore@v4
+        with:
+          path: dist/kernel
+          key: ${{ steps.fixture-cache-keys.outputs.kernel-key }}
+          enableCrossOsArchive: true
+          fail-on-cache-miss: true
+
+      - name: Restore init fixture cache
+        uses: actions/cache/restore@v4
+        with:
+          path: dist/init
+          key: ${{ steps.fixture-cache-keys.outputs.init-key }}
+          enableCrossOsArchive: true
+          fail-on-cache-miss: true
+
+      - name: Restore rootfs fixture cache
+        uses: actions/cache/restore@v4
+        with:
+          path: dist/rootfs
+          key: ${{ steps.fixture-cache-keys.outputs.rootfs-key }}
+          enableCrossOsArchive: true
+          fail-on-cache-miss: true
+
+      - name: Build host artifact
+        run: npm run build:host
+
+      - name: Stage release platform artifact
+        run: |
+          set -euo pipefail
+          artifact_root="dist/release-platform/${{ matrix.platform }}"
+          mkdir -p "${artifact_root}/rootfs"
+          cp target/release/sandbox-host "${artifact_root}/sandbox-host"
+          cp dist/rootfs/alpine-3.23.qcow2 "${artifact_root}/rootfs/alpine-3.23.qcow2"
+          node ./scripts/release-artifact-manifest.ts write \
+            --head-sha "${{ github.sha }}" \
+            --platform "${{ matrix.platform }}" \
+            --output "${artifact_root}/build-manifest.json" \
+            --base-dir "${artifact_root}" \
+            --kernel-key "${{ steps.fixture-cache-keys.outputs.kernel-key }}" \
+            --init-key "${{ steps.fixture-cache-keys.outputs.init-key }}" \
+            --rootfs-key "${{ steps.fixture-cache-keys.outputs.rootfs-key }}" \
+            --file sandbox-host \
+            --file rootfs/alpine-3.23.qcow2
+
+      - name: Upload release platform artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-platform-${{ matrix.platform }}
+          path: dist/release-platform/${{ matrix.platform }}
+          if-no-files-found: error

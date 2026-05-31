@@ -17,6 +17,7 @@ on:
         default: false
 
 permissions:
+  actions: read
   contents: read
 
 env:
@@ -26,44 +27,21 @@ jobs:
   verify:
     name: Verify release gates
     runs-on: ubuntu-24.04
+    outputs:
+      target-sha: ${{ steps.release-target.outputs.target-sha }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+          fetch-depth: 0
           submodules: recursive
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 24
-          cache: npm
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Restore Rust build cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-${{ runner.os }}-${{ runner.arch }}
-
-      - name: Install Linux host dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang llvm pkg-config build-essential
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Test unit
-        run: npm run test:unit
-
-      - name: Check Rust workspace
-        run: cargo check --workspace
 
       - name: Validate release version
         run: |
@@ -76,95 +54,35 @@ jobs:
           }
           EOF
 
-  build-kernel:
-    name: Build kernel artifact (${{ matrix.kernel_arch }})
-    needs: verify
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - kernel_arch: arm64
-            runner: ubuntu-24.04-arm
-          - kernel_arch: x86_64
-            runner: ubuntu-24.04
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
-          submodules: recursive
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-
-      - name: Compute fixture cache keys
-        id: fixture-cache-keys
-        run: node ./scripts/fixture-cache-keys.ts --runner-arch "${{ runner.arch }}"
-
-      - name: Restore kernel fixture cache
-        id: kernel-cache
-        uses: actions/cache@v4
-        with:
-          path: dist/kernel
-          key: ${{ steps.fixture-cache-keys.outputs.kernel-key }}
-          enableCrossOsArchive: true
-
-      - name: Install dependencies
-        if: steps.kernel-cache.outputs.cache-hit != 'true'
-        run: npm ci
-
-      - name: Build kernel artifact
-        if: steps.kernel-cache.outputs.cache-hit != 'true'
-        run: npm run build:kernel
-        env:
-          SANDBOX_KERNEL_ARCH: ${{ matrix.kernel_arch }}
-
-      - name: Upload kernel artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernel-${{ matrix.kernel_arch }}
-          path: dist/kernel
-          if-no-files-found: error
+      - name: Resolve release target
+        id: release-target
+        run: |
+          set -euo pipefail
+          target_sha="$(git rev-parse HEAD)"
+          git fetch origin main
+          git merge-base --is-ancestor "$target_sha" origin/main
+          echo "target-sha=${target_sha}" >> "$GITHUB_OUTPUT"
 
   build-platform:
     name: Build platform package (${{ matrix.os }})
     needs:
       - verify
-      - build-kernel
-      - build-rootfs
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: macos-15
-            kernel_arch: arm64
+            platform: darwin-arm64
           - os: ubuntu-24.04
-            kernel_arch: x86_64
+            platform: linux-x64-gnu
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+          ref: ${{ needs.verify.outputs.target-sha }}
           submodules: recursive
-
-      - name: Download kernel artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: kernel-${{ matrix.kernel_arch }}
-          path: dist/kernel
-
-      - name: Download rootfs artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: rootfs-${{ matrix.kernel_arch }}
-          path: dist/rootfs
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -172,25 +90,27 @@ jobs:
           node-version: 24
           cache: npm
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Restore Rust build cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-platform-${{ runner.os }}-${{ runner.arch }}
-
-      - name: Install Linux host dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang llvm pkg-config build-essential
-
       - name: Install dependencies
         run: npm ci
 
-      - name: Build platform artifacts
-        run: npm run build:host
+      - name: Download release platform artifact from main
+        run: node ./scripts/download-release-artifacts.ts --target-sha "${{ needs.verify.outputs.target-sha }}"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Stage release platform artifact
+        run: |
+          set -euo pipefail
+          artifact_root="dist/release-artifacts/release-platform-${{ matrix.platform }}"
+          node ./scripts/release-artifact-manifest.ts verify \
+            --head-sha "${{ needs.verify.outputs.target-sha }}" \
+            --platform "${{ matrix.platform }}" \
+            --manifest "${artifact_root}/build-manifest.json" \
+            --base-dir "${artifact_root}"
+          mkdir -p target/release dist/rootfs
+          cp "${artifact_root}/sandbox-host" target/release/sandbox-host
+          chmod 755 target/release/sandbox-host
+          cp "${artifact_root}/rootfs/alpine-3.23.qcow2" dist/rootfs/alpine-3.23.qcow2
 
       - name: Prepare platform package
         run: node ./scripts/prepare-npm-packages.ts --version "$SANDBOX_RELEASE_VERSION" --platform --current
@@ -205,76 +125,6 @@ jobs:
           path: dist/npm/*.tgz
           if-no-files-found: error
 
-  build-rootfs:
-    name: Build rootfs artifact (${{ matrix.guest_arch }})
-    needs: verify
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - guest_arch: arm64
-            runner: ubuntu-24.04-arm
-          - guest_arch: x86_64
-            runner: ubuntu-24.04
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
-          submodules: recursive
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-
-      - name: Compute fixture cache keys
-        id: fixture-cache-keys
-        run: node ./scripts/fixture-cache-keys.ts --runner-arch "${{ runner.arch }}"
-
-      - name: Restore init fixture cache
-        id: init-cache
-        uses: actions/cache@v4
-        with:
-          path: dist/init
-          key: ${{ steps.fixture-cache-keys.outputs.init-key }}
-          enableCrossOsArchive: true
-
-      - name: Restore rootfs fixture cache
-        id: rootfs-cache
-        uses: actions/cache@v4
-        with:
-          path: dist/rootfs
-          key: ${{ steps.fixture-cache-keys.outputs.rootfs-key }}
-          enableCrossOsArchive: true
-
-      - name: Install dependencies
-        if: steps.init-cache.outputs.cache-hit != 'true' || steps.rootfs-cache.outputs.cache-hit != 'true'
-        run: npm ci
-
-      - name: Build init binary for built-in rootfs
-        if: steps.init-cache.outputs.cache-hit != 'true'
-        run: npm run build:init
-
-      - name: Build built-in rootfs
-        if: steps.rootfs-cache.outputs.cache-hit != 'true'
-        run: npm run build:rootfs
-
-      - name: Build built-in rootfs QCOW2 image
-        if: steps.rootfs-cache.outputs.cache-hit != 'true'
-        run: npm run build:rootfs:qcow2
-
-      - name: Upload rootfs artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: rootfs-${{ matrix.guest_arch }}
-          path: |
-            dist/rootfs/alpine-3.23.qcow2
-          if-no-files-found: error
-
   build-root:
     name: Build root package
     needs: verify
@@ -284,7 +134,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+          ref: ${{ needs.verify.outputs.target-sha }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -315,6 +165,7 @@ jobs:
     name: Publish to npm
     runs-on: ubuntu-24.04
     needs:
+      - verify
       - build-platform
       - build-root
     if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish)
@@ -326,7 +177,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+          ref: ${{ needs.verify.outputs.target-sha }}
 
       - name: Download package tarballs
         uses: actions/download-artifact@v4

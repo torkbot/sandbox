@@ -85,19 +85,46 @@ test("release packaging derives platform dependency versions from the supplied r
   assert.match(prepareScript, /parseReleaseVersion/);
 });
 
-test("release workflow builds platform packages before publishing the root package", async () => {
+test("release artifact downloader waits for the exact main build", async () => {
+  const downloadScript = await readFile(
+    new URL("../../scripts/download-release-artifacts.ts", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(downloadScript, /waitForSuccessfulRun/);
+  assert.match(downloadScript, /--branch/);
+  assert.match(downloadScript, /"main"/);
+  assert.match(downloadScript, /--commit/);
+  assert.match(downloadScript, /targetSha/);
+  assert.match(downloadScript, /timed out waiting for successful main/);
+  assert.match(downloadScript, /main .* run failed/);
+});
+
+test("release workflow packages main-built platform artifacts before publishing", async () => {
   const workflow = await readFile(
     new URL("../../.github/workflows/release.yml", import.meta.url),
     "utf8",
   );
+  const ciWorkflow = await readFile(
+    new URL("../../.github/workflows/ci.yml", import.meta.url),
+    "utf8",
+  );
 
-  assert.match(workflow, /npm run build:host/);
+  assert.match(ciWorkflow, /release-platform-artifacts:/);
+  assert.match(ciWorkflow, /npm run build:host/);
+  assert.match(ciWorkflow, /release-artifact-manifest\.ts write/);
+  assert.match(ciWorkflow, /release-platform-\$\{\{ matrix\.platform \}\}/);
+  assert.match(workflow, /download-release-artifacts\.ts --target-sha/);
+  assert.match(workflow, /release-artifact-manifest\.ts verify/);
+  assert.match(workflow, /needs\.verify\.outputs\.target-sha/);
+  assert.match(workflow, /chmod 755 target\/release\/sandbox-host/);
+  assert.doesNotMatch(workflow, /npm run build:host/);
   assert.doesNotMatch(workflow, /build:native/);
-  assert.match(workflow, /Build kernel artifact/);
-  assert.match(workflow, /Build rootfs artifact/);
-  assert.match(workflow, /SANDBOX_KERNEL_ARCH/);
-  assert.match(workflow, /Download kernel artifact/);
-  assert.match(workflow, /Download rootfs artifact/);
+  assert.doesNotMatch(workflow, /Build kernel artifact/);
+  assert.doesNotMatch(workflow, /Build rootfs artifact/);
+  assert.doesNotMatch(workflow, /SANDBOX_KERNEL_ARCH/);
+  assert.doesNotMatch(workflow, /Download kernel artifact/);
+  assert.doesNotMatch(workflow, /Download rootfs artifact/);
   assert.match(workflow, /dist\/rootfs\/alpine-3\.23\.qcow2/);
   assert.doesNotMatch(workflow, /dist\/rootfs\/alpine-3\.23\.erofs/);
   assert.doesNotMatch(workflow, /dist\/rootfs\/alpine-3\.23\.ext4/);
@@ -113,8 +140,8 @@ test("release workflow builds platform packages before publishing the root packa
   const publishJob = workflow.slice(workflow.indexOf("  publish:"));
   assert.match(publishJob, /uses: actions\/checkout@v4/);
 
-  const rootfsJob = workflow.slice(workflow.indexOf("  build-rootfs:"), workflow.lastIndexOf("  publish:"));
-  assert.match(rootfsJob, /submodules: recursive/);
+  const platformJob = workflow.slice(workflow.indexOf("  build-platform:"), workflow.lastIndexOf("  build-root:"));
+  assert.match(platformJob, /submodules: recursive/);
 });
 
 test("local release scripts build current rootfs before packaging platform packages", async () => {
