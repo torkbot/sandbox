@@ -1156,6 +1156,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "init-blob"
+version = "0.1.0-1.18.1"
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1338,6 +1342,7 @@ dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
+ "linux-loader",
  "vm-memory",
  "vmm-sys-util",
 ]
@@ -1500,6 +1505,7 @@ dependencies = [
  "crossbeam-channel",
  "env_logger",
  "imago",
+ "init-blob",
  "krun-devices",
  "krun-hvf",
  "krun-polly",
