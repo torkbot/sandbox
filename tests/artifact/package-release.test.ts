@@ -111,6 +111,11 @@ test("release workflow packages main-built platform artifacts before publishing"
   );
 
   assert.match(ciWorkflow, /release-platform-artifacts:/);
+  assert.match(ciWorkflow, /sign-notarize-macos-release-artifact:/);
+  assert.match(ciWorkflow, /environment: macos-release-signing/);
+  assert.match(ciWorkflow, /unsigned-release-platform-darwin-arm64/);
+  assert.match(ciWorkflow, /xcrun notarytool submit/);
+  assert.match(ciWorkflow, /--macos-notarization-status "\$notarization_status"/);
   assert.match(ciWorkflow, /npm run build:host/);
   assert.match(ciWorkflow, /release-artifact-manifest\.ts write/);
   assert.match(ciWorkflow, /release-platform-\$\{\{ matrix\.platform \}\}/);
@@ -138,7 +143,8 @@ test("release workflow packages main-built platform artifacts before publishing"
   assert.match(workflow, /id-token: write/);
 
   const publishJob = workflow.slice(workflow.indexOf("  publish:"));
-  assert.match(publishJob, /uses: actions\/checkout@v4/);
+  assert.match(publishJob, /uses: actions\/checkout@[0-9a-f]{40}/);
+  assert.doesNotMatch(publishJob, /uses: actions\/checkout@v\d+/);
 
   const platformJob = workflow.slice(workflow.indexOf("  build-platform:"), workflow.lastIndexOf("  build-root:"));
   assert.match(platformJob, /submodules: recursive/);

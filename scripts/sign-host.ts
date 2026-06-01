@@ -11,12 +11,19 @@ if (process.platform !== "darwin") {
 
 const artifactPath = resolve(import.meta.dirname, "../target/release/sandbox-host");
 const entitlementsPath = resolve(import.meta.dirname, "../entitlements/macos-hvf.plist");
+const signingIdentity = process.env.SANDBOX_MACOS_SIGNING_IDENTITY ?? "-";
+
+if (signingIdentity.length === 0) {
+  throw new Error("SANDBOX_MACOS_SIGNING_IDENTITY must not be empty when set");
+}
 
 await access(artifactPath);
 await execFileAsync("codesign", [
   "--force",
   "--sign",
-  "-",
+  signingIdentity,
+  "--options",
+  "runtime",
   "--entitlements",
   entitlementsPath,
   artifactPath,

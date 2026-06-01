@@ -13,7 +13,10 @@ await assertExists(kernelBundle);
 await run("cargo", ["build", "-p", "sandbox-host", "--release"], {
   SANDBOX_KERNEL_BUNDLE_C: kernelBundle,
 });
-await run("node", ["./scripts/sign-host.ts"]);
+
+if (process.env.SANDBOX_SKIP_HOST_SIGNING !== "1") {
+  await run("node", ["./scripts/sign-host.ts"]);
+}
 
 function kernelArch(): string {
   switch (process.arch) {
