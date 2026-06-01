@@ -130,11 +130,13 @@ across boots. Sandbox owns the block-device protocol; your application owns the
 storage backend.
 
 ```ts
+const source = rootfs.compose({
+  base: rootfs.builtIn("alpine:3.23"),
+  overlay: blockStore,
+});
+
 const sandbox = defineSandbox({
-  rootfs: rootfs.cow({
-    base: rootfs.builtIn("alpine:3.23"),
-    writable: blockStore,
-  }),
+  rootfs: rootfs.cow({ source }),
 });
 ```
 
@@ -251,12 +253,39 @@ rootfs.cow({
 });
 ```
 
-Mounts a built-in base rootfs through a writable copy-on-write block store.
-Clean base-image blocks are served from the built-in artifact. Dirty blocks are
-read lazily and flushed through your `SandboxBlockStore`. `maxDirtyBytes`
-limits how many dirty COW block bytes the native runtime buffers before forcing
-a write to the block store. When omitted, Sandbox uses a 64 MiB block-aligned
-default.
+Mounts a built-in base rootfs through a writable copy-on-write block store. For
+offline image work, describe the same merged view without booting a VM:
+
+```ts
+const source = rootfs.compose({
+  base: rootfs.builtIn("alpine:3.23"),
+  overlay: blockStore,
+});
+
+const image = await rootfs.flatten({
+  format: "qcow2",
+  source,
+  dest: imageStore,
+  clusterSize: 65536,
+});
+
+for await (const chunk of rootfs.bytes(image)) {
+  await upload(chunk);
+}
+```
+
+`rootfs.cow(...)` normalizes through the same composed source used by
+`rootfs.flatten(...)`, so boot and image export share one base-plus-overlay
+contract. Clean base-image blocks are served from the built-in artifact. Dirty
+blocks are read lazily and flushed through your `SandboxBlockStore`.
+`maxDirtyBytes` limits how many dirty COW block bytes the native runtime buffers
+before forcing a write to the block store during a VM run. When omitted, Sandbox
+uses a 64 MiB block-aligned default.
+
+`rootfs.flatten(...)` writes a standalone QCOW2 image into `dest`, using
+`dest` as random-access image-byte storage. `rootfs.bytes(...)` streams raw image
+container bytes for a built-in image or a flattened image; it does not stream the
+filesystem contents inside the image.
 
 ```ts
 interface SandboxBlockStore {

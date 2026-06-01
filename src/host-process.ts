@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
-import { closeSync, mkdtempSync, openSync, readSync, rmSync, statSync } from "node:fs";
+import { appendFileSync, closeSync, mkdtempSync, openSync, readSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Binary, BSON } from "bson";
@@ -12,6 +12,7 @@ import type {
   SandboxFileSystem,
   SandboxBlockStoreContext,
   SandboxBlockStore,
+  SandboxBlockRange,
   SandboxPosixFileSystem,
 } from "./index.ts";
 import type {
@@ -48,6 +49,10 @@ export class HostProcessSandboxVm implements HostControlChannel {
   readonly #hostFs = new Map<string, SandboxFileSystem>();
   readonly #rootBlockStore?: SandboxBlockStore;
   readonly #rootBlockStoreContext?: SandboxBlockStoreContext;
+  readonly #blockStores = new Map<string, {
+    readonly blockStore: SandboxBlockStore;
+    readonly context: SandboxBlockStoreContext;
+  }>();
   readonly #requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook>;
   readonly #networkConnectionHook?: RegisteredNetworkConnectionHook;
   readonly #httpMiddlewareByFlow = new Map<string, HttpRequestMiddleware | undefined>();
@@ -76,6 +81,12 @@ export class HostProcessSandboxVm implements HostControlChannel {
     this.#consoleOutputCleanupPath = consoleOutputCleanupPath;
     this.#rootBlockStore = options.rootfs.storage?.blockStore;
     this.#rootBlockStoreContext = options.rootfs.storage?.context;
+    if (this.#rootBlockStore !== undefined && this.#rootBlockStoreContext !== undefined) {
+      this.#blockStores.set("host.block", {
+        blockStore: this.#rootBlockStore,
+        context: this.#rootBlockStoreContext,
+      });
+    }
     for (const mount of options.mounts ?? []) {
       this.#hostFs.set(mount.path, mount.fileSystem);
     }
@@ -152,6 +163,80 @@ export class HostProcessSandboxVm implements HostControlChannel {
       return vm;
     } catch (error) {
       await vm?.close();
+      const signingError = macosHostSigningError(hostPath);
+      if (signingError !== null) {
+        throw signingError;
+      }
+      throw error;
+    }
+  }
+
+  static async flattenQcow2(input: {
+    readonly basePath: string;
+    readonly overlay: SandboxBlockStore;
+    readonly overlayContext: SandboxBlockStoreContext;
+    readonly dest: SandboxBlockStore;
+    readonly destContext: SandboxBlockStoreContext;
+    readonly clusterSize: number;
+  }): Promise<{ readonly sizeBytes: bigint }> {
+    const hostPath = hostBinaryPath();
+    const child = spawn(hostPath, ["--flatten-qcow2"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: process.env,
+    });
+    const host = new HostProcessSandboxVm(
+      child,
+      {
+        hostname: "flatten-qcow2",
+        rootfs: { path: input.basePath, readonly: true, format: "qcow2" },
+      },
+      new Map(),
+    );
+    host.#blockStores.set("host.block.source", {
+      blockStore: input.overlay,
+      context: input.overlayContext,
+    });
+    host.#blockStores.set("host.block.dest", {
+      blockStore: input.dest,
+      context: input.destContext,
+    });
+    try {
+      await Promise.race([
+        once(child, "spawn"),
+        once(child, "error").then(([error]) => {
+          throw error;
+        }),
+      ]);
+      const result = new Promise<{ readonly sizeBytes: bigint }>((resolve, reject) => {
+        host.#packets[Symbol.asyncIterator]().next().then(({ value }) => {
+          if (value === undefined) {
+            reject(new Error("sandbox-host did not return a QCOW2 flatten result"));
+            return;
+          }
+          const document = BSON.deserialize(value.slice(4)) as Record<string, unknown>;
+          if (document.type !== "host.flattenQcow2.result" || document.ok !== true) {
+            reject(new Error(typeof document.error === "string" ? document.error : "sandbox-host QCOW2 flatten failed"));
+            return;
+          }
+          if (typeof document.sizeBytes !== "string") {
+            reject(new Error("sandbox-host QCOW2 flatten result missing sizeBytes"));
+            return;
+          }
+          resolve({ sizeBytes: BigInt(document.sizeBytes) });
+        }, reject);
+      });
+      host.#writeToHost(encodePacket({
+        type: "host.flattenQcow2",
+        basePath: input.basePath,
+        overlayBlockSize: input.overlay.blockSize.toString(),
+        destBlockSize: input.dest.blockSize.toString(),
+        clusterSize: input.clusterSize,
+      }));
+      const output = await result;
+      await host.close();
+      return output;
+    } catch (error) {
+      await host.close();
       const signingError = macosHostSigningError(hostPath);
       if (signingError !== null) {
         throw signingError;
@@ -332,6 +417,14 @@ export class HostProcessSandboxVm implements HostControlChannel {
       && type !== "host.block.read"
       && type !== "host.block.write"
       && type !== "host.block.flush"
+      && type !== "host.block.source.list"
+      && type !== "host.block.source.read"
+      && type !== "host.block.source.write"
+      && type !== "host.block.source.flush"
+      && type !== "host.block.dest.list"
+      && type !== "host.block.dest.read"
+      && type !== "host.block.dest.write"
+      && type !== "host.block.dest.flush"
     ) {
       return false;
     }
@@ -349,8 +442,16 @@ export class HostProcessSandboxVm implements HostControlChannel {
       || type === "host.block.read"
       || type === "host.block.write"
       || type === "host.block.flush"
+      || type === "host.block.source.list"
+      || type === "host.block.source.read"
+      || type === "host.block.source.write"
+      || type === "host.block.source.flush"
+      || type === "host.block.dest.list"
+      || type === "host.block.dest.read"
+      || type === "host.block.dest.write"
+      || type === "host.block.dest.flush"
     ) {
-      void this.#handleBlockStoreRequest(document);
+      void this.#handleBlockStoreRequest(document, packet.byteLength);
     } else {
       void this.#handleVirtualFsRequest(document);
     }
@@ -842,31 +943,43 @@ export class HostProcessSandboxVm implements HostControlChannel {
     }
   }
 
-  async #handleBlockStoreRequest(document: Record<string, unknown>): Promise<void> {
+  async #handleBlockStoreRequest(document: Record<string, unknown>, requestBytes: number): Promise<void> {
     const id = typeof document.id === "string" ? document.id : "";
+    const request = parseBlockStoreRequest(document.type);
     try {
-      const blockStore = this.#rootBlockStore;
-      const blockStoreContext = this.#rootBlockStoreContext;
-      if (blockStore === undefined || blockStoreContext === undefined) {
-        throw new Error("root block store is not configured");
+      if (request === undefined) {
+        throw new Error("unsupported block store request");
       }
+      const entry = this.#blockStores.get(request.prefix);
+      if (entry === undefined) {
+        throw new Error(`${request.prefix} store is not configured`);
+      }
+      const { blockStore, context: blockStoreContext } = entry;
 
-      switch (document.type) {
-        case "host.block.list": {
-          this.#tryWriteToHost(encodePacket({
+      switch (request.operation) {
+        case "list": {
+          const blocks = (await blockStore.list(blockStoreContext)).map((block) => block.toString());
+          this.#writeBlockStoreResponse({
             type: "host.block.response",
             id,
             ok: true,
-            blocks: (await blockStore.list(blockStoreContext)).map((block) => block.toString()),
-          }));
+            blocks,
+          }, {
+            requestBytes,
+            operation: "list",
+            returnedBlocks: blocks.length,
+          });
           return;
         }
-        case "host.block.read": {
+        case "read": {
+          const start = assertString(document.start, "start");
+          const count = assertNumber(document.count, "count");
           const chunks = await blockStore.read({
-            start: BigInt(assertString(document.start, "start")),
-            count: assertNumber(document.count, "count"),
+            start: BigInt(start),
+            count,
           }, blockStoreContext);
-          this.#tryWriteToHost(encodePacket({
+          const returnedBytes = chunks.reduce((total, chunk) => total + chunk.data.byteLength, 0);
+          this.#writeBlockStoreResponse({
             type: "host.block.response",
             id,
             ok: true,
@@ -874,40 +987,80 @@ export class HostProcessSandboxVm implements HostControlChannel {
               start: chunk.start.toString(),
               data: new Binary(chunk.data),
             })),
-          }));
+          }, {
+            requestBytes,
+            operation: "read",
+            requestedBlocks: count,
+            requestedBytes: count * blockStore.blockSize,
+            returnedBlocks: chunks.length,
+            returnedBytes,
+          });
           return;
         }
-        case "host.block.write": {
+        case "write": {
           const chunks = assertDocumentArray(document.chunks, "chunks").map((chunk) => ({
             start: BigInt(assertString(chunk.start, "chunks.start")),
             data: binaryField(chunk.data, "chunks.data").slice(),
           }));
+          const writtenBytes = chunks.reduce((total, chunk) => total + chunk.data.byteLength, 0);
           await blockStore.write(chunks, blockStoreContext);
-          this.#tryWriteToHost(encodePacket({
+          this.#writeBlockStoreResponse({
             type: "host.block.response",
             id,
             ok: true,
-          }));
+          }, {
+            requestBytes,
+            operation: "write",
+            requestedBlocks: chunks.length,
+            requestedBytes: writtenBytes,
+          });
           return;
         }
-        case "host.block.flush": {
+        case "flush": {
           await blockStore.flush?.(blockStoreContext);
-          this.#tryWriteToHost(encodePacket({
+          this.#writeBlockStoreResponse({
             type: "host.block.response",
             id,
             ok: true,
-          }));
+          }, {
+            requestBytes,
+            operation: "flush",
+          });
           return;
         }
       }
     } catch (error) {
-      this.#tryWriteToHost(encodePacket({
+      this.#writeBlockStoreResponse({
         type: "host.block.response",
         id,
         ok: false,
         error: error instanceof Error ? error.message : String(error),
-      }));
+      }, {
+        requestBytes,
+        operation: typeof document.type === "string" ? document.type : "unknown",
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
+  }
+
+  #writeBlockStoreResponse(
+    document: Record<string, unknown>,
+    trace: {
+      readonly requestBytes: number;
+      readonly operation: string;
+      readonly requestedBlocks?: number;
+      readonly requestedBytes?: number;
+      readonly returnedBlocks?: number;
+      readonly returnedBytes?: number;
+      readonly error?: string;
+    },
+  ): void {
+    const packet = encodePacket(document);
+    traceBlockStoreRequest({
+      ...trace,
+      responseBytes: packet.byteLength,
+    });
+    this.#tryWriteToHost(packet);
   }
 
   async #waitForLaunch(): Promise<void> {
@@ -1486,10 +1639,48 @@ function encodeHostSpawn(options: HostSpawnSandboxOptions): Uint8Array {
   });
 }
 
+function parseBlockStoreRequest(type: unknown): {
+  readonly prefix: string;
+  readonly operation: "list" | "read" | "write" | "flush";
+} | undefined {
+  if (typeof type !== "string") {
+    return undefined;
+  }
+  const match = /^(host\.block(?:\.(?:source|dest))?)\.(list|read|write|flush)$/.exec(type);
+  if (match === null) {
+    return undefined;
+  }
+  return {
+    prefix: match[1] ?? "",
+    operation: match[2] as "list" | "read" | "write" | "flush",
+  };
+}
+
 function encodePacket(document: Record<string, unknown>): Uint8Array {
   const frame = BSON.serialize(document, { ignoreUndefined: true });
   const packet = new Uint8Array(4 + frame.byteLength);
   new DataView(packet.buffer, packet.byteOffset, 4).setUint32(0, frame.byteLength, true);
   packet.set(frame, 4);
   return packet;
+}
+
+function traceBlockStoreRequest(event: {
+  readonly requestBytes: number;
+  readonly responseBytes: number;
+  readonly operation: string;
+  readonly requestedBlocks?: number;
+  readonly requestedBytes?: number;
+  readonly returnedBlocks?: number;
+  readonly returnedBytes?: number;
+  readonly error?: string;
+}): void {
+  const path = process.env.SANDBOX_BLOCK_TRACE;
+  if (path === undefined || path.length === 0) {
+    return;
+  }
+  appendFileSync(path, `${JSON.stringify({
+    at: new Date().toISOString(),
+    step: process.env.SANDBOX_BLOCK_TRACE_STEP,
+    ...event,
+  })}\n`);
 }

@@ -6,7 +6,7 @@ import {
   rootfs,
   type SandboxBlockStore,
 } from "../../../src/index.ts";
-import { requireVmLaunchSupport } from "../support/capabilities.ts";
+import { requireHostArtifact, requireVmLaunchSupport } from "../support/capabilities.ts";
 
 test("new public API boots a built-in rootfs and runs a process", async (t) => {
   if (!requireVmLaunchSupport(t)) {
@@ -641,6 +641,40 @@ test("COW rootfs round-trips rootfs mutations across instances", async (t) => {
   assert.equal(read.stdout, "persisted");
   assert.deepEqual(blockStore.observedBaseIdentities().length, 1);
   assert.match(blockStore.observedBaseIdentities()[0] ?? "", /built-in:alpine:3\.23:qcow2:/);
+});
+
+test("COW rootfs can be flattened to a QCOW2 image stream", async (t) => {
+  if (!requireHostArtifact(t)) {
+    return;
+  }
+
+  const overlay = memoryBlockStore();
+  const dest = memoryBlockStore();
+  const source = rootfs.compose({
+    base: rootfs.builtIn("alpine:3.23"),
+    overlay,
+  });
+
+  const image = await rootfs.flatten({
+    format: "qcow2",
+    source,
+    dest,
+    clusterSize: 65536,
+  });
+  const chunks = [];
+  for await (const chunk of rootfs.bytes(image, {
+    chunkSize: 4,
+    signal: AbortSignal.timeout(5_000),
+  })) {
+    chunks.push(chunk);
+    break;
+  }
+
+  assert.equal(image.format, "qcow2");
+  assert.ok(image.sizeBytes > 0n);
+  assert.deepEqual(chunks[0], new Uint8Array([0x51, 0x46, 0x49, 0xfb]));
+  assert.equal(dest.observedBaseIdentities().length, 1);
+  assert.match(dest.observedBaseIdentities()[0] ?? "", /^rootfs-image:qcow2:/);
 });
 
 test("COW rootfs close sync ignores the instance cwd", async (t) => {

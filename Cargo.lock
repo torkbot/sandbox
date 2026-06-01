@@ -2529,6 +2529,7 @@ dependencies = [
  "bson",
  "libc",
  "sandbox",
+ "tokio",
 ]
 
 [[package]]

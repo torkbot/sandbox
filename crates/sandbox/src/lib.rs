@@ -12,6 +12,7 @@ pub mod http_interception;
 pub mod mounts;
 pub mod network;
 pub mod network_service;
+pub mod rootfs_image;
 pub mod runtime;
 pub mod vfs;
 

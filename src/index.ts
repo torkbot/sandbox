@@ -2,6 +2,8 @@ import {
   builtInRootfsIdentity,
   builtInRootfsPath,
 } from "./artifacts.ts";
+import { randomUUID } from "node:crypto";
+import { open } from "node:fs/promises";
 import { HostControlTransport } from "./control.ts";
 import { HostProcessSandboxVm } from "./host-process.ts";
 import { createMemoryFileSystem } from "./memory-fs.ts";
@@ -127,14 +129,25 @@ export type BuiltInRootfsConfig = {
   readonly name: BuiltInRootfsName;
 };
 
+export type ComposedRootfsConfig = {
+  readonly kind: "composed-rootfs";
+  readonly base: BuiltInRootfsConfig;
+  readonly overlay: SandboxBlockStore;
+};
+
 export type CowRootfsConfig = {
   readonly kind: "cow-rootfs";
-  readonly base: BuiltInRootfsConfig;
-  readonly writable: SandboxBlockStore;
+  readonly source: ComposedRootfsConfig;
   readonly maxDirtyBytes?: number;
 };
 
 export type Rootfs = BuiltInRootfsConfig | CowRootfsConfig;
+
+export type Qcow2RootfsImage = {
+  readonly kind: "rootfs-image";
+  readonly format: "qcow2";
+  readonly sizeBytes: bigint;
+};
 
 export type SandboxFileSystemSource = {
   readonly kind: "virtual-fs";
@@ -173,6 +186,10 @@ export interface SandboxBlockStore {
 }
 
 const DEFAULT_COW_MAX_DIRTY_BYTES = 64 * 1024 * 1024;
+const rootfsImageStorage = new WeakMap<Qcow2RootfsImage, {
+  readonly blockStore: SandboxBlockStore;
+  readonly context: SandboxBlockStoreContext;
+}>();
 
 /**
  * Middleware invoked for an HTTP request allowed by a network policy.
@@ -535,19 +552,134 @@ export const rootfs = {
       name,
     };
   },
+  compose(options: {
+    readonly base: BuiltInRootfsConfig;
+    readonly overlay: SandboxBlockStore;
+  }): ComposedRootfsConfig {
+    return composeRootfs(options);
+  },
   cow(options: {
+    readonly source: ComposedRootfsConfig;
+    readonly maxDirtyBytes?: number;
+  } | {
     readonly base: BuiltInRootfsConfig;
     readonly writable: SandboxBlockStore;
     readonly maxDirtyBytes?: number;
   }): Rootfs {
+    const source = "source" in options
+      ? options.source
+      : composeRootfs({
+        base: options.base,
+        overlay: options.writable,
+      });
     return {
       kind: "cow-rootfs",
-      base: options.base,
-      writable: options.writable,
+      source,
       ...(options.maxDirtyBytes === undefined ? {} : { maxDirtyBytes: options.maxDirtyBytes }),
     };
   },
+  async flatten(options: {
+    readonly format: "qcow2";
+    readonly source: BuiltInRootfsConfig | ComposedRootfsConfig;
+    readonly dest: SandboxBlockStore;
+    readonly clusterSize?: number;
+  }): Promise<Qcow2RootfsImage> {
+    if (options.format !== "qcow2") {
+      throw new Error("invalid rootfs flatten options: format must be qcow2");
+    }
+    validateImageDestination(options.dest);
+    validateQcow2Options(options);
+    const source = options.source.kind === "built-in-rootfs"
+      ? composeRootfs({
+        base: options.source,
+        overlay: createEphemeralCowBlockStore(),
+      })
+      : options.source;
+    if (source.base.kind !== "built-in-rootfs") {
+      throw new Error("invalid rootfs source: base must be created with rootfs.builtIn(...)");
+    }
+    validateBuiltInRootfsName(source.base.name);
+    validateBlockStore(source.overlay);
+    const destContext = {
+      base: `rootfs-image:qcow2:${randomUUID()}`,
+    };
+    if ((await options.dest.list(destContext)).length !== 0) {
+      throw new Error("invalid rootfs image destination: destination block store context must be empty");
+    }
+    const result = await HostProcessSandboxVm.flattenQcow2({
+      basePath: builtInRootfsPath(source.base.name),
+      overlay: source.overlay,
+      overlayContext: {
+        base: builtInRootfsIdentity(source.base.name),
+      },
+      dest: options.dest,
+      destContext,
+      clusterSize: options.clusterSize ?? 65536,
+    });
+    const image: Qcow2RootfsImage = {
+      kind: "rootfs-image",
+      format: "qcow2",
+      sizeBytes: result.sizeBytes,
+    };
+    rootfsImageStorage.set(image, {
+      blockStore: options.dest,
+      context: destContext,
+    });
+    return image;
+  },
+  async *bytes(
+    image: BuiltInRootfsConfig | Qcow2RootfsImage,
+    options: {
+      readonly chunkSize?: number;
+      readonly signal?: AbortSignal;
+    } = {},
+  ): AsyncIterable<Uint8Array> {
+    const chunkSize = validateByteStreamChunkSize(options.chunkSize);
+    if (image.kind === "built-in-rootfs") {
+      const file = await open(builtInRootfsPath(image.name), "r");
+      try {
+        const buffer = new Uint8Array(chunkSize);
+        let offset = 0;
+        while (true) {
+          options.signal?.throwIfAborted();
+          const { bytesRead } = await file.read(buffer, 0, buffer.byteLength, offset);
+          if (bytesRead === 0) {
+            return;
+          }
+          offset += bytesRead;
+          yield buffer.slice(0, bytesRead);
+        }
+      } finally {
+        await file.close();
+      }
+      return;
+    }
+
+    const storage = rootfsImageStorage.get(image);
+    if (storage === undefined) {
+      throw new Error("invalid rootfs image: image was not created by rootfs.flatten(...)");
+    }
+    let offset = 0n;
+    while (offset < image.sizeBytes) {
+      options.signal?.throwIfAborted();
+      const remaining = image.sizeBytes - offset;
+      const nextLength = Number(remaining < BigInt(chunkSize) ? remaining : BigInt(chunkSize));
+      yield await readBlockStoreBytes(storage.blockStore, storage.context, offset, nextLength);
+      offset += BigInt(nextLength);
+    }
+  },
 };
+
+function composeRootfs(options: {
+  readonly base: BuiltInRootfsConfig;
+  readonly overlay: SandboxBlockStore;
+}): ComposedRootfsConfig {
+  return {
+    kind: "composed-rootfs",
+    base: options.base,
+    overlay: options.overlay,
+  };
+}
 
 function virtualFs(fileSystem: SandboxPosixFileSystem): SandboxWritableFileSystemSource;
 function virtualFs(fileSystem: SandboxFileSystem): SandboxFileSystemSource;
@@ -1031,7 +1163,11 @@ async function lowerRootfs(
       };
     }
     case "cow-rootfs":
-      return lowerCowRootfs(rootfs.base, rootfs.writable, resolveCowMaxDirtyBytes(rootfs.writable, rootfs.maxDirtyBytes));
+      return lowerCowRootfs(
+        rootfs.source.base,
+        rootfs.source.overlay,
+        resolveCowMaxDirtyBytes(rootfs.source.overlay, rootfs.maxDirtyBytes),
+      );
   }
 }
 
@@ -1088,11 +1224,14 @@ function validateRootfs(rootfs: Rootfs): void {
       validateBuiltInRootfsName(rootfs.name);
       return;
     case "cow-rootfs":
-      if (rootfs.base.kind !== "built-in-rootfs") {
+      if (rootfs.source?.kind !== "composed-rootfs") {
+        throw new Error("invalid sandbox definition: rootfs.cow source must be created with rootfs.compose(...)");
+      }
+      if (rootfs.source.base.kind !== "built-in-rootfs") {
         throw new Error("invalid sandbox definition: rootfs.cow base must be created with rootfs.builtIn(...)");
       }
-      validateBuiltInRootfsName(rootfs.base.name);
-      validateBlockStore(rootfs.writable);
+      validateBuiltInRootfsName(rootfs.source.base.name);
+      validateBlockStore(rootfs.source.overlay);
       validateCowMaxDirtyBytes(rootfs);
       return;
     default:
@@ -1120,6 +1259,68 @@ function validateBlockStore(blockStore: SandboxBlockStore): void {
   }
 }
 
+function validateImageDestination(blockStore: SandboxBlockStore): void {
+  if (!Number.isInteger(blockStore.blockSize) || blockStore.blockSize <= 0) {
+    throw new Error("invalid rootfs image destination: blockSize must be a positive integer");
+  }
+  if (blockStore.blockSize % 512 !== 0) {
+    throw new Error("invalid rootfs image destination: blockSize must be a positive multiple of 512 bytes");
+  }
+  if (typeof blockStore.list !== "function") {
+    throw new Error("invalid rootfs image destination: block store must provide list()");
+  }
+  if (typeof blockStore.read !== "function") {
+    throw new Error("invalid rootfs image destination: block store must provide read()");
+  }
+  if (typeof blockStore.write !== "function") {
+    throw new Error("invalid rootfs image destination: block store must provide write()");
+  }
+}
+
+function validateQcow2Options(options: { readonly clusterSize?: number } | undefined): void {
+  if (options?.clusterSize !== undefined) {
+    const size = options.clusterSize;
+    if (!Number.isInteger(size) || size < 512 || size > 2 * 1024 * 1024 || (size & (size - 1)) !== 0) {
+      throw new Error("invalid rootfs QCOW2 options: clusterSize must be a power of two between 512 and 2097152 bytes");
+    }
+  }
+}
+
+function validateByteStreamChunkSize(chunkSize: number | undefined): number {
+  if (chunkSize === undefined) {
+    return 1024 * 1024;
+  }
+  if (!Number.isSafeInteger(chunkSize) || chunkSize <= 0) {
+    throw new Error("invalid rootfs bytes options: chunkSize must be a positive safe integer");
+  }
+  return chunkSize;
+}
+
+async function readBlockStoreBytes(
+  blockStore: SandboxBlockStore,
+  context: SandboxBlockStoreContext,
+  offset: bigint,
+  length: number,
+): Promise<Uint8Array> {
+  const output = new Uint8Array(length);
+  const blockSize = BigInt(blockStore.blockSize);
+  const firstBlock = offset / blockSize;
+  const blockOffset = Number(offset % blockSize);
+  const count = Math.ceil((blockOffset + length) / blockStore.blockSize);
+  const chunks = await blockStore.read({ start: firstBlock, count }, context);
+  for (const chunk of chunks) {
+    const chunkStart = chunk.start * blockSize;
+    const chunkEnd = chunkStart + BigInt(chunk.data.byteLength);
+    const outputStart = offset > chunkStart ? Number(offset - chunkStart) : 0;
+    const sourceStart = chunkStart > offset ? Number(chunkStart - offset) : 0;
+    const readable = Number((chunkEnd < offset + BigInt(length) ? chunkEnd : offset + BigInt(length)) - (chunkStart > offset ? chunkStart : offset));
+    if (readable > 0) {
+      output.set(chunk.data.subarray(outputStart, outputStart + readable), sourceStart);
+    }
+  }
+  return output;
+}
+
 function validateCowMaxDirtyBytes(rootfs: CowRootfsConfig): void {
   if (rootfs.maxDirtyBytes === undefined) {
     return;
@@ -1127,7 +1328,7 @@ function validateCowMaxDirtyBytes(rootfs: CowRootfsConfig): void {
   if (!Number.isSafeInteger(rootfs.maxDirtyBytes) || rootfs.maxDirtyBytes <= 0) {
     throw new Error("invalid sandbox definition: rootfs COW maxDirtyBytes must be a positive safe integer");
   }
-  if (rootfs.maxDirtyBytes < rootfs.writable.blockSize) {
+  if (rootfs.maxDirtyBytes < rootfs.source.overlay.blockSize) {
     throw new Error("invalid sandbox definition: rootfs COW maxDirtyBytes must be at least the COW block size");
   }
 }

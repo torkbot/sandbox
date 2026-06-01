@@ -32,6 +32,20 @@ test("defineSandbox rejects invalid COW rootfs", () => {
     () => defineSandbox({
       rootfs: { kind: "cow-rootfs", base: { kind: "other-rootfs" }, writable: memoryBlockStore() } as never,
     }),
+    /invalid sandbox definition: rootfs.cow source must be created with rootfs\.compose\(\.\.\.\)/,
+  );
+
+  assert.throws(
+    () => defineSandbox({
+      rootfs: {
+        kind: "cow-rootfs",
+        source: {
+          kind: "composed-rootfs",
+          base: { kind: "other-rootfs" },
+          overlay: memoryBlockStore(),
+        },
+      } as never,
+    }),
     /invalid sandbox definition: rootfs.cow base must be created with rootfs\.builtIn\(\.\.\.\)/,
   );
 
