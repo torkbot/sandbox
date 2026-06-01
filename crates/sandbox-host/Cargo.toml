@@ -9,3 +9,4 @@ repository.workspace = true
 bson = "3.1"
 libc = "0.2"
 sandbox = { path = "../sandbox" }
+tokio = { version = "1.52", features = ["rt"] }

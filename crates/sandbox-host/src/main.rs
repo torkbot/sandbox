@@ -1,5 +1,6 @@
 use std::env;
 use std::io::{self, ErrorKind, Read};
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
@@ -19,13 +20,14 @@ use sandbox::network_service::{
     DnsResolver, NetworkConnectionAttempt, NetworkPolicyAction, NetworkPolicyDecision,
     NetworkPolicyRuntime, NetworkProtocol,
 };
+use sandbox::rootfs_image::{Qcow2FlattenOptions, flatten_rootfs_to_qcow2};
 use sandbox::runtime::{ControlSocket, HostServices, StartStatusObserver, VirtualFsDevice};
 
 mod host_vfs;
 
 use host_vfs::{HostIoBridge, NodeVirtualFs, StaticFileVirtualFs};
 
-const USAGE: &str = "usage: sandbox-host --capabilities | --stdio";
+const USAGE: &str = "usage: sandbox-host --capabilities | --stdio | --flatten-qcow2";
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
@@ -35,6 +37,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         (Some("--stdio"), None) => run_stdio(),
+        (Some("--flatten-qcow2"), None) => run_flatten_qcow2(),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
@@ -51,6 +54,76 @@ fn print_capabilities() {
         "\"hypervisorEntitlementProcess\":true",
         "}}"
     ));
+}
+
+fn run_flatten_qcow2() -> ExitCode {
+    match run_flatten_qcow2_inner() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("sandbox-host: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_flatten_qcow2_inner() -> Result<(), Box<dyn std::error::Error>> {
+    let mut stdin = io::stdin().lock();
+    let document = read_document_packet(&mut stdin)?;
+    drop(stdin);
+
+    let request = parse_flatten_qcow2(document)?;
+    let bridge = HostIoBridge::new();
+    let stdin_bridge = bridge.clone();
+    let (stdin_tx, stdin_rx) = mpsc::channel::<Result<(), String>>();
+    thread::spawn(move || {
+        let mut stdin = io::stdin().lock();
+        loop {
+            let (_, document) = match read_packet(&mut stdin) {
+                Ok(value) => value,
+                Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+                    let _ = stdin_tx.send(Ok(()));
+                    return;
+                }
+                Err(error) => {
+                    let _ = stdin_tx.send(Err(format!("read host control packet: {error}")));
+                    return;
+                }
+            };
+            if stdin_bridge.route_response(document) {
+                continue;
+            }
+        }
+    });
+
+    let result = tokio::runtime::Builder::new_current_thread()
+        .build()?
+        .block_on(flatten_rootfs_to_qcow2(
+            Path::new(&request.base_path),
+            Arc::new(NodeCowBlockStore::new(
+                bridge.clone(),
+                request.overlay_block_size,
+                "host.block.source",
+            )),
+            Arc::new(NodeCowBlockStore::new(
+                bridge.clone(),
+                request.dest_block_size,
+                "host.block.dest",
+            )),
+            Qcow2FlattenOptions {
+                cluster_size: request.cluster_size,
+            },
+        ))?;
+    bridge.write_raw_packet(&encode_document_packet(&doc! {
+        "type": "host.flattenQcow2.result",
+        "ok": true,
+        "sizeBytes": result.size_bytes.to_string(),
+    })?)?;
+    drop(bridge);
+    match stdin_rx.recv() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.into()),
+        Err(_) => Ok(()),
+    }
 }
 
 fn run_stdio() -> ExitCode {
@@ -129,6 +202,7 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
                         *block_size
                     }
                 },
+                "host.block",
             )) as Arc<dyn CowBlockStore>
         }),
     };
@@ -267,15 +341,31 @@ struct NodeNetworkPolicyRuntime {
     bridge: Arc<HostIoBridge>,
 }
 
+struct FlattenQcow2Request {
+    base_path: String,
+    overlay_block_size: u64,
+    dest_block_size: u64,
+    cluster_size: usize,
+}
+
 #[derive(Debug)]
 struct NodeCowBlockStore {
     bridge: Arc<HostIoBridge>,
     block_size: u64,
+    operation_prefix: &'static str,
 }
 
 impl NodeCowBlockStore {
-    fn new(bridge: Arc<HostIoBridge>, block_size: u64) -> Self {
-        Self { bridge, block_size }
+    fn new(bridge: Arc<HostIoBridge>, block_size: u64, operation_prefix: &'static str) -> Self {
+        Self {
+            bridge,
+            block_size,
+            operation_prefix,
+        }
+    }
+
+    fn operation(&self, operation: &str) -> String {
+        format!("{}.{}", self.operation_prefix, operation)
     }
 }
 
@@ -286,7 +376,7 @@ impl CowBlockStore for NodeCowBlockStore {
 
     fn list_blocks(&self) -> io::Result<std::collections::HashSet<u64>> {
         let response = self.bridge.request(doc! {
-            "type": "host.block.list",
+            "type": self.operation("list"),
         })?;
         let blocks = response
             .get_array("blocks")
@@ -307,7 +397,7 @@ impl CowBlockStore for NodeCowBlockStore {
 
     fn read_blocks(&self, start: u64, count: u64) -> io::Result<Vec<(u64, Vec<u8>)>> {
         let response = self.bridge.request(doc! {
-            "type": "host.block.read",
+            "type": self.operation("read"),
             "start": start.to_string(),
             "count": i64::try_from(count).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "block count exceeds i64"))?,
         })?;
@@ -348,7 +438,7 @@ impl CowBlockStore for NodeCowBlockStore {
             })
             .collect::<Vec<_>>();
         self.bridge.request(doc! {
-            "type": "host.block.write",
+            "type": self.operation("write"),
             "chunks": chunks,
         })?;
         Ok(())
@@ -356,7 +446,7 @@ impl CowBlockStore for NodeCowBlockStore {
 
     fn flush(&self) -> io::Result<()> {
         self.bridge.request(doc! {
-            "type": "host.block.flush",
+            "type": self.operation("flush"),
         })?;
         Ok(())
     }
@@ -616,6 +706,18 @@ fn read_packet(reader: &mut impl Read) -> io::Result<(Vec<u8>, Document)> {
     Ok((packet, document))
 }
 
+fn encode_document_packet(document: &Document) -> io::Result<Vec<u8>> {
+    let frame = document
+        .to_vec()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let frame_len = u32::try_from(frame.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "host frame too large"))?;
+    let mut packet = Vec::with_capacity(4 + frame.len());
+    packet.extend_from_slice(&frame_len.to_le_bytes());
+    packet.extend_from_slice(&frame);
+    Ok(packet)
+}
+
 fn virtual_fs_devices(
     spec: &sandbox::MicroVmSpec,
     bridge: std::sync::Arc<HostIoBridge>,
@@ -682,6 +784,21 @@ fn parse_spawn(document: Document) -> Result<MicroVmSpecInput, Box<dyn std::erro
     })
 }
 
+fn parse_flatten_qcow2(
+    document: Document,
+) -> Result<FlattenQcow2Request, Box<dyn std::error::Error>> {
+    let frame_type = document.get_str("type")?;
+    if frame_type != "host.flattenQcow2" {
+        return Err(format!("expected host.flattenQcow2, got {frame_type}").into());
+    }
+    Ok(FlattenQcow2Request {
+        base_path: document.get_str("basePath")?.to_string(),
+        overlay_block_size: document_u64(&document, "overlayBlockSize")?,
+        dest_block_size: document_u64(&document, "destBlockSize")?,
+        cluster_size: usize::try_from(document.get_i32("clusterSize")?)?,
+    })
+}
+
 fn parse_network_policy(
     document: Option<&Document>,
 ) -> Result<Option<NetworkPolicySpec>, Box<dyn std::error::Error>> {
@@ -710,6 +827,7 @@ fn document_u64(document: &Document, field: &str) -> Result<u64, Box<dyn std::er
     match document.get(field) {
         Some(Bson::Int32(value)) => Ok(u64::try_from(*value)?),
         Some(Bson::Int64(value)) => Ok(u64::try_from(*value)?),
+        Some(Bson::String(value)) => Ok(value.parse::<u64>()?),
         Some(Bson::Double(value))
             if value.fract() == 0.0 && *value >= 0.0 && *value <= u64::MAX as f64 =>
         {

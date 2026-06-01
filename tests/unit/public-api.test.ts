@@ -28,18 +28,90 @@ test("fs.virtual wraps user-space filesystems for mounts", () => {
 
 test("rootfs.cow couples a built-in base with writable block storage", () => {
   const blockStore = memoryBlockStore();
+  const composed = rootfs.compose({
+    base: rootfs.builtIn("alpine:3.23"),
+    overlay: blockStore,
+  });
+
+  assert.deepEqual(composed, {
+    kind: "composed-rootfs",
+    base: {
+      kind: "built-in-rootfs",
+      name: "alpine:3.23",
+    },
+    overlay: blockStore,
+  });
 
   assert.deepEqual(rootfs.cow({
     base: rootfs.builtIn("alpine:3.23"),
     writable: blockStore,
   }), {
     kind: "cow-rootfs",
-    base: {
-      kind: "built-in-rootfs",
-      name: "alpine:3.23",
-    },
-    writable: blockStore,
+    source: composed,
   });
+});
+
+test("rootfs.cow accepts a composed rootfs source", () => {
+  const blockStore = memoryBlockStore();
+  const source = rootfs.compose({
+    base: rootfs.builtIn("alpine:3.23"),
+    overlay: blockStore,
+  });
+
+  assert.deepEqual(rootfs.cow({ source }), {
+    kind: "cow-rootfs",
+    source,
+  });
+});
+
+test("rootfs.cow can be called without binding rootfs as this", () => {
+  const blockStore = memoryBlockStore();
+  const { cow } = rootfs;
+
+  assert.deepEqual(cow({
+    base: rootfs.builtIn("alpine:3.23"),
+    writable: blockStore,
+  }), {
+    kind: "cow-rootfs",
+    source: {
+      kind: "composed-rootfs",
+      base: rootfs.builtIn("alpine:3.23"),
+      overlay: blockStore,
+    },
+  });
+});
+
+test("rootfs.flatten requires an explicit destination block store", async () => {
+  const blockStore = memoryBlockStore();
+  const source = rootfs.compose({
+    base: rootfs.builtIn("alpine:3.23"),
+    overlay: blockStore,
+  });
+
+  await assert.rejects(
+    rootfs.flatten({
+      format: "qcow2",
+      source,
+      dest: {
+        ...memoryBlockStore(),
+        blockSize: 123,
+      },
+    }),
+    /invalid rootfs image destination: blockSize must be a positive multiple of 512/,
+  );
+});
+
+test("rootfs.bytes validates byte stream options", async () => {
+  await assert.rejects(
+    async () => {
+      for await (const _chunk of rootfs.bytes(rootfs.builtIn("alpine:3.23"), {
+        chunkSize: 0,
+      })) {
+        break;
+      }
+    },
+    /invalid rootfs bytes options: chunkSize must be a positive safe integer/,
+  );
 });
 
 test("fs.memory supports POSIX hard links and extended attributes", async () => {

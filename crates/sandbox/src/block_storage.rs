@@ -23,9 +23,30 @@ pub struct CowBlockStorage {
     helper: CommonStorageHelper,
 }
 
+pub struct BlockStoreImageStorage {
+    state: Arc<Mutex<BlockStoreImageStorageState>>,
+    helper: CommonStorageHelper,
+}
+
+impl Clone for BlockStoreImageStorage {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            helper: CommonStorageHelper::default(),
+        }
+    }
+}
+
 impl fmt::Debug for CowBlockStorage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CowBlockStorage").finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for BlockStoreImageStorage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BlockStoreImageStorage")
+            .finish_non_exhaustive()
     }
 }
 
@@ -41,6 +62,12 @@ struct CowBlockStorageState {
     clean_cached_blocks: HashSet<u64>,
     clean_cache_order: VecDeque<u64>,
     max_dirty_bytes: u64,
+}
+
+struct BlockStoreImageStorageState {
+    size: u64,
+    block_size: u64,
+    store: Arc<dyn CowBlockStore>,
 }
 
 enum CowBlockBase {
@@ -108,9 +135,35 @@ impl CowBlockStorage {
     }
 }
 
+impl BlockStoreImageStorage {
+    pub fn new(store: Arc<dyn CowBlockStore>, size: u64) -> io::Result<Self> {
+        let block_size = store.block_size();
+        if block_size == 0 || block_size % 512 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "image block store block size must be a positive multiple of 512 bytes",
+            ));
+        }
+        Ok(Self {
+            state: Arc::new(Mutex::new(BlockStoreImageStorageState {
+                size,
+                block_size,
+                store,
+            })),
+            helper: CommonStorageHelper::default(),
+        })
+    }
+}
+
 impl fmt::Display for CowBlockStorage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("sandbox COW block storage")
+    }
+}
+
+impl fmt::Display for BlockStoreImageStorage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("sandbox block store image storage")
     }
 }
 
@@ -246,8 +299,237 @@ impl Storage for CowBlockStorage {
     }
 }
 
+impl Storage for BlockStoreImageStorage {
+    fn mem_align(&self) -> usize {
+        512
+    }
+
+    fn req_align(&self) -> usize {
+        512
+    }
+
+    fn zero_align(&self) -> usize {
+        512
+    }
+
+    fn discard_align(&self) -> usize {
+        512
+    }
+
+    fn size(&self) -> io::Result<u64> {
+        Ok(self
+            .state
+            .lock()
+            .expect("block store image storage lock poisoned")
+            .size)
+    }
+
+    async unsafe fn pure_readv(
+        &self,
+        mut bufv: IoVectorMut<'_>,
+        mut offset: u64,
+    ) -> io::Result<()> {
+        while !bufv.is_empty() {
+            let chunk_len = usize::try_from(bufv.len().min(1024 * 1024))
+                .map_err(|_| io::Error::other("image read buffer is too large"))?;
+            let (mut head, tail) = bufv.split_at(chunk_len as u64);
+            let mut bytes = vec![0; chunk_len];
+            self.read_into(&mut bytes, offset)?;
+            head.copy_from_slice(&bytes);
+            bufv = tail;
+            offset = offset
+                .checked_add(chunk_len as u64)
+                .ok_or_else(|| io::Error::other("image read offset overflow"))?;
+        }
+        Ok(())
+    }
+
+    async unsafe fn pure_writev(&self, mut bufv: IoVector<'_>, mut offset: u64) -> io::Result<()> {
+        while !bufv.is_empty() {
+            let chunk_len = usize::try_from(bufv.len().min(1024 * 1024))
+                .map_err(|_| io::Error::other("image write buffer is too large"))?;
+            let (head, tail) = bufv.split_at(chunk_len as u64);
+            let mut bytes = vec![0; chunk_len];
+            head.copy_into_slice(&mut bytes);
+            self.write_from(&bytes, offset)?;
+            bufv = tail;
+            offset = offset
+                .checked_add(chunk_len as u64)
+                .ok_or_else(|| io::Error::other("image write offset overflow"))?;
+        }
+        Ok(())
+    }
+
+    async unsafe fn pure_write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        self.write_zeroes(offset, length)
+    }
+
+    async unsafe fn pure_write_allocated_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        self.write_zeroes(offset, length)
+    }
+
+    async unsafe fn pure_discard(&self, offset: u64, length: u64) -> io::Result<()> {
+        self.write_zeroes(offset, length)
+    }
+
+    async fn flush(&self) -> io::Result<()> {
+        let store = self
+            .state
+            .lock()
+            .expect("block store image storage lock poisoned")
+            .store
+            .clone();
+        store.flush()
+    }
+
+    async fn sync(&self) -> io::Result<()> {
+        self.flush().await
+    }
+
+    async unsafe fn invalidate_cache(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn get_storage_helper(&self) -> &CommonStorageHelper {
+        &self.helper
+    }
+
+    async fn resize(&self, new_size: u64, _prealloc_mode: PreallocateMode) -> io::Result<()> {
+        self.state
+            .lock()
+            .expect("block store image storage lock poisoned")
+            .size = new_size;
+        Ok(())
+    }
+}
+
+impl BlockStoreImageStorage {
+    fn read_into(&self, output: &mut [u8], offset: u64) -> io::Result<()> {
+        let (size, block_size, store) = {
+            let state = self
+                .state
+                .lock()
+                .expect("block store image storage lock poisoned");
+            (state.size, state.block_size, state.store.clone())
+        };
+        if offset >= size {
+            output.fill(0);
+            return Ok(());
+        }
+        let readable = output.len().min((size - offset) as usize);
+        output.fill(0);
+        let first_block = offset / block_size;
+        let last_block = (offset + readable as u64 - 1) / block_size;
+        for (index, data) in store.read_blocks(first_block, last_block - first_block + 1)? {
+            if index < first_block || index > last_block {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "image block store returned a block outside the requested range",
+                ));
+            }
+            if data.len() > block_size as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "image block store returned a chunk larger than block size",
+                ));
+            }
+            let block_start = index * block_size;
+            let range_start = offset.max(block_start);
+            let range_end = (offset + readable as u64).min(block_start + data.len() as u64);
+            if range_start >= range_end {
+                continue;
+            }
+            let output_start = (range_start - offset) as usize;
+            let block_offset = (range_start - block_start) as usize;
+            let len = (range_end - range_start) as usize;
+            output[output_start..output_start + len]
+                .copy_from_slice(&data[block_offset..block_offset + len]);
+        }
+        Ok(())
+    }
+
+    fn write_from(&self, input: &[u8], offset: u64) -> io::Result<()> {
+        let (block_size, store) = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("block store image storage lock poisoned");
+            let end = offset
+                .checked_add(input.len() as u64)
+                .ok_or_else(|| io::Error::other("image write offset overflow"))?;
+            if end > state.size {
+                state.size = end;
+            }
+            (state.block_size, state.store.clone())
+        };
+        if input.is_empty() {
+            return Ok(());
+        }
+        let first_block = offset / block_size;
+        let last_block = (offset + input.len() as u64 - 1) / block_size;
+        let mut chunks = Vec::with_capacity((last_block - first_block + 1) as usize);
+        for block_index in first_block..=last_block {
+            let block_start = block_index * block_size;
+            let range_start = offset.max(block_start);
+            let range_end = (offset + input.len() as u64).min(block_start + block_size);
+            let mut block = if range_start == block_start && range_end == block_start + block_size {
+                vec![0; block_size as usize]
+            } else {
+                self.read_block(&*store, block_size, block_index)?
+            };
+            let input_start = (range_start - offset) as usize;
+            let block_offset = (range_start - block_start) as usize;
+            let len = (range_end - range_start) as usize;
+            block[block_offset..block_offset + len]
+                .copy_from_slice(&input[input_start..input_start + len]);
+            chunks.push((block_index, block));
+        }
+        store.write_blocks(chunks)
+    }
+
+    fn read_block(
+        &self,
+        store: &dyn CowBlockStore,
+        block_size: u64,
+        block_index: u64,
+    ) -> io::Result<Vec<u8>> {
+        let mut block = vec![0; block_size as usize];
+        for (index, data) in store.read_blocks(block_index, 1)? {
+            if index != block_index {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "image block store returned a block outside the requested range",
+                ));
+            }
+            if data.len() > block_size as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "image block store returned a chunk larger than block size",
+                ));
+            }
+            block[..data.len()].copy_from_slice(&data);
+        }
+        Ok(block)
+    }
+
+    fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        let mut remaining = length;
+        let mut next_offset = offset;
+        while remaining > 0 {
+            let chunk_len = remaining.min(1024 * 1024) as usize;
+            let zeroes = vec![0; chunk_len];
+            self.write_from(&zeroes, next_offset)?;
+            remaining -= chunk_len as u64;
+            next_offset = next_offset
+                .checked_add(chunk_len as u64)
+                .ok_or_else(|| io::Error::other("image zero offset overflow"))?;
+        }
+        Ok(())
+    }
+}
+
 impl CowBlockStorage {
-    async fn read_into(&self, output: &mut [u8], offset: u64) -> io::Result<()> {
+    pub(crate) async fn read_into(&self, output: &mut [u8], offset: u64) -> io::Result<()> {
         let mut state = self.state.lock().expect("COW block storage lock poisoned");
         if offset >= state.size {
             output.fill(0);
@@ -693,6 +975,44 @@ mod tests {
         assert!(state.cached_blocks.contains_key(&3));
         assert_eq!(state.loaded_store_blocks, HashSet::from([3]));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn block_store_image_storage_grows_and_preserves_partial_blocks() {
+        let store = Arc::new(TestBlockStore {
+            block_size: 4096,
+            blocks: Mutex::new(HashMap::new()),
+            write_calls: Mutex::new(0),
+        });
+        let storage = BlockStoreImageStorage::new(store.clone(), 0).unwrap();
+
+        storage.write_from(&[1; 512], 512).unwrap();
+        storage.write_from(&[2; 512], 1024).unwrap();
+
+        assert_eq!(storage.size().unwrap(), 1536);
+        let blocks = store.blocks.lock().unwrap();
+        let block = blocks.get(&0).unwrap();
+        assert_eq!(&block[..512], &[0; 512]);
+        assert_eq!(&block[512..1024], &[1; 512]);
+        assert_eq!(&block[1024..1536], &[2; 512]);
+        assert_eq!(&block[1536..], &[0; 2560]);
+    }
+
+    #[test]
+    fn block_store_image_storage_reads_missing_blocks_as_zero() {
+        let store = Arc::new(TestBlockStore {
+            block_size: 4096,
+            blocks: Mutex::new(HashMap::from([(1, vec![7; 4096])])),
+            write_calls: Mutex::new(0),
+        });
+        let storage = BlockStoreImageStorage::new(store, 3 * 4096).unwrap();
+
+        let mut bytes = vec![9; 3 * 4096];
+        storage.read_into(&mut bytes, 0).unwrap();
+
+        assert_eq!(&bytes[..4096], &[0; 4096]);
+        assert_eq!(&bytes[4096..8192], &[7; 4096]);
+        assert_eq!(&bytes[8192..], &[0; 4096]);
     }
 
     fn temp_base_image_path() -> std::path::PathBuf {
