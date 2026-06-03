@@ -1445,6 +1445,7 @@ fn dns_answer_pins(request: &DnsMessage, response: &DnsMessage) -> Vec<DnsAnswer
     response
         .answers
         .iter()
+        .chain(response.additionals.iter())
         .filter_map(|record| match &record.data {
             RData::A(address)
                 if record.dns_class == DNSClass::IN && answer_names.contains(&record.name) =>
@@ -3524,6 +3525,33 @@ mod tests {
             vec![DnsAnswerPin {
                 hostname: "alias.example".to_string(),
                 address: [203, 0, 113, 46],
+                ttl: Duration::from_secs(DNS_DEFAULT_TTL_SECS.into()),
+            }],
+        );
+    }
+
+    #[test]
+    fn custom_dns_response_records_cname_backed_additional_a_answers_for_query_name() {
+        let request = DnsMessage::from_vec(&dns_query("alias-additional.example", 1)).unwrap();
+        let query = single_dns_query(&request).unwrap();
+        let canonical_name = Name::from_ascii("target-additional.example").unwrap();
+        let mut response = dns_response_message(&request);
+        response.add_answer(Record::from_rdata(
+            query.name().clone(),
+            DNS_DEFAULT_TTL_SECS,
+            RData::CNAME(hickory_proto::rr::rdata::CNAME(canonical_name.clone())),
+        ));
+        response.add_additional(Record::from_rdata(
+            canonical_name,
+            DNS_DEFAULT_TTL_SECS,
+            RData::A(A(Ipv4Addr::new(203, 0, 113, 48))),
+        ));
+
+        assert_eq!(
+            dns_answer_pins(&request, &response),
+            vec![DnsAnswerPin {
+                hostname: "alias-additional.example".to_string(),
+                address: [203, 0, 113, 48],
                 ttl: Duration::from_secs(DNS_DEFAULT_TTL_SECS.into()),
             }],
         );

@@ -682,6 +682,142 @@ test("network.policy uses DNS cache hostname as HTTP policy authority", async (t
   assert.deepEqual(observedHeaders, [hostname]);
 });
 
+test("network.policy uses DNS cache hostname for multi-answer Cloudflare-like A records", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+
+  const hostname = "registry.npmjs.org";
+  const originAddress = hostOriginAddress();
+  const dnsServer = await startUdpDnsServer([
+    "104.16.7.34",
+    "104.16.1.34",
+    originAddress,
+    "104.16.10.34",
+  ]);
+  t.after(() => {
+    void dnsServer.close();
+  });
+  const observedHeaders: string[] = [];
+  const origin = await startTcpServer((socket) => {
+    socket.once("data", (chunk) => {
+      const request = chunk.toString("utf8");
+      observedHeaders.push(request.match(/^x-sandbox-policy: (.+)$/im)?.[1] ?? "");
+      socket.end("HTTP/1.1 200 OK\r\ncontent-length: 18\r\nconnection: close\r\n\r\ncloudflare-dns-ok");
+    });
+  }, 18084);
+  t.after(() => void origin.close());
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      if (conn.matchDns()?.accept({
+        resolvers: [{ ip: "127.0.0.1", port: dnsServer.port }],
+      })) return;
+
+      conn.matchHttp(hostname)?.accept((request) => {
+        request.headers.set("x-sandbox-policy", request.destination.hostname ?? "");
+      });
+    }),
+  }).boot();
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "http-dns-cache-cloudflare-authority",
+    script: [
+      "python3 - <<'PY'",
+      "import socket",
+      `hostname = ${JSON.stringify(hostname)}`,
+      `origin_address = ${JSON.stringify(originAddress)}`,
+      `port = ${origin.port}`,
+      "addresses = [info[4][0] for info in socket.getaddrinfo(hostname, port, socket.AF_INET, socket.SOCK_STREAM)]",
+      "assert origin_address in addresses, addresses",
+      "with socket.create_connection((origin_address, port), timeout=5) as conn:",
+      "    conn.sendall(b'GET / HTTP/1.1\\r\\nHost: untrusted-host-header.test\\r\\nConnection: close\\r\\n\\r\\n')",
+      "    response = b''",
+      "    while True:",
+      "        chunk = conn.recv(4096)",
+      "        if not chunk:",
+      "            break",
+      "        response += chunk",
+      "print(response.split(b'\\r\\n\\r\\n', 1)[1].decode(), end='')",
+      "PY",
+    ].join("\n"),
+  }), 10_000, "HTTP request matched by multi-answer DNS cache hostname");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "cloudflare-dns-ok");
+  assert.equal(dnsServer.queries, 1);
+  assert.deepEqual(observedHeaders, [hostname]);
+});
+
+test("network.policy uses DNS cache hostname for CNAME additional-section A records", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+
+  const hostname = "registry.npmjs.org";
+  const originAddress = hostOriginAddress();
+  const dnsServer = await startUdpDnsServer((request) => dnsCnameAdditionalAnswer(request, {
+    canonicalName: "registry-npmjs-org.cdn.cloudflare.net",
+    address: originAddress,
+  }));
+  t.after(() => {
+    void dnsServer.close();
+  });
+  const observedHeaders: string[] = [];
+  const origin = await startTcpServer((socket) => {
+    socket.once("data", (chunk) => {
+      const request = chunk.toString("utf8");
+      observedHeaders.push(request.match(/^x-sandbox-policy: (.+)$/im)?.[1] ?? "");
+      socket.end("HTTP/1.1 200 OK\r\ncontent-length: 19\r\nconnection: close\r\n\r\ncname-additional-ok");
+    });
+  }, 18084);
+  t.after(() => void origin.close());
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      if (conn.matchDns()?.accept({
+        resolvers: [{ ip: "127.0.0.1", port: dnsServer.port }],
+      })) return;
+
+      conn.matchHttp(hostname)?.accept((request) => {
+        request.headers.set("x-sandbox-policy", request.destination.hostname ?? "");
+      });
+    }),
+  }).boot();
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "http-dns-cache-cname-additional-authority",
+    script: [
+      "python3 - <<'PY'",
+      "import socket",
+      `hostname = ${JSON.stringify(hostname)}`,
+      `origin_address = ${JSON.stringify(originAddress)}`,
+      `port = ${origin.port}`,
+      "packet = bytearray(b'\\x12\\x34\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00')",
+      "for label in hostname.split('.'):",
+      "    packet.append(len(label))",
+      "    packet += label.encode()",
+      "packet += b'\\x00\\x00\\x01\\x00\\x01'",
+      "dns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)",
+      "dns.settimeout(3)",
+      "dns.sendto(bytes(packet), ('10.0.2.1', 53))",
+      "dns.recvfrom(4096)",
+      "dns.close()",
+      "with socket.create_connection((origin_address, port), timeout=5) as conn:",
+      "    conn.sendall(b'GET / HTTP/1.1\\r\\nHost: untrusted-host-header.test\\r\\nConnection: close\\r\\n\\r\\n')",
+      "    response = b''",
+      "    while True:",
+      "        chunk = conn.recv(4096)",
+      "        if not chunk:",
+      "            break",
+      "        response += chunk",
+      "print(response.split(b'\\r\\n\\r\\n', 1)[1].decode(), end='')",
+      "PY",
+    ].join("\n"),
+  }), 10_000, "HTTP request matched by CNAME additional-section DNS cache hostname");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "cname-additional-ok");
+  assert.equal(dnsServer.queries, 1);
+  assert.deepEqual(observedHeaders, [hostname]);
+});
+
 test("network.policy resolver survives synthesized mount directories", async (t) => {
   if (!requireVmLaunchSupport(t)) return;
 
@@ -1198,7 +1334,7 @@ async function startUdpEchoServer(): Promise<{
   };
 }
 
-async function startUdpDnsServer(answer: string): Promise<{
+async function startUdpDnsServer(answer: string | readonly string[] | ((request: Buffer) => Buffer)): Promise<{
   readonly port: number;
   readonly queries: number;
   close(): Promise<void>;
@@ -1207,7 +1343,8 @@ async function startUdpDnsServer(answer: string): Promise<{
   const server = dgram.createSocket("udp4");
   server.on("message", (request, remote) => {
     queries += 1;
-    server.send(dnsAnswer(request, answer), remote.port, remote.address);
+    const response = typeof answer === "function" ? answer(request) : dnsAnswer(request, answer);
+    server.send(response, remote.port, remote.address);
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -1301,6 +1438,66 @@ function dnsAnswer(request: Buffer, answer: string | readonly string[]): Buffer 
     }
   }
   return response;
+}
+
+function dnsCnameAdditionalAnswer(
+  request: Buffer,
+  additional: { readonly canonicalName: string; readonly address: string },
+): Buffer {
+  let offset = 12;
+  while (request[offset] !== 0) {
+    offset += (request[offset] ?? 0) + 1;
+  }
+  const questionEnd = offset + 5;
+  const qtype = request.readUInt16BE(offset + 1);
+  if (qtype !== 1) {
+    return dnsAnswer(request, []);
+  }
+
+  const canonicalName = dnsName(additional.canonicalName);
+  const response = Buffer.alloc(questionEnd + 12 + canonicalName.length + canonicalName.length + 16);
+  request.copy(response, 0, 0, questionEnd);
+  response[2] = 0x81;
+  response[3] = 0x80;
+  response.writeUInt16BE(1, 6);
+  response.writeUInt16BE(0, 8);
+  response.writeUInt16BE(1, 10);
+
+  let answerOffset = questionEnd;
+  response[answerOffset++] = 0xc0;
+  response[answerOffset++] = 0x0c;
+  response.writeUInt16BE(5, answerOffset);
+  answerOffset += 2;
+  response.writeUInt16BE(1, answerOffset);
+  answerOffset += 2;
+  response.writeUInt32BE(60, answerOffset);
+  answerOffset += 4;
+  response.writeUInt16BE(canonicalName.length, answerOffset);
+  answerOffset += 2;
+  canonicalName.copy(response, answerOffset);
+  answerOffset += canonicalName.length;
+
+  canonicalName.copy(response, answerOffset);
+  answerOffset += canonicalName.length;
+  response.writeUInt16BE(1, answerOffset);
+  answerOffset += 2;
+  response.writeUInt16BE(1, answerOffset);
+  answerOffset += 2;
+  response.writeUInt32BE(60, answerOffset);
+  answerOffset += 4;
+  response.writeUInt16BE(4, answerOffset);
+  answerOffset += 2;
+  for (const part of additional.address.split(".")) {
+    response[answerOffset++] = Number(part);
+  }
+  return response;
+}
+
+function dnsName(name: string): Buffer {
+  return Buffer.concat([
+    ...name.split(".").map((label) => Buffer.concat([Buffer.from([label.length]), Buffer.from(label)])),
+    Buffer.from([0]),
+  ]);
 }
 
 async function createSelfSignedCertificate(): Promise<{
