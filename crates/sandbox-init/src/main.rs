@@ -481,6 +481,7 @@ fn mount_kernel_filesystems() -> Result<(), InitError> {
     mount_fs("devpts", "/dev/pts", "devpts", 0)?;
     mount_fs("tmpfs", "/dev/shm", "tmpfs", 0)?;
     set_directory_mode("/dev/shm", 0o1777)?;
+    create_standard_fd_links()?;
     mount_fs_if_supported("mqueue", "/dev/mqueue", "mqueue", 0)?;
     mount_fs("cgroup2", "/sys/fs/cgroup", "cgroup2", 0)?;
     mount_fs("tmpfs", "/run", "tmpfs", 0)?;
@@ -492,6 +493,34 @@ fn mount_kernel_filesystems() -> Result<(), InitError> {
 #[cfg(not(target_os = "linux"))]
 fn mount_kernel_filesystems() -> Result<(), InitError> {
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn create_standard_fd_links() -> Result<(), InitError> {
+    create_symlink("/proc/self/fd", "/dev/fd")?;
+    create_symlink("/proc/self/fd/0", "/dev/stdin")?;
+    create_symlink("/proc/self/fd/1", "/dev/stdout")?;
+    create_symlink("/proc/self/fd/2", "/dev/stderr")?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn create_symlink(target: &str, link: &str) -> Result<(), InitError> {
+    match std::os::unix::fs::symlink(target, link) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = std::fs::read_link(link)
+                .map_err(|error| InitError(format!("read existing symlink {link}: {error}")))?;
+            if existing == std::path::Path::new(target) {
+                return Ok(());
+            }
+            Err(InitError(format!(
+                "existing symlink {link} points to {}, expected {target}",
+                existing.display()
+            )))
+        }
+        Err(error) => Err(InitError(format!("create symlink {link}: {error}"))),
+    }
 }
 
 #[cfg(target_os = "linux")]
