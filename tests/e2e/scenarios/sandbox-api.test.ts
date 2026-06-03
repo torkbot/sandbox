@@ -90,6 +90,7 @@ test("guest init provides baseline Linux facilities", async (t) => {
   }).boot();
 
   const result = await sandbox.exec("/bin/sh", ["-lc", [
+    "set -e",
     "ip addr show lo | grep -q '127.0.0.1/8'",
     "python3 - <<'PY'",
     "import socket",
@@ -105,6 +106,11 @@ test("guest init provides baseline Linux facilities", async (t) => {
     "listener.close()",
     "PY",
     "grep -q 'devpts /dev/pts devpts' /proc/mounts",
+    "test \"$(readlink /dev/fd)\" = /proc/self/fd",
+    "test \"$(readlink /dev/stdin)\" = /proc/self/fd/0",
+    "test \"$(readlink /dev/stdout)\" = /proc/self/fd/1",
+    "test \"$(readlink /dev/stderr)\" = /proc/self/fd/2",
+    "test \"$(bash -c 'cat < <(printf fd-ready)')\" = fd-ready",
     "python3 - <<'PY'",
     "import os, pty",
     "master, slave = pty.openpty()",
