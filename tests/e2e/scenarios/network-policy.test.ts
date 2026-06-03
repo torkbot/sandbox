@@ -747,6 +747,71 @@ test("network.policy uses DNS cache hostname for multi-answer Cloudflare-like A 
   assert.deepEqual(observedHeaders, [hostname]);
 });
 
+test("network.policy keeps DNS cache hostname for delayed Cloudflare-like package fetches", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+
+  const hostname = "registry.npmjs.org";
+  const originAddress = hostOriginAddress();
+  const dnsServer = await startUdpDnsServer((request) => dnsAnswerWithTtl(request, [
+    "104.16.8.34",
+    originAddress,
+    "104.16.10.34",
+  ], 1));
+  t.after(() => {
+    void dnsServer.close();
+  });
+  const observedHeaders: string[] = [];
+  const origin = await startTcpServer((socket) => {
+    socket.once("data", (chunk) => {
+      const request = chunk.toString("utf8");
+      observedHeaders.push(request.match(/^x-sandbox-policy: (.+)$/im)?.[1] ?? "");
+      socket.end("HTTP/1.1 200 OK\r\ncontent-length: 14\r\nconnection: close\r\n\r\ndelayed-dns-ok");
+    });
+  }, 18084);
+  t.after(() => void origin.close());
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      if (conn.matchDns()?.accept({
+        resolvers: [{ ip: "127.0.0.1", port: dnsServer.port }],
+      })) return;
+
+      conn.matchHttp(hostname)?.accept((request) => {
+        request.headers.set("x-sandbox-policy", request.destination.hostname ?? "");
+      });
+    }),
+  }).boot();
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "http-dns-cache-delayed-cloudflare-authority",
+    script: [
+      "python3 - <<'PY'",
+      "import socket, time",
+      `hostname = ${JSON.stringify(hostname)}`,
+      `origin_address = ${JSON.stringify(originAddress)}`,
+      `port = ${origin.port}`,
+      "addresses = [info[4][0] for info in socket.getaddrinfo(hostname, port, socket.AF_INET, socket.SOCK_STREAM)]",
+      "assert origin_address in addresses, addresses",
+      "time.sleep(2)",
+      "with socket.create_connection((origin_address, port), timeout=5) as conn:",
+      "    conn.sendall(b'GET / HTTP/1.1\\r\\nHost: untrusted-host-header.test\\r\\nConnection: close\\r\\n\\r\\n')",
+      "    response = b''",
+      "    while True:",
+      "        chunk = conn.recv(4096)",
+      "        if not chunk:",
+      "            break",
+      "        response += chunk",
+      "print(response.split(b'\\r\\n\\r\\n', 1)[1].decode(), end='')",
+      "PY",
+    ].join("\n"),
+  }), 12_000, "delayed HTTP request matched by DNS cache hostname");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+  assert.equal(result.stdout, "delayed-dns-ok");
+  assert.equal(dnsServer.queries, 1);
+  assert.deepEqual(observedHeaders, [hostname]);
+});
+
 test("network.policy uses DNS cache hostname for CNAME additional-section A records", async (t) => {
   if (!requireVmLaunchSupport(t)) return;
 
@@ -1406,6 +1471,10 @@ async function startTcpDnsServer(answer: string): Promise<{
 }
 
 function dnsAnswer(request: Buffer, answer: string | readonly string[]): Buffer {
+  return dnsAnswerWithTtl(request, answer, 60);
+}
+
+function dnsAnswerWithTtl(request: Buffer, answer: string | readonly string[], ttl: number): Buffer {
   const answers = typeof answer === "string" ? [answer] : answer;
   let offset = 12;
   while (request[offset] !== 0) {
@@ -1429,7 +1498,7 @@ function dnsAnswer(request: Buffer, answer: string | readonly string[]): Buffer 
     answerOffset += 2;
     response.writeUInt16BE(1, answerOffset);
     answerOffset += 2;
-    response.writeUInt32BE(60, answerOffset);
+    response.writeUInt32BE(ttl, answerOffset);
     answerOffset += 4;
     response.writeUInt16BE(4, answerOffset);
     answerOffset += 2;

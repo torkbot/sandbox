@@ -49,6 +49,9 @@ const TLS_READ_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_INTERCEPT_HEAD_BYTES: usize = 64 * 1024;
 const DNS_PACKET_BUFFER_BYTES: usize = 4096;
 const DNS_DEFAULT_TTL_SECS: u32 = 60;
+// DNS TTL controls resolver freshness. Pins are trusted attribution evidence for
+// delayed connections that use an IP learned from an accepted DNS answer.
+const DNS_PIN_ATTRIBUTION_MIN_TTL: Duration = Duration::from_secs(10 * 60);
 const DNS_UPSTREAM_ATTEMPTS: usize = 3;
 const DNS_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
 const UDP_RELAY_BUFFER_BYTES: usize = 64 * 1024;
@@ -2732,7 +2735,7 @@ impl TransparentInterception {
             guest_ip,
             hostname: answer.hostname.clone(),
             address: answer.address,
-            expires_at: now + answer.ttl,
+            expires_at: now + answer.ttl.max(DNS_PIN_ATTRIBUTION_MIN_TTL),
             observed_at: now,
         });
     }
@@ -3592,6 +3595,26 @@ mod tests {
             Some("other.example".to_string()),
         );
         assert_eq!(interception.resolved_hostname(guest, "192.0.2.11"), None);
+    }
+
+    #[test]
+    fn dns_pins_keep_short_ttl_answers_for_connection_attribution_window() {
+        let mut interception = TransparentInterception::new(Ipv4Address::new(10, 0, 2, 1));
+        let guest = IpAddress::v4(10, 0, 2, 15);
+        let before = StdInstant::now();
+
+        interception.record_dns_answer(guest, &DnsAnswerPin {
+            hostname: "short-ttl.example".to_string(),
+            address: [192, 0, 2, 10],
+            ttl: Duration::from_secs(1),
+        });
+
+        let pin = interception.dns_pins.pins.first().expect("DNS pin was recorded");
+        assert!(pin.expires_at.duration_since(before) >= DNS_PIN_ATTRIBUTION_MIN_TTL);
+        assert_eq!(
+            interception.resolved_hostname(guest, "192.0.2.10"),
+            Some("short-ttl.example".to_string()),
+        );
     }
 
     #[test]

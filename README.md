@@ -432,7 +432,9 @@ conn.matchHttp("api.example.com");
 use Sandbox's internal resolver; policy code decides whether to accept that DNS
 flow and can choose explicit upstream resolvers in `accept(...)`. Accepted DNS
 answers are cached as trusted, guest-scoped hostname metadata for later
-connection policy decisions.
+connection policy decisions. Sandbox may retain this attribution metadata for a
+bounded window after a short DNS TTL so delayed connections can still be tied
+back to the accepted DNS answer that produced their destination IP.
 
 ```ts
 const dns = conn.matchDns();
