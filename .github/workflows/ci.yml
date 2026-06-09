@@ -505,6 +505,7 @@ jobs:
           codesign --display --verbose=4 "$artifact_path" 2>&1 | tee dist/signing/darwin-arm64/codesign-display.txt
 
       - name: Notarize sandbox-host
+        timeout-minutes: 45
         env:
           APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
           APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
@@ -523,12 +524,30 @@ jobs:
               --key "$notary_key_path" \
               --key-id "$APPLE_NOTARY_KEY_ID" \
               --issuer "$APPLE_NOTARY_ISSUER_ID" \
-              --wait \
               --output-format json
           )"
-          printf '%s\n' "$submit_json" | tee dist/signing/darwin-arm64/notarytool-submit.json
           submission_id="$(printf '%s' "$submit_json" | node -e 'let input = ""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => { const result = JSON.parse(input); if (!result.id) throw new Error("notarytool output did not include id"); console.log(result.id); });')"
-          status="$(printf '%s' "$submit_json" | node -e 'let input = ""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => { const result = JSON.parse(input); if (!result.status) throw new Error("notarytool output did not include status"); console.log(result.status); });')"
+          echo "::notice title=Apple Notary submission::$submission_id"
+          if ! wait_json="$(
+            xcrun notarytool wait "$submission_id" \
+              --key "$notary_key_path" \
+              --key-id "$APPLE_NOTARY_KEY_ID" \
+              --issuer "$APPLE_NOTARY_ISSUER_ID" \
+              --timeout 40m \
+              --output-format json
+          )"; then
+            xcrun notarytool log "$submission_id" \
+              --key "$notary_key_path" \
+              --key-id "$APPLE_NOTARY_KEY_ID" \
+              --issuer "$APPLE_NOTARY_ISSUER_ID" \
+              dist/signing/darwin-arm64/notarytool-log.json || true
+            if [ -f dist/signing/darwin-arm64/notarytool-log.json ]; then
+              cat dist/signing/darwin-arm64/notarytool-log.json
+            fi
+            exit 1
+          fi
+          printf '%s\n' "$wait_json" | tee dist/signing/darwin-arm64/notarytool-submit.json
+          status="$(printf '%s' "$wait_json" | node -e 'let input = ""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => { const result = JSON.parse(input); if (!result.status) throw new Error("notarytool output did not include status"); console.log(result.status); });')"
           xcrun notarytool log "$submission_id" \
             --key "$notary_key_path" \
             --key-id "$APPLE_NOTARY_KEY_ID" \
