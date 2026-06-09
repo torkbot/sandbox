@@ -1,0 +1,142 @@
+name: Complete macOS Notarization
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: GitHub Actions run ID that uploaded signed-macos-notarization-workspace-darwin-arm64
+        type: string
+        required: true
+      notarization_submission_id:
+        description: Apple notarization submission ID to verify and finalize
+        type: string
+        required: true
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  complete-macos-notarization:
+    name: Complete macOS notarization
+    runs-on: macos-15
+    environment: macos-release-signing
+
+    steps:
+      - name: Resolve source run
+        id: source-run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          set -euo pipefail
+          source_run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}")"
+          target_sha="$(printf '%s' "$source_run_json" | node -e 'let input = ""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => { const run = JSON.parse(input); if (run.event !== "push") throw new Error(`source run must be a push run, got ${run.event}`); if (run.head_branch !== "main") throw new Error(`source run must be from main, got ${run.head_branch}`); if (!run.head_sha) throw new Error("source run did not include head_sha"); console.log(run.head_sha); });')"
+          echo "target-sha=${target_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ steps.source-run.outputs.target-sha }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24
+
+      - name: Download signed macOS notarization workspace
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          set -euo pipefail
+          gh run download "$SOURCE_RUN_ID" \
+            --name signed-macos-notarization-workspace-darwin-arm64 \
+            --dir dist/signing/darwin-arm64
+
+      - name: Verify accepted notarization
+        env:
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          NOTARIZATION_SUBMISSION_ID: ${{ inputs.notarization_submission_id }}
+        run: |
+          set -euo pipefail
+          : "${APPLE_NOTARY_KEY_P8:?missing APPLE_NOTARY_KEY_P8 secret}"
+          : "${APPLE_NOTARY_KEY_ID:?missing APPLE_NOTARY_KEY_ID secret}"
+          : "${APPLE_NOTARY_ISSUER_ID:?missing APPLE_NOTARY_ISSUER_ID secret}"
+          : "${NOTARIZATION_SUBMISSION_ID:?missing notarization_submission_id input}"
+          recorded_submission_id="$(node -e 'const result = JSON.parse(require("node:fs").readFileSync("dist/signing/darwin-arm64/notarytool-submit.json", "utf8")); if (!result.id) throw new Error("notarytool submit output did not include id"); console.log(result.id);')"
+          if [ "$recorded_submission_id" != "$NOTARIZATION_SUBMISSION_ID" ]; then
+            echo "::error title=Apple Notary submission mismatch::workspace has ${recorded_submission_id}, input was ${NOTARIZATION_SUBMISSION_ID}"
+            exit 1
+          fi
+          notary_key_path="$RUNNER_TEMP/sandbox-notary-key.p8"
+          printf '%s' "$APPLE_NOTARY_KEY_P8" > "$notary_key_path"
+          info_json="$(
+            xcrun notarytool info "$NOTARIZATION_SUBMISSION_ID" \
+              --key "$notary_key_path" \
+              --key-id "$APPLE_NOTARY_KEY_ID" \
+              --issuer "$APPLE_NOTARY_ISSUER_ID" \
+              --output-format json
+          )"
+          printf '%s\n' "$info_json" > dist/signing/darwin-arm64/notarytool-submit.json
+          status="$(printf '%s' "$info_json" | node -e 'let input = ""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => { const result = JSON.parse(input); if (!result.status) throw new Error("notarytool info output did not include status"); console.log(result.status); });')"
+          echo "::notice title=Apple Notary status::${status}"
+          if [ "$status" != "Accepted" ]; then
+            xcrun notarytool log "$NOTARIZATION_SUBMISSION_ID" \
+              --key "$notary_key_path" \
+              --key-id "$APPLE_NOTARY_KEY_ID" \
+              --issuer "$APPLE_NOTARY_ISSUER_ID" \
+              dist/signing/darwin-arm64/notarytool-log.json || true
+            if [ -f dist/signing/darwin-arm64/notarytool-log.json ]; then
+              cat dist/signing/darwin-arm64/notarytool-log.json
+            fi
+            exit 1
+          fi
+          xcrun notarytool log "$NOTARIZATION_SUBMISSION_ID" \
+            --key "$notary_key_path" \
+            --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID" \
+            dist/signing/darwin-arm64/notarytool-log.json
+
+      - name: Stage signed and notarized release platform artifact
+        run: |
+          set -euo pipefail
+          . dist/signing/darwin-arm64/fixture-keys.env
+          codesign_authority="$(grep '^Authority=' dist/signing/darwin-arm64/codesign-display.txt | head -n 1 | cut -d '=' -f 2-)"
+          codesign_team_identifier="$(grep '^TeamIdentifier=' dist/signing/darwin-arm64/codesign-display.txt | head -n 1 | cut -d '=' -f 2-)"
+          notarization_submission_id="$(node -e 'const result = JSON.parse(require("node:fs").readFileSync("dist/signing/darwin-arm64/notarytool-submit.json", "utf8")); console.log(result.id);')"
+          notarization_status="$(node -e 'const result = JSON.parse(require("node:fs").readFileSync("dist/signing/darwin-arm64/notarytool-submit.json", "utf8")); console.log(result.status);')"
+          artifact_root="dist/release-platform/darwin-arm64"
+          mkdir -p "${artifact_root}/rootfs"
+          cp dist/signing/darwin-arm64/sandbox-host "${artifact_root}/sandbox-host"
+          cp dist/signing/darwin-arm64/rootfs/alpine-3.23.qcow2 "${artifact_root}/rootfs/alpine-3.23.qcow2"
+          node ./scripts/release-artifact-manifest.ts write \
+            --head-sha "${{ steps.source-run.outputs.target-sha }}" \
+            --platform darwin-arm64 \
+            --output "${artifact_root}/build-manifest.json" \
+            --base-dir "${artifact_root}" \
+            --kernel-key "$kernel_key" \
+            --init-key "$init_key" \
+            --rootfs-key "$rootfs_key" \
+            --macos-codesign-authority "$codesign_authority" \
+            --macos-codesign-team-identifier "$codesign_team_identifier" \
+            --macos-notarization-submission-id "$notarization_submission_id" \
+            --macos-notarization-status "$notarization_status" \
+            --file sandbox-host \
+            --file rootfs/alpine-3.23.qcow2
+
+      - name: Upload release platform artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-platform-darwin-arm64
+          path: dist/release-platform/darwin-arm64
+          if-no-files-found: error
+
+      - name: Upload target-addressed release platform artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-platform-darwin-arm64-${{ steps.source-run.outputs.target-sha }}
+          path: dist/release-platform/darwin-arm64
+          if-no-files-found: error

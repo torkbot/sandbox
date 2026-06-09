@@ -6,6 +6,7 @@ const repoRoot = resolve(import.meta.dirname, "..");
 const args = process.argv.slice(2);
 const targetSha = requiredArg("--target-sha");
 const workflow = optionalArg("--workflow") ?? "CI";
+const completionWorkflow = optionalArg("--completion-workflow") ?? "Complete macOS Notarization";
 const outDir = optionalArg("--out-dir") ?? "dist/release-artifacts";
 const timeoutMs = Number.parseInt(optionalArg("--timeout-ms") ?? "900000", 10);
 const pollIntervalMs = Number.parseInt(optionalArg("--poll-interval-ms") ?? "15000", 10);
@@ -19,60 +20,121 @@ type WorkflowRun = {
   readonly url: string;
 };
 
-const selectedRun = await waitForSuccessfulRun();
+type Artifact = {
+  readonly name: string;
+};
+
+type ArtifactRun = {
+  readonly databaseId: number;
+  readonly url: string;
+};
 
 await mkdir(resolve(repoRoot, outDir), { recursive: true });
-await execute("gh", [
-  "run",
-  "download",
-  String(selectedRun.databaseId),
-  "--dir",
-  outDir,
-  "--pattern",
-  "release-platform-*",
-]);
+const artifactRuns = await waitForReleaseArtifactRuns();
+await downloadArtifact(artifactRuns.linux, "release-platform-linux-x64-gnu");
+await downloadArtifact(artifactRuns.darwin, "release-platform-darwin-arm64");
 
-console.log(`downloaded release artifacts from ${selectedRun.url}`);
+console.log(`downloaded linux release artifact from ${artifactRuns.linux.url}`);
+console.log(`downloaded darwin release artifact from ${artifactRuns.darwin.url}`);
 
-async function waitForSuccessfulRun(): Promise<WorkflowRun> {
+async function waitForReleaseArtifactRuns(): Promise<{
+  readonly linux: ArtifactRun;
+  readonly darwin: ArtifactRun;
+}> {
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() <= deadline) {
     const runs = await listRuns();
-    const completed = runs.find((run) => run.status === "completed");
-    if (completed?.conclusion === "success") {
-      return completed;
-    }
-    if (completed !== undefined) {
-      throw new Error(`main ${workflow} run failed for ${targetSha}: ${JSON.stringify(completed)}`);
+    const linux = await findRunWithArtifact(runs.ciRuns, "release-platform-linux-x64-gnu");
+    const darwin =
+      await findRunWithArtifact(runs.ciRuns, "release-platform-darwin-arm64") ??
+      await findRunWithArtifact(runs.completionRuns, `release-platform-darwin-arm64-${targetSha}`);
+    if (linux !== undefined && darwin !== undefined) {
+      return { linux, darwin };
     }
 
-    console.log(`waiting for successful main ${workflow} run for ${targetSha}`);
+    console.log(`waiting for successful release artifact run for ${targetSha}`);
     await sleep(pollIntervalMs);
   }
 
-  throw new Error(`timed out waiting for successful main ${workflow} run for ${targetSha}`);
+  throw new Error(`timed out waiting for successful release artifact run for ${targetSha}: ${JSON.stringify(await listRuns())}`);
 }
 
-async function listRuns(): Promise<WorkflowRun[]> {
-  const runJson = await execute("gh", [
+async function listRuns(): Promise<{
+  readonly ciRuns: readonly WorkflowRun[];
+  readonly completionRuns: readonly WorkflowRun[];
+}> {
+  const [ciRuns, completionRuns] = await Promise.all([
+    listWorkflowRuns(workflow, "push", targetSha),
+    listWorkflowRuns(completionWorkflow, "workflow_dispatch"),
+  ]);
+  return {
+    ciRuns: ciRuns.filter((run) => run.headBranch === "main" && run.headSha === targetSha),
+    completionRuns: completionRuns.filter((run) => run.headBranch === "main"),
+  };
+}
+
+async function listWorkflowRuns(workflowName: string, event: string, commit?: string): Promise<WorkflowRun[]> {
+  const runArgs = [
     "run",
     "list",
     "--workflow",
-    workflow,
+    workflowName,
     "--branch",
     "main",
-    "--commit",
-    targetSha,
     "--event",
-    "push",
+    event,
     "--limit",
-    "5",
+    "20",
     "--json",
     "databaseId,headBranch,headSha,conclusion,status,url",
+  ];
+  if (commit !== undefined) {
+    runArgs.push("--commit", commit);
+  }
+  const runJson = await execute("gh", runArgs);
+  return JSON.parse(runJson) as WorkflowRun[];
+}
+
+async function findRunWithArtifact(runs: readonly WorkflowRun[], artifactName: string): Promise<ArtifactRun | undefined> {
+  for (const run of runs) {
+    if (run.status !== "completed") {
+      continue;
+    }
+    if (run.conclusion !== "success" && run.conclusion !== "cancelled") {
+      continue;
+    }
+    const artifacts = await listArtifacts(run.databaseId);
+    if (artifacts.some((artifact) => artifact.name === artifactName)) {
+      return {
+        databaseId: run.databaseId,
+        url: run.url,
+      };
+    }
+  }
+  return undefined;
+}
+
+async function listArtifacts(runId: number): Promise<readonly Artifact[]> {
+  const artifactJson = await execute("gh", [
+    "api",
+    `repos/${requiredEnv("GITHUB_REPOSITORY")}/actions/runs/${runId}/artifacts`,
+    "--jq",
+    ".artifacts",
   ]);
-  const runs = JSON.parse(runJson) as WorkflowRun[];
-  return runs.filter((run) => run.headBranch === "main" && run.headSha === targetSha);
+  return JSON.parse(artifactJson) as Artifact[];
+}
+
+async function downloadArtifact(run: ArtifactRun, artifactName: string): Promise<void> {
+  await execute("gh", [
+    "run",
+    "download",
+    String(run.databaseId),
+    "--name",
+    artifactName,
+    "--dir",
+    resolve(repoRoot, outDir, artifactName),
+  ]);
 }
 
 async function sleep(milliseconds: number): Promise<void> {
@@ -95,6 +157,14 @@ function optionalArg(name: string): string | undefined {
   }
   if (value.length === 0 || value.startsWith("--")) {
     throw new Error(`missing value for argument: ${name}`);
+  }
+  return value;
+}
+
+function requiredEnv(name: string): string {
+  const value = process.env[name];
+  if (value === undefined || value.length === 0) {
+    throw new Error(`missing required environment variable: ${name}`);
   }
   return value;
 }

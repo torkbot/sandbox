@@ -485,8 +485,7 @@ jobs:
           codesign --verify --strict --verbose=2 "$artifact_path"
           codesign --display --verbose=4 "$artifact_path" 2>&1 | tee dist/signing/darwin-arm64/codesign-display.txt
 
-      - name: Notarize sandbox-host
-        timeout-minutes: 45
+      - name: Submit sandbox-host for notarization
         env:
           APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
           APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
@@ -508,7 +507,30 @@ jobs:
               --output-format json
           )"
           submission_id="$(printf '%s' "$submit_json" | node -e 'let input = ""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => { const result = JSON.parse(input); if (!result.id) throw new Error("notarytool output did not include id"); console.log(result.id); });')"
+          printf '%s\n' "$submit_json" > dist/signing/darwin-arm64/notarytool-submit.json
           echo "::notice title=Apple Notary submission::$submission_id"
+
+      - name: Upload signed macOS notarization workspace
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: signed-macos-notarization-workspace-darwin-arm64
+          path: dist/signing/darwin-arm64
+          if-no-files-found: error
+
+      - name: Poll sandbox-host notarization
+        timeout-minutes: 45
+        env:
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          : "${APPLE_NOTARY_KEY_P8:?missing APPLE_NOTARY_KEY_P8 secret}"
+          : "${APPLE_NOTARY_KEY_ID:?missing APPLE_NOTARY_KEY_ID secret}"
+          : "${APPLE_NOTARY_ISSUER_ID:?missing APPLE_NOTARY_ISSUER_ID secret}"
+          notary_key_path="$RUNNER_TEMP/sandbox-notary-key.p8"
+          printf '%s' "$APPLE_NOTARY_KEY_P8" > "$notary_key_path"
+          submission_id="$(node -e 'const result = JSON.parse(require("node:fs").readFileSync("dist/signing/darwin-arm64/notarytool-submit.json", "utf8")); if (!result.id) throw new Error("notarytool submit output did not include id"); console.log(result.id);')"
           status=""
           for attempt in $(seq 1 80); do
             info_json="$(
@@ -542,10 +564,6 @@ jobs:
             --key-id "$APPLE_NOTARY_KEY_ID" \
             --issuer "$APPLE_NOTARY_ISSUER_ID" \
             dist/signing/darwin-arm64/notarytool-log.json
-          if [ "$status" != "Accepted" ]; then
-            cat dist/signing/darwin-arm64/notarytool-log.json
-            exit 1
-          fi
 
       - name: Stage signed and notarized release platform artifact
         run: |
