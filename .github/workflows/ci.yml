@@ -24,22 +24,25 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
           submodules: recursive
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 24
           cache: npm
 
+      - name: Check workflow action pinning
+        run: node ./scripts/check-github-actions-pinned.ts
+
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Restore Rust build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           shared-key: test-${{ runner.os }}-${{ runner.arch }}
 
@@ -70,13 +73,13 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
           submodules: recursive
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 24
 
@@ -86,7 +89,7 @@ jobs:
 
       - name: Restore kernel fixture cache
         id: kernel-cache
-        uses: actions/cache@v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
           path: dist/kernel
           key: ${{ steps.fixture-cache-keys.outputs.kernel-key }}
@@ -94,7 +97,7 @@ jobs:
 
       - name: Restore init fixture cache
         id: init-cache
-        uses: actions/cache@v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
           path: dist/init
           key: ${{ steps.fixture-cache-keys.outputs.init-key }}
@@ -102,7 +105,7 @@ jobs:
 
       - name: Restore rootfs fixture cache
         id: rootfs-cache
-        uses: actions/cache@v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
           path: dist/rootfs
           key: ${{ steps.fixture-cache-keys.outputs.rootfs-key }}
@@ -129,13 +132,13 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
           submodules: recursive
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 24
 
@@ -145,7 +148,7 @@ jobs:
 
       - name: Restore kernel fixture cache
         id: kernel-cache
-        uses: actions/cache@v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
           path: dist/kernel
           key: ${{ steps.fixture-cache-keys.outputs.kernel-key }}
@@ -153,7 +156,7 @@ jobs:
 
       - name: Restore init fixture cache
         id: init-cache
-        uses: actions/cache@v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
           path: dist/init
           key: ${{ steps.fixture-cache-keys.outputs.init-key }}
@@ -161,7 +164,7 @@ jobs:
 
       - name: Restore rootfs fixture cache
         id: rootfs-cache
-        uses: actions/cache@v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
           path: dist/rootfs
           key: ${{ steps.fixture-cache-keys.outputs.rootfs-key }}
@@ -189,22 +192,22 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
           submodules: recursive
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 24
           cache: npm
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Restore Rust build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           shared-key: e2e-${{ runner.os }}-${{ runner.arch }}
 
@@ -229,7 +232,7 @@ jobs:
         run: node ./scripts/fixture-cache-keys.ts --runner-arch "${{ runner.arch }}"
 
       - name: Restore kernel fixture cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
           path: dist/kernel
           key: ${{ steps.fixture-cache-keys.outputs.kernel-key }}
@@ -237,7 +240,7 @@ jobs:
           fail-on-cache-miss: true
 
       - name: Restore init fixture cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
           path: dist/init
           key: ${{ steps.fixture-cache-keys.outputs.init-key }}
@@ -245,7 +248,7 @@ jobs:
           fail-on-cache-miss: true
 
       - name: Restore rootfs fixture cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
           path: dist/rootfs
           key: ${{ steps.fixture-cache-keys.outputs.rootfs-key }}
@@ -280,7 +283,7 @@ jobs:
 
       - name: Restore package artifact cache
         id: package-cache
-        uses: actions/cache@v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
           path: |
             dist
@@ -299,7 +302,7 @@ jobs:
 
       - name: Upload e2e diagnostics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: e2e-diagnostics-${{ runner.os }}-${{ runner.arch }}
           path: test-results/e2e
@@ -323,22 +326,22 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
           submodules: recursive
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 24
           cache: npm
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Restore Rust build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           shared-key: release-platform-main-${{ runner.os }}-${{ runner.arch }}
 
@@ -356,7 +359,7 @@ jobs:
         run: node ./scripts/fixture-cache-keys.ts --runner-arch "${{ runner.arch }}"
 
       - name: Restore kernel fixture cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
           path: dist/kernel
           key: ${{ steps.fixture-cache-keys.outputs.kernel-key }}
@@ -364,7 +367,7 @@ jobs:
           fail-on-cache-miss: true
 
       - name: Restore init fixture cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
           path: dist/init
           key: ${{ steps.fixture-cache-keys.outputs.init-key }}
@@ -372,7 +375,7 @@ jobs:
           fail-on-cache-miss: true
 
       - name: Restore rootfs fixture cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
           path: dist/rootfs
           key: ${{ steps.fixture-cache-keys.outputs.rootfs-key }}
@@ -381,8 +384,11 @@ jobs:
 
       - name: Build host artifact
         run: npm run build:host
+        env:
+          SANDBOX_SKIP_HOST_SIGNING: ${{ matrix.platform == 'darwin-arm64' && '1' || '' }}
 
       - name: Stage release platform artifact
+        if: matrix.platform != 'darwin-arm64'
         run: |
           set -euo pipefail
           artifact_root="dist/release-platform/${{ matrix.platform }}"
@@ -401,8 +407,168 @@ jobs:
             --file rootfs/alpine-3.23.qcow2
 
       - name: Upload release platform artifact
-        uses: actions/upload-artifact@v4
+        if: matrix.platform != 'darwin-arm64'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-platform-${{ matrix.platform }}
           path: dist/release-platform/${{ matrix.platform }}
+          if-no-files-found: error
+
+      - name: Stage unsigned macOS release inputs
+        if: matrix.platform == 'darwin-arm64'
+        run: |
+          set -euo pipefail
+          artifact_root="dist/unsigned-release-platform/${{ matrix.platform }}"
+          mkdir -p "${artifact_root}/rootfs"
+          cp target/release/sandbox-host "${artifact_root}/sandbox-host"
+          cp dist/rootfs/alpine-3.23.qcow2 "${artifact_root}/rootfs/alpine-3.23.qcow2"
+          {
+            printf 'kernel_key=%s\n' '${{ steps.fixture-cache-keys.outputs.kernel-key }}'
+            printf 'init_key=%s\n' '${{ steps.fixture-cache-keys.outputs.init-key }}'
+            printf 'rootfs_key=%s\n' '${{ steps.fixture-cache-keys.outputs.rootfs-key }}'
+          } > "${artifact_root}/fixture-keys.env"
+
+      - name: Upload unsigned macOS release inputs
+        if: matrix.platform == 'darwin-arm64'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: unsigned-release-platform-darwin-arm64
+          path: dist/unsigned-release-platform/darwin-arm64
+          if-no-files-found: error
+
+  sign-notarize-macos-release-artifact:
+    name: Sign and notarize release platform artifact (darwin-arm64)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs:
+      - release-platform-artifacts
+    runs-on: macos-15
+    environment: macos-release-signing
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24
+
+      - name: Download unsigned macOS release inputs
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: unsigned-release-platform-darwin-arm64
+          path: dist/signing/darwin-arm64
+
+      - name: Import macOS signing certificate
+        env:
+          SANDBOX_MACOS_SIGNING_CERTIFICATE_P12: ${{ secrets.SANDBOX_MACOS_SIGNING_CERTIFICATE_P12 }}
+          SANDBOX_MACOS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SANDBOX_MACOS_SIGNING_CERTIFICATE_PASSWORD }}
+          SANDBOX_MACOS_SIGNING_KEYCHAIN_PASSWORD: ${{ secrets.SANDBOX_MACOS_SIGNING_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${SANDBOX_MACOS_SIGNING_CERTIFICATE_P12:?missing SANDBOX_MACOS_SIGNING_CERTIFICATE_P12 secret}"
+          : "${SANDBOX_MACOS_SIGNING_CERTIFICATE_PASSWORD:?missing SANDBOX_MACOS_SIGNING_CERTIFICATE_PASSWORD secret}"
+          : "${SANDBOX_MACOS_SIGNING_KEYCHAIN_PASSWORD:?missing SANDBOX_MACOS_SIGNING_KEYCHAIN_PASSWORD secret}"
+          certificate_path="$RUNNER_TEMP/sandbox-macos-signing-certificate.p12"
+          keychain_path="$RUNNER_TEMP/sandbox-macos-signing.keychain-db"
+          printf '%s' "$SANDBOX_MACOS_SIGNING_CERTIFICATE_P12" | base64 -D > "$certificate_path"
+          security create-keychain -p "$SANDBOX_MACOS_SIGNING_KEYCHAIN_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$SANDBOX_MACOS_SIGNING_KEYCHAIN_PASSWORD" "$keychain_path"
+          security import "$certificate_path" \
+            -P "$SANDBOX_MACOS_SIGNING_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -t cert \
+            -f pkcs12 \
+            -k "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$SANDBOX_MACOS_SIGNING_KEYCHAIN_PASSWORD" \
+            "$keychain_path"
+
+      - name: Sign and verify sandbox-host
+        env:
+          SANDBOX_MACOS_SIGNING_IDENTITY: ${{ vars.SANDBOX_MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          : "${SANDBOX_MACOS_SIGNING_IDENTITY:?missing SANDBOX_MACOS_SIGNING_IDENTITY variable}"
+          artifact_path="dist/signing/darwin-arm64/sandbox-host"
+          codesign \
+            --force \
+            --sign "$SANDBOX_MACOS_SIGNING_IDENTITY" \
+            --options runtime \
+            --entitlements entitlements/macos-hvf.plist \
+            --timestamp \
+            "$artifact_path"
+          codesign --verify --strict --verbose=2 "$artifact_path"
+          codesign --display --verbose=4 "$artifact_path" 2>&1 | tee dist/signing/darwin-arm64/codesign-display.txt
+
+      - name: Notarize sandbox-host
+        env:
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          : "${APPLE_NOTARY_KEY_P8:?missing APPLE_NOTARY_KEY_P8 secret}"
+          : "${APPLE_NOTARY_KEY_ID:?missing APPLE_NOTARY_KEY_ID secret}"
+          : "${APPLE_NOTARY_ISSUER_ID:?missing APPLE_NOTARY_ISSUER_ID secret}"
+          mkdir -p dist/notary
+          notary_key_path="$RUNNER_TEMP/sandbox-notary-key.p8"
+          printf '%s' "$APPLE_NOTARY_KEY_P8" > "$notary_key_path"
+          ditto -c -k --keepParent dist/signing/darwin-arm64/sandbox-host dist/notary/sandbox-host.zip
+          submit_json="$(
+            xcrun notarytool submit dist/notary/sandbox-host.zip \
+              --key "$notary_key_path" \
+              --key-id "$APPLE_NOTARY_KEY_ID" \
+              --issuer "$APPLE_NOTARY_ISSUER_ID" \
+              --wait \
+              --output-format json
+          )"
+          printf '%s\n' "$submit_json" | tee dist/signing/darwin-arm64/notarytool-submit.json
+          submission_id="$(printf '%s' "$submit_json" | node -e 'let input = ""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => { const result = JSON.parse(input); if (!result.id) throw new Error("notarytool output did not include id"); console.log(result.id); });')"
+          status="$(printf '%s' "$submit_json" | node -e 'let input = ""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => { const result = JSON.parse(input); if (!result.status) throw new Error("notarytool output did not include status"); console.log(result.status); });')"
+          xcrun notarytool log "$submission_id" \
+            --key "$notary_key_path" \
+            --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID" \
+            dist/signing/darwin-arm64/notarytool-log.json
+          if [ "$status" != "Accepted" ]; then
+            cat dist/signing/darwin-arm64/notarytool-log.json
+            exit 1
+          fi
+
+      - name: Stage signed and notarized release platform artifact
+        run: |
+          set -euo pipefail
+          . dist/signing/darwin-arm64/fixture-keys.env
+          codesign_authority="$(grep '^Authority=' dist/signing/darwin-arm64/codesign-display.txt | head -n 1 | cut -d '=' -f 2-)"
+          codesign_team_identifier="$(grep '^TeamIdentifier=' dist/signing/darwin-arm64/codesign-display.txt | head -n 1 | cut -d '=' -f 2-)"
+          notarization_submission_id="$(node -e 'const result = JSON.parse(require("node:fs").readFileSync("dist/signing/darwin-arm64/notarytool-submit.json", "utf8")); console.log(result.id);')"
+          notarization_status="$(node -e 'const result = JSON.parse(require("node:fs").readFileSync("dist/signing/darwin-arm64/notarytool-submit.json", "utf8")); console.log(result.status);')"
+          artifact_root="dist/release-platform/darwin-arm64"
+          mkdir -p "${artifact_root}/rootfs"
+          cp dist/signing/darwin-arm64/sandbox-host "${artifact_root}/sandbox-host"
+          cp dist/signing/darwin-arm64/rootfs/alpine-3.23.qcow2 "${artifact_root}/rootfs/alpine-3.23.qcow2"
+          node ./scripts/release-artifact-manifest.ts write \
+            --head-sha "${{ github.sha }}" \
+            --platform darwin-arm64 \
+            --output "${artifact_root}/build-manifest.json" \
+            --base-dir "${artifact_root}" \
+            --kernel-key "$kernel_key" \
+            --init-key "$init_key" \
+            --rootfs-key "$rootfs_key" \
+            --macos-codesign-authority "$codesign_authority" \
+            --macos-codesign-team-identifier "$codesign_team_identifier" \
+            --macos-notarization-submission-id "$notarization_submission_id" \
+            --macos-notarization-status "$notarization_status" \
+            --file sandbox-host \
+            --file rootfs/alpine-3.23.qcow2
+
+      - name: Upload release platform artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-platform-darwin-arm64
+          path: dist/release-platform/darwin-arm64
           if-no-files-found: error

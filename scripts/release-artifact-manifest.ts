@@ -16,6 +16,12 @@ type ReleaseArtifactManifest = {
     readonly init: string;
     readonly rootfs: string;
   };
+  readonly macosSigning?: {
+    readonly authority: string;
+    readonly teamIdentifier: string;
+    readonly notarizationSubmissionId: string;
+    readonly notarizationStatus: string;
+  };
   readonly files: readonly ArtifactFile[];
 };
 
@@ -42,10 +48,23 @@ async function writeManifest(): Promise<void> {
   const kernelKey = requiredArg("--kernel-key");
   const initKey = requiredArg("--init-key");
   const rootfsKey = requiredArg("--rootfs-key");
+  const authority = optionalArg("--macos-codesign-authority");
+  const teamIdentifier = optionalArg("--macos-codesign-team-identifier");
+  const notarizationSubmissionId = optionalArg("--macos-notarization-submission-id");
+  const notarizationStatus = optionalArg("--macos-notarization-status");
   const files = repeatedArgs("--file");
 
   if (files.length === 0) {
     throw new Error("at least one --file is required");
+  }
+  const macosSigningArgs = [
+    authority,
+    teamIdentifier,
+    notarizationSubmissionId,
+    notarizationStatus,
+  ];
+  if (macosSigningArgs.some((value) => value !== undefined) && macosSigningArgs.some((value) => value === undefined)) {
+    throw new Error("macOS signing metadata requires authority, team identifier, notarization submission ID, and notarization status");
   }
 
   const manifest: ReleaseArtifactManifest = {
@@ -57,6 +76,16 @@ async function writeManifest(): Promise<void> {
       init: initKey,
       rootfs: rootfsKey,
     },
+    ...(authority !== undefined
+      ? {
+          macosSigning: {
+            authority,
+            teamIdentifier: teamIdentifier!,
+            notarizationSubmissionId: notarizationSubmissionId!,
+            notarizationStatus: notarizationStatus!,
+          },
+        }
+      : {}),
     files: await Promise.all(
       files.map(async (file) => ({
         path: file,
@@ -85,6 +114,14 @@ async function verifyManifest(): Promise<void> {
   }
   if (manifest.platform !== platform) {
     throw new Error(`release artifact platform mismatch: expected ${platform}, got ${manifest.platform}`);
+  }
+  if (platform === "darwin-arm64") {
+    if (manifest.macosSigning === undefined) {
+      throw new Error("darwin-arm64 release artifact is missing macOS signing metadata");
+    }
+    if (manifest.macosSigning.notarizationStatus !== "Accepted") {
+      throw new Error(`darwin-arm64 release artifact notarization was not accepted: ${manifest.macosSigning.notarizationStatus}`);
+    }
   }
 
   for (const file of manifest.files) {
