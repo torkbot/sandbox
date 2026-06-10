@@ -85,22 +85,19 @@ test("release packaging derives platform dependency versions from the supplied r
   assert.match(prepareScript, /parseReleaseVersion/);
 });
 
-test("release artifact downloader assembles exact main release artifacts", async () => {
+test("release artifact downloader waits for the exact main build", async () => {
   const downloadScript = await readFile(
     new URL("../../scripts/download-release-artifacts.ts", import.meta.url),
     "utf8",
   );
 
-  assert.match(downloadScript, /waitForReleaseArtifactRuns/);
-  assert.match(downloadScript, /findRunWithArtifact/);
-  assert.match(downloadScript, /Complete macOS Notarization/);
+  assert.match(downloadScript, /waitForSuccessfulRun/);
   assert.match(downloadScript, /--branch/);
   assert.match(downloadScript, /"main"/);
   assert.match(downloadScript, /--commit/);
   assert.match(downloadScript, /targetSha/);
-  assert.match(downloadScript, /release-platform-linux-x64-gnu/);
-  assert.match(downloadScript, /release-platform-darwin-arm64-\$\{targetSha\}/);
-  assert.match(downloadScript, /timed out waiting for successful release artifact run/);
+  assert.match(downloadScript, /timed out waiting for successful main/);
+  assert.match(downloadScript, /main .* run failed/);
 });
 
 test("release workflow packages main-built platform artifacts before publishing", async () => {
@@ -117,7 +114,6 @@ test("release workflow packages main-built platform artifacts before publishing"
   assert.match(ciWorkflow, /sign-notarize-macos-release-artifact:/);
   assert.match(ciWorkflow, /environment: macos-release-signing/);
   assert.match(ciWorkflow, /unsigned-release-platform-darwin-arm64/);
-  assert.match(ciWorkflow, /signed-macos-notarization-workspace-darwin-arm64/);
   assert.match(ciWorkflow, /xcrun notarytool submit/);
   assert.match(ciWorkflow, /--macos-notarization-status "\$notarization_status"/);
   assert.match(ciWorkflow, /npm run build:host/);
