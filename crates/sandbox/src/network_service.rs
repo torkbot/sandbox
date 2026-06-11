@@ -5,8 +5,8 @@ use std::net::{Ipv4Addr, Shutdown, TcpStream, ToSocketAddrs, UdpSocket};
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant as StdInstant};
 
@@ -22,7 +22,7 @@ use rama_http_backend::client::http_connect;
 use rama_http_backend::server::HttpServer;
 use rama_net::client::EstablishedClientConnection;
 use rama_tcp::stream::TcpStream as RamaTcpStream;
-use rama_tls_rustls::client::{TlsConnector, TlsConnectorData};
+use rama_tls_rustls::client::TlsConnector;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::{tcp, udp};
@@ -34,6 +34,12 @@ use crate::http_flow::{HttpInterceptRuntime, InterceptedDestination, Intercepted
 use crate::http_interception::HttpRequestProtocol;
 use crate::network::{CidrRange, OutboundRulePlan};
 use rustls::pki_types::pem::PemObject;
+
+mod egress;
+
+#[cfg(test)]
+use egress::tls_connector_data_from_roots;
+use egress::{AdmittedHostFlow, DirectHostEgress, FlowAdmission, HostEgress, HostFlowAttempt};
 
 const HOST_HTTP_PROBE_PORT: u16 = 8080;
 const HOST_HTTP_PORT: u16 = 80;
@@ -144,38 +150,6 @@ pub struct DnsResolver {
     pub port: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HostFlowAttempt {
-    protocol: NetworkProtocol,
-    transport: NetworkProtocol,
-    src: NetworkEndpoint,
-    dst: NetworkEndpoint,
-    hostname: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AdmittedHostFlow {
-    attempt: HostFlowAttempt,
-    action: NetworkPolicyAction,
-    dns_resolvers: Vec<DnsResolver>,
-}
-
-#[derive(Debug, Clone)]
-struct FlowAdmission {
-    outbound_rules: Option<Vec<OutboundRulePlan>>,
-    policy: Option<Arc<dyn NetworkPolicyRuntime>>,
-}
-
-trait HostEgress: Send + Sync + std::fmt::Debug {
-    fn connect_tcp(&self, flow: &AdmittedHostFlow) -> io::Result<TcpStream>;
-    fn connect_udp(&self, flow: &AdmittedHostFlow) -> io::Result<UdpSocket>;
-    fn resolve_dns(&self, flow: &AdmittedHostFlow, request: &[u8]) -> io::Result<DnsResponse>;
-    fn tls_connector_data(&self, flow: &AdmittedHostFlow) -> io::Result<TlsConnectorData>;
-}
-
-#[derive(Debug)]
-struct DirectHostEgress;
-
 pub trait NetworkPolicyRuntime: Send + Sync + std::fmt::Debug {
     fn decide_connection(
         &self,
@@ -229,186 +203,6 @@ impl MitmTlsAuthority {
         rustls::ServerConnection::new(Arc::new(config))
             .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))
     }
-}
-
-impl FlowAdmission {
-    fn new(
-        outbound_rules: Option<Vec<OutboundRulePlan>>,
-        policy: Option<Arc<dyn NetworkPolicyRuntime>>,
-    ) -> Self {
-        Self {
-            outbound_rules,
-            policy,
-        }
-    }
-
-    fn admit_transport(&self, attempt: HostFlowAttempt) -> Option<AdmittedHostFlow> {
-        let decision = decide_transport(
-            self.policy.as_deref(),
-            self.outbound_rules.as_deref(),
-            attempt.protocol,
-            attempt.src.clone(),
-            attempt.dst.clone(),
-            attempt.hostname.clone(),
-        );
-        self.admit(attempt, decision)
-    }
-
-    fn admit_dns(&self, attempt: HostFlowAttempt) -> Option<AdmittedHostFlow> {
-        if self
-            .outbound_rules
-            .as_deref()
-            .is_some_and(|rules| !match attempt.transport {
-                NetworkProtocol::Tcp => {
-                    is_allowed_outbound_tcp(&attempt.dst.ip, attempt.dst.port, rules)
-                }
-                NetworkProtocol::Udp => {
-                    is_allowed_outbound_udp(&attempt.dst.ip, attempt.dst.port, rules)
-                }
-                NetworkProtocol::Dns => true,
-            })
-        {
-            return None;
-        }
-        let decision = decide_dns(
-            self.policy.as_deref(),
-            attempt.transport,
-            attempt.src.clone(),
-            attempt.dst.clone(),
-        )
-        .unwrap_or_else(|_| denied_decision());
-        self.admit(attempt, decision)
-    }
-
-    fn notify_closed(&self, flow: &AdmittedHostFlow) {
-        let Some(policy) = self.policy.as_deref() else {
-            return;
-        };
-        let _ = policy.connection_closed(NetworkConnectionAttempt {
-            protocol: flow.attempt.protocol,
-            transport: flow.attempt.transport,
-            src: flow.attempt.src.clone(),
-            dst: flow.attempt.dst.clone(),
-            hostname: flow.attempt.hostname.clone(),
-        });
-    }
-
-    fn admit(
-        &self,
-        attempt: HostFlowAttempt,
-        decision: NetworkPolicyDecision,
-    ) -> Option<AdmittedHostFlow> {
-        (decision.action != NetworkPolicyAction::Deny).then_some(AdmittedHostFlow {
-            attempt,
-            action: decision.action,
-            dns_resolvers: decision.dns_resolvers,
-        })
-    }
-}
-
-impl HostEgress for DirectHostEgress {
-    fn connect_tcp(&self, flow: &AdmittedHostFlow) -> io::Result<TcpStream> {
-        TcpStream::connect(upstream_socket_addr(
-            &flow.attempt.dst.ip,
-            flow.attempt.dst.port,
-        ))
-    }
-
-    fn connect_udp(&self, flow: &AdmittedHostFlow) -> io::Result<UdpSocket> {
-        let destination_ip = flow
-            .attempt
-            .dst
-            .ip
-            .parse::<std::net::IpAddr>()
-            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
-        let bind_address = if destination_ip.is_ipv6() {
-            "[::]:0"
-        } else {
-            "0.0.0.0:0"
-        };
-        let socket = UdpSocket::bind(bind_address)?;
-        socket.connect(std::net::SocketAddr::new(
-            destination_ip,
-            flow.attempt.dst.port,
-        ))?;
-        Ok(socket)
-    }
-
-    fn resolve_dns(&self, flow: &AdmittedHostFlow, request: &[u8]) -> io::Result<DnsResponse> {
-        if flow.dns_resolvers.is_empty() {
-            return resolve_dns_with_default(request)
-                .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "unsupported DNS request"));
-        }
-
-        let request_message = DnsMessage::from_vec(request)
-            .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
-        let packet = resolve_dns_with_upstreams(request, flow)
-            .ok_or_else(|| io::Error::new(ErrorKind::TimedOut, "DNS upstream did not answer"))?;
-        let response_message = DnsMessage::from_vec(&packet)
-            .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
-        Ok(DnsResponse {
-            packet,
-            pins: dns_answer_pins(&request_message, &response_message),
-        })
-    }
-
-    fn tls_connector_data(&self, _flow: &AdmittedHostFlow) -> io::Result<TlsConnectorData> {
-        native_root_tls_connector_data()
-    }
-}
-
-fn native_root_tls_connector_data() -> io::Result<TlsConnectorData> {
-    static TLS: OnceLock<TlsConnectorData> = OnceLock::new();
-    if let Some(tls) = TLS.get() {
-        return Ok(tls.clone());
-    }
-    let tls = build_native_root_tls_connector_data()?;
-    let _ = TLS.set(tls.clone());
-    Ok(tls)
-}
-
-fn build_native_root_tls_connector_data() -> io::Result<TlsConnectorData> {
-    let roots = load_native_root_cert_store()?;
-    Ok(tls_connector_data_from_roots(roots))
-}
-
-fn tls_connector_data_from_roots(roots: rustls::RootCertStore) -> TlsConnectorData {
-    let mut config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    TlsConnectorData::from(config)
-}
-
-fn load_native_root_cert_store() -> io::Result<rustls::RootCertStore> {
-    let result = rustls_native_certs::load_native_certs();
-    if result.certs.is_empty() {
-        let error = if result.errors.is_empty() {
-            "native TLS root store is empty".to_string()
-        } else {
-            format!(
-                "failed to load native TLS roots: {}",
-                result
-                    .errors
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            )
-        };
-        return Err(io::Error::new(ErrorKind::NotFound, error));
-    }
-
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in result.certs {
-        roots.add(cert).map_err(|error| {
-            io::Error::new(
-                ErrorKind::InvalidData,
-                format!("failed to add native TLS root: {error}"),
-            )
-        })?;
-    }
-    Ok(roots)
 }
 
 /// Host-owned endpoint for libkrun's explicit virtio-net unixstream backend.
@@ -1552,18 +1346,22 @@ fn single_dns_query(message: &DnsMessage) -> Option<&hickory_proto::op::Query> {
     }
 }
 
-fn resolve_dns_with_upstreams(request: &[u8], flow: &AdmittedHostFlow) -> Option<Vec<u8>> {
+fn resolve_dns_with_upstreams(
+    egress: &dyn HostEgress,
+    request: &[u8],
+    flow: &AdmittedHostFlow,
+) -> Option<Vec<u8>> {
     for _ in 0..DNS_UPSTREAM_ATTEMPTS {
         for resolver in &flow.dns_resolvers {
-            let Ok(ip) = resolver.ip.parse::<std::net::IpAddr>() else {
-                continue;
-            };
-            let address = std::net::SocketAddr::new(ip, resolver.port);
             let response = match flow.attempt.transport {
-                NetworkProtocol::Udp => resolve_dns_with_udp_upstream(request, address)
-                    .or_else(|| resolve_dns_with_tcp_upstream(request, address)),
-                NetworkProtocol::Tcp => resolve_dns_with_tcp_upstream(request, address)
-                    .or_else(|| resolve_dns_with_udp_upstream(request, address)),
+                NetworkProtocol::Udp => {
+                    resolve_dns_with_udp_upstream(egress, request, flow, resolver)
+                        .or_else(|| resolve_dns_with_tcp_upstream(egress, request, flow, resolver))
+                }
+                NetworkProtocol::Tcp => {
+                    resolve_dns_with_tcp_upstream(egress, request, flow, resolver)
+                        .or_else(|| resolve_dns_with_udp_upstream(egress, request, flow, resolver))
+                }
                 NetworkProtocol::Dns => None,
             };
             if response.is_some() {
@@ -1574,17 +1372,39 @@ fn resolve_dns_with_upstreams(request: &[u8], flow: &AdmittedHostFlow) -> Option
     None
 }
 
-fn resolve_dns_with_udp_upstream(request: &[u8], address: std::net::SocketAddr) -> Option<Vec<u8>> {
-    let ip = address.ip();
-    let bind_address = if ip.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
-    let Ok(socket) = UdpSocket::bind(bind_address) else {
+fn dns_upstream_flow(
+    base: &AdmittedHostFlow,
+    transport: NetworkProtocol,
+    resolver: &DnsResolver,
+) -> AdmittedHostFlow {
+    AdmittedHostFlow {
+        attempt: HostFlowAttempt {
+            protocol: NetworkProtocol::Dns,
+            transport,
+            src: base.attempt.src.clone(),
+            dst: NetworkEndpoint {
+                ip: resolver.ip.clone(),
+                port: resolver.port,
+            },
+            hostname: None,
+        },
+        action: base.action,
+        dns_resolvers: Vec::new(),
+    }
+}
+
+fn resolve_dns_with_udp_upstream(
+    egress: &dyn HostEgress,
+    request: &[u8],
+    flow: &AdmittedHostFlow,
+    resolver: &DnsResolver,
+) -> Option<Vec<u8>> {
+    let resolver_flow = dns_upstream_flow(flow, NetworkProtocol::Udp, resolver);
+    let Ok(socket) = egress.connect_udp(&resolver_flow) else {
         return None;
     };
     let _ = socket.set_read_timeout(Some(DNS_UPSTREAM_TIMEOUT));
     let _ = socket.set_write_timeout(Some(DNS_UPSTREAM_TIMEOUT));
-    if socket.connect(address).is_err() {
-        return None;
-    }
     if socket.send(request).is_err() {
         return None;
     }
@@ -1596,8 +1416,14 @@ fn resolve_dns_with_udp_upstream(request: &[u8], address: std::net::SocketAddr) 
     Some(response)
 }
 
-fn resolve_dns_with_tcp_upstream(request: &[u8], address: std::net::SocketAddr) -> Option<Vec<u8>> {
-    let Ok(mut stream) = TcpStream::connect_timeout(&address, DNS_UPSTREAM_TIMEOUT) else {
+fn resolve_dns_with_tcp_upstream(
+    egress: &dyn HostEgress,
+    request: &[u8],
+    flow: &AdmittedHostFlow,
+    resolver: &DnsResolver,
+) -> Option<Vec<u8>> {
+    let resolver_flow = dns_upstream_flow(flow, NetworkProtocol::Tcp, resolver);
+    let Ok(mut stream) = egress.connect_tcp_timeout(&resolver_flow, DNS_UPSTREAM_TIMEOUT) else {
         return None;
     };
     let _ = stream.set_read_timeout(Some(DNS_UPSTREAM_TIMEOUT));
@@ -3345,6 +3171,48 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct CaptureEgress {
+        tcp: std::sync::Mutex<Vec<AdmittedHostFlow>>,
+        udp: std::sync::Mutex<Vec<AdmittedHostFlow>>,
+    }
+
+    impl HostEgress for CaptureEgress {
+        fn connect_tcp(&self, flow: &AdmittedHostFlow) -> io::Result<TcpStream> {
+            self.tcp.lock().unwrap().push(flow.clone());
+            Err(io::Error::other("tcp unavailable"))
+        }
+
+        fn connect_tcp_timeout(
+            &self,
+            flow: &AdmittedHostFlow,
+            _timeout: Duration,
+        ) -> io::Result<TcpStream> {
+            self.tcp.lock().unwrap().push(flow.clone());
+            Err(io::Error::other("tcp unavailable"))
+        }
+
+        fn connect_udp(&self, flow: &AdmittedHostFlow) -> io::Result<UdpSocket> {
+            self.udp.lock().unwrap().push(flow.clone());
+            Err(io::Error::other("udp unavailable"))
+        }
+
+        fn resolve_dns(
+            &self,
+            _flow: &AdmittedHostFlow,
+            _request: &[u8],
+        ) -> io::Result<DnsResponse> {
+            Err(io::Error::other("dns unavailable"))
+        }
+
+        fn tls_connector_data(
+            &self,
+            _flow: &AdmittedHostFlow,
+        ) -> io::Result<rama_tls_rustls::client::TlsConnectorData> {
+            Err(io::Error::other("tls unavailable"))
+        }
+    }
+
     #[test]
     fn reads_libkrun_unixstream_ethernet_frame() {
         let ethernet = [
@@ -3707,6 +3575,37 @@ mod tests {
 
         assert_eq!(&response.packet[2..4], &[0x81, 0x80]);
         assert_eq!(&response.packet[6..8], &[0, 0]);
+    }
+
+    #[test]
+    fn custom_dns_upstreams_dial_through_host_egress() {
+        let egress = CaptureEgress::default();
+        let mut flow = default_dns_flow();
+        flow.dns_resolvers = vec![DnsResolver {
+            ip: "192.0.2.53".to_string(),
+            port: 5353,
+        }];
+
+        assert!(resolve_dns_with_upstreams(&egress, &dns_query("example.com", 1), &flow).is_none());
+
+        let udp = egress.udp.lock().unwrap();
+        let tcp = egress.tcp.lock().unwrap();
+        assert_eq!(udp.len(), DNS_UPSTREAM_ATTEMPTS);
+        assert_eq!(tcp.len(), DNS_UPSTREAM_ATTEMPTS);
+        for upstream in udp.iter() {
+            assert_eq!(upstream.attempt.protocol, NetworkProtocol::Dns);
+            assert_eq!(upstream.attempt.transport, NetworkProtocol::Udp);
+            assert_eq!(upstream.attempt.dst.ip, "192.0.2.53");
+            assert_eq!(upstream.attempt.dst.port, 5353);
+            assert!(upstream.dns_resolvers.is_empty());
+        }
+        for upstream in tcp.iter() {
+            assert_eq!(upstream.attempt.protocol, NetworkProtocol::Dns);
+            assert_eq!(upstream.attempt.transport, NetworkProtocol::Tcp);
+            assert_eq!(upstream.attempt.dst.ip, "192.0.2.53");
+            assert_eq!(upstream.attempt.dst.port, 5353);
+            assert!(upstream.dns_resolvers.is_empty());
+        }
     }
 
     #[test]
