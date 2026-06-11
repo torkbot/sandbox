@@ -1125,9 +1125,9 @@ dependencies = [
 
 [[package]]
 name = "imago"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e8e4b92aa0dd860579cfba776dbf0918a3a7ac5cb601af7d3fc835e71592a5b"
+checksum = "ae7cfee876c698a1a2ed9c705ab18f21acbed82110f19b51cc458de73426fe2c"
 dependencies = [
  "async-trait",
  "bincode",
@@ -1154,10 +1154,6 @@ dependencies = [
  "serde",
  "serde_core",
 ]
-
-[[package]]
-name = "init-blob"
-version = "0.1.0-1.18.1"
 
 [[package]]
 name = "ipnet"
@@ -1339,12 +1335,14 @@ dependencies = [
  "krun-arch-gen",
  "krun-smbios",
  "krun-utils",
+ "krun-whp",
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
  "linux-loader",
  "vm-memory",
  "vmm-sys-util",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1372,6 +1370,7 @@ dependencies = [
  "krun-hvf",
  "krun-polly",
  "krun-utils",
+ "krun-whp",
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
@@ -1383,6 +1382,7 @@ dependencies = [
  "virtio-bindings",
  "vm-fdt",
  "vm-memory",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1456,7 +1456,16 @@ dependencies = [
  "nix",
  "vm-memory",
  "vmm-sys-util",
+ "windows-sys 0.61.2",
  "zstd",
+]
+
+[[package]]
+name = "krun-whp"
+version = "0.1.0-1.18.0"
+dependencies = [
+ "log",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1505,7 +1514,6 @@ dependencies = [
  "crossbeam-channel",
  "env_logger",
  "imago",
- "init-blob",
  "krun-devices",
  "krun-hvf",
  "krun-polly",
@@ -1519,6 +1527,7 @@ dependencies = [
  "once_cell",
  "rand 0.9.4",
  "vm-memory",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

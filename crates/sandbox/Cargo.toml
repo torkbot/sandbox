@@ -8,7 +8,7 @@ repository.workspace = true
 [dependencies]
 base64 = "0.22"
 hickory-proto = { version = "0.26.1", default-features = false }
-imago = { version = "=0.2.2", features = ["sync-wrappers", "vm-memory"] }
+imago = { version = "=0.2.3", features = ["sync-wrappers", "vm-memory"] }
 rcgen = { version = "0.14.8", features = ["x509-parser"] }
 krun-devices = { path = "../../deps/libkrun/src/devices", default-features = false, features = ["blk", "net"] }
 krun = { package = "libkrun", path = "../../deps/libkrun/src/libkrun", default-features = false, features = ["blk", "net"] }
