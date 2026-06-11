@@ -5,11 +5,13 @@ use std::time::Duration;
 
 use rama_tls_rustls::client::TlsConnectorData;
 
+use super::dns::{
+    DnsResponse, dns_answer_pins, resolve_dns_with_default, resolve_dns_with_upstreams,
+};
 use super::{
-    DnsResolver, DnsResponse, NetworkConnectionAttempt, NetworkEndpoint, NetworkPolicyAction,
+    DnsResolver, NetworkConnectionAttempt, NetworkEndpoint, NetworkPolicyAction,
     NetworkPolicyDecision, NetworkPolicyRuntime, NetworkProtocol, decide_dns, decide_transport,
-    denied_decision, is_allowed_outbound_tcp, is_allowed_outbound_udp, resolve_dns_with_default,
-    resolve_dns_with_upstreams, upstream_socket_addr,
+    denied_decision, is_allowed_outbound_tcp, is_allowed_outbound_udp, upstream_socket_addr,
 };
 use crate::network::OutboundRulePlan;
 
@@ -170,15 +172,15 @@ impl HostEgress for DirectHostEgress {
                 .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "unsupported DNS request"));
         }
 
-        let request_message = super::DnsMessage::from_vec(request)
+        let request_message = hickory_proto::op::Message::from_vec(request)
             .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
         let packet = resolve_dns_with_upstreams(self, request, flow)
             .ok_or_else(|| io::Error::new(ErrorKind::TimedOut, "DNS upstream did not answer"))?;
-        let response_message = super::DnsMessage::from_vec(&packet)
+        let response_message = hickory_proto::op::Message::from_vec(&packet)
             .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
         Ok(DnsResponse {
             packet,
-            pins: super::dns_answer_pins(&request_message, &response_message),
+            pins: dns_answer_pins(&request_message, &response_message),
         })
     }
 
