@@ -1112,6 +1112,7 @@ fn run_guest_spawn(
 
     let (mut child, child_id) = spawn_active_child(&mut command)
         .map_err(|error| InitError(format!("{}: {error}", argv[0])))?;
+    drop(command);
 
     let (events, event_receiver) = mpsc::channel();
     let controls_stopped = Arc::new(AtomicBool::new(false));
