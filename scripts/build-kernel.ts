@@ -1,4 +1,4 @@
-import { mkdir, copyFile, stat } from "node:fs/promises";
+import { mkdir, copyFile, readFile, stat } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { spawn } from "node:child_process";
 
@@ -30,7 +30,8 @@ await run("docker", [
 
 await mkdir(outDir, { recursive: true });
 
-const kernelBinary = kernelBinaryForArch(arch);
+const kernelSourceDir = await kernelSourceDirFromMakefile();
+const kernelBinary = kernelBinaryForArch(arch, kernelSourceDir);
 const outputs = [
   ["kernel.c", "kernel.c"],
   [kernelBinary, kernelBinary],
@@ -57,16 +58,26 @@ function guestArch(): string {
   }
 }
 
-function kernelBinaryForArch(value: string): string {
+async function kernelSourceDirFromMakefile(): Promise<string> {
+  const makefile = await readFile(resolve(libkrunfwRoot, "Makefile"), "utf8");
+  const match = /^KERNEL_VERSION\s*=\s*(\S+)\s*$/m.exec(makefile);
+  const kernelVersion = match?.[1];
+  if (!kernelVersion) {
+    throw new Error("deps/libkrunfw/Makefile does not define KERNEL_VERSION");
+  }
+  return kernelVersion;
+}
+
+function kernelBinaryForArch(value: string, kernelSourceDir: string): string {
   switch (value) {
     case "arm64":
     case "aarch64":
-      return "linux-6.12.87/arch/arm64/boot/Image";
+      return `${kernelSourceDir}/arch/arm64/boot/Image`;
     case "x86_64":
-      return "linux-6.12.87/vmlinux";
+      return `${kernelSourceDir}/vmlinux`;
     case "riscv":
     case "riscv64":
-      return "linux-6.12.87/arch/riscv/boot/Image";
+      return `${kernelSourceDir}/arch/riscv/boot/Image`;
     default:
       throw new Error(`unsupported guest architecture for kernel build: ${value}`);
   }
