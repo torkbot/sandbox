@@ -65,6 +65,7 @@ const HTTP_SOCKET_BUFFER_BYTES: usize = 64 * 1024;
 const HTTP_BRIDGE_BUFFER_BYTES: usize = 64 * 1024;
 const TLS_READ_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_INTERCEPT_HEAD_BYTES: usize = 64 * 1024;
+const TCP_DNS_LISTENERS: usize = 4;
 const TCP_DNS_SOCKET_BUFFER_BYTES: usize = 8 * 1024;
 // DNS TTL controls resolver freshness. Pins are trusted attribution evidence for
 // delayed connections that use an IP learned from an accepted DNS answer.
@@ -430,7 +431,7 @@ fn add_dns_socket(sockets: &mut SocketSet<'_>) -> SocketHandle {
 }
 
 fn add_tcp_dns_listeners(sockets: &mut SocketSet<'_>) -> Vec<SocketHandle> {
-    (0..HTTP_LISTENERS_PER_PORT)
+    (0..TCP_DNS_LISTENERS)
         .map(|_| {
             let mut socket = tcp::Socket::new(
                 tcp::SocketBuffer::new(vec![0; TCP_DNS_SOCKET_BUFFER_BYTES]),
@@ -3250,7 +3251,7 @@ mod tests {
             + tcp_dns_handles.len() * 2 * TCP_DNS_SOCKET_BUFFER_BYTES
             + http_listener_count * 2 * HTTP_SOCKET_BUFFER_BYTES;
 
-        assert_eq!(tcp_dns_handles.len(), HTTP_LISTENERS_PER_PORT);
+        assert_eq!(tcp_dns_handles.len(), TCP_DNS_LISTENERS);
         assert_eq!(http_listener_count, 5 * HTTP_LISTENERS_PER_PORT);
         assert!(
             reserved_bytes <= 1024 * 1024,
