@@ -315,6 +315,38 @@ test("spawn kill terminates a long-lived guest process", async (t) => {
   assert.deepEqual(await child.exit, { exitCode: null, signal: "SIGKILL" });
 });
 
+test("spawn and pty honor already-aborted signals before launching", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot();
+
+  const controller = new AbortController();
+  controller.abort();
+
+  assert.throws(
+    () => sandbox.spawn("/bin/sh", ["-lc", "touch /tmp/spawn-started"], { signal: controller.signal }),
+    { name: "AbortError" },
+  );
+  assert.throws(
+    () =>
+      sandbox.pty("/bin/sh", ["-lc", "touch /tmp/pty-started"], {
+        signal: controller.signal,
+        size: { rows: 24, cols: 80 },
+      }),
+    { name: "AbortError" },
+  );
+
+  const result = await sandbox.exec("/bin/sh", [
+    "-lc",
+    "test ! -e /tmp/spawn-started && test ! -e /tmp/pty-started",
+  ]);
+  assert.equal(result.exitCode, 0, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+});
+
 test("pty runs an interactive terminal process with a required size", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;

@@ -417,6 +417,34 @@ test("HostControlTransport rejects pre-start spawn failures without exposing a p
   await assert.rejects(spawned.exit, /sandbox control is closed/);
 });
 
+test("HostControlTransport rejects spawn ready when process exits before start", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const spawned = control.spawn({ id: "spawn", argv: ["/missing"] });
+
+  channel.packets.push(
+    encodePacket({
+      type: "guest.spawn.stderr",
+      id: "spawn",
+      data: new Binary(new TextEncoder().encode("spawn guest command: missing\n")),
+    }),
+    encodePacket({
+      type: "guest.spawn.exit",
+      id: "spawn",
+      exitCode: 127,
+    }),
+    encodePacket({
+      type: "guest.spawn.streams.closed",
+      id: "spawn",
+    }),
+  );
+
+  await assert.rejects(spawned.ready, /sandbox spawn exited before ready: spawn/);
+  assert.deepEqual(await spawned.exit, { exitCode: 127, signal: null });
+  assert.equal(await readAll(spawned.stderr), "spawn guest command: missing\n");
+  await control.close();
+});
+
 test("HostControlTransport demultiplexes concurrent spawn output", async () => {
   const channel = new MemoryControlChannel();
   const control = new HostControlTransport({ channel });
@@ -618,6 +646,31 @@ test("HostControlTransport ignores spawn output after stream cancellation", asyn
   );
 
   assert.deepEqual(await spawned.exit, { exitCode: 0, signal: null });
+  await control.close();
+});
+
+test("HostControlTransport errors process stdin after streams close", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const spawned = startSpawn(control, channel, "spawn");
+  await spawned.ready;
+  const writer = spawned.stdin.getWriter();
+
+  channel.packets.push(
+    encodePacket({
+      type: "guest.spawn.exit",
+      id: "spawn",
+      exitCode: 0,
+    }),
+    encodePacket({
+      type: "guest.spawn.streams.closed",
+      id: "spawn",
+    }),
+  );
+
+  assert.deepEqual(await spawned.exit, { exitCode: 0, signal: null });
+  assert.equal(await readAll(spawned.stdout), "");
+  await assert.rejects(writer.write(new TextEncoder().encode("late")), /sandbox process stdin is closed: spawn/);
   await control.close();
 });
 

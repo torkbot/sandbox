@@ -891,6 +891,7 @@ class HostBackedSandboxVm implements SandboxVm {
     args ??= [];
     validateSandboxProcessArgs(args, "sandbox spawn");
     validateSandboxSpawnOptions(options);
+    throwIfAborted(options.signal);
     const process = new ControlBackedSandboxSpawn(this.control, this.#options.cwd)
       .spawn(command, args, options);
     linkAbortSignal(options.signal, process);
@@ -913,6 +914,7 @@ class HostBackedSandboxVm implements SandboxVm {
     }
     validateSandboxProcessArgs(args, "sandbox pty");
     validateSandboxPtyOptions(ptyOptions);
+    throwIfAborted(ptyOptions.signal);
     const process = new ControlBackedSandboxSpawn(this.control, this.#options.cwd)
       .pty(command, args, ptyOptions);
     linkAbortSignal(ptyOptions.signal, process);
@@ -939,6 +941,18 @@ function linkAbortSignal(
     () => signal.removeEventListener("abort", abort),
     () => signal.removeEventListener("abort", abort),
   );
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) {
+    const reason = signal.reason;
+    if (reason instanceof Error) {
+      throw reason;
+    }
+    const error = new Error("sandbox spawn aborted");
+    error.name = "AbortError";
+    throw error;
+  }
 }
 
 class ControlBackedSandboxExec {
