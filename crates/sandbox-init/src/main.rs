@@ -1114,11 +1114,18 @@ fn run_guest_spawn(
         .map_err(|error| InitError(format!("{}: {error}", argv[0])))?;
 
     let (events, event_receiver) = mpsc::channel();
+    let controls_stopped = Arc::new(AtomicBool::new(false));
     if let Some(master) = pty_master {
         let writer = master
             .try_clone()
             .map_err(|error| InitError(format!("clone pty master for input: {error}")))?;
-        pump_spawn_controls(child_id, controls, Some(writer), true);
+        pump_spawn_controls(
+            child_id,
+            controls,
+            Some(writer),
+            true,
+            controls_stopped.clone(),
+        );
         pump_spawn_output(
             master,
             events.clone(),
@@ -1139,7 +1146,13 @@ fn run_guest_spawn(
             .stderr
             .take()
             .ok_or_else(|| InitError("spawned command did not expose stderr".to_string()))?;
-        pump_spawn_controls(child_id, controls, Some(stdin), false);
+        pump_spawn_controls(
+            child_id,
+            controls,
+            Some(stdin),
+            false,
+            controls_stopped.clone(),
+        );
         pump_spawn_output(
             stdout,
             events.clone(),
@@ -1158,6 +1171,7 @@ fn run_guest_spawn(
     std::thread::spawn(move || {
         let status = child.wait();
         unregister_active_child(child_id);
+        controls_stopped.store(true, Ordering::Relaxed);
         let (exit_code, signal) = match status {
             Ok(status) => spawn_exit_status(status),
             Err(_) => (Some(128), None),
@@ -1204,12 +1218,18 @@ fn pump_spawn_controls<W>(
     controls: mpsc::Receiver<SpawnControl>,
     mut stdin: Option<W>,
     resize_input: bool,
+    stopped: Arc<AtomicBool>,
 ) where
     W: Write + Send + 'static,
     W: std::os::fd::AsRawFd,
 {
     std::thread::spawn(move || {
-        while let Ok(control) = controls.recv() {
+        while !stopped.load(Ordering::Relaxed) {
+            let control = match controls.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(control) => control,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            };
             match control {
                 SpawnControl::Stdin(data) => {
                     if let Some(writer) = stdin.as_mut() {
@@ -1249,11 +1269,17 @@ fn pump_spawn_controls<W>(
     controls: mpsc::Receiver<SpawnControl>,
     mut stdin: Option<W>,
     _resize_input: bool,
+    stopped: Arc<AtomicBool>,
 ) where
     W: Write + Send + 'static,
 {
     std::thread::spawn(move || {
-        while let Ok(control) = controls.recv() {
+        while !stopped.load(Ordering::Relaxed) {
+            let control = match controls.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(control) => control,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            };
             match control {
                 SpawnControl::Stdin(data) => {
                     if let Some(writer) = stdin.as_mut() {
@@ -1821,7 +1847,10 @@ fn spawn_exit_status(status: std::process::ExitStatus) -> (Option<i32>, Option<S
         return (Some(code), None);
     }
     if let Some(signal) = terminating_signal(status) {
-        return (None, signal_name(signal).map(str::to_string));
+        if let Some(name) = signal_name(signal) {
+            return (None, Some(name.to_string()));
+        }
+        return (Some(128 + signal), None);
     }
     (Some(128), None)
 }

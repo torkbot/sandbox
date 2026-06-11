@@ -41,6 +41,8 @@ export interface HostControlChannel {
 
 type SandboxProcessSignal = "SIGHUP" | "SIGINT" | "SIGQUIT" | "SIGTERM" | "SIGKILL";
 
+const MAX_PTY_SIZE = 65_535;
+
 export class HostControlTransport implements SandboxControl {
   readonly incoming: AsyncIterable<SandboxControlEvent>;
 
@@ -491,6 +493,7 @@ export class ControlBackedSandboxPty {
   }
 
   resize(size: { readonly rows: number; readonly cols: number }): void {
+    validatePtySize(size, "invalid sandbox pty resize");
     void this.#control.send({
       type: "guest.spawn.resize",
       id: this.#id,
@@ -554,6 +557,10 @@ class ReadableByteQueue {
       start: (controller) => {
         this.#controller = controller;
       },
+      cancel: () => {
+        this.#closed = true;
+        this.#controller = null;
+      },
     });
   }
 
@@ -561,7 +568,12 @@ class ReadableByteQueue {
     if (this.#closed) {
       return;
     }
-    this.#controller?.enqueue(chunk);
+    try {
+      this.#controller?.enqueue(chunk);
+    } catch {
+      this.#closed = true;
+      this.#controller = null;
+    }
   }
 
   close(error?: unknown): void {
@@ -574,6 +586,15 @@ class ReadableByteQueue {
     } else {
       this.#controller?.error(error);
     }
+  }
+}
+
+function validatePtySize(size: { readonly rows: number; readonly cols: number }, field: string): void {
+  if (!Number.isSafeInteger(size.rows) || size.rows <= 0 || size.rows > MAX_PTY_SIZE) {
+    throw new Error(`${field}.rows must be an integer between 1 and ${MAX_PTY_SIZE}`);
+  }
+  if (!Number.isSafeInteger(size.cols) || size.cols <= 0 || size.cols > MAX_PTY_SIZE) {
+    throw new Error(`${field}.cols must be an integer between 1 and ${MAX_PTY_SIZE}`);
   }
 }
 

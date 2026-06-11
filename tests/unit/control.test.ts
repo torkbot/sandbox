@@ -561,6 +561,66 @@ test("HostControlTransport pty streams terminal data and sends resize", async ()
   await control.close();
 });
 
+test("HostControlTransport rejects invalid pty resize before sending", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const pty = control.pty({
+    id: "pty",
+    argv: ["/bin/sh"],
+    size: { rows: 24, cols: 80 },
+  });
+
+  channel.packets.push(encodePacket({ type: "guest.spawn.started", id: "pty" }));
+  await pty.ready;
+
+  assert.throws(
+    () => pty.resize({ rows: 65_536, cols: 80 }),
+    /invalid sandbox pty resize\.rows must be an integer between 1 and 65535/,
+  );
+  assert.equal(channel.writes.length, 1);
+  channel.packets.push(
+    encodePacket({
+      type: "guest.spawn.exit",
+      id: "pty",
+      exitCode: 0,
+    }),
+    encodePacket({
+      type: "guest.spawn.streams.closed",
+      id: "pty",
+    }),
+  );
+  assert.deepEqual(await pty.exit, { exitCode: 0, signal: null });
+  await control.close();
+});
+
+test("HostControlTransport ignores spawn output after stream cancellation", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const spawned = startSpawn(control, channel, "spawn");
+  await spawned.ready;
+
+  await spawned.stdout.cancel();
+  channel.packets.push(
+    encodePacket({
+      type: "guest.spawn.stdout",
+      id: "spawn",
+      data: new Binary(new TextEncoder().encode("ignored")),
+    }),
+    encodePacket({
+      type: "guest.spawn.exit",
+      id: "spawn",
+      exitCode: 0,
+    }),
+    encodePacket({
+      type: "guest.spawn.streams.closed",
+      id: "spawn",
+    }),
+  );
+
+  assert.deepEqual(await spawned.exit, { exitCode: 0, signal: null });
+  await control.close();
+});
+
 test("HostControlTransport demultiplexes concurrent exec completions", async () => {
   const channel = new MemoryControlChannel();
   const control = new HostControlTransport({ channel });

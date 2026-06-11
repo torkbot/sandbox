@@ -186,6 +186,7 @@ export interface SandboxBlockStore {
 }
 
 const DEFAULT_COW_MAX_DIRTY_BYTES = 64 * 1024 * 1024;
+const MAX_PTY_SIZE = 65_535;
 const rootfsImageStorage = new WeakMap<Qcow2RootfsImage, {
   readonly blockStore: SandboxBlockStore;
   readonly context: SandboxBlockStoreContext;
@@ -1511,11 +1512,11 @@ function validateSandboxProcessArgs(args: readonly string[], label: string): voi
 }
 
 function validatePtySize(size: SandboxPtySize, field: string): void {
-  if (!Number.isSafeInteger(size.rows) || size.rows <= 0) {
-    throw new Error(`${field}.rows must be a positive safe integer`);
+  if (!Number.isSafeInteger(size.rows) || size.rows <= 0 || size.rows > MAX_PTY_SIZE) {
+    throw new Error(`${field}.rows must be an integer between 1 and ${MAX_PTY_SIZE}`);
   }
-  if (!Number.isSafeInteger(size.cols) || size.cols <= 0) {
-    throw new Error(`${field}.cols must be a positive safe integer`);
+  if (!Number.isSafeInteger(size.cols) || size.cols <= 0 || size.cols > MAX_PTY_SIZE) {
+    throw new Error(`${field}.cols must be an integer between 1 and ${MAX_PTY_SIZE}`);
   }
 }
 
