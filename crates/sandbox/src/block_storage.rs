@@ -18,6 +18,108 @@ pub trait CowBlockStore: Send + Sync {
     fn flush(&self) -> io::Result<()>;
 }
 
+#[derive(Debug)]
+pub struct MemoryCowBlockStore {
+    block_size: u64,
+    max_bytes: u64,
+    state: Mutex<MemoryCowBlockStoreState>,
+}
+
+#[derive(Debug, Default)]
+struct MemoryCowBlockStoreState {
+    blocks: HashMap<u64, Vec<u8>>,
+    bytes: u64,
+}
+
+impl MemoryCowBlockStore {
+    pub fn new(block_size: u64, max_bytes: u64) -> io::Result<Self> {
+        if block_size == 0 || block_size % 512 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "memory COW block size must be a positive multiple of 512 bytes",
+            ));
+        }
+        if max_bytes < block_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "memory COW max bytes must be at least the block size",
+            ));
+        }
+        Ok(Self {
+            block_size,
+            max_bytes,
+            state: Mutex::new(MemoryCowBlockStoreState::default()),
+        })
+    }
+}
+
+impl CowBlockStore for MemoryCowBlockStore {
+    fn block_size(&self) -> u64 {
+        self.block_size
+    }
+
+    fn list_blocks(&self) -> io::Result<HashSet<u64>> {
+        Ok(self
+            .state
+            .lock()
+            .expect("memory COW block store lock poisoned")
+            .blocks
+            .keys()
+            .copied()
+            .collect())
+    }
+
+    fn read_blocks(&self, start: u64, count: u64) -> io::Result<Vec<(u64, Vec<u8>)>> {
+        let state = self
+            .state
+            .lock()
+            .expect("memory COW block store lock poisoned");
+        Ok((start..start + count)
+            .filter_map(|index| state.blocks.get(&index).map(|data| (index, data.clone())))
+            .collect())
+    }
+
+    fn write_blocks(&self, chunks: Vec<(u64, Vec<u8>)>) -> io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("memory COW block store lock poisoned");
+        let mut projected_bytes = state.bytes;
+        let mut projected_sizes = HashMap::<u64, u64>::new();
+        for (index, data) in &chunks {
+            if data.len() > self.block_size as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "memory COW block chunk exceeds block size",
+                ));
+            }
+            let old_size = projected_sizes
+                .get(index)
+                .copied()
+                .or_else(|| state.blocks.get(index).map(|block| block.len() as u64))
+                .unwrap_or(0);
+            let new_size = data.len() as u64;
+            projected_bytes = projected_bytes - old_size + new_size;
+            projected_sizes.insert(*index, new_size);
+            if projected_bytes > self.max_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "memory COW block store dirty byte limit exceeded",
+                ));
+            }
+        }
+        for (index, data) in chunks {
+            state.blocks.insert(index, data);
+        }
+        state.bytes = projected_bytes;
+        Ok(())
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 pub struct CowBlockStorage {
     state: Mutex<CowBlockStorageState>,
     helper: CommonStorageHelper,
@@ -764,6 +866,53 @@ mod tests {
     use std::sync::Mutex;
     use std::task::{Context, Poll, Waker};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn memory_cow_block_store_lists_reads_and_replaces_blocks() {
+        let store = MemoryCowBlockStore::new(4096, 8192).unwrap();
+
+        store.write_blocks(vec![(2, vec![1; 4096])]).unwrap();
+        store.write_blocks(vec![(4, vec![2; 1024])]).unwrap();
+        store.write_blocks(vec![(2, vec![3; 512])]).unwrap();
+
+        assert_eq!(store.list_blocks().unwrap(), HashSet::from([2, 4]));
+        assert_eq!(
+            store.read_blocks(2, 3).unwrap(),
+            vec![(2, vec![3; 512]), (4, vec![2; 1024])],
+        );
+        store.flush().unwrap();
+    }
+
+    #[test]
+    fn memory_cow_block_store_rejects_writes_over_dirty_byte_limit() {
+        let store = MemoryCowBlockStore::new(4096, 8192).unwrap();
+
+        store
+            .write_blocks(vec![(2, vec![1; 4096]), (4, vec![2; 4096])])
+            .unwrap();
+        let error = store.write_blocks(vec![(6, vec![3; 512])]).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+        assert_eq!(store.list_blocks().unwrap(), HashSet::from([2, 4]));
+        assert_eq!(store.read_blocks(6, 1).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn memory_cow_block_store_accounts_replacement_writes_against_dirty_byte_limit() {
+        let store = MemoryCowBlockStore::new(4096, 8192).unwrap();
+
+        store
+            .write_blocks(vec![(2, vec![1; 4096]), (4, vec![2; 4096])])
+            .unwrap();
+        store.write_blocks(vec![(2, vec![3; 512])]).unwrap();
+        store.write_blocks(vec![(6, vec![4; 512])]).unwrap();
+
+        assert_eq!(store.list_blocks().unwrap(), HashSet::from([2, 4, 6]));
+        assert_eq!(
+            store.read_blocks(2, 5).unwrap(),
+            vec![(2, vec![3; 512]), (4, vec![2; 4096]), (6, vec![4; 512])],
+        );
+    }
 
     #[derive(Debug)]
     struct TestBlockStore {

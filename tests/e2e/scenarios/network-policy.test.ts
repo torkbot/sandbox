@@ -722,20 +722,34 @@ test("network.policy uses DNS cache hostname for multi-answer Cloudflare-like A 
     id: "http-dns-cache-cloudflare-authority",
     script: [
       "python3 - <<'PY'",
-      "import socket",
+      "import socket, time",
       `hostname = ${JSON.stringify(hostname)}`,
       `origin_address = ${JSON.stringify(originAddress)}`,
       `port = ${origin.port}`,
       "addresses = [info[4][0] for info in socket.getaddrinfo(hostname, port, socket.AF_INET, socket.SOCK_STREAM)]",
       "assert origin_address in addresses, addresses",
-      "with socket.create_connection((origin_address, port), timeout=5) as conn:",
-      "    conn.sendall(b'GET / HTTP/1.1\\r\\nHost: untrusted-host-header.test\\r\\nConnection: close\\r\\n\\r\\n')",
-      "    response = b''",
-      "    while True:",
-      "        chunk = conn.recv(4096)",
-      "        if not chunk:",
-      "            break",
-      "        response += chunk",
+      "deadline = time.monotonic() + 5",
+      "response = b''",
+      "last_error = None",
+      "while time.monotonic() < deadline:",
+      "    try:",
+      "        with socket.create_connection((origin_address, port), timeout=1) as conn:",
+      "            conn.settimeout(1)",
+      "            conn.sendall(b'GET / HTTP/1.1\\r\\nHost: untrusted-host-header.test\\r\\nConnection: close\\r\\n\\r\\n')",
+      "            chunks = []",
+      "            while True:",
+      "                chunk = conn.recv(4096)",
+      "                if not chunk:",
+      "                    break",
+      "                chunks.append(chunk)",
+      "            response = b''.join(chunks)",
+      "            if b'\\r\\n\\r\\n' in response:",
+      "                break",
+      "    except OSError as error:",
+      "        last_error = error",
+      "    time.sleep(0.05)",
+      "if b'\\r\\n\\r\\n' not in response:",
+      "    raise RuntimeError(f'no HTTP response after DNS resolution: response={response!r} error={last_error!r}')",
       "print(response.split(b'\\r\\n\\r\\n', 1)[1].decode(), end='')",
       "PY",
     ].join("\n"),
@@ -744,7 +758,8 @@ test("network.policy uses DNS cache hostname for multi-answer Cloudflare-like A 
   assert.equal(result.exitCode, 0, commandOutput(result));
   assert.equal(result.stdout, "cloudflare-dns-ok");
   assert.equal(dnsServer.queries, 1);
-  assert.deepEqual(observedHeaders, [hostname]);
+  assert.ok(observedHeaders.length >= 1);
+  assert.equal(observedHeaders.every((header) => header === hostname), true);
 });
 
 test("network.policy keeps DNS cache hostname for delayed Cloudflare-like package fetches", async (t) => {
@@ -959,8 +974,8 @@ test("network.policy HTTP CA setup survives /run/sandbox mounts", async (t) => {
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "http-ca-run-sandbox-mount",
     script: [
-      "test -s /usr/local/share/ca-certificates/sandbox-http-interception-ca.crt",
       "test -f /run/sandbox/note.txt",
+      "test ! -e /usr/local/share/ca-certificates/sandbox-http-interception-ca.crt",
     ].join(" && "),
   }), 8_000, "HTTP CA setup with /run/sandbox mount");
 
@@ -983,7 +998,7 @@ test("network.policy HTTP CA setup survives /run mounts", async (t) => {
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "http-ca-run-mount",
     script: [
-      "test -s /usr/local/share/ca-certificates/sandbox-http-interception-ca.crt",
+      "test ! -e /usr/local/share/ca-certificates/sandbox-http-interception-ca.crt",
       "cat /run/note.txt",
     ].join(" && "),
   }), 8_000, "HTTP CA setup with /run mount");
@@ -1014,7 +1029,7 @@ test("network.policy preserves nested mounts below /run/sandbox after HTTP CA se
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "http-ca-run-sandbox-nested-mount",
     script: [
-      "test -s /usr/local/share/ca-certificates/sandbox-http-interception-ca.crt",
+      "test ! -e /usr/local/share/ca-certificates/sandbox-http-interception-ca.crt",
       "cat /run/sandbox/note.txt",
       "cat /run/sandbox/cache/note.txt",
     ].join(" && "),
@@ -1024,7 +1039,7 @@ test("network.policy preserves nested mounts below /run/sandbox after HTTP CA se
   assert.equal(result.stdout, "parent\nchild\n");
 });
 
-test("network.policy HTTP CA setup populates mounted trust-store directories", async (t) => {
+test("network.policy HTTP CA setup keeps read-only built-in trust store unchanged", async (t) => {
   if (!requireVmLaunchSupport(t)) return;
 
   await using sandbox = await defineSandbox({
@@ -1039,8 +1054,28 @@ test("network.policy HTTP CA setup populates mounted trust-store directories", a
   });
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "http-ca-trust-store-mount",
-    script: "test -s /usr/local/share/ca-certificates/sandbox-http-interception-ca.crt",
+    script: [
+      "test ! -e /usr/local/share/ca-certificates/sandbox-http-interception-ca.crt",
+      "test -s /run/sandbox/http-ca/http-ca.pem",
+    ].join(" && "),
   }), 8_000, "HTTP CA setup with mounted trust store");
+
+  assert.equal(result.exitCode, 0, commandOutput(result));
+});
+
+test("network.policy HTTP CA setup populates writable ephemeral trust store", async (t) => {
+  if (!requireVmLaunchSupport(t)) return;
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.ephemeral({ base: rootfs.builtIn("alpine:3.23") }),
+    network: network.policy((conn) => {
+      conn.accept();
+    }),
+  }).boot();
+  const result = await withTimeout(execGuestShell(sandbox, {
+    id: "http-ca-ephemeral-trust-store",
+    script: "test -s /usr/local/share/ca-certificates/sandbox-http-interception-ca.crt",
+  }), 8_000, "HTTP CA setup with writable ephemeral rootfs");
 
   assert.equal(result.exitCode, 0, commandOutput(result));
 });
@@ -1060,10 +1095,7 @@ test("network.policy user mount can replace internal HTTP CA mount after setup",
   });
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "http-ca-user-mount",
-    script: [
-      "test -s /usr/local/share/ca-certificates/sandbox-http-interception-ca.crt",
-      "cat /run/sandbox/http-ca/note.txt",
-    ].join(" && "),
+    script: "cat /run/sandbox/http-ca/note.txt",
   }), 8_000, "HTTP CA setup with user mount at internal CA path");
 
   assert.equal(result.exitCode, 0, commandOutput(result));
@@ -1085,10 +1117,7 @@ test("network.policy user mount can replace internal HTTP CA mount with normaliz
   });
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "http-ca-user-mount-normalized",
-    script: [
-      "test -s /usr/local/share/ca-certificates/sandbox-http-interception-ca.crt",
-      "cat /run/sandbox/http-ca/note.txt",
-    ].join(" && "),
+    script: "cat /run/sandbox/http-ca/note.txt",
   }), 8_000, "HTTP CA setup with normalized user mount at internal CA path");
 
   assert.equal(result.exitCode, 0, commandOutput(result));

@@ -246,6 +246,19 @@ prepared at build or install time; Sandbox does not pull container images or
 build root filesystems during `boot()`.
 
 ```ts
+rootfs.ephemeral({
+  base: rootfs.builtIn("alpine:3.23"),
+  maxDirtyBytes: 64 * 1024 * 1024,
+});
+```
+
+Mounts a built-in base rootfs through a writable in-process copy-on-write block
+store. Clean base-image blocks are served from the built-in artifact, dirty
+blocks are kept by the native runtime, and all rootfs mutations are discarded
+when the sandbox instance exits. Use this when a command needs to mutate the
+machine rootfs but those mutations must not persist across boots.
+
+```ts
 rootfs.cow({
   base: rootfs.builtIn("alpine:3.23"),
   writable: blockStore,
@@ -274,13 +287,17 @@ for await (const chunk of rootfs.bytes(image)) {
 }
 ```
 
-`rootfs.cow(...)` normalizes through the same composed source used by
+`rootfs.ephemeral(...)` and `rootfs.cow(...)` both present a writable block
+rootfs without modifying the built-in artifact. `rootfs.cow(...)` normalizes
+through the same composed source used by
 `rootfs.flatten(...)`, so boot and image export share one base-plus-overlay
 contract. Clean base-image blocks are served from the built-in artifact. Dirty
 blocks are read lazily and flushed through your `SandboxBlockStore`.
 `maxDirtyBytes` limits how many dirty COW block bytes the native runtime buffers
-before forcing a write to the block store during a VM run. When omitted, Sandbox
-uses a 64 MiB block-aligned default.
+before forcing a write to the block store during a VM run. For
+`rootfs.ephemeral(...)`, the same value is the native in-memory dirty block
+quota; guest writes beyond that budget fail instead of growing host memory
+without bound. When omitted, Sandbox uses a 64 MiB block-aligned default.
 
 `rootfs.flatten(...)` writes a standalone QCOW2 image into `dest`, using
 `dest` as random-access image-byte storage. `rootfs.bytes(...)` streams raw image
@@ -505,10 +522,11 @@ API:
 
 When HTTP interception is enabled, the host generates CA material and passes
 only the public CA certificate to Sandbox init. Init installs that CA using the
-selected rootfs' native trust-store mechanism. Built-in rootfs launches use an
-ephemeral writable COW view for HTTP interception so trust-store installation is
-deterministic. If a rootfs does not provide a supported trust-store installer,
-init fails closed.
+selected rootfs' native trust-store mechanism only when the rootfs is writable.
+Read-only built-in rootfs launches keep the CA available under `/run` and do not
+mutate the trust store, so HTTP interception does not change rootfs write
+behavior. If a writable rootfs does not provide a supported trust-store
+installer, init fails closed.
 
 The intended boundary is:
 

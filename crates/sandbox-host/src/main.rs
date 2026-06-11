@@ -194,17 +194,20 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
     let services = HostServices {
         http: http_intercept_runtime(&spec, bridge.clone())?,
         network_policy: network_policy_runtime(&spec, bridge.clone()),
-        root_storage: spec.rootfs.storage.as_ref().map(|storage| {
-            Arc::new(NodeCowBlockStore::new(
-                bridge.clone(),
-                match storage {
-                    sandbox::config::RootfsStorageSpec::CowBlockStore { block_size, .. } => {
-                        *block_size
-                    }
-                },
-                "host.block",
-            )) as Arc<dyn CowBlockStore>
-        }),
+        root_storage: spec
+            .rootfs
+            .storage
+            .as_ref()
+            .and_then(|storage| match storage {
+                sandbox::config::RootfsStorageSpec::CowBlockStore { block_size, .. } => {
+                    Some(Arc::new(NodeCowBlockStore::new(
+                        bridge.clone(),
+                        *block_size,
+                        "host.block",
+                    )) as Arc<dyn CowBlockStore>)
+                }
+                sandbox::config::RootfsStorageSpec::EphemeralCow { .. } => None,
+            }),
     };
     let mut vm = sandbox::runtime::KrunVm::create_with_services(&spec, virtual_fs, services)?;
     vm.start()?;

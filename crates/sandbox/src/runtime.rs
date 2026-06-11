@@ -14,7 +14,7 @@ use imago::{
 };
 
 use crate::MicroVmSpec;
-use crate::block_storage::{CowBlockStorage, CowBlockStore};
+use crate::block_storage::{CowBlockStorage, CowBlockStore, MemoryCowBlockStore};
 use crate::config::{KernelFormat, RootfsFormat, RootfsStorageSpec};
 use crate::control::INIT_CONTROL_PORT;
 use crate::http_flow::HttpInterceptRuntime;
@@ -246,13 +246,29 @@ impl KrunContext {
                 );
                 cstring_path("rootfs.path", &spec.rootfs.path)?;
                 let writable = spec.rootfs.storage.is_some();
-                let disk = if let Some(RootfsStorageSpec::CowBlockStore {
-                    max_dirty_bytes, ..
-                }) = spec.rootfs.storage
-                {
-                    let store = services.root_storage.clone().ok_or_else(|| {
-                        KrunError::new("root COW block store missing", -libc::EINVAL)
-                    })?;
+                let disk = if let Some(storage_spec) = &spec.rootfs.storage {
+                    let (store, max_dirty_bytes): (Arc<dyn CowBlockStore>, u64) = match storage_spec
+                    {
+                        RootfsStorageSpec::CowBlockStore {
+                            max_dirty_bytes, ..
+                        } => {
+                            let store = services.root_storage.clone().ok_or_else(|| {
+                                KrunError::new("root COW block store missing", -libc::EINVAL)
+                            })?;
+                            (store, *max_dirty_bytes)
+                        }
+                        RootfsStorageSpec::EphemeralCow {
+                            block_size,
+                            max_dirty_bytes,
+                        } => (
+                            Arc::new(
+                                MemoryCowBlockStore::new(*block_size, *max_dirty_bytes).map_err(
+                                    |_| KrunError::new("MemoryCowBlockStore::new", -libc::EINVAL),
+                                )?,
+                            ),
+                            *max_dirty_bytes,
+                        ),
+                    };
                     let open_start = Instant::now();
                     let storage = Box::<dyn DynStorage>::open_sync(
                         StorageOpenOptions::new()
@@ -332,13 +348,22 @@ impl KrunContext {
         let network_enabled = spec.network.is_some();
         let mount_env = CString::new(format!("SANDBOX_VIRTIOFS_MOUNTS={encoded_mounts}")).unwrap();
         let hostname_env = CString::new(format!("SANDBOX_HOSTNAME={}", spec.hostname)).unwrap();
+        let rootfs_readonly_env = CString::new(format!(
+            "SANDBOX_ROOTFS_READONLY={}",
+            if spec.rootfs.readonly { "1" } else { "0" }
+        ))
+        .unwrap();
         let http_network_env = CString::new("SANDBOX_HTTP_NETWORK=1").unwrap();
         let mut argv = vec![
             exec_path.as_ptr(),
             mount_arg.as_ptr(),
             hostname_arg.as_ptr(),
         ];
-        let mut envp = vec![mount_env.as_ptr(), hostname_env.as_ptr()];
+        let mut envp = vec![
+            mount_env.as_ptr(),
+            hostname_env.as_ptr(),
+            rootfs_readonly_env.as_ptr(),
+        ];
         if network_enabled {
             argv.push(http_network_arg.as_ptr());
             envp.push(http_network_env.as_ptr());

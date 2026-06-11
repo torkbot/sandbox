@@ -141,7 +141,13 @@ export type CowRootfsConfig = {
   readonly maxDirtyBytes?: number;
 };
 
-export type Rootfs = BuiltInRootfsConfig | CowRootfsConfig;
+export type EphemeralRootfsConfig = {
+  readonly kind: "ephemeral-rootfs";
+  readonly base: BuiltInRootfsConfig;
+  readonly maxDirtyBytes?: number;
+};
+
+export type Rootfs = BuiltInRootfsConfig | CowRootfsConfig | EphemeralRootfsConfig;
 
 export type Qcow2RootfsImage = {
   readonly kind: "rootfs-image";
@@ -590,6 +596,7 @@ interface SandboxVm extends SandboxInstance {
 
 interface SandboxDiagnostics {
   terminateHostForTest(): Promise<void>;
+  hostPid(): number;
 }
 
 export const rootfs = {
@@ -622,6 +629,16 @@ export const rootfs = {
     return {
       kind: "cow-rootfs",
       source,
+      ...(options.maxDirtyBytes === undefined ? {} : { maxDirtyBytes: options.maxDirtyBytes }),
+    };
+  },
+  ephemeral(options: {
+    readonly base: BuiltInRootfsConfig;
+    readonly maxDirtyBytes?: number;
+  }): Rootfs {
+    return {
+      kind: "ephemeral-rootfs",
+      base: options.base,
       ...(options.maxDirtyBytes === undefined ? {} : { maxDirtyBytes: options.maxDirtyBytes }),
     };
   },
@@ -777,7 +794,6 @@ class DefinedSandbox implements SandboxDefinition {
       this.#options,
       options,
       networkPolicy?.network,
-      (networkPolicy?.hooks.length ?? 0) > 0,
     );
     try {
       validateInternalSandboxOptions(launchOptions);
@@ -807,6 +823,7 @@ class HostBackedSandboxVm implements SandboxVm {
     readonly packets: AsyncIterable<Uint8Array>;
     writeControlPacket(packet: Uint8Array): void;
     close(): Promise<void> | void;
+    hostPid?(): number;
     terminateHostForTest?(): Promise<void>;
   };
   #closed = false;
@@ -817,6 +834,7 @@ class HostBackedSandboxVm implements SandboxVm {
       readonly packets: AsyncIterable<Uint8Array>;
       writeControlPacket(packet: Uint8Array): void;
       close(): Promise<void> | void;
+      hostPid?(): number;
       terminateHostForTest?(): Promise<void>;
     },
     options: InternalSandboxOptions,
@@ -832,6 +850,12 @@ class HostBackedSandboxVm implements SandboxVm {
     if (hostVm.terminateHostForTest !== undefined) {
       this.diagnostics = {
         terminateHostForTest: () => hostVm.terminateHostForTest?.() ?? Promise.resolve(),
+        hostPid: () => {
+          if (hostVm.hostPid === undefined) {
+            throw new Error("sandbox host PID is not available");
+          }
+          return hostVm.hostPid();
+        },
       };
     }
   }
@@ -1111,9 +1135,8 @@ async function toInternalSandboxOptions(
   config: SandboxDefinitionOptions,
   boot: SandboxBootOptions,
   network?: InternalNetworkConfig,
-  httpInterception = false,
 ): Promise<InternalSandboxOptions> {
-  const rootfs = await lowerRootfs(config.rootfs, { httpInterception });
+  const rootfs = await lowerRootfs(config.rootfs);
   return {
     resources: config.resources,
     rootfs,
@@ -1281,18 +1304,9 @@ function ipv6StartsWith(ip: string, prefix: string): boolean {
   return parseIpv4(ip) === undefined && normalizeIpv6(ip).startsWith(prefix);
 }
 
-async function lowerRootfs(
-  rootfs: Rootfs,
-  options: {
-    readonly httpInterception?: boolean;
-  } = {},
-): Promise<InternalSandboxOptions["rootfs"]> {
+async function lowerRootfs(rootfs: Rootfs): Promise<InternalSandboxOptions["rootfs"]> {
   switch (rootfs.kind) {
     case "built-in-rootfs": {
-      if (options.httpInterception === true) {
-        const writable = createEphemeralCowBlockStore();
-        return lowerCowRootfs(rootfs, writable, resolveCowMaxDirtyBytes(writable));
-      }
       return {
         path: builtInRootfsPath(rootfs.name),
         readonly: true,
@@ -1305,6 +1319,8 @@ async function lowerRootfs(
         rootfs.source.overlay,
         resolveCowMaxDirtyBytes(rootfs.source.overlay, rootfs.maxDirtyBytes),
       );
+    case "ephemeral-rootfs":
+      return lowerEphemeralRootfs(rootfs.base, rootfs.maxDirtyBytes);
   }
 }
 
@@ -1325,6 +1341,23 @@ function lowerCowRootfs(
       context: {
         base: builtInRootfsIdentity(base.name),
       },
+    },
+  };
+}
+
+function lowerEphemeralRootfs(
+  base: BuiltInRootfsConfig,
+  maxDirtyBytes: number | undefined,
+): InternalSandboxOptions["rootfs"] {
+  const blockSize = 65536;
+  return {
+    path: builtInRootfsPath(base.name),
+    readonly: false,
+    format: "qcow2",
+    storage: {
+      kind: "ephemeral-cow",
+      blockSize,
+      maxDirtyBytes: maxDirtyBytes ?? DEFAULT_COW_MAX_DIRTY_BYTES,
     },
   };
 }
@@ -1371,9 +1404,16 @@ function validateRootfs(rootfs: Rootfs): void {
       validateBlockStore(rootfs.source.overlay);
       validateCowMaxDirtyBytes(rootfs);
       return;
+    case "ephemeral-rootfs":
+      if (rootfs.base?.kind !== "built-in-rootfs") {
+        throw new Error("invalid sandbox definition: rootfs.ephemeral base must be created with rootfs.builtIn(...)");
+      }
+      validateBuiltInRootfsName(rootfs.base.name);
+      validateEphemeralRootfs(rootfs);
+      return;
     default:
       throw new Error(
-        "invalid sandbox definition: rootfs must be created with rootfs.builtIn(...) or rootfs.cow(...)",
+        "invalid sandbox definition: rootfs must be created with rootfs.builtIn(...), rootfs.ephemeral(...), or rootfs.cow(...)",
       );
   }
 }
@@ -1467,6 +1507,18 @@ function validateCowMaxDirtyBytes(rootfs: CowRootfsConfig): void {
   }
   if (rootfs.maxDirtyBytes < rootfs.source.overlay.blockSize) {
     throw new Error("invalid sandbox definition: rootfs COW maxDirtyBytes must be at least the COW block size");
+  }
+}
+
+function validateEphemeralRootfs(rootfs: EphemeralRootfsConfig): void {
+  if (rootfs.maxDirtyBytes === undefined) {
+    return;
+  }
+  if (!Number.isSafeInteger(rootfs.maxDirtyBytes) || rootfs.maxDirtyBytes <= 0) {
+    throw new Error("invalid sandbox definition: ephemeral rootfs maxDirtyBytes must be a positive safe integer");
+  }
+  if (rootfs.maxDirtyBytes < 65536) {
+    throw new Error("invalid sandbox definition: ephemeral rootfs maxDirtyBytes must be at least the COW block size");
   }
 }
 
@@ -1593,7 +1645,6 @@ function validateInternalSandboxOptions(options: InternalSandboxOptions): void {
   if (options.rootfs.format !== "qcow2") {
     throw new Error("invalid sandbox options: rootfs.format must be qcow2");
   }
-
   const mountPaths = new Set<string>();
   for (const mount of options.mounts ?? []) {
     validateGuestPath(mount.path, "mount.path");
