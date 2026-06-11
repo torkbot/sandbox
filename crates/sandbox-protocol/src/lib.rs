@@ -29,6 +29,26 @@ pub enum ControlFrame {
         id: String,
         argv: Vec<String>,
         env: Vec<(String, String)>,
+        stdin: GuestSpawnStdio,
+        stdout: GuestSpawnStdio,
+        stderr: GuestSpawnStdio,
+        pty: Option<GuestPtySize>,
+    },
+    GuestSpawnStdin {
+        id: String,
+        data: Vec<u8>,
+    },
+    GuestSpawnStdinClose {
+        id: String,
+    },
+    GuestSpawnSignal {
+        id: String,
+        signal: String,
+    },
+    GuestSpawnResize {
+        id: String,
+        rows: u16,
+        cols: u16,
     },
     GuestSpawnStarted {
         id: String,
@@ -43,7 +63,8 @@ pub enum ControlFrame {
     },
     GuestSpawnExit {
         id: String,
-        exit_code: i32,
+        exit_code: Option<i32>,
+        signal: Option<String>,
     },
     GuestSpawnStreamsClosed {
         id: String,
@@ -54,6 +75,18 @@ pub enum ControlFrame {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestSpawnStdio {
+    Pipe,
+    Pty,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestPtySize {
+    pub rows: u16,
+    pub cols: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,14 +131,60 @@ impl ControlFrame {
                 "type": "guest.exec.abort",
                 "id": id,
             },
-            Self::GuestSpawn { id, argv, env } => bson::doc! {
-                "type": "guest.spawn",
+            Self::GuestSpawn {
+                id,
+                argv,
+                env,
+                stdin,
+                stdout,
+                stderr,
+                pty,
+            } => {
+                let mut document = bson::doc! {
+                    "type": "guest.spawn",
+                    "id": id,
+                    "argv": argv,
+                    "env": env.iter().map(|(key, value)| bson::doc! {
+                        "key": key,
+                        "value": value,
+                    }).collect::<Vec<_>>(),
+                    "stdin": stdin.as_str(),
+                    "stdout": stdout.as_str(),
+                    "stderr": stderr.as_str(),
+                };
+                if let Some(pty) = pty {
+                    document.insert(
+                        "pty",
+                        bson::doc! {
+                            "rows": i32::from(pty.rows),
+                            "cols": i32::from(pty.cols),
+                        },
+                    );
+                }
+                document
+            }
+            Self::GuestSpawnStdin { id, data } => bson::doc! {
+                "type": "guest.spawn.stdin",
                 "id": id,
-                "argv": argv,
-                "env": env.iter().map(|(key, value)| bson::doc! {
-                    "key": key,
-                    "value": value,
-                }).collect::<Vec<_>>(),
+                "data": bson::Binary {
+                    subtype: bson::spec::BinarySubtype::Generic,
+                    bytes: data.clone(),
+                },
+            },
+            Self::GuestSpawnStdinClose { id } => bson::doc! {
+                "type": "guest.spawn.stdin.close",
+                "id": id,
+            },
+            Self::GuestSpawnSignal { id, signal } => bson::doc! {
+                "type": "guest.spawn.signal",
+                "id": id,
+                "signal": signal,
+            },
+            Self::GuestSpawnResize { id, rows, cols } => bson::doc! {
+                "type": "guest.spawn.resize",
+                "id": id,
+                "rows": i32::from(*rows),
+                "cols": i32::from(*cols),
             },
             Self::GuestSpawnStarted { id } => bson::doc! {
                 "type": "guest.spawn.started",
@@ -127,11 +206,23 @@ impl ControlFrame {
                     bytes: data.clone(),
                 },
             },
-            Self::GuestSpawnExit { id, exit_code } => bson::doc! {
-                "type": "guest.spawn.exit",
-                "id": id,
-                "exitCode": *exit_code,
-            },
+            Self::GuestSpawnExit {
+                id,
+                exit_code,
+                signal,
+            } => {
+                let mut document = bson::doc! {
+                    "type": "guest.spawn.exit",
+                    "id": id,
+                };
+                if let Some(exit_code) = exit_code {
+                    document.insert("exitCode", *exit_code);
+                }
+                if let Some(signal) = signal {
+                    document.insert("signal", signal);
+                }
+                document
+            }
             Self::GuestSpawnStreamsClosed { id } => bson::doc! {
                 "type": "guest.spawn.streams.closed",
                 "id": id,
@@ -242,6 +333,44 @@ impl ControlFrame {
                     .to_string(),
                 argv: read_string_array(&document, "argv", "guest.spawn argv")?,
                 env: read_env_array(&document, "env", "guest.spawn env")?,
+                stdin: read_spawn_stdio(&document, "stdin", "guest.spawn stdin")?,
+                stdout: read_spawn_stdio(&document, "stdout", "guest.spawn stdout")?,
+                stderr: read_spawn_stdio(&document, "stderr", "guest.spawn stderr")?,
+                pty: read_optional_pty_size(&document)?,
+            }),
+            "guest.spawn.stdin" => Ok(Self::GuestSpawnStdin {
+                id: document
+                    .get_str("id")
+                    .map_err(|_| ControlFrameError::new("guest.spawn.stdin missing id"))?
+                    .to_string(),
+                data: document
+                    .get_binary_generic("data")
+                    .map_err(|_| ControlFrameError::new("guest.spawn.stdin missing data"))?
+                    .to_vec(),
+            }),
+            "guest.spawn.stdin.close" => Ok(Self::GuestSpawnStdinClose {
+                id: document
+                    .get_str("id")
+                    .map_err(|_| ControlFrameError::new("guest.spawn.stdin.close missing id"))?
+                    .to_string(),
+            }),
+            "guest.spawn.signal" => Ok(Self::GuestSpawnSignal {
+                id: document
+                    .get_str("id")
+                    .map_err(|_| ControlFrameError::new("guest.spawn.signal missing id"))?
+                    .to_string(),
+                signal: document
+                    .get_str("signal")
+                    .map_err(|_| ControlFrameError::new("guest.spawn.signal missing signal"))?
+                    .to_string(),
+            }),
+            "guest.spawn.resize" => Ok(Self::GuestSpawnResize {
+                id: document
+                    .get_str("id")
+                    .map_err(|_| ControlFrameError::new("guest.spawn.resize missing id"))?
+                    .to_string(),
+                rows: read_u16(&document, "rows", "guest.spawn.resize rows")?,
+                cols: read_u16(&document, "cols", "guest.spawn.resize cols")?,
             }),
             "guest.spawn.started" => Ok(Self::GuestSpawnStarted {
                 id: document
@@ -274,9 +403,8 @@ impl ControlFrame {
                     .get_str("id")
                     .map_err(|_| ControlFrameError::new("guest.spawn.exit missing id"))?
                     .to_string(),
-                exit_code: document
-                    .get_i32("exitCode")
-                    .map_err(|_| ControlFrameError::new("guest.spawn.exit missing exitCode"))?,
+                exit_code: document.get_i32("exitCode").ok(),
+                signal: document.get_str("signal").ok().map(str::to_string),
             }),
             "guest.spawn.streams.closed" => Ok(Self::GuestSpawnStreamsClosed {
                 id: document
@@ -407,6 +535,57 @@ fn read_env_array(
         .map(|env| env.unwrap_or_default())
 }
 
+impl GuestSpawnStdio {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pipe => "pipe",
+            Self::Pty => "pty",
+        }
+    }
+}
+
+fn read_spawn_stdio(
+    document: &bson::Document,
+    key: &str,
+    label: &str,
+) -> Result<GuestSpawnStdio, ControlFrameError> {
+    match document
+        .get_str(key)
+        .map_err(|_| ControlFrameError::new(format!("{label} missing")))?
+    {
+        "pipe" => Ok(GuestSpawnStdio::Pipe),
+        "pty" => Ok(GuestSpawnStdio::Pty),
+        other => Err(ControlFrameError::new(format!(
+            "{label} must be pipe or pty, got {other}"
+        ))),
+    }
+}
+
+fn read_optional_pty_size(
+    document: &bson::Document,
+) -> Result<Option<GuestPtySize>, ControlFrameError> {
+    let Some(value) = document.get("pty") else {
+        return Ok(None);
+    };
+    let document = value
+        .as_document()
+        .ok_or_else(|| ControlFrameError::new("guest.spawn pty must be a document"))?;
+    Ok(Some(GuestPtySize {
+        rows: read_u16(document, "rows", "guest.spawn pty rows")?,
+        cols: read_u16(document, "cols", "guest.spawn pty cols")?,
+    }))
+}
+
+fn read_u16(document: &bson::Document, key: &str, label: &str) -> Result<u16, ControlFrameError> {
+    let value = document
+        .get_i32(key)
+        .map_err(|_| ControlFrameError::new(format!("{label} missing")))?;
+    if value <= 0 {
+        return Err(ControlFrameError::new(format!("{label} must be positive")));
+    }
+    u16::try_from(value).map_err(|_| ControlFrameError::new(format!("{label} must fit in u16")))
+}
+
 fn read_optional_u64(
     document: &bson::Document,
     key: &str,
@@ -501,6 +680,35 @@ mod tests {
                 id: "spawn".to_string(),
                 argv: vec!["/bin/cat".to_string()],
                 env: vec![("FOO".to_string(), "bar".to_string())],
+                stdin: GuestSpawnStdio::Pipe,
+                stdout: GuestSpawnStdio::Pipe,
+                stderr: GuestSpawnStdio::Pipe,
+                pty: None,
+            },
+            ControlFrame::GuestSpawn {
+                id: "pty".to_string(),
+                argv: vec!["/bin/sh".to_string()],
+                env: vec![],
+                stdin: GuestSpawnStdio::Pty,
+                stdout: GuestSpawnStdio::Pty,
+                stderr: GuestSpawnStdio::Pty,
+                pty: Some(GuestPtySize { rows: 24, cols: 80 }),
+            },
+            ControlFrame::GuestSpawnStdin {
+                id: "spawn".to_string(),
+                data: b"input".to_vec(),
+            },
+            ControlFrame::GuestSpawnStdinClose {
+                id: "spawn".to_string(),
+            },
+            ControlFrame::GuestSpawnSignal {
+                id: "spawn".to_string(),
+                signal: "SIGTERM".to_string(),
+            },
+            ControlFrame::GuestSpawnResize {
+                id: "pty".to_string(),
+                rows: 40,
+                cols: 120,
             },
             ControlFrame::GuestSpawnStarted {
                 id: "spawn".to_string(),
@@ -515,7 +723,13 @@ mod tests {
             },
             ControlFrame::GuestSpawnExit {
                 id: "spawn".to_string(),
-                exit_code: 7,
+                exit_code: Some(7),
+                signal: None,
+            },
+            ControlFrame::GuestSpawnExit {
+                id: "spawn".to_string(),
+                exit_code: None,
+                signal: Some("SIGKILL".to_string()),
             },
             ControlFrame::GuestSpawnStreamsClosed {
                 id: "spawn".to_string(),

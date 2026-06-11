@@ -30,6 +30,9 @@ test("control command codec encodes guest spawn commands", () => {
     id: "spawn",
     argv: ["/bin/cat"],
     env: { FOO: "bar" },
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
   });
 
   assert.deepEqual(BSON.deserialize(packet.subarray(4)), {
@@ -37,6 +40,9 @@ test("control command codec encodes guest spawn commands", () => {
     id: "spawn",
     argv: ["/bin/cat"],
     env: [{ key: "FOO", value: "bar" }],
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
   });
 });
 
@@ -105,13 +111,14 @@ test("control event codec decodes init ready and binary exec output", () => {
       encodePacket({
         type: "guest.spawn.exit",
         id: "spawn",
-        exitCode: 7,
+        signal: "SIGKILL",
       }),
     ),
     {
       type: "guest.spawn.exit",
       id: "spawn",
-      exitCode: 7,
+      exitCode: null,
+      signal: "SIGKILL",
     },
   );
 

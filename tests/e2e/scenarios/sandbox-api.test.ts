@@ -274,6 +274,109 @@ test("buffered exec closes stdin for commands that read input", async (t) => {
   assert.equal(result.stderr, "");
 });
 
+test("spawn returns stream handles immediately and pipes guest stdio", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot();
+
+  const child = sandbox.spawn("/bin/sh", [
+    "-lc",
+    "cat; printf stderr-ready >&2",
+  ]);
+  const stdout = readStreamText(child.stdout);
+  const stderr = readStreamText(child.stderr);
+  const writer = child.stdin.getWriter();
+  await writer.write(new TextEncoder().encode("stdin-ready"));
+  await writer.close();
+
+  await child.ready;
+  assert.equal(await stdout, "stdin-ready");
+  assert.equal(await stderr, "stderr-ready");
+  assert.deepEqual(await child.exit, { exitCode: 0, signal: null });
+});
+
+test("spawn kill terminates a long-lived guest process", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot();
+
+  const child = sandbox.spawn("/bin/sleep", ["30"]);
+  await child.ready;
+  child.kill("SIGKILL");
+
+  assert.deepEqual(await child.exit, { exitCode: null, signal: "SIGKILL" });
+});
+
+test("spawn and pty honor already-aborted signals before launching", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot();
+
+  const controller = new AbortController();
+  controller.abort();
+
+  assert.throws(
+    () => sandbox.spawn("/bin/sh", ["-lc", "touch /tmp/spawn-started"], { signal: controller.signal }),
+    { name: "AbortError" },
+  );
+  assert.throws(
+    () =>
+      sandbox.pty("/bin/sh", ["-lc", "touch /tmp/pty-started"], {
+        signal: controller.signal,
+        size: { rows: 24, cols: 80 },
+      }),
+    { name: "AbortError" },
+  );
+
+  const result = await sandbox.exec("/bin/sh", [
+    "-lc",
+    "test ! -e /tmp/spawn-started && test ! -e /tmp/pty-started",
+  ]);
+  assert.equal(result.exitCode, 0, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+});
+
+test("pty runs an interactive terminal process with a required size", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot();
+
+  const term = sandbox.pty("/bin/sh", [
+    "-lc",
+    "IFS= read -r line; stty size; printf 'line=%s done' \"$line\"",
+  ], {
+    env: { TERM: "xterm-256color" },
+    size: { rows: 24, cols: 80 },
+  });
+  const output = readStreamText(term.output, { timeoutMs: 5_000 });
+  const writer = term.input.getWriter();
+  await term.ready;
+  term.resize({ rows: 33, cols: 101 });
+  await writer.write(new TextEncoder().encode("pty-ready\n"));
+  await writer.close();
+
+  const text = await output;
+  assert.match(text, /33 101/);
+  assert.match(text, /line=pty-ready/);
+  assert.match(text, /done/);
+  assert.deepEqual(await term.exit, { exitCode: 0, signal: null });
+});
+
 test("buffered exec timeout includes output drain time", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
@@ -592,7 +695,7 @@ test("boot cwd becomes the default process working directory", async (t) => {
     cwd: "/tmp",
   });
 
-  const result = await sandbox.exec("/bin/pwd");
+  const result = await sandbox.exec("/bin/pwd", []);
 
   assert.equal(result.exitCode, 0);
   assert.equal(result.stdout.trim(), "/tmp");
@@ -762,4 +865,43 @@ function memoryBlockStore(): SandboxBlockStore & {
       return Array.from(blocks.keys());
     },
   };
+}
+
+async function readStreamText(
+  stream: ReadableStream<Uint8Array>,
+  options: { readonly timeoutMs?: number } = {},
+): Promise<string> {
+  const timeout = options.timeoutMs === undefined
+    ? undefined
+    : new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error(`timed out reading stream after ${options.timeoutMs}ms`)), options.timeoutMs);
+      });
+  if (timeout !== undefined) {
+    return await Promise.race([readStreamTextUntilClosed(stream), timeout]);
+  }
+  return await readStreamTextUntilClosed(stream);
+}
+
+async function readStreamTextUntilClosed(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) {
+        break;
+      }
+      chunks.push(next.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const size = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
+  const data = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    data.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(data);
 }
