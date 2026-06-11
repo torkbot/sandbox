@@ -5,8 +5,8 @@ use std::net::{Ipv4Addr, Shutdown, TcpStream, ToSocketAddrs, UdpSocket};
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant as StdInstant};
 
@@ -41,12 +41,13 @@ const HOST_ALT_HTTP_PORT: u16 = 8000;
 const HOST_HTTPS_PORT: u16 = 443;
 const HOST_ALT_HTTPS_PORT: u16 = 8443;
 const HOST_DNS_PORT: u16 = 53;
-const HTTP_LISTENERS_PER_PORT: usize = 16;
-const HTTP_MAX_SOCKETS_PER_PORT: usize = 256;
-const HTTP_SOCKET_BUFFER_BYTES: usize = 256 * 1024;
-const HTTP_BRIDGE_BUFFER_BYTES: usize = 256 * 1024;
+const HTTP_LISTENERS_PER_PORT: usize = 1;
+const HTTP_MAX_SOCKETS_PER_PORT: usize = 64;
+const HTTP_SOCKET_BUFFER_BYTES: usize = 64 * 1024;
+const HTTP_BRIDGE_BUFFER_BYTES: usize = 64 * 1024;
 const TLS_READ_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_INTERCEPT_HEAD_BYTES: usize = 64 * 1024;
+const TCP_DNS_SOCKET_BUFFER_BYTES: usize = 8 * 1024;
 const DNS_PACKET_BUFFER_BYTES: usize = 4096;
 const DNS_DEFAULT_TTL_SECS: u32 = 60;
 // DNS TTL controls resolver freshness. Pins are trusted attribution evidence for
@@ -54,7 +55,7 @@ const DNS_DEFAULT_TTL_SECS: u32 = 60;
 const DNS_PIN_ATTRIBUTION_MIN_TTL: Duration = Duration::from_secs(10 * 60);
 const DNS_UPSTREAM_ATTEMPTS: usize = 3;
 const DNS_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
-const UDP_RELAY_BUFFER_BYTES: usize = 64 * 1024;
+const UDP_RELAY_BUFFER_BYTES: usize = 16 * 1024;
 const UDP_INTERCEPT_PORT_START: u16 = 40_000;
 const UDP_INTERCEPT_PORT_END: u16 = 60_999;
 const INTERCEPT_FLOW_IDLE_TTL: Duration = Duration::from_secs(300);
@@ -143,6 +144,38 @@ pub struct DnsResolver {
     pub port: u16,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostFlowAttempt {
+    protocol: NetworkProtocol,
+    transport: NetworkProtocol,
+    src: NetworkEndpoint,
+    dst: NetworkEndpoint,
+    hostname: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdmittedHostFlow {
+    attempt: HostFlowAttempt,
+    action: NetworkPolicyAction,
+    dns_resolvers: Vec<DnsResolver>,
+}
+
+#[derive(Debug, Clone)]
+struct FlowAdmission {
+    outbound_rules: Option<Vec<OutboundRulePlan>>,
+    policy: Option<Arc<dyn NetworkPolicyRuntime>>,
+}
+
+trait HostEgress: Send + Sync + std::fmt::Debug {
+    fn connect_tcp(&self, flow: &AdmittedHostFlow) -> io::Result<TcpStream>;
+    fn connect_udp(&self, flow: &AdmittedHostFlow) -> io::Result<UdpSocket>;
+    fn resolve_dns(&self, flow: &AdmittedHostFlow, request: &[u8]) -> io::Result<DnsResponse>;
+    fn tls_connector_data(&self, flow: &AdmittedHostFlow) -> io::Result<TlsConnectorData>;
+}
+
+#[derive(Debug)]
+struct DirectHostEgress;
+
 pub trait NetworkPolicyRuntime: Send + Sync + std::fmt::Debug {
     fn decide_connection(
         &self,
@@ -198,6 +231,186 @@ impl MitmTlsAuthority {
     }
 }
 
+impl FlowAdmission {
+    fn new(
+        outbound_rules: Option<Vec<OutboundRulePlan>>,
+        policy: Option<Arc<dyn NetworkPolicyRuntime>>,
+    ) -> Self {
+        Self {
+            outbound_rules,
+            policy,
+        }
+    }
+
+    fn admit_transport(&self, attempt: HostFlowAttempt) -> Option<AdmittedHostFlow> {
+        let decision = decide_transport(
+            self.policy.as_deref(),
+            self.outbound_rules.as_deref(),
+            attempt.protocol,
+            attempt.src.clone(),
+            attempt.dst.clone(),
+            attempt.hostname.clone(),
+        );
+        self.admit(attempt, decision)
+    }
+
+    fn admit_dns(&self, attempt: HostFlowAttempt) -> Option<AdmittedHostFlow> {
+        if self
+            .outbound_rules
+            .as_deref()
+            .is_some_and(|rules| !match attempt.transport {
+                NetworkProtocol::Tcp => {
+                    is_allowed_outbound_tcp(&attempt.dst.ip, attempt.dst.port, rules)
+                }
+                NetworkProtocol::Udp => {
+                    is_allowed_outbound_udp(&attempt.dst.ip, attempt.dst.port, rules)
+                }
+                NetworkProtocol::Dns => true,
+            })
+        {
+            return None;
+        }
+        let decision = decide_dns(
+            self.policy.as_deref(),
+            attempt.transport,
+            attempt.src.clone(),
+            attempt.dst.clone(),
+        )
+        .unwrap_or_else(|_| denied_decision());
+        self.admit(attempt, decision)
+    }
+
+    fn notify_closed(&self, flow: &AdmittedHostFlow) {
+        let Some(policy) = self.policy.as_deref() else {
+            return;
+        };
+        let _ = policy.connection_closed(NetworkConnectionAttempt {
+            protocol: flow.attempt.protocol,
+            transport: flow.attempt.transport,
+            src: flow.attempt.src.clone(),
+            dst: flow.attempt.dst.clone(),
+            hostname: flow.attempt.hostname.clone(),
+        });
+    }
+
+    fn admit(
+        &self,
+        attempt: HostFlowAttempt,
+        decision: NetworkPolicyDecision,
+    ) -> Option<AdmittedHostFlow> {
+        (decision.action != NetworkPolicyAction::Deny).then_some(AdmittedHostFlow {
+            attempt,
+            action: decision.action,
+            dns_resolvers: decision.dns_resolvers,
+        })
+    }
+}
+
+impl HostEgress for DirectHostEgress {
+    fn connect_tcp(&self, flow: &AdmittedHostFlow) -> io::Result<TcpStream> {
+        TcpStream::connect(upstream_socket_addr(
+            &flow.attempt.dst.ip,
+            flow.attempt.dst.port,
+        ))
+    }
+
+    fn connect_udp(&self, flow: &AdmittedHostFlow) -> io::Result<UdpSocket> {
+        let destination_ip = flow
+            .attempt
+            .dst
+            .ip
+            .parse::<std::net::IpAddr>()
+            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
+        let bind_address = if destination_ip.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let socket = UdpSocket::bind(bind_address)?;
+        socket.connect(std::net::SocketAddr::new(
+            destination_ip,
+            flow.attempt.dst.port,
+        ))?;
+        Ok(socket)
+    }
+
+    fn resolve_dns(&self, flow: &AdmittedHostFlow, request: &[u8]) -> io::Result<DnsResponse> {
+        if flow.dns_resolvers.is_empty() {
+            return resolve_dns_with_default(request)
+                .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "unsupported DNS request"));
+        }
+
+        let request_message = DnsMessage::from_vec(request)
+            .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
+        let packet = resolve_dns_with_upstreams(request, flow)
+            .ok_or_else(|| io::Error::new(ErrorKind::TimedOut, "DNS upstream did not answer"))?;
+        let response_message = DnsMessage::from_vec(&packet)
+            .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
+        Ok(DnsResponse {
+            packet,
+            pins: dns_answer_pins(&request_message, &response_message),
+        })
+    }
+
+    fn tls_connector_data(&self, _flow: &AdmittedHostFlow) -> io::Result<TlsConnectorData> {
+        native_root_tls_connector_data()
+    }
+}
+
+fn native_root_tls_connector_data() -> io::Result<TlsConnectorData> {
+    static TLS: OnceLock<TlsConnectorData> = OnceLock::new();
+    if let Some(tls) = TLS.get() {
+        return Ok(tls.clone());
+    }
+    let tls = build_native_root_tls_connector_data()?;
+    let _ = TLS.set(tls.clone());
+    Ok(tls)
+}
+
+fn build_native_root_tls_connector_data() -> io::Result<TlsConnectorData> {
+    let roots = load_native_root_cert_store()?;
+    Ok(tls_connector_data_from_roots(roots))
+}
+
+fn tls_connector_data_from_roots(roots: rustls::RootCertStore) -> TlsConnectorData {
+    let mut config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    TlsConnectorData::from(config)
+}
+
+fn load_native_root_cert_store() -> io::Result<rustls::RootCertStore> {
+    let result = rustls_native_certs::load_native_certs();
+    if result.certs.is_empty() {
+        let error = if result.errors.is_empty() {
+            "native TLS root store is empty".to_string()
+        } else {
+            format!(
+                "failed to load native TLS roots: {}",
+                result
+                    .errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        };
+        return Err(io::Error::new(ErrorKind::NotFound, error));
+    }
+
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in result.certs {
+        roots.add(cert).map_err(|error| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                format!("failed to add native TLS root: {error}"),
+            )
+        })?;
+    }
+    Ok(roots)
+}
+
 /// Host-owned endpoint for libkrun's explicit virtio-net unixstream backend.
 #[derive(Debug)]
 pub struct HostNetwork {
@@ -218,6 +431,8 @@ impl HostNetwork {
             .map(MitmTlsAuthority::new)
             .transpose()?
             .map(Arc::new);
+        let admission = FlowAdmission::new(outbound_rules, policy);
+        let egress = Arc::new(DirectHostEgress);
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = shutdown.clone();
         let worker = thread::spawn(move || {
@@ -225,9 +440,9 @@ impl HostNetwork {
                 host,
                 worker_shutdown,
                 tls_authority,
-                outbound_rules,
+                admission,
                 http,
-                policy,
+                egress,
             )
         });
         Ok(Self {
@@ -255,22 +470,17 @@ fn run_network_service(
     stream: UnixStream,
     shutdown: Arc<AtomicBool>,
     tls_authority: Option<Arc<MitmTlsAuthority>>,
-    outbound_rules: Option<Vec<OutboundRulePlan>>,
+    admission: FlowAdmission,
     http: Option<Arc<dyn HttpInterceptRuntime>>,
-    policy: Option<Arc<dyn NetworkPolicyRuntime>>,
+    egress: Arc<dyn HostEgress>,
 ) {
     let _ = stream.set_nonblocking(true);
     let tx = match stream.try_clone() {
         Ok(tx) => tx,
         Err(_) => return,
     };
-    let mut device = LibkrunNetDevice::new(
-        stream,
-        tx,
-        Ipv4Address::new(10, 0, 2, 1),
-        outbound_rules.clone(),
-        policy.clone(),
-    );
+    let mut device =
+        LibkrunNetDevice::new(stream, tx, Ipv4Address::new(10, 0, 2, 1), admission.clone());
     let mut iface = Interface::new(
         Config::new(EthernetAddress([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xf0]).into()),
         &mut device,
@@ -295,16 +505,16 @@ fn run_network_service(
         poll_dns_socket(
             &mut sockets,
             dns_handle,
-            outbound_rules.as_deref(),
-            policy.as_deref(),
+            &admission,
+            egress.as_ref(),
             &mut device.interception,
         );
         for handle in &tcp_dns_handles {
             poll_tcp_dns_socket(
                 &mut sockets,
                 *handle,
-                outbound_rules.as_deref(),
-                policy.as_deref(),
+                &admission,
+                egress.as_ref(),
                 &mut tcp_dns_connections,
                 &mut device.interception,
             );
@@ -342,8 +552,8 @@ fn run_network_service(
                 handle,
                 port,
                 &mut device.interception,
-                outbound_rules.as_deref(),
-                policy.as_deref(),
+                &admission,
+                egress.as_ref(),
                 &mut udp_relays,
             );
         }
@@ -357,10 +567,10 @@ fn run_network_service(
                 handle,
                 port,
                 &mut device.interception,
-                outbound_rules.as_deref(),
+                &admission,
                 http.clone(),
-                policy.clone(),
                 tls_authority.clone(),
+                egress.clone(),
                 &mut http_connections,
             );
         }
@@ -421,8 +631,8 @@ fn add_tcp_dns_listeners(sockets: &mut SocketSet<'_>) -> Vec<SocketHandle> {
     (0..HTTP_LISTENERS_PER_PORT)
         .map(|_| {
             let mut socket = tcp::Socket::new(
-                tcp::SocketBuffer::new(vec![0; HTTP_SOCKET_BUFFER_BYTES]),
-                tcp::SocketBuffer::new(vec![0; HTTP_SOCKET_BUFFER_BYTES]),
+                tcp::SocketBuffer::new(vec![0; TCP_DNS_SOCKET_BUFFER_BYTES]),
+                tcp::SocketBuffer::new(vec![0; TCP_DNS_SOCKET_BUFFER_BYTES]),
             );
             let _ = socket.listen(HOST_DNS_PORT);
             sockets.add(socket)
@@ -433,8 +643,8 @@ fn add_tcp_dns_listeners(sockets: &mut SocketSet<'_>) -> Vec<SocketHandle> {
 fn poll_dns_socket(
     sockets: &mut SocketSet<'_>,
     handle: SocketHandle,
-    outbound_rules: Option<&[OutboundRulePlan]>,
-    policy: Option<&dyn NetworkPolicyRuntime>,
+    admission: &FlowAdmission,
+    egress: &dyn HostEgress,
     interception: &mut TransparentInterception,
 ) {
     let socket = sockets.get_mut::<udp::Socket>(handle);
@@ -442,11 +652,6 @@ fn poll_dns_socket(
         let Ok((request, remote)) = socket.recv() else {
             return;
         };
-        if outbound_rules
-            .is_some_and(|rules| !is_allowed_outbound_udp("10.0.2.1", HOST_DNS_PORT, rules))
-        {
-            continue;
-        }
         let src = NetworkEndpoint {
             ip: remote.endpoint.addr.to_string(),
             port: remote.endpoint.port,
@@ -455,12 +660,16 @@ fn poll_dns_socket(
             ip: "10.0.2.1".to_string(),
             port: HOST_DNS_PORT,
         };
-        let decision = match decide_dns(policy, NetworkProtocol::Udp, src, dst) {
-            Ok(decision) if decision.action != NetworkPolicyAction::Deny => decision,
-            _ => continue,
+        let Some(flow) = admission.admit_dns(HostFlowAttempt {
+            protocol: NetworkProtocol::Dns,
+            transport: NetworkProtocol::Udp,
+            src,
+            dst,
+            hostname: None,
+        }) else {
+            continue;
         };
-        let Some(answer) = dns_response(request, NetworkProtocol::Udp, &decision.dns_resolvers)
-        else {
+        let Ok(answer) = egress.resolve_dns(&flow, request) else {
             continue;
         };
         for pin in answer.answer_pins() {
@@ -470,6 +679,44 @@ fn poll_dns_socket(
             &answer.packet,
             IpEndpoint::new(remote.endpoint.addr, remote.endpoint.port),
         );
+    }
+}
+
+fn dns_flow_attempt(
+    transport: NetworkProtocol,
+    src: NetworkEndpoint,
+    dst: NetworkEndpoint,
+) -> HostFlowAttempt {
+    HostFlowAttempt {
+        protocol: NetworkProtocol::Dns,
+        transport,
+        src,
+        dst,
+        hostname: None,
+    }
+}
+
+fn udp_flow_attempt(src: NetworkEndpoint, dst: NetworkEndpoint) -> HostFlowAttempt {
+    HostFlowAttempt {
+        protocol: NetworkProtocol::Udp,
+        transport: NetworkProtocol::Udp,
+        src,
+        dst,
+        hostname: None,
+    }
+}
+
+fn tcp_flow_attempt(
+    src: NetworkEndpoint,
+    dst: NetworkEndpoint,
+    hostname: Option<String>,
+) -> HostFlowAttempt {
+    HostFlowAttempt {
+        protocol: NetworkProtocol::Tcp,
+        transport: NetworkProtocol::Tcp,
+        src,
+        dst,
+        hostname,
     }
 }
 
@@ -517,8 +764,8 @@ fn poll_udp_relay_socket(
     handle: SocketHandle,
     host_port: u16,
     interception: &mut TransparentInterception,
-    outbound_rules: Option<&[OutboundRulePlan]>,
-    policy: Option<&dyn NetworkPolicyRuntime>,
+    admission: &FlowAdmission,
+    egress: &dyn HostEgress,
     relays: &mut HashMap<UdpFlow, UdpRelay>,
 ) {
     let socket = sockets.get_mut::<udp::Socket>(handle);
@@ -533,10 +780,7 @@ fn poll_udp_relay_socket(
         ) else {
             continue;
         };
-        let decision = decide_transport(
-            policy,
-            outbound_rules,
-            NetworkProtocol::Udp,
+        let Some(admitted) = admission.admit_transport(udp_flow_attempt(
             NetworkEndpoint {
                 ip: remote.endpoint.addr.to_string(),
                 port: remote.endpoint.port,
@@ -545,11 +789,9 @@ fn poll_udp_relay_socket(
                 ip: destination.ip.clone(),
                 port: destination.port,
             },
-            None,
-        );
-        if decision.action == NetworkPolicyAction::Deny {
+        )) else {
             continue;
-        }
+        };
         let flow = UdpFlow {
             guest_ip: remote.endpoint.addr,
             guest_port: remote.endpoint.port,
@@ -558,8 +800,7 @@ fn poll_udp_relay_socket(
             destination_port: destination.port,
         };
         let relay = relays.entry(flow).or_insert_with(|| {
-            UdpRelay::connect(&destination.ip, destination.port)
-                .unwrap_or_else(|_| UdpRelay::closed())
+            UdpRelay::connect(egress, &admitted).unwrap_or_else(|_| UdpRelay::closed())
         });
         relay.send(payload);
     }
@@ -594,9 +835,8 @@ struct UdpRelay {
 }
 
 impl UdpRelay {
-    fn connect(destination_ip: &str, destination_port: u16) -> io::Result<Self> {
-        let socket = UdpSocket::bind(("0.0.0.0", 0))?;
-        socket.connect(upstream_socket_addr(destination_ip, destination_port))?;
+    fn connect(egress: &dyn HostEgress, flow: &AdmittedHostFlow) -> io::Result<Self> {
+        let socket = egress.connect_udp(flow)?;
         socket.set_nonblocking(true)?;
         Ok(Self {
             socket: Some(socket),
@@ -639,8 +879,8 @@ impl UdpRelay {
 fn poll_tcp_dns_socket(
     sockets: &mut SocketSet<'_>,
     handle: SocketHandle,
-    outbound_rules: Option<&[OutboundRulePlan]>,
-    policy: Option<&dyn NetworkPolicyRuntime>,
+    admission: &FlowAdmission,
+    egress: &dyn HostEgress,
     connections: &mut HashMap<SocketHandle, TcpDnsConnection>,
     interception: &mut TransparentInterception,
 ) {
@@ -668,8 +908,7 @@ fn poll_tcp_dns_socket(
         }
         let request = connection.from_guest[2..2 + request_len].to_vec();
         connection.from_guest.drain(..2 + request_len);
-        let response =
-            handle_tcp_dns_request(socket, outbound_rules, policy, interception, &request);
+        let response = handle_tcp_dns_request(socket, admission, egress, interception, &request);
         if let Some(response) = response {
             connection
                 .to_guest
@@ -695,16 +934,11 @@ fn poll_tcp_dns_socket(
 
 fn handle_tcp_dns_request(
     socket: &tcp::Socket<'_>,
-    outbound_rules: Option<&[OutboundRulePlan]>,
-    policy: Option<&dyn NetworkPolicyRuntime>,
+    admission: &FlowAdmission,
+    egress: &dyn HostEgress,
     interception: &mut TransparentInterception,
     request: &[u8],
 ) -> Option<DnsResponse> {
-    if outbound_rules
-        .is_some_and(|rules| !is_allowed_outbound_tcp("10.0.2.1", HOST_DNS_PORT, rules))
-    {
-        return None;
-    }
     let remote = socket.remote_endpoint()?;
     let src = NetworkEndpoint {
         ip: remote.addr.to_string(),
@@ -714,11 +948,8 @@ fn handle_tcp_dns_request(
         ip: "10.0.2.1".to_string(),
         port: HOST_DNS_PORT,
     };
-    let decision = match decide_dns(policy, NetworkProtocol::Tcp, src, dst) {
-        Ok(decision) if decision.action != NetworkPolicyAction::Deny => decision,
-        _ => return None,
-    };
-    let response = dns_response(request, NetworkProtocol::Tcp, &decision.dns_resolvers)?;
+    let flow = admission.admit_dns(dns_flow_attempt(NetworkProtocol::Tcp, src, dst))?;
+    let response = egress.resolve_dns(&flow, request).ok()?;
     for pin in response.answer_pins() {
         interception.record_dns_answer(remote.addr, pin);
     }
@@ -813,16 +1044,16 @@ fn poll_http_socket(
     handle: SocketHandle,
     port: u16,
     interception: &mut TransparentInterception,
-    outbound_rules: Option<&[OutboundRulePlan]>,
+    admission: &FlowAdmission,
     http: Option<Arc<dyn HttpInterceptRuntime>>,
-    policy: Option<Arc<dyn NetworkPolicyRuntime>>,
     tls_authority: Option<Arc<MitmTlsAuthority>>,
+    egress: Arc<dyn HostEgress>,
     http_connections: &mut HashMap<SocketHandle, HttpConnection>,
 ) {
     let socket = sockets.get_mut::<tcp::Socket>(handle);
     if !socket.is_active() {
         if let Some(connection) = http_connections.remove(&handle) {
-            notify_connection_closed(policy.as_deref(), NetworkProtocol::Tcp, &connection);
+            connection.notify_closed(admission);
         }
         let _ = socket.listen(port);
         return;
@@ -832,7 +1063,7 @@ fn poll_http_socket(
         poll_http_connection(socket, connection);
         if connection.is_finished() {
             if let Some(connection) = http_connections.remove(&handle) {
-                notify_connection_closed(policy.as_deref(), NetworkProtocol::Tcp, &connection);
+                connection.notify_closed(admission);
             }
             socket.close();
         }
@@ -843,38 +1074,12 @@ fn poll_http_socket(
         socket,
         handle,
         interception,
-        outbound_rules,
+        admission,
         http,
-        policy,
         tls_authority,
+        egress,
         http_connections,
     );
-}
-
-fn notify_connection_closed(
-    policy: Option<&dyn NetworkPolicyRuntime>,
-    protocol: NetworkProtocol,
-    connection: &HttpConnection,
-) {
-    let Some(policy) = policy else {
-        return;
-    };
-    let Some(destination) = connection.destination() else {
-        return;
-    };
-    let _ = policy.connection_closed(NetworkConnectionAttempt {
-        protocol,
-        transport: protocol,
-        src: NetworkEndpoint {
-            ip: destination.source_ip.clone(),
-            port: destination.source_port,
-        },
-        dst: NetworkEndpoint {
-            ip: destination.ip.clone(),
-            port: destination.port,
-        },
-        hostname: destination.hostname.clone(),
-    });
 }
 
 fn looks_like_tls(bytes: &[u8]) -> bool {
@@ -919,10 +1124,10 @@ fn poll_plain_http_socket(
     socket: &mut tcp::Socket<'_>,
     handle: SocketHandle,
     interception: &mut TransparentInterception,
-    outbound_rules: Option<&[OutboundRulePlan]>,
+    admission: &FlowAdmission,
     http: Option<Arc<dyn HttpInterceptRuntime>>,
-    policy: Option<Arc<dyn NetworkPolicyRuntime>>,
     tls_authority: Option<Arc<MitmTlsAuthority>>,
+    egress: Arc<dyn HostEgress>,
     http_connections: &mut HashMap<SocketHandle, HttpConnection>,
 ) {
     let Some(destination) = original_http_destination(socket, interception) else {
@@ -933,10 +1138,7 @@ fn poll_plain_http_socket(
         socket.abort();
         return;
     };
-    let decision = decide_transport(
-        policy.as_deref(),
-        outbound_rules,
-        NetworkProtocol::Tcp,
+    let Some(admitted) = admission.admit_transport(tcp_flow_attempt(
         NetworkEndpoint {
             ip: remote.addr.to_string(),
             port: remote.port,
@@ -946,18 +1148,19 @@ fn poll_plain_http_socket(
             port: destination.port,
         },
         destination.hostname.clone(),
-    );
-    if decision.action == NetworkPolicyAction::Deny {
+    )) else {
         http_connections.remove(&handle);
         socket.abort();
         return;
-    }
+    };
 
-    let connection = match (port_is_probe(destination.port), decision.action) {
+    let connection = match (port_is_probe(destination.port), admitted.action) {
         (true, _) => HttpConnection::response(HOST_HTTP_PROBE_RESPONSE),
-        (_, NetworkPolicyAction::Accept) => HttpConnection::raw_relay(destination),
+        (_, NetworkPolicyAction::Accept) => {
+            HttpConnection::raw_relay(destination, admitted, egress)
+        }
         (_, NetworkPolicyAction::AcceptHttp) => {
-            HttpConnection::intercept(destination, http, tls_authority)
+            HttpConnection::intercept(destination, admitted, http, tls_authority, egress)
         }
         (_, NetworkPolicyAction::Deny) => {
             unreachable!("deny decision returned before connection creation")
@@ -1297,21 +1500,7 @@ impl DnsResponse {
     }
 }
 
-fn dns_response(
-    request: &[u8],
-    transport: NetworkProtocol,
-    resolvers: &[DnsResolver],
-) -> Option<DnsResponse> {
-    if !resolvers.is_empty() {
-        let request_message = DnsMessage::from_vec(request).ok()?;
-        let packet = resolve_dns_with_upstreams(request, transport, resolvers)?;
-        let response_message = DnsMessage::from_vec(&packet).ok()?;
-        return Some(DnsResponse {
-            packet,
-            pins: dns_answer_pins(&request_message, &response_message),
-        });
-    }
-
+fn resolve_dns_with_default(request: &[u8]) -> Option<DnsResponse> {
     let request_message = DnsMessage::from_vec(request).ok()?;
     let query = single_dns_query(&request_message)?;
     let name = dns_name_string(query.name());
@@ -1363,18 +1552,14 @@ fn single_dns_query(message: &DnsMessage) -> Option<&hickory_proto::op::Query> {
     }
 }
 
-fn resolve_dns_with_upstreams(
-    request: &[u8],
-    transport: NetworkProtocol,
-    resolvers: &[DnsResolver],
-) -> Option<Vec<u8>> {
+fn resolve_dns_with_upstreams(request: &[u8], flow: &AdmittedHostFlow) -> Option<Vec<u8>> {
     for _ in 0..DNS_UPSTREAM_ATTEMPTS {
-        for resolver in resolvers {
+        for resolver in &flow.dns_resolvers {
             let Ok(ip) = resolver.ip.parse::<std::net::IpAddr>() else {
                 continue;
             };
             let address = std::net::SocketAddr::new(ip, resolver.port);
-            let response = match transport {
+            let response = match flow.attempt.transport {
                 NetworkProtocol::Udp => resolve_dns_with_udp_upstream(request, address)
                     .or_else(|| resolve_dns_with_tcp_upstream(request, address)),
                 NetworkProtocol::Tcp => resolve_dns_with_tcp_upstream(request, address)
@@ -1504,27 +1689,19 @@ struct LibkrunNetDevice {
     rx: UnixStream,
     tx: UnixStream,
     interception: TransparentInterception,
-    outbound_rules: Option<Vec<OutboundRulePlan>>,
-    policy: Option<Arc<dyn NetworkPolicyRuntime>>,
+    admission: FlowAdmission,
     rx_buffer: Vec<u8>,
     staged_rx: Option<Vec<u8>>,
     pending_tx: Vec<u8>,
 }
 
 impl LibkrunNetDevice {
-    fn new(
-        rx: UnixStream,
-        tx: UnixStream,
-        host_ip: Ipv4Address,
-        outbound_rules: Option<Vec<OutboundRulePlan>>,
-        policy: Option<Arc<dyn NetworkPolicyRuntime>>,
-    ) -> Self {
+    fn new(rx: UnixStream, tx: UnixStream, host_ip: Ipv4Address, admission: FlowAdmission) -> Self {
         Self {
             rx,
             tx,
             interception: TransparentInterception::new(host_ip),
-            outbound_rules,
-            policy,
+            admission,
             rx_buffer: Vec::new(),
             staged_rx: None,
             pending_tx: Vec::new(),
@@ -1610,13 +1787,12 @@ impl LibkrunNetDevice {
             .to_string(),
             port: packet.destination_port(frame),
         };
-        let decision = decide_transport(
-            self.policy.as_deref(),
-            self.outbound_rules.as_deref(),
-            NetworkProtocol::Tcp,
+        let attempt = HostFlowAttempt {
+            protocol: NetworkProtocol::Tcp,
+            transport: NetworkProtocol::Tcp,
             src,
             dst,
-            self.interception.resolved_hostname(
+            hostname: self.interception.resolved_hostname(
                 IpAddress::v4(source_ip[0], source_ip[1], source_ip[2], source_ip[3]),
                 &Ipv4Address::new(
                     destination_ip[0],
@@ -1626,10 +1802,8 @@ impl LibkrunNetDevice {
                 )
                 .to_string(),
             ),
-        );
-        if decision.action == NetworkPolicyAction::Accept
-            || decision.action == NetworkPolicyAction::AcceptHttp
-        {
+        };
+        if self.admission.admit_transport(attempt).is_some() {
             return false;
         }
         let Some(reset) = tcp_reset_frame_for_syn(frame, packet) else {
@@ -1747,13 +1921,17 @@ impl HttpConnection {
 
     fn intercept(
         destination: HttpDestination,
+        admitted: AdmittedHostFlow,
         runtime: Option<Arc<dyn HttpInterceptRuntime>>,
         tls_authority: Option<Arc<MitmTlsAuthority>>,
+        egress: Arc<dyn HostEgress>,
     ) -> Self {
         Self::Intercept(InterceptConnection {
             destination,
+            admitted,
             runtime,
             tls_authority,
+            egress,
             http_enforced: true,
             state: InterceptState::ReadingHead {
                 guest_head: Vec::new(),
@@ -1765,11 +1943,17 @@ impl HttpConnection {
         })
     }
 
-    fn raw_relay(destination: HttpDestination) -> Self {
+    fn raw_relay(
+        destination: HttpDestination,
+        admitted: AdmittedHostFlow,
+        egress: Arc<dyn HostEgress>,
+    ) -> Self {
         let mut connection = InterceptConnection {
             destination,
+            admitted,
             runtime: None,
             tls_authority: None,
+            egress,
             http_enforced: false,
             state: InterceptState::ReadingHead {
                 guest_head: Vec::new(),
@@ -1794,10 +1978,10 @@ impl HttpConnection {
         }
     }
 
-    fn destination(&self) -> Option<&HttpDestination> {
+    fn notify_closed(&self, admission: &FlowAdmission) {
         match self {
-            Self::Response(_) => None,
-            Self::Intercept(intercept) => Some(&intercept.destination),
+            Self::Response(_) => {}
+            Self::Intercept(intercept) => admission.notify_closed(&intercept.admitted),
         }
     }
 }
@@ -1818,8 +2002,10 @@ enum InterceptState {
 
 struct InterceptConnection {
     destination: HttpDestination,
+    admitted: AdmittedHostFlow,
     runtime: Option<Arc<dyn HttpInterceptRuntime>>,
     tls_authority: Option<Arc<MitmTlsAuthority>>,
+    egress: Arc<dyn HostEgress>,
     http_enforced: bool,
     state: InterceptState,
     upstream: Option<TcpStream>,
@@ -1861,7 +2047,9 @@ impl HttpScheme {
 struct HttpFlowContext {
     scheme: HttpScheme,
     destination: HttpDestination,
+    admitted: AdmittedHostFlow,
     tls: Option<HostTlsMetadata>,
+    egress: Arc<dyn HostEgress>,
 }
 
 impl HttpFlowContext {
@@ -1878,7 +2066,8 @@ impl HttpFlowContext {
 
 #[derive(Debug, Clone)]
 struct FixedDestinationConnector {
-    destination: HttpDestination,
+    flow: AdmittedHostFlow,
+    egress: Arc<dyn HostEgress>,
 }
 
 impl<B> Service<RamaRequest<B>> for FixedDestinationConnector
@@ -1890,10 +2079,7 @@ where
 
     async fn serve(&self, _request: RamaRequest<B>) -> Result<Self::Output, Self::Error> {
         let request = _request;
-        let upstream = TcpStream::connect(upstream_socket_addr(
-            &self.destination.ip,
-            self.destination.port,
-        ))?;
+        let upstream = self.egress.connect_tcp(&self.flow)?;
         upstream.set_nonblocking(true)?;
         let conn = RamaTcpStream::try_from_std_tcp_stream(upstream, Extensions::new())?;
         Ok(EstablishedClientConnection {
@@ -1993,12 +2179,13 @@ async fn serve_rama_http_request(
     }
 
     let connector = FixedDestinationConnector {
-        destination: context.destination.clone(),
+        flow: context.admitted.clone(),
+        egress: context.egress.clone(),
     };
     match context.scheme {
         HttpScheme::Http => serve_rama_upstream(connector, request).await,
         HttpScheme::Https => {
-            let Ok(tls) = TlsConnectorData::try_new_http_auto() else {
+            let Ok(tls) = context.egress.tls_connector_data(&context.admitted) else {
                 return rama_response(502, "upstream tls connect failed");
             };
             let connector = TlsConnector::auto(connector).with_connector_data(tls);
@@ -2168,7 +2355,9 @@ impl TlsInterceptConnection {
         sni: Option<String>,
         initial_guest_tls: &[u8],
         destination: HttpDestination,
+        admitted: AdmittedHostFlow,
         runtime: Option<Arc<dyn HttpInterceptRuntime>>,
+        egress: Arc<dyn HostEgress>,
     ) -> io::Result<Self> {
         let (bridge, async_io) = SyncAsyncBridge::new(HTTP_BRIDGE_BUFFER_BYTES);
         let metadata = HostTlsMetadata {
@@ -2185,7 +2374,9 @@ impl TlsInterceptConnection {
                 let context = Arc::new(HttpFlowContext {
                     scheme: HttpScheme::Https,
                     destination,
+                    admitted,
                     tls: Some(metadata),
+                    egress,
                 });
                 let service = rama_core::service::service_fn(move |request: RamaRequest<Body>| {
                     let context = context.clone();
@@ -2399,7 +2590,9 @@ impl InterceptConnection {
                 sni,
                 guest_head,
                 self.destination.clone(),
+                self.admitted.clone(),
                 self.runtime.clone(),
+                self.egress.clone(),
             ) {
                 Ok(tls) => {
                     self.state = InterceptState::Tls(tls);
@@ -2418,7 +2611,9 @@ impl InterceptConnection {
             HttpFlowContext {
                 scheme: HttpScheme::Http,
                 destination: self.destination.clone(),
+                admitted: self.admitted.clone(),
                 tls: None,
+                egress: self.egress.clone(),
             },
             initial_bytes,
             self.runtime.clone(),
@@ -2435,10 +2630,7 @@ impl InterceptConnection {
     }
 
     fn start_raw_relay(&mut self, initial_bytes: Vec<u8>) {
-        match TcpStream::connect(upstream_socket_addr(
-            &self.destination.ip,
-            self.destination.port,
-        )) {
+        match self.egress.connect_tcp(&self.admitted) {
             Ok(upstream) => {
                 let _ = upstream.set_nonblocking(true);
                 self.to_upstream.extend_from_slice(&initial_bytes);
@@ -3183,7 +3375,12 @@ mod tests {
         let (rx, mut rx_writer) = UnixStream::pair().unwrap();
         let (tx, _tx_reader) = UnixStream::pair().unwrap();
         rx.set_nonblocking(true).unwrap();
-        let mut device = LibkrunNetDevice::new(rx, tx, Ipv4Address::new(10, 0, 2, 1), None, None);
+        let mut device = LibkrunNetDevice::new(
+            rx,
+            tx,
+            Ipv4Address::new(10, 0, 2, 1),
+            FlowAdmission::new(None, None),
+        );
         let ethernet = [0u8; 14];
         let mut packet = Vec::new();
         packet.extend_from_slice(&(ethernet.len() as u32).to_be_bytes());
@@ -3400,6 +3597,28 @@ mod tests {
     }
 
     #[test]
+    fn idle_network_service_listener_buffers_stay_bounded() {
+        let mut sockets = SocketSet::new(Vec::new());
+        let _dns_handle = add_dns_socket(&mut sockets);
+        let tcp_dns_handles = add_tcp_dns_listeners(&mut sockets);
+        let mut http_sockets = HashMap::new();
+
+        add_static_http_listeners(&mut sockets, &mut http_sockets, true);
+
+        let http_listener_count: usize = http_sockets.values().map(Vec::len).sum();
+        let reserved_bytes = (2 * DNS_PACKET_BUFFER_BYTES)
+            + tcp_dns_handles.len() * 2 * TCP_DNS_SOCKET_BUFFER_BYTES
+            + http_listener_count * 2 * HTTP_SOCKET_BUFFER_BYTES;
+
+        assert_eq!(tcp_dns_handles.len(), HTTP_LISTENERS_PER_PORT);
+        assert_eq!(http_listener_count, 5 * HTTP_LISTENERS_PER_PORT);
+        assert!(
+            reserved_bytes <= 1024 * 1024,
+            "idle listener buffers reserve {reserved_bytes} bytes"
+        );
+    }
+
+    #[test]
     fn transparent_interception_assigns_distinct_udp_ports_for_distinct_destinations() {
         let mut interception = TransparentInterception::new(Ipv4Address::new(10, 0, 2, 1));
         let mut first = udp_frame([10, 0, 2, 15], [1, 1, 1, 1], 50_000, 53);
@@ -3481,11 +3700,23 @@ mod tests {
 
     #[test]
     fn dns_unsupported_query_type_returns_nodata_for_known_name() {
-        let response =
-            dns_response(&dns_query("localhost", 28), NetworkProtocol::Udp, &[]).unwrap();
+        let egress = DirectHostEgress;
+        let response = egress
+            .resolve_dns(&default_dns_flow(), &dns_query("localhost", 28))
+            .unwrap();
 
         assert_eq!(&response.packet[2..4], &[0x81, 0x80]);
         assert_eq!(&response.packet[6..8], &[0, 0]);
+    }
+
+    #[test]
+    fn upstream_tls_config_advertises_http_alpn() {
+        let tls = tls_connector_data_from_roots(rustls::RootCertStore::empty());
+
+        assert_eq!(
+            tls.client_config.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
     }
 
     #[test]
@@ -3603,13 +3834,20 @@ mod tests {
         let guest = IpAddress::v4(10, 0, 2, 15);
         let before = StdInstant::now();
 
-        interception.record_dns_answer(guest, &DnsAnswerPin {
-            hostname: "short-ttl.example".to_string(),
-            address: [192, 0, 2, 10],
-            ttl: Duration::from_secs(1),
-        });
+        interception.record_dns_answer(
+            guest,
+            &DnsAnswerPin {
+                hostname: "short-ttl.example".to_string(),
+                address: [192, 0, 2, 10],
+                ttl: Duration::from_secs(1),
+            },
+        );
 
-        let pin = interception.dns_pins.pins.first().expect("DNS pin was recorded");
+        let pin = interception
+            .dns_pins
+            .pins
+            .first()
+            .expect("DNS pin was recorded");
         assert!(pin.expires_at.duration_since(before) >= DNS_PIN_ATTRIBUTION_MIN_TTL);
         assert_eq!(
             interception.resolved_hostname(guest, "192.0.2.10"),
@@ -3773,6 +4011,26 @@ mod tests {
             ca_private_key_pem: key.serialize_pem(),
         })
         .unwrap()
+    }
+
+    fn default_dns_flow() -> AdmittedHostFlow {
+        AdmittedHostFlow {
+            attempt: HostFlowAttempt {
+                protocol: NetworkProtocol::Dns,
+                transport: NetworkProtocol::Udp,
+                src: NetworkEndpoint {
+                    ip: "10.0.2.15".to_string(),
+                    port: 50_000,
+                },
+                dst: NetworkEndpoint {
+                    ip: "10.0.2.1".to_string(),
+                    port: HOST_DNS_PORT,
+                },
+                hostname: None,
+            },
+            action: NetworkPolicyAction::Accept,
+            dns_resolvers: Vec::new(),
+        }
     }
 
     fn dns_answer(request: &DnsMessage, addresses: &[[u8; 4]]) -> Vec<u8> {
