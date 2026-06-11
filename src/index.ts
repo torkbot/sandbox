@@ -12,7 +12,7 @@ import {
   isSandboxWritableFileSystem,
 } from "./vfs.ts";
 import type { HostSpawnSandboxOptions } from "./spawn-options.ts";
-import type { ControlBackedSandboxProcess, SandboxControl } from "./control.ts";
+import type { ControlBackedSandboxProcess, ControlBackedSandboxPty, SandboxControl } from "./control.ts";
 import type { SandboxControlEvent } from "./control-codec.ts";
 import type {
   InternalNetworkConfig,
@@ -507,6 +507,19 @@ export interface SandboxExecOptions {
 export interface SandboxSpawnOptions {
   readonly cwd?: string;
   readonly env?: Record<string, string>;
+  readonly signal?: AbortSignal;
+}
+
+export interface SandboxPtyOptions {
+  readonly cwd?: string;
+  readonly env?: Record<string, string>;
+  readonly size: SandboxPtySize;
+  readonly signal?: AbortSignal;
+}
+
+export interface SandboxPtySize {
+  readonly rows: number;
+  readonly cols: number;
 }
 
 export interface SandboxExecResult {
@@ -516,10 +529,34 @@ export interface SandboxExecResult {
 }
 
 export interface SandboxProcess {
-  readonly stdout: AsyncIterable<Uint8Array>;
-  readonly stderr: AsyncIterable<Uint8Array>;
-  readonly exit: Promise<{ readonly exitCode: number }>;
+  readonly stdin: WritableStream<Uint8Array>;
+  readonly stdout: ReadableStream<Uint8Array>;
+  readonly stderr: ReadableStream<Uint8Array>;
+  readonly ready: Promise<void>;
+  readonly exit: Promise<SandboxProcessExit>;
+  kill(signal?: SandboxSignal): void;
 }
+
+export interface SandboxPty {
+  readonly input: WritableStream<Uint8Array>;
+  readonly output: ReadableStream<Uint8Array>;
+  readonly ready: Promise<void>;
+  readonly exit: Promise<SandboxProcessExit>;
+  resize(size: SandboxPtySize): void;
+  kill(signal?: SandboxSignal): void;
+}
+
+export interface SandboxProcessExit {
+  readonly exitCode: number | null;
+  readonly signal: SandboxSignal | null;
+}
+
+export type SandboxSignal =
+  | "SIGHUP"
+  | "SIGINT"
+  | "SIGQUIT"
+  | "SIGTERM"
+  | "SIGKILL";
 
 export interface SandboxInstance {
   exec(
@@ -531,7 +568,16 @@ export interface SandboxInstance {
     command: string,
     args?: readonly string[],
     options?: SandboxSpawnOptions,
-  ): Promise<SandboxProcess>;
+  ): SandboxProcess;
+  pty(
+    command: string,
+    options: SandboxPtyOptions,
+  ): SandboxPty;
+  pty(
+    command: string,
+    args: readonly string[] | undefined,
+    options: SandboxPtyOptions,
+  ): SandboxPty;
   close(): Promise<void>;
   [Symbol.asyncDispose](): Promise<void>;
 }
@@ -799,7 +845,7 @@ class HostBackedSandboxVm implements SandboxVm {
     if (this.#options.rootfs.storage !== undefined) {
       try {
         for (let attempt = 0; attempt < 2; attempt += 1) {
-          const result = await this.#rootExec.exec("/bin/sync");
+          const result = await this.#rootExec.exec("/bin/sync", []);
           if (result.exitCode !== 0) {
             throw new Error(`sandbox close sync failed with exit code ${result.exitCode}: ${result.stderr}`);
           }
@@ -827,21 +873,71 @@ class HostBackedSandboxVm implements SandboxVm {
 
   async exec(
     command: string,
-    args: readonly string[] = [],
+    args: readonly string[] | undefined = [],
     options: SandboxExecOptions = {},
   ): Promise<SandboxExecResult> {
+    args ??= [];
+    validateSandboxProcessArgs(args, "sandbox exec");
     validateSandboxExecOptions(options);
     return await this.#exec.exec(command, args, options);
   }
 
-  async spawn(
+  spawn(
     command: string,
-    args: readonly string[] = [],
+    args: readonly string[] | undefined = [],
     options: SandboxSpawnOptions = {},
-  ): Promise<SandboxProcess> {
-    return await new ControlBackedSandboxSpawn(this.control, this.#options.cwd)
+  ): SandboxProcess {
+    args ??= [];
+    validateSandboxProcessArgs(args, "sandbox spawn");
+    validateSandboxSpawnOptions(options);
+    const process = new ControlBackedSandboxSpawn(this.control, this.#options.cwd)
       .spawn(command, args, options);
+    linkAbortSignal(options.signal, process);
+    return process;
   }
+
+  pty(
+    command: string,
+    argsOrOptions: readonly string[] | SandboxPtyOptions | undefined,
+    options?: SandboxPtyOptions,
+  ): SandboxPty {
+    let args: readonly string[];
+    let ptyOptions: SandboxPtyOptions | undefined;
+    if (Array.isArray(argsOrOptions) || argsOrOptions === undefined) {
+      args = argsOrOptions ?? [];
+      ptyOptions = options;
+    } else {
+      args = [];
+      ptyOptions = argsOrOptions as SandboxPtyOptions;
+    }
+    validateSandboxProcessArgs(args, "sandbox pty");
+    validateSandboxPtyOptions(ptyOptions);
+    const process = new ControlBackedSandboxSpawn(this.control, this.#options.cwd)
+      .pty(command, args, ptyOptions);
+    linkAbortSignal(ptyOptions.signal, process);
+    return process;
+  }
+}
+
+function linkAbortSignal(
+  signal: AbortSignal | undefined,
+  process: { readonly exit: Promise<unknown>; kill(signal?: SandboxSignal): void },
+): void {
+  if (signal === undefined) {
+    return;
+  }
+  const abort = () => {
+    process.kill("SIGTERM");
+  };
+  if (signal.aborted) {
+    abort();
+    return;
+  }
+  signal.addEventListener("abort", abort, { once: true });
+  void process.exit.then(
+    () => signal.removeEventListener("abort", abort),
+    () => signal.removeEventListener("abort", abort),
+  );
 }
 
 class ControlBackedSandboxExec {
@@ -855,9 +951,10 @@ class ControlBackedSandboxExec {
 
   async exec(
     command: string,
-    args: readonly string[] = [],
+    args: readonly string[] | undefined = [],
     options: SandboxExecOptions = {},
   ): Promise<SandboxExecResult> {
+    args ??= [];
     const cwd = options.cwd ?? this.#cwd;
     const env = cwd === undefined
       ? options.env
@@ -893,11 +990,12 @@ class ControlBackedSandboxSpawn {
     this.#cwd = cwd;
   }
 
-  async spawn(
+  spawn(
     command: string,
-    args: readonly string[] = [],
+    args: readonly string[] | undefined = [],
     options: SandboxSpawnOptions = {},
-  ): Promise<ControlBackedSandboxProcess> {
+  ): ControlBackedSandboxProcess {
+    args ??= [];
     const cwd = options.cwd ?? this.#cwd;
     const env = cwd === undefined
       ? options.env
@@ -909,9 +1007,33 @@ class ControlBackedSandboxSpawn {
     const argv = cwd === undefined
       ? [command, ...args]
       : ["/bin/sh", "-lc", "cd \"$SANDBOX_EXEC_CWD\" && exec \"$@\"", "sandbox-spawn", command, ...args];
-    return await this.#control.spawn({
+    return this.#control.spawn({
       argv,
       env,
+    });
+  }
+
+  pty(
+    command: string,
+    args: readonly string[] | undefined,
+    options: SandboxPtyOptions,
+  ): ControlBackedSandboxPty {
+    args ??= [];
+    const cwd = options.cwd ?? this.#cwd;
+    const env = cwd === undefined
+      ? options.env
+      : {
+          ...options.env,
+          SANDBOX_EXEC_CWD: cwd,
+          PWD: cwd,
+        };
+    const argv = cwd === undefined
+      ? [command, ...args]
+      : ["/bin/sh", "-lc", "cd \"$SANDBOX_EXEC_CWD\" && exec \"$@\"", "sandbox-pty", command, ...args];
+    return this.#control.pty({
+      argv,
+      env,
+      size: options.size,
     });
   }
 }
@@ -1365,6 +1487,35 @@ function validateSandboxExecOptions(options: SandboxExecOptions): void {
     && (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs <= 0)
   ) {
     throw new Error("invalid sandbox exec options: timeoutMs must be a positive safe integer");
+  }
+}
+
+function validateSandboxSpawnOptions(_options: SandboxSpawnOptions): void {}
+
+function validateSandboxPtyOptions(options: SandboxPtyOptions | undefined): asserts options is SandboxPtyOptions {
+  if (options === undefined || options === null) {
+    throw new Error("invalid sandbox pty options: size is required");
+  }
+  validatePtySize(options.size, "invalid sandbox pty options: size");
+}
+
+function validateSandboxProcessArgs(args: readonly string[], label: string): void {
+  if (!Array.isArray(args)) {
+    throw new Error(`invalid ${label} arguments: args must be an array`);
+  }
+  for (const [index, arg] of args.entries()) {
+    if (typeof arg !== "string") {
+      throw new Error(`invalid ${label} arguments: args[${index}] must be a string`);
+    }
+  }
+}
+
+function validatePtySize(size: SandboxPtySize, field: string): void {
+  if (!Number.isSafeInteger(size.rows) || size.rows <= 0) {
+    throw new Error(`${field}.rows must be a positive safe integer`);
+  }
+  if (!Number.isSafeInteger(size.cols) || size.cols <= 0) {
+    throw new Error(`${field}.cols must be a positive safe integer`);
   }
 }
 

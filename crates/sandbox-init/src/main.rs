@@ -1,7 +1,7 @@
 use base64::Engine;
-use sandbox_protocol::ControlFrame;
 #[cfg(target_os = "linux")]
 use sandbox_protocol::INIT_CONTROL_PORT;
+use sandbox_protocol::{ControlFrame, GuestPtySize, GuestSpawnStdio};
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
@@ -942,6 +942,7 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
         write_lock,
     ));
     let execs = Arc::new(ActiveExecs::default());
+    let spawns = Arc::new(ActiveSpawns::default());
     loop {
         let frame = match ControlFrame::decode_packet_from_reader(control) {
             Ok(frame) => frame,
@@ -983,10 +984,30 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
             ControlFrame::GuestExecAbort { id } => {
                 execs.abort(&id);
             }
-            ControlFrame::GuestSpawn { id, argv, env } => {
+            ControlFrame::GuestSpawn {
+                id,
+                argv,
+                env,
+                stdin,
+                stdout,
+                stderr,
+                pty,
+            } => {
                 let writer = writer.clone();
+                let spawns_for_thread = spawns.clone();
+                let controls = spawns.insert(id.clone());
                 std::thread::spawn(move || {
-                    match run_guest_spawn(id.clone(), argv, env, writer.clone()) {
+                    match run_guest_spawn(
+                        id.clone(),
+                        argv,
+                        env,
+                        stdin,
+                        stdout,
+                        stderr,
+                        pty,
+                        controls,
+                        writer.clone(),
+                    ) {
                         Ok(()) => {}
                         Err(error) => {
                             let _ = send_control_frame(
@@ -1000,16 +1021,30 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
                                 &writer,
                                 ControlFrame::GuestSpawnExit {
                                     id: id.clone(),
-                                    exit_code: 127,
+                                    exit_code: Some(127),
+                                    signal: None,
                                 },
                             );
                             let _ = send_control_frame(
                                 &writer,
-                                ControlFrame::GuestSpawnStreamsClosed { id },
+                                ControlFrame::GuestSpawnStreamsClosed { id: id.clone() },
                             );
                         }
                     }
+                    spawns_for_thread.remove(&id);
                 });
+            }
+            ControlFrame::GuestSpawnStdin { id, data } => {
+                spawns.send(&id, SpawnControl::Stdin(data));
+            }
+            ControlFrame::GuestSpawnStdinClose { id } => {
+                spawns.send(&id, SpawnControl::StdinClose);
+            }
+            ControlFrame::GuestSpawnSignal { id, signal } => {
+                spawns.send(&id, SpawnControl::Signal(signal));
+            }
+            ControlFrame::GuestSpawnResize { id, rows, cols } => {
+                spawns.send(&id, SpawnControl::Resize(GuestPtySize { rows, cols }));
             }
             ControlFrame::InitReady { .. }
             | ControlFrame::GuestExecComplete { .. }
@@ -1026,6 +1061,11 @@ fn run_guest_spawn(
     id: String,
     argv: Vec<String>,
     env: Vec<(String, String)>,
+    stdin: GuestSpawnStdio,
+    stdout: GuestSpawnStdio,
+    stderr: GuestSpawnStdio,
+    pty: Option<GuestPtySize>,
+    controls: mpsc::Receiver<SpawnControl>,
     control: Arc<ControlWriter>,
 ) -> Result<(), InitError> {
     if argv.is_empty() {
@@ -1034,54 +1074,98 @@ fn run_guest_spawn(
 
     prepare_exec_environment(&env)?;
 
+    let pty_mode = match (stdin, stdout, stderr, pty) {
+        (GuestSpawnStdio::Pipe, GuestSpawnStdio::Pipe, GuestSpawnStdio::Pipe, None) => None,
+        (GuestSpawnStdio::Pty, GuestSpawnStdio::Pty, GuestSpawnStdio::Pty, Some(size)) => {
+            Some(size)
+        }
+        _ => {
+            return Err(InitError(
+                "guest.spawn stdio must be all pipe with no pty or all pty with pty size"
+                    .to_string(),
+            ));
+        }
+    };
+
     let mut command = std::process::Command::new(&argv[0]);
     command.args(&argv[1..]);
-
-    command.stdin(std::process::Stdio::null());
-    command.stdout(std::process::Stdio::piped());
-    command.stderr(std::process::Stdio::piped());
-
     command.envs(env);
+
+    let mut pty_master = None;
+    if let Some(size) = pty_mode {
+        let (master, slave) = open_guest_pty(size)?;
+        configure_pty_command(&mut command, &slave);
+        command.stdin(std::process::Stdio::from(slave.try_clone().map_err(
+            |error| InitError(format!("clone pty slave for stdin: {error}")),
+        )?));
+        command.stdout(std::process::Stdio::from(slave.try_clone().map_err(
+            |error| InitError(format!("clone pty slave for stdout: {error}")),
+        )?));
+        command.stderr(std::process::Stdio::from(slave));
+        pty_master = Some(master);
+    } else {
+        configure_command_process_group(&mut command);
+        command.stdin(std::process::Stdio::piped());
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+    }
+
     let (mut child, child_id) = spawn_active_child(&mut command)
         .map_err(|error| InitError(format!("{}: {error}", argv[0])))?;
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| InitError("spawned command did not expose stdout".to_string()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| InitError("spawned command did not expose stderr".to_string()))?;
+    let (events, event_receiver) = mpsc::channel();
+    if let Some(master) = pty_master {
+        let writer = master
+            .try_clone()
+            .map_err(|error| InitError(format!("clone pty master for input: {error}")))?;
+        pump_spawn_controls(child_id, controls, Some(writer), true);
+        pump_spawn_output(
+            master,
+            events.clone(),
+            SpawnOutputEvent::Stdout,
+            SpawnOutputEvent::StderrClosed,
+        );
+        let _ = events.send(SpawnOutputEvent::StdoutClosed);
+    } else {
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| InitError("spawned command did not expose stdin".to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| InitError("spawned command did not expose stdout".to_string()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| InitError("spawned command did not expose stderr".to_string()))?;
+        pump_spawn_controls(child_id, controls, Some(stdin), false);
+        pump_spawn_output(
+            stdout,
+            events.clone(),
+            SpawnOutputEvent::Stdout,
+            SpawnOutputEvent::StdoutClosed,
+        );
+        pump_spawn_output(
+            stderr,
+            events.clone(),
+            SpawnOutputEvent::Stderr,
+            SpawnOutputEvent::StderrClosed,
+        );
+    }
     send_control_frame(&control, ControlFrame::GuestSpawnStarted { id: id.clone() })?;
 
-    let (events, event_receiver) = mpsc::channel();
-    pump_spawn_output(
-        stdout,
-        events.clone(),
-        SpawnOutputEvent::Stdout,
-        SpawnOutputEvent::StdoutClosed,
-    );
-    pump_spawn_output(
-        stderr,
-        events.clone(),
-        SpawnOutputEvent::Stderr,
-        SpawnOutputEvent::StderrClosed,
-    );
     std::thread::spawn(move || {
         let status = child.wait();
         unregister_active_child(child_id);
-        let exit_code = match status {
-            Ok(status) => exec_status(status, Vec::new()).0,
-            Err(_) => 128,
+        let (exit_code, signal) = match status {
+            Ok(status) => spawn_exit_status(status),
+            Err(_) => (Some(128), None),
         };
-        let _ = events.send(SpawnOutputEvent::Exit(exit_code));
+        let _ = events.send(SpawnOutputEvent::Exit { exit_code, signal });
     });
 
-    std::thread::spawn(move || {
-        run_spawn_output_coordinator(id, control, event_receiver);
-    });
-
+    run_spawn_output_coordinator(id, control, event_receiver);
     Ok(())
 }
 
@@ -1114,6 +1198,199 @@ fn pump_spawn_output(
     });
 }
 
+#[cfg(unix)]
+fn pump_spawn_controls<W>(
+    child_id: u32,
+    controls: mpsc::Receiver<SpawnControl>,
+    mut stdin: Option<W>,
+    resize_input: bool,
+) where
+    W: Write + Send + 'static,
+    W: std::os::fd::AsRawFd,
+{
+    std::thread::spawn(move || {
+        while let Ok(control) = controls.recv() {
+            match control {
+                SpawnControl::Stdin(data) => {
+                    if let Some(writer) = stdin.as_mut() {
+                        let _ = writer.write_all(&data);
+                        let _ = writer.flush();
+                    }
+                }
+                SpawnControl::StdinClose => {
+                    if resize_input {
+                        if let Some(writer) = stdin.as_mut() {
+                            let _ = writer.write_all(&[0x04]);
+                            let _ = writer.flush();
+                        }
+                    }
+                    stdin = None;
+                }
+                SpawnControl::Signal(signal) => {
+                    if let Some(signal) = signal_number(&signal) {
+                        signal_child_process_group(child_id, signal);
+                    }
+                }
+                SpawnControl::Resize(size) => {
+                    if resize_input {
+                        if let Some(writer) = stdin.as_mut() {
+                            let _ = resize_spawn_input(writer, size);
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn pump_spawn_controls<W>(
+    _child_id: u32,
+    controls: mpsc::Receiver<SpawnControl>,
+    mut stdin: Option<W>,
+    _resize_input: bool,
+) where
+    W: Write + Send + 'static,
+{
+    std::thread::spawn(move || {
+        while let Ok(control) = controls.recv() {
+            match control {
+                SpawnControl::Stdin(data) => {
+                    if let Some(writer) = stdin.as_mut() {
+                        let _ = writer.write_all(&data);
+                        let _ = writer.flush();
+                    }
+                }
+                SpawnControl::StdinClose => {
+                    stdin = None;
+                }
+                SpawnControl::Signal(_) | SpawnControl::Resize(_) => {}
+            }
+        }
+    });
+}
+
+#[cfg(unix)]
+fn signal_number(signal: &str) -> Option<i32> {
+    match signal {
+        "SIGHUP" => Some(libc::SIGHUP),
+        "SIGINT" => Some(libc::SIGINT),
+        "SIGQUIT" => Some(libc::SIGQUIT),
+        "SIGTERM" => Some(libc::SIGTERM),
+        "SIGKILL" => Some(libc::SIGKILL),
+        _ => None,
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_number(_signal: &str) -> Option<i32> {
+    None
+}
+
+#[cfg(unix)]
+fn signal_child_process_group(child_pid: u32, signal: i32) {
+    let pgid = -(child_pid as libc::pid_t);
+    unsafe {
+        libc::kill(pgid, signal);
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_child_process_group(_child_pid: u32, _signal: i32) {}
+
+#[cfg(unix)]
+fn resize_spawn_input<W: std::os::fd::AsRawFd>(
+    input: &W,
+    size: GuestPtySize,
+) -> std::io::Result<()> {
+    set_pty_size(input.as_raw_fd(), size)
+}
+
+#[cfg(not(unix))]
+fn resize_spawn_input<W>(_input: &W, _size: GuestPtySize) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_guest_pty(size: GuestPtySize) -> Result<(std::fs::File, std::fs::File), InitError> {
+    use std::os::fd::FromRawFd;
+
+    let mut master = 0;
+    let mut slave = 0;
+    let mut winsize = libc::winsize {
+        ws_row: size.rows,
+        ws_col: size.cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let result = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut winsize,
+        )
+    };
+    if result < 0 {
+        return Err(InitError(format!(
+            "openpty: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(unsafe {
+        (
+            std::fs::File::from_raw_fd(master),
+            std::fs::File::from_raw_fd(slave),
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn open_guest_pty(_size: GuestPtySize) -> Result<(std::fs::File, std::fs::File), InitError> {
+    Err(InitError("guest PTY is only supported on Unix".to_string()))
+}
+
+#[cfg(unix)]
+fn configure_pty_command(command: &mut std::process::Command, slave: &std::fs::File) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let slave_fd = slave.as_raw_fd();
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(slave_fd, libc::TIOCSCTTY.into(), 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::tcsetpgrp(slave_fd, libc::getpgrp()) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_pty_command(_command: &mut std::process::Command, _slave: &std::fs::File) {}
+
+#[cfg(unix)]
+fn set_pty_size(fd: std::os::fd::RawFd, size: GuestPtySize) -> std::io::Result<()> {
+    let winsize = libc::winsize {
+        ws_row: size.rows,
+        ws_col: size.cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let result = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &winsize) };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn run_spawn_output_coordinator(
     id: String,
     control: Arc<ControlWriter>,
@@ -1121,7 +1398,7 @@ fn run_spawn_output_coordinator(
 ) {
     let mut stdout_open = true;
     let mut stderr_open = true;
-    let mut exit_code = None;
+    let mut exited = false;
     loop {
         let event = match events.recv() {
             Ok(event) => event,
@@ -1149,19 +1426,20 @@ fn run_spawn_output_coordinator(
             }
             SpawnOutputEvent::StdoutClosed => stdout_open = false,
             SpawnOutputEvent::StderrClosed => stderr_open = false,
-            SpawnOutputEvent::Exit(code) => {
-                exit_code = Some(code);
+            SpawnOutputEvent::Exit { exit_code, signal } => {
+                exited = true;
                 let _ = send_control_frame(
                     &control,
                     ControlFrame::GuestSpawnExit {
                         id: id.clone(),
-                        exit_code: code,
+                        exit_code,
+                        signal,
                     },
                 );
             }
         }
 
-        if exit_code.is_some() && !stdout_open && !stderr_open {
+        if exited && !stdout_open && !stderr_open {
             break;
         }
     }
@@ -1174,7 +1452,46 @@ enum SpawnOutputEvent {
     Stderr(Vec<u8>),
     StdoutClosed,
     StderrClosed,
-    Exit(i32),
+    Exit {
+        exit_code: Option<i32>,
+        signal: Option<String>,
+    },
+}
+
+enum SpawnControl {
+    Stdin(Vec<u8>),
+    StdinClose,
+    Signal(String),
+    Resize(GuestPtySize),
+}
+
+#[derive(Default)]
+struct ActiveSpawns {
+    spawns: Mutex<HashMap<String, mpsc::Sender<SpawnControl>>>,
+}
+
+impl ActiveSpawns {
+    fn insert(&self, id: String) -> mpsc::Receiver<SpawnControl> {
+        let (sender, receiver) = mpsc::channel();
+        if let Ok(mut spawns) = self.spawns.lock() {
+            spawns.insert(id, sender);
+        }
+        receiver
+    }
+
+    fn send(&self, id: &str, control: SpawnControl) {
+        if let Ok(spawns) = self.spawns.lock() {
+            if let Some(sender) = spawns.get(id) {
+                let _ = sender.send(control);
+            }
+        }
+    }
+
+    fn remove(&self, id: &str) {
+        if let Ok(mut spawns) = self.spawns.lock() {
+            spawns.remove(id);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1499,6 +1816,16 @@ fn exec_status(status: std::process::ExitStatus, mut stderr: Vec<u8>) -> (i32, V
     (128, stderr)
 }
 
+fn spawn_exit_status(status: std::process::ExitStatus) -> (Option<i32>, Option<String>) {
+    if let Some(code) = status.code() {
+        return (Some(code), None);
+    }
+    if let Some(signal) = terminating_signal(status) {
+        return (None, signal_name(signal).map(str::to_string));
+    }
+    (Some(128), None)
+}
+
 #[cfg(unix)]
 fn terminating_signal(status: std::process::ExitStatus) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt;
@@ -1509,6 +1836,17 @@ fn terminating_signal(status: std::process::ExitStatus) -> Option<i32> {
 #[cfg(not(unix))]
 fn terminating_signal(_status: std::process::ExitStatus) -> Option<i32> {
     None
+}
+
+fn signal_name(signal: i32) -> Option<&'static str> {
+    match signal {
+        libc::SIGHUP => Some("SIGHUP"),
+        libc::SIGINT => Some("SIGINT"),
+        libc::SIGQUIT => Some("SIGQUIT"),
+        libc::SIGTERM => Some("SIGTERM"),
+        libc::SIGKILL => Some("SIGKILL"),
+        _ => None,
+    }
 }
 
 fn install_http_ca() -> Result<(), InitError> {

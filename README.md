@@ -366,16 +366,35 @@ the guest process group and returns exit code `124`. When `signal` aborts,
 Sandbox terminates that guest process group, rejects the `exec(...)` promise with
 an `AbortError`, and keeps the sandbox usable for subsequent commands.
 
-Use `spawn(...)` for streaming output:
+Use `spawn(...)` for non-interactive long-lived processes with streaming
+stdin, stdout, and stderr. It returns a process handle immediately; `ready`
+tracks guest-side startup.
 
 ```ts
-const child = await lane.spawn("npm", ["test"], { cwd: "/workspace" });
+import { Writable } from "node:stream";
 
-for await (const chunk of child.stdout) {
-  process.stdout.write(chunk);
-}
+const child = lane.spawn("npm", ["test"], { cwd: "/workspace" });
+
+child.stdout.pipeTo(Writable.toWeb(process.stdout));
+child.stderr.pipeTo(Writable.toWeb(process.stderr));
 
 const { exitCode } = await child.exit;
+```
+
+Use `pty(...)` when the guest process should see a real terminal, such as an
+interactive shell, REPL, pager, or terminal UI:
+
+```ts
+import { Readable, Writable } from "node:stream";
+
+const shell = lane.pty("/bin/sh", ["-i"], {
+  cwd: "/workspace",
+  env: { TERM: "xterm-256color" },
+  size: { rows: 40, cols: 120 },
+});
+
+Readable.toWeb(process.stdin).pipeTo(shell.input);
+shell.output.pipeTo(Writable.toWeb(process.stdout));
 ```
 
 ### Network Policy

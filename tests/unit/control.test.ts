@@ -276,7 +276,7 @@ test("HostControlTransport omits exec timeout when not requested", async () => {
 test("HostControlTransport spawn streams stdio and resolves exit", async () => {
   const channel = new MemoryControlChannel();
   const control = new HostControlTransport({ channel });
-  const spawned = await startSpawn(control, channel, "spawn");
+  const spawned = startSpawn(control, channel, "spawn");
 
   assert.deepEqual(
     channel.writes.map((packet) => BSON.deserialize(packet.subarray(4))),
@@ -286,6 +286,29 @@ test("HostControlTransport spawn streams stdio and resolves exit", async () => {
         id: "spawn",
         argv: ["/bin/cat"],
         env: [],
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    ],
+  );
+
+  await spawned.ready;
+  const writer = spawned.stdin.getWriter();
+  await writer.write(new TextEncoder().encode("input"));
+  await writer.close();
+
+  assert.deepEqual(
+    channel.writes.slice(1).map((packet) => BSON.deserialize(packet.subarray(4))),
+    [
+      {
+        type: "guest.spawn.stdin",
+        id: "spawn",
+        data: new Binary(new TextEncoder().encode("input")),
+      },
+      {
+        type: "guest.spawn.stdin.close",
+        id: "spawn",
       },
     ],
   );
@@ -314,7 +337,7 @@ test("HostControlTransport spawn streams stdio and resolves exit", async () => {
 
   assert.equal(await readAll(spawned.stdout), "out");
   assert.equal(await readAll(spawned.stderr), "err");
-  assert.deepEqual(await spawned.exit, { exitCode: 7 });
+  assert.deepEqual(await spawned.exit, { exitCode: 7, signal: null });
   await control.close();
 });
 
@@ -322,7 +345,8 @@ test("HostControlTransport does not duplicate spawn output in incoming events", 
   const channel = new MemoryControlChannel();
   const control = new HostControlTransport({ channel });
   const incoming = control.incoming[Symbol.asyncIterator]();
-  const spawned = await startSpawn(control, channel, "spawn");
+  const spawned = startSpawn(control, channel, "spawn");
+  await spawned.ready;
 
   assert.equal((await incoming.next()).value?.type, "guest.spawn.started");
 
@@ -357,7 +381,8 @@ test("HostControlTransport does not duplicate spawn output in incoming events", 
 test("HostControlTransport keeps spawn streams open after process exit", async () => {
   const channel = new MemoryControlChannel();
   const control = new HostControlTransport({ channel });
-  const spawned = await startSpawn(control, channel, "spawn");
+  const spawned = startSpawn(control, channel, "spawn");
+  await spawned.ready;
 
   channel.packets.push(
     encodePacket({
@@ -376,7 +401,7 @@ test("HostControlTransport keeps spawn streams open after process exit", async (
     }),
   );
 
-  assert.deepEqual(await spawned.exit, { exitCode: 0 });
+  assert.deepEqual(await spawned.exit, { exitCode: 0, signal: null });
   assert.equal(await readAll(spawned.stdout), "tail");
   await control.close();
 });
@@ -388,14 +413,16 @@ test("HostControlTransport rejects pre-start spawn failures without exposing a p
 
   await control.close();
 
-  await assert.rejects(spawned, /sandbox control is closed/);
+  await assert.rejects(spawned.ready, /sandbox control is closed/);
+  await assert.rejects(spawned.exit, /sandbox control is closed/);
 });
 
 test("HostControlTransport demultiplexes concurrent spawn output", async () => {
   const channel = new MemoryControlChannel();
   const control = new HostControlTransport({ channel });
-  const first = await startSpawn(control, channel, "first");
-  const second = await startSpawn(control, channel, "second");
+  const first = startSpawn(control, channel, "first");
+  const second = startSpawn(control, channel, "second");
+  await Promise.all([first.ready, second.ready]);
 
   channel.packets.push(
     encodePacket({
@@ -430,8 +457,8 @@ test("HostControlTransport demultiplexes concurrent spawn output", async () => {
 
   assert.equal(await readAll(first.stdout), "first");
   assert.equal(await readAll(second.stdout), "second");
-  assert.deepEqual(await first.exit, { exitCode: 0 });
-  assert.deepEqual(await second.exit, { exitCode: 0 });
+  assert.deepEqual(await first.exit, { exitCode: 0, signal: null });
+  assert.deepEqual(await second.exit, { exitCode: 0, signal: null });
   await control.close();
 });
 
@@ -441,8 +468,9 @@ test("HostControlTransport rejects duplicate in-flight spawn ids", async () => {
   const first = control.spawn({ id: "duplicate", argv: ["/bin/cat"] });
 
   channel.packets.push(encodePacket({ type: "guest.spawn.started", id: "duplicate" }));
-  await assert.rejects(
-    control.spawn({ id: "duplicate", argv: ["/bin/cat"] }),
+  await first.ready;
+  assert.throws(
+    () => control.spawn({ id: "duplicate", argv: ["/bin/cat"] }),
     /sandbox spawn id is already in flight: duplicate/,
   );
 
@@ -458,7 +486,78 @@ test("HostControlTransport rejects duplicate in-flight spawn ids", async () => {
     }),
   );
 
-  assert.deepEqual(await (await first).exit, { exitCode: 0 });
+  assert.deepEqual(await first.exit, { exitCode: 0, signal: null });
+  await control.close();
+});
+
+test("HostControlTransport pty streams terminal data and sends resize", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const pty = control.pty({
+    id: "pty",
+    argv: ["/bin/sh"],
+    size: { rows: 24, cols: 80 },
+  });
+
+  assert.deepEqual(BSON.deserialize(channel.writes[0]!.subarray(4)), {
+    type: "guest.spawn",
+    id: "pty",
+    argv: ["/bin/sh"],
+    env: [],
+    stdin: "pty",
+    stdout: "pty",
+    stderr: "pty",
+    pty: { rows: 24, cols: 80 },
+  });
+
+  channel.packets.push(encodePacket({ type: "guest.spawn.started", id: "pty" }));
+  await pty.ready;
+
+  pty.resize({ rows: 40, cols: 120 });
+  const writer = pty.input.getWriter();
+  await writer.write(new TextEncoder().encode("echo hi\r"));
+  await writer.close();
+
+  assert.deepEqual(
+    channel.writes.slice(1).map((packet) => BSON.deserialize(packet.subarray(4))),
+    [
+      {
+        type: "guest.spawn.resize",
+        id: "pty",
+        rows: 40,
+        cols: 120,
+      },
+      {
+        type: "guest.spawn.stdin",
+        id: "pty",
+        data: new Binary(new TextEncoder().encode("echo hi\r")),
+      },
+      {
+        type: "guest.spawn.stdin.close",
+        id: "pty",
+      },
+    ],
+  );
+
+  channel.packets.push(
+    encodePacket({
+      type: "guest.spawn.stdout",
+      id: "pty",
+      data: new Binary(new TextEncoder().encode("hi\r\n")),
+    }),
+    encodePacket({
+      type: "guest.spawn.exit",
+      id: "pty",
+      exitCode: 0,
+    }),
+    encodePacket({
+      type: "guest.spawn.streams.closed",
+      id: "pty",
+    }),
+  );
+
+  assert.equal(await readAll(pty.output), "hi\r\n");
+  assert.deepEqual(await pty.exit, { exitCode: 0, signal: null });
   await control.close();
 });
 
@@ -605,20 +704,29 @@ class MemoryPacketStream implements AsyncIterable<Uint8Array> {
   }
 }
 
-async function startSpawn(
+function startSpawn(
   control: HostControlTransport,
   channel: MemoryControlChannel,
   id: string,
 ) {
   const spawned = control.spawn({ id, argv: ["/bin/cat"] });
   channel.packets.push(encodePacket({ type: "guest.spawn.started", id }));
-  return await spawned;
+  return spawned;
 }
 
-async function readAll(source: AsyncIterable<Uint8Array>): Promise<string> {
+async function readAll(source: ReadableStream<Uint8Array>): Promise<string> {
   const chunks: Uint8Array[] = [];
-  for await (const chunk of source) {
-    chunks.push(chunk);
+  const reader = source.getReader();
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) {
+        break;
+      }
+      chunks.push(next.value);
+    }
+  } finally {
+    reader.releaseLock();
   }
   const size = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
   const data = new Uint8Array(size);

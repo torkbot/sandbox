@@ -19,7 +19,13 @@ export interface SandboxControl extends Transport<SandboxControlEvent, SandboxCo
     readonly id?: string;
     readonly argv: readonly string[];
     readonly env?: Record<string, string>;
-  }): Promise<ControlBackedSandboxProcess>;
+  }): ControlBackedSandboxProcess;
+  pty(input: {
+    readonly id?: string;
+    readonly argv: readonly string[];
+    readonly env?: Record<string, string>;
+    readonly size: { readonly rows: number; readonly cols: number };
+  }): ControlBackedSandboxPty;
 }
 
 export interface Transport<TIncoming = unknown, TOutgoing = unknown> {
@@ -33,6 +39,8 @@ export interface HostControlChannel {
   writeControlPacket(packet: Uint8Array): void;
 }
 
+type SandboxProcessSignal = "SIGHUP" | "SIGINT" | "SIGQUIT" | "SIGTERM" | "SIGKILL";
+
 export class HostControlTransport implements SandboxControl {
   readonly incoming: AsyncIterable<SandboxControlEvent>;
 
@@ -45,10 +53,10 @@ export class HostControlTransport implements SandboxControl {
     aborted: boolean;
   }>();
   readonly #pendingSpawn = new Map<string, {
-    resolve(process: ControlBackedSandboxProcess): void;
+    resolve(): void;
     reject(error: unknown): void;
-    process: ControlBackedSandboxProcess;
-    returned: boolean;
+    process: ControlBackedSandboxProcess | ControlBackedSandboxPty;
+    ready: boolean;
     exited: boolean;
     streamsClosed: boolean;
   }>();
@@ -150,39 +158,74 @@ export class HostControlTransport implements SandboxControl {
     return await completion;
   }
 
-  async spawn(input: {
+  spawn(input: {
     readonly id?: string;
     readonly argv: readonly string[];
     readonly env?: Record<string, string>;
-  }): Promise<ControlBackedSandboxProcess> {
+  }): ControlBackedSandboxProcess {
     this.#assertOpen();
     const id = input.id ?? crypto.randomUUID();
     if (this.#pendingSpawn.has(id)) {
       throw new Error(`sandbox spawn id is already in flight: ${id}`);
     }
     const process = new ControlBackedSandboxProcess(id, this);
-    const started = new Promise<ControlBackedSandboxProcess>((resolve, reject) => {
-      this.#pendingSpawn.set(id, {
-        resolve,
-        reject,
-        process,
-        returned: false,
-        exited: false,
-        streamsClosed: false,
-      });
+    this.#pendingSpawn.set(id, {
+      resolve: () => process.resolveReady(),
+      reject: (error) => process.fail(error),
+      process,
+      ready: false,
+      exited: false,
+      streamsClosed: false,
     });
-    try {
-      await this.send({
+    void this.send({
         type: "guest.spawn",
         id,
         argv: input.argv,
         env: input.env,
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+      }).catch((error) => {
+        this.#pendingSpawn.delete(id);
+        process.fail(error);
       });
-    } catch (error) {
-      this.#pendingSpawn.delete(id);
-      throw error;
+    return process;
+  }
+
+  pty(input: {
+    readonly id?: string;
+    readonly argv: readonly string[];
+    readonly env?: Record<string, string>;
+    readonly size: { readonly rows: number; readonly cols: number };
+  }): ControlBackedSandboxPty {
+    this.#assertOpen();
+    const id = input.id ?? crypto.randomUUID();
+    if (this.#pendingSpawn.has(id)) {
+      throw new Error(`sandbox spawn id is already in flight: ${id}`);
     }
-    return await started;
+    const process = new ControlBackedSandboxPty(id, this);
+    this.#pendingSpawn.set(id, {
+      resolve: () => process.resolveReady(),
+      reject: (error) => process.fail(error),
+      process,
+      ready: false,
+      exited: false,
+      streamsClosed: false,
+    });
+    void this.send({
+      type: "guest.spawn",
+      id,
+      argv: input.argv,
+      env: input.env,
+      stdin: "pty",
+      stdout: "pty",
+      stderr: "pty",
+      pty: input.size,
+    }).catch((error) => {
+      this.#pendingSpawn.delete(id);
+      process.fail(error);
+    });
+    return process;
   }
 
   async close(): Promise<void> {
@@ -263,14 +306,14 @@ export class HostControlTransport implements SandboxControl {
       return;
     }
     if (event.type === "guest.spawn.started") {
-      pending.returned = true;
-      pending.resolve(pending.process);
+      pending.ready = true;
+      pending.resolve();
       return;
     }
     if (event.type === "guest.spawn.exit") {
-      pending.returned = true;
+      pending.ready = true;
       pending.exited = true;
-      pending.resolve(pending.process);
+      pending.resolve();
     }
     if (event.type === "guest.spawn.streams.closed") {
       pending.streamsClosed = true;
@@ -302,9 +345,7 @@ export class HostControlTransport implements SandboxControl {
   #rejectPendingSpawn(error: unknown): void {
     for (const pending of this.#pendingSpawn.values()) {
       pending.reject(error);
-      if (pending.returned) {
-        pending.process.fail(error);
-      }
+      pending.process.fail(error);
     }
     this.#pendingSpawn.clear();
   }
@@ -327,23 +368,32 @@ function abortError(signal: AbortSignal | undefined): Error {
 }
 
 export class ControlBackedSandboxProcess {
-  readonly stdout: AsyncIterable<Uint8Array>;
-  readonly stderr: AsyncIterable<Uint8Array>;
-  readonly exit: Promise<{ readonly exitCode: number }>;
+  readonly stdin: WritableStream<Uint8Array>;
+  readonly stdout: ReadableStream<Uint8Array>;
+  readonly stderr: ReadableStream<Uint8Array>;
+  readonly ready: Promise<void>;
+  readonly exit: Promise<{ readonly exitCode: number | null; readonly signal: SandboxProcessSignal | null }>;
 
   readonly #id: string;
   readonly #control: SandboxControl;
-  readonly #stdout = new AsyncQueue<Uint8Array>();
-  readonly #stderr = new AsyncQueue<Uint8Array>();
-  #resolveExit!: (result: { readonly exitCode: number }) => void;
+  readonly #stdout = new ReadableByteQueue();
+  readonly #stderr = new ReadableByteQueue();
+  #resolveReady!: () => void;
+  #rejectReady!: (error: unknown) => void;
+  #resolveExit!: (result: { readonly exitCode: number | null; readonly signal: SandboxProcessSignal | null }) => void;
   #rejectExit!: (error: unknown) => void;
   #exited = false;
 
   constructor(id: string, control: SandboxControl) {
     this.#id = id;
     this.#control = control;
-    this.stdout = this.#stdout;
-    this.stderr = this.#stderr;
+    this.stdin = createControlWritable(control, id);
+    this.stdout = this.#stdout.stream;
+    this.stderr = this.#stderr.stream;
+    this.ready = new Promise((resolve, reject) => {
+      this.#resolveReady = resolve;
+      this.#rejectReady = reject;
+    });
     this.exit = new Promise((resolve, reject) => {
       this.#resolveExit = resolve;
       this.#rejectExit = reject;
@@ -355,14 +405,14 @@ export class ControlBackedSandboxProcess {
   }>): void {
     switch (event.type) {
       case "guest.spawn.stdout":
-        this.#stdout.push(event.data);
+        this.#stdout.enqueue(event.data);
         return;
       case "guest.spawn.stderr":
-        this.#stderr.push(event.data);
+        this.#stderr.enqueue(event.data);
         return;
       case "guest.spawn.exit":
         this.#exited = true;
-        this.#resolveExit({ exitCode: event.exitCode });
+        this.#resolveExit({ exitCode: event.exitCode, signal: readSpawnSignal(event.signal) });
         return;
       case "guest.spawn.streams.closed":
         this.#stdout.close();
@@ -371,11 +421,159 @@ export class ControlBackedSandboxProcess {
     }
   }
 
+  resolveReady(): void {
+    this.#resolveReady();
+  }
+
+  kill(signal: SandboxProcessSignal = "SIGTERM"): void {
+    void this.#control.send({ type: "guest.spawn.signal", id: this.#id, signal }).catch((error) => {
+      this.fail(error);
+    });
+  }
+
   fail(error: unknown): void {
     this.#exited = true;
     this.#stdout.close(error);
     this.#stderr.close(error);
+    this.#rejectReady(error);
     this.#rejectExit(error);
+  }
+}
+
+export class ControlBackedSandboxPty {
+  readonly input: WritableStream<Uint8Array>;
+  readonly output: ReadableStream<Uint8Array>;
+  readonly ready: Promise<void>;
+  readonly exit: Promise<{ readonly exitCode: number | null; readonly signal: SandboxProcessSignal | null }>;
+
+  readonly #id: string;
+  readonly #control: SandboxControl;
+  readonly #output = new ReadableByteQueue();
+  #resolveReady!: () => void;
+  #rejectReady!: (error: unknown) => void;
+  #resolveExit!: (result: { readonly exitCode: number | null; readonly signal: SandboxProcessSignal | null }) => void;
+  #rejectExit!: (error: unknown) => void;
+
+  constructor(id: string, control: SandboxControl) {
+    this.#id = id;
+    this.#control = control;
+    this.input = createControlWritable(control, id);
+    this.output = this.#output.stream;
+    this.ready = new Promise((resolve, reject) => {
+      this.#resolveReady = resolve;
+      this.#rejectReady = reject;
+    });
+    this.exit = new Promise((resolve, reject) => {
+      this.#resolveExit = resolve;
+      this.#rejectExit = reject;
+    });
+  }
+
+  emit(event: Extract<SandboxControlEvent, {
+    type: "guest.spawn.stdout" | "guest.spawn.stderr" | "guest.spawn.exit" | "guest.spawn.streams.closed";
+  }>): void {
+    switch (event.type) {
+      case "guest.spawn.stdout":
+      case "guest.spawn.stderr":
+        this.#output.enqueue(event.data);
+        return;
+      case "guest.spawn.exit":
+        this.#resolveExit({ exitCode: event.exitCode, signal: readSpawnSignal(event.signal) });
+        return;
+      case "guest.spawn.streams.closed":
+        this.#output.close();
+        return;
+    }
+  }
+
+  resolveReady(): void {
+    this.#resolveReady();
+  }
+
+  resize(size: { readonly rows: number; readonly cols: number }): void {
+    void this.#control.send({
+      type: "guest.spawn.resize",
+      id: this.#id,
+      rows: size.rows,
+      cols: size.cols,
+    }).catch((error) => {
+      this.fail(error);
+    });
+  }
+
+  kill(signal: SandboxProcessSignal = "SIGTERM"): void {
+    void this.#control.send({ type: "guest.spawn.signal", id: this.#id, signal }).catch((error) => {
+      this.fail(error);
+    });
+  }
+
+  fail(error: unknown): void {
+    this.#output.close(error);
+    this.#rejectReady(error);
+    this.#rejectExit(error);
+  }
+}
+
+function readSpawnSignal(signal: string | undefined): SandboxProcessSignal | null {
+  if (signal === undefined) {
+    return null;
+  }
+  switch (signal) {
+    case "SIGHUP":
+    case "SIGINT":
+    case "SIGQUIT":
+    case "SIGTERM":
+    case "SIGKILL":
+      return signal;
+    default:
+      throw new Error(`unknown sandbox process signal: ${signal}`);
+  }
+}
+
+function createControlWritable(control: SandboxControl, id: string): WritableStream<Uint8Array> {
+  return new WritableStream<Uint8Array>({
+    write: async (chunk) => {
+      await control.send({ type: "guest.spawn.stdin", id, data: chunk });
+    },
+    close: async () => {
+      await control.send({ type: "guest.spawn.stdin.close", id });
+    },
+    abort: async () => {
+      await control.send({ type: "guest.spawn.stdin.close", id });
+    },
+  });
+}
+
+class ReadableByteQueue {
+  readonly stream: ReadableStream<Uint8Array>;
+  #controller: ReadableStreamDefaultController<Uint8Array> | null = null;
+  #closed = false;
+
+  constructor() {
+    this.stream = new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        this.#controller = controller;
+      },
+    });
+  }
+
+  enqueue(chunk: Uint8Array): void {
+    if (this.#closed) {
+      return;
+    }
+    this.#controller?.enqueue(chunk);
+  }
+
+  close(error?: unknown): void {
+    if (this.#closed) {
+      return;
+    }
+    this.#closed = true;
+    if (error === undefined) {
+      this.#controller?.close();
+    } else {
+      this.#controller?.error(error);
+    }
   }
 }
 
