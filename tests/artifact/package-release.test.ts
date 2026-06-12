@@ -213,7 +213,7 @@ test("host build validates kernel artifact metadata before Cargo embeds it", asy
   assert.match(fixtureCacheKeys, /kernel-artifact-metadata\.ts/);
 });
 
-test("vendored kernel configs include Docker bridge xtables matches", async () => {
+test("vendored kernel configs include Docker bridge iptables-nft support", async () => {
   for (const arch of ["aarch64", "x86_64"]) {
     const config = await readFile(
       new URL(`../../deps/libkrunfw/config-libkrunfw_${arch}`, import.meta.url),
@@ -221,6 +221,7 @@ test("vendored kernel configs include Docker bridge xtables matches", async () =
     );
 
     for (const option of [
+      "CONFIG_NFT_COMPAT=y",
       "CONFIG_NETFILTER_XTABLES=y",
       "CONFIG_NETFILTER_XT_TARGET_MASQUERADE=y",
       "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y",
