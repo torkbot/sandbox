@@ -7,11 +7,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use bson::{Bson, Document, doc};
-use sandbox::block_storage::CowBlockStore;
+use sandbox::block_storage::{CowBlockStore, FileCowBlockStore};
 use sandbox::config::MountSpec;
 use sandbox::config::{
-    HttpRequestHeaderHookSpec, HttpSpecInput, MicroVmSpecInput, MountSpecInput, NetworkPolicySpec,
-    OutboundPolicy, OutboundRuleSpec, OutboundSpec, RootfsStorageSpecInput,
+    FileStorageSpecInput, HttpRequestHeaderHookSpec, HttpSpecInput, MicroVmSpecInput,
+    MountSpecInput, NetworkPolicySpec, OutboundPolicy, OutboundRuleSpec, OutboundSpec,
+    RootfsStorageSpecInput,
 };
 use sandbox::http_flow::{
     HookBackedHttpInterceptRuntime, HttpHookExecutor, InterceptedHttpRequest,
@@ -191,23 +192,11 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let virtual_fs = virtual_fs_devices(&spec, bridge.clone());
+    let root_storage = root_storage(&spec, bridge.clone())?;
     let services = HostServices {
         http: http_intercept_runtime(&spec, bridge.clone())?,
         network_policy: network_policy_runtime(&spec, bridge.clone()),
-        root_storage: spec
-            .rootfs
-            .storage
-            .as_ref()
-            .and_then(|storage| match storage {
-                sandbox::config::RootfsStorageSpec::CowBlockStore { block_size, .. } => {
-                    Some(Arc::new(NodeCowBlockStore::new(
-                        bridge.clone(),
-                        *block_size,
-                        "host.block",
-                    )) as Arc<dyn CowBlockStore>)
-                }
-                sandbox::config::RootfsStorageSpec::EphemeralCow { .. } => None,
-            }),
+        root_storage,
     };
     let mut vm = sandbox::runtime::KrunVm::create_with_services(&spec, virtual_fs, services)?;
     vm.start()?;
@@ -255,6 +244,32 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(error) => Err(format!("control bridge stopped: {error}").into()),
     }
+}
+
+fn root_storage(
+    spec: &sandbox::MicroVmSpec,
+    bridge: Arc<HostIoBridge>,
+) -> Result<Option<Arc<dyn CowBlockStore>>, Box<dyn std::error::Error>> {
+    let Some(storage) = spec.rootfs.storage.as_ref() else {
+        return Ok(None);
+    };
+    Ok(match storage {
+        sandbox::config::RootfsStorageSpec::CowBlockStore { block_size, .. } => Some(Arc::new(
+            NodeCowBlockStore::new(bridge, *block_size, "host.block"),
+        )
+            as Arc<dyn CowBlockStore>),
+        sandbox::config::RootfsStorageSpec::File {
+            path,
+            format: sandbox::config::FileStorageFormat::RawSparse,
+            block_size,
+            max_bytes,
+            ..
+        } => Some(
+            Arc::new(FileCowBlockStore::open(path, *block_size, *max_bytes)?)
+                as Arc<dyn CowBlockStore>,
+        ),
+        sandbox::config::RootfsStorageSpec::EphemeralCow { .. } => None,
+    })
 }
 
 fn network_policy_runtime(
@@ -754,6 +769,7 @@ fn virtual_fs_devices(
                         backend: NodeVirtualFs::new(path.clone(), bridge.clone()),
                     })
                 }
+                MountSpec::Block { .. } => None,
             }),
     );
     devices
@@ -821,9 +837,22 @@ fn parse_rootfs_storage(
     };
     Ok(Some(RootfsStorageSpecInput {
         kind: document.get_str("kind")?.to_string(),
+        path: optional_string(document, "path"),
+        format: optional_string(document, "format"),
         block_size: u64::try_from(document.get_i32("blockSize")?)?,
+        max_bytes: optional_document_u64(document, "maxBytes")?,
         max_dirty_bytes: document_u64(document, "maxDirtyBytes")?,
     }))
+}
+
+fn optional_document_u64(
+    document: &Document,
+    field: &str,
+) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+    match document.get(field) {
+        Some(_) => Ok(Some(document_u64(document, field)?)),
+        None => Ok(None),
+    }
 }
 
 fn document_u64(document: &Document, field: &str) -> Result<u64, Box<dyn std::error::Error>> {
@@ -850,9 +879,26 @@ fn parse_mounts(values: &[bson::Bson]) -> Result<Vec<MountSpecInput>, Box<dyn st
                 kind: document.get_str("kind")?.to_string(),
                 path: document.get_str("path")?.to_string(),
                 writable: optional_bool(document, "writable"),
+                storage: parse_file_storage(document.get_document("storage").ok())?,
+                fstype: optional_string(document, "fstype"),
+                options: optional_string(document, "options"),
             })
         })
         .collect()
+}
+
+fn parse_file_storage(
+    document: Option<&Document>,
+) -> Result<Option<FileStorageSpecInput>, Box<dyn std::error::Error>> {
+    let Some(document) = document else {
+        return Ok(None);
+    };
+    Ok(Some(FileStorageSpecInput {
+        path: document.get_str("path")?.to_string(),
+        format: document.get_str("format")?.to_string(),
+        block_size: u64::try_from(document.get_i32("blockSize")?)?,
+        max_bytes: document_u64(document, "maxBytes")?,
+    }))
 }
 
 fn parse_network_outbound(

@@ -38,11 +38,16 @@ fn run() -> Result<(), InitError> {
         std::env::args().skip(1),
         std::env::var("SANDBOX_VIRTIOFS_MOUNTS").ok(),
     )?;
+    let block_mounts = block_mounts(
+        std::env::args().skip(1),
+        std::env::var("SANDBOX_BLOCK_MOUNTS").ok(),
+    )?;
     let mut mounted_virtual_paths = Vec::new();
     mount_internal_http_ca(&mounts, &mut mounted_virtual_paths)?;
     mount_virtual_filesystems_before_http_ca(&mounts, &mut mounted_virtual_paths)?;
     install_http_ca(root_readonly)?;
     mount_virtual_filesystems_after_http_ca(&mounts, &mut mounted_virtual_paths)?;
+    mount_block_devices(&block_mounts, &mounted_virtual_paths)?;
     let packet = init_ready_packet(root_readonly)?;
     let mut control = connect_control()?;
     send_init_ready(&mut control, &packet)?;
@@ -730,6 +735,23 @@ struct VirtualFsMount {
     readonly: bool,
 }
 
+#[cfg(not(target_os = "linux"))]
+fn block_mounts(
+    _args: impl Iterator<Item = String>,
+    _env_mounts: Option<String>,
+) -> Result<Vec<BlockMount>, InitError> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+struct BlockMount {
+    device: String,
+    path: String,
+    fstype: String,
+    options: String,
+}
+
 #[cfg(target_os = "linux")]
 fn parse_virtual_fs_mount(mount: &str) -> Result<VirtualFsMount, InitError> {
     let parts = mount.split(':').collect::<Vec<_>>();
@@ -742,6 +764,48 @@ fn parse_virtual_fs_mount(mount: &str) -> Result<VirtualFsMount, InitError> {
         tag: decode_mount_field(tag)?,
         path: decode_mount_field(path)?,
         readonly: *mode != "rw",
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn block_mounts(
+    args: impl Iterator<Item = String>,
+    env_mounts: Option<String>,
+) -> Result<Vec<BlockMount>, InitError> {
+    let mounts = args
+        .filter_map(|arg| arg.strip_prefix("--block-mounts=").map(str::to_string))
+        .next()
+        .or(env_mounts);
+    let Some(mounts) = mounts else {
+        return Ok(Vec::new());
+    };
+
+    mounts
+        .split(';')
+        .filter(|mount| !mount.is_empty())
+        .map(parse_block_mount)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+#[cfg(target_os = "linux")]
+struct BlockMount {
+    device: String,
+    path: String,
+    fstype: String,
+    options: String,
+}
+
+#[cfg(target_os = "linux")]
+fn parse_block_mount(mount: &str) -> Result<BlockMount, InitError> {
+    let parts = mount.split(':').collect::<Vec<_>>();
+    let [device, path, fstype, options] = parts.as_slice() else {
+        return Err(InitError(format!("invalid block mount: {mount}")));
+    };
+    Ok(BlockMount {
+        device: decode_mount_field(device)?,
+        path: decode_mount_field(path)?,
+        fstype: decode_mount_field(fstype)?,
+        options: decode_mount_field(options)?,
     })
 }
 
@@ -863,6 +927,53 @@ fn mount_virtiofs(tag: &str, path: &str, readonly: bool) -> Result<(), InitError
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn mount_block_devices(
+    mounts: &[BlockMount],
+    mounted_virtual_paths: &[std::path::PathBuf],
+) -> Result<(), InitError> {
+    for mount in mounts {
+        ensure_mount_point(&mount.path, mounted_virtual_paths)?;
+        mount_block_device(mount)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn mount_block_device(mount: &BlockMount) -> Result<(), InitError> {
+    use std::ffi::CString;
+
+    let source = CString::new(mount.device.as_str())
+        .map_err(|_| InitError(format!("block mount source contains nul: {}", mount.device)))?;
+    let target = CString::new(mount.path.as_str())
+        .map_err(|_| InitError(format!("block mount path contains nul: {}", mount.path)))?;
+    let fstype = CString::new(mount.fstype.as_str())
+        .map_err(|_| InitError(format!("block mount fstype contains nul: {}", mount.fstype)))?;
+    let options = CString::new(mount.options.as_str()).map_err(|_| {
+        InitError(format!(
+            "block mount options contain nul: {}",
+            mount.options
+        ))
+    })?;
+
+    let result = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            0,
+            options.as_ptr().cast(),
+        )
+    };
+    if result < 0 {
+        return Err(InitError::last_os(&format!(
+            "mount block device {} at {}",
+            mount.device, mount.path
+        )));
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 fn decode_mount_field(value: &str) -> Result<String, InitError> {
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -915,6 +1026,14 @@ fn mount_virtual_filesystems_before_http_ca(
 fn mount_virtual_filesystems_after_http_ca(
     _mounts: &[VirtualFsMount],
     _mounted_virtual_paths: &mut Vec<std::path::PathBuf>,
+) -> Result<(), InitError> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_block_devices(
+    _mounts: &[BlockMount],
+    _mounted_virtual_paths: &[std::path::PathBuf],
 ) -> Result<(), InitError> {
     Ok(())
 }

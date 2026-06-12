@@ -1,19 +1,13 @@
-import {
-  builtInRootfsIdentity,
-  builtInRootfsPath,
-} from "./artifacts.ts";
 import { randomUUID } from "node:crypto";
 import { open } from "node:fs/promises";
+import { builtInRootfsIdentity, builtInRootfsPath } from "./artifacts.ts";
+import type {
+  ControlBackedSandboxProcess,
+  ControlBackedSandboxPty,
+  SandboxControl,
+} from "./control.ts";
 import { HostControlTransport } from "./control.ts";
 import { HostProcessSandboxVm } from "./host-process.ts";
-import { createMemoryFileSystem } from "./memory-fs.ts";
-import {
-  isSandboxPosixFileSystem,
-  isSandboxWritableFileSystem,
-} from "./vfs.ts";
-import type { HostSpawnSandboxOptions } from "./spawn-options.ts";
-import type { ControlBackedSandboxProcess, ControlBackedSandboxPty, SandboxControl } from "./control.ts";
-import type { SandboxControlEvent } from "./control-codec.ts";
 import type {
   InternalNetworkConfig,
   InternalSandboxOptions,
@@ -21,6 +15,12 @@ import type {
   RegisteredNetworkConnectionHook,
   SandboxHttpRequestSelector,
 } from "./launch-options.ts";
+import { createMemoryFileSystem } from "./memory-fs.ts";
+import type { HostSpawnSandboxOptions } from "./spawn-options.ts";
+import {
+  isSandboxPosixFileSystem,
+  isSandboxWritableFileSystem,
+} from "./vfs.ts";
 
 export type SandboxFileType = "file" | "directory" | "symlink";
 
@@ -68,7 +68,12 @@ export interface SandboxPosixFileSystem extends SandboxWritableFileSystem {
   link(from: string, to: string): Promise<SandboxFileStat>;
   symlink(target: string, path: string): Promise<SandboxFileStat>;
   readlink(path: string): Promise<string>;
-  setxattr(path: string, name: string, value: Uint8Array, flags?: number): Promise<void>;
+  setxattr(
+    path: string,
+    name: string,
+    value: Uint8Array,
+    flags?: number,
+  ): Promise<void>;
   getxattr(path: string, name: string): Promise<Uint8Array>;
   listxattr(path: string): Promise<readonly string[]>;
   removexattr(path: string, name: string): Promise<void>;
@@ -147,7 +152,10 @@ export type EphemeralRootfsConfig = {
   readonly maxDirtyBytes?: number;
 };
 
-export type Rootfs = BuiltInRootfsConfig | CowRootfsConfig | EphemeralRootfsConfig;
+export type Rootfs =
+  | BuiltInRootfsConfig
+  | CowRootfsConfig
+  | EphemeralRootfsConfig;
 
 export type Qcow2RootfsImage = {
   readonly kind: "rootfs-image";
@@ -164,6 +172,17 @@ export type SandboxWritableFileSystemSource = {
   readonly kind: "virtual-fs";
   readonly fileSystem: SandboxPosixFileSystem;
 };
+
+export type SandboxBlockMountSource = {
+  readonly kind: "block";
+  readonly source: FileStorageBlockStore;
+  readonly fstype: string;
+  readonly options: string;
+};
+
+export type SandboxMountSource =
+  | SandboxFileSystemSource
+  | SandboxBlockMountSource;
 
 export type SandboxBlockRange = {
   readonly start: bigint;
@@ -182,21 +201,39 @@ export type SandboxBlockStoreContext = {
 export interface SandboxBlockStore {
   readonly blockSize: number;
   list(context: SandboxBlockStoreContext): Promise<readonly bigint[]>;
-  read(range: SandboxBlockRange, context: SandboxBlockStoreContext): Promise<readonly SandboxBlockChunk[]>;
+  read(
+    range: SandboxBlockRange,
+    context: SandboxBlockStoreContext,
+  ): Promise<readonly SandboxBlockChunk[]>;
   /**
    * Receives block bytes owned by the block store. Sandbox will not mutate
    * chunk data after calling write(), so stores may retain those arrays.
    */
-  write(chunks: readonly SandboxBlockChunk[], context: SandboxBlockStoreContext): Promise<void>;
+  write(
+    chunks: readonly SandboxBlockChunk[],
+    context: SandboxBlockStoreContext,
+  ): Promise<void>;
   flush?(context: SandboxBlockStoreContext): Promise<void>;
 }
 
+export type FileStorageFormat = "raw-sparse";
+
+export type FileStorageBlockStore = SandboxBlockStore & {
+  readonly kind: "file-storage";
+  readonly format: FileStorageFormat;
+  readonly path: string;
+  readonly maxBytes: number;
+};
+
 const DEFAULT_COW_MAX_DIRTY_BYTES = 64 * 1024 * 1024;
 const MAX_PTY_SIZE = 65_535;
-const rootfsImageStorage = new WeakMap<Qcow2RootfsImage, {
-  readonly blockStore: SandboxBlockStore;
-  readonly context: SandboxBlockStoreContext;
-}>();
+const rootfsImageStorage = new WeakMap<
+  Qcow2RootfsImage,
+  {
+    readonly blockStore: SandboxBlockStore;
+    readonly context: SandboxBlockStoreContext;
+  }
+>();
 
 /**
  * Middleware invoked for an HTTP request allowed by a network policy.
@@ -214,8 +251,7 @@ export type HttpRequestMiddleware = (
  * Grants intentionally carry no public fields today. They reserve a stable
  * extension point for future instance-local grant state.
  */
-export interface NetworkGrant {
-}
+export interface NetworkGrant {}
 
 /**
  * Opaque grant returned by `conn.acceptHttp(...)`.
@@ -223,8 +259,7 @@ export interface NetworkGrant {
  * HTTP grants are distinct from generic network grants so future HTTP-specific
  * policy state can remain type-safe.
  */
-export interface HttpNetworkGrant extends NetworkGrant {
-}
+export interface HttpNetworkGrant extends NetworkGrant {}
 
 /** IP transport observed by the network policy hook. */
 export type NetworkTransport = "tcp" | "udp";
@@ -233,21 +268,21 @@ export type NetworkTransport = "tcp" | "udp";
 export type NetworkEndpointSpec =
   | `${string}:${number}`
   | {
-    /** Numeric destination IP address. */
-    readonly ip: string;
-    /** Destination transport port. */
-    readonly port: number;
-  };
+      /** Numeric destination IP address. */
+      readonly ip: string;
+      /** Destination transport port. */
+      readonly port: number;
+    };
 
 /** Upstream DNS resolver used to answer an accepted DNS flow. */
 export type DnsUpstreamResolver =
   | string
   | {
-    /** Numeric upstream resolver IP address. */
-    readonly ip: string;
-    /** Upstream resolver port. Defaults to 53. */
-    readonly port?: number;
-  };
+      /** Numeric upstream resolver IP address. */
+      readonly ip: string;
+      /** Upstream resolver port. Defaults to 53. */
+      readonly port?: number;
+    };
 
 /** Options for accepting a matched DNS flow. */
 export interface DnsAcceptOptions {
@@ -262,11 +297,11 @@ export interface DnsAcceptOptions {
 export type HttpAuthoritySpec =
   | string
   | {
-    /** Trusted HTTP authority hostname. */
-    readonly hostname: string;
-    /** Trusted HTTP authority port. Omit to match any port. */
-    readonly port?: number;
-  };
+      /** Trusted HTTP authority hostname. */
+      readonly hostname: string;
+      /** Trusted HTTP authority port. Omit to match any port. */
+      readonly port?: number;
+    };
 
 /** Synchronous predicate used by protocol-specific match helpers. */
 export type NetworkMatchPredicate<TMatch> = (candidate: TMatch) => boolean;
@@ -378,7 +413,9 @@ export interface UdpNetworkEndpoint extends NetworkEndpoint {
  * `transport` is the only stable discriminant. Higher-level protocol semantics
  * are opt-in through protocol-specific accept helpers.
  */
-export interface NetworkConnectionRequestBase<TTransport extends NetworkTransport> {
+export interface NetworkConnectionRequestBase<
+  TTransport extends NetworkTransport,
+> {
   /** IP transport that carried this event. Narrows TCP vs UDP request shapes. */
   readonly transport: TTransport;
   /** Source endpoint observed at the sandbox network boundary. */
@@ -491,7 +528,7 @@ export interface SandboxResourceLimits {
 }
 
 export interface SandboxBootOptions {
-  readonly mounts?: Readonly<Record<string, SandboxFileSystemSource>>;
+  readonly mounts?: Readonly<Record<string, SandboxMountSource>>;
   readonly cwd?: string;
   readonly hostname?: string;
 }
@@ -576,10 +613,7 @@ export interface SandboxInstance {
     args?: readonly string[],
     options?: SandboxSpawnOptions,
   ): SandboxProcess;
-  pty(
-    command: string,
-    options: SandboxPtyOptions,
-  ): SandboxPty;
+  pty(command: string, options: SandboxPtyOptions): SandboxPty;
   pty(
     command: string,
     args: readonly string[] | undefined,
@@ -612,24 +646,31 @@ export const rootfs = {
   }): ComposedRootfsConfig {
     return composeRootfs(options);
   },
-  cow(options: {
-    readonly source: ComposedRootfsConfig;
-    readonly maxDirtyBytes?: number;
-  } | {
-    readonly base: BuiltInRootfsConfig;
-    readonly writable: SandboxBlockStore;
-    readonly maxDirtyBytes?: number;
-  }): Rootfs {
-    const source = "source" in options
-      ? options.source
-      : composeRootfs({
-        base: options.base,
-        overlay: options.writable,
-      });
+  cow(
+    options:
+      | {
+          readonly source: ComposedRootfsConfig;
+          readonly maxDirtyBytes?: number;
+        }
+      | {
+          readonly base: BuiltInRootfsConfig;
+          readonly writable: SandboxBlockStore;
+          readonly maxDirtyBytes?: number;
+        },
+  ): Rootfs {
+    const source =
+      "source" in options
+        ? options.source
+        : composeRootfs({
+            base: options.base,
+            overlay: options.writable,
+          });
     return {
       kind: "cow-rootfs",
       source,
-      ...(options.maxDirtyBytes === undefined ? {} : { maxDirtyBytes: options.maxDirtyBytes }),
+      ...(options.maxDirtyBytes === undefined
+        ? {}
+        : { maxDirtyBytes: options.maxDirtyBytes }),
     };
   },
   ephemeral(options: {
@@ -639,7 +680,9 @@ export const rootfs = {
     return {
       kind: "ephemeral-rootfs",
       base: options.base,
-      ...(options.maxDirtyBytes === undefined ? {} : { maxDirtyBytes: options.maxDirtyBytes }),
+      ...(options.maxDirtyBytes === undefined
+        ? {}
+        : { maxDirtyBytes: options.maxDirtyBytes }),
     };
   },
   async flatten(options: {
@@ -653,14 +696,17 @@ export const rootfs = {
     }
     validateImageDestination(options.dest);
     validateQcow2Options(options);
-    const source = options.source.kind === "built-in-rootfs"
-      ? composeRootfs({
-        base: options.source,
-        overlay: createEphemeralCowBlockStore(),
-      })
-      : options.source;
+    const source =
+      options.source.kind === "built-in-rootfs"
+        ? composeRootfs({
+            base: options.source,
+            overlay: createEphemeralCowBlockStore(),
+          })
+        : options.source;
     if (source.base.kind !== "built-in-rootfs") {
-      throw new Error("invalid rootfs source: base must be created with rootfs.builtIn(...)");
+      throw new Error(
+        "invalid rootfs source: base must be created with rootfs.builtIn(...)",
+      );
     }
     validateBuiltInRootfsName(source.base.name);
     validateBlockStore(source.overlay);
@@ -668,7 +714,9 @@ export const rootfs = {
       base: `rootfs-image:qcow2:${randomUUID()}`,
     };
     if ((await options.dest.list(destContext)).length !== 0) {
-      throw new Error("invalid rootfs image destination: destination block store context must be empty");
+      throw new Error(
+        "invalid rootfs image destination: destination block store context must be empty",
+      );
     }
     const result = await HostProcessSandboxVm.flattenQcow2({
       basePath: builtInRootfsPath(source.base.name),
@@ -706,7 +754,12 @@ export const rootfs = {
         let offset = 0;
         while (true) {
           options.signal?.throwIfAborted();
-          const { bytesRead } = await file.read(buffer, 0, buffer.byteLength, offset);
+          const { bytesRead } = await file.read(
+            buffer,
+            0,
+            buffer.byteLength,
+            offset,
+          );
           if (bytesRead === 0) {
             return;
           }
@@ -721,16 +774,81 @@ export const rootfs = {
 
     const storage = rootfsImageStorage.get(image);
     if (storage === undefined) {
-      throw new Error("invalid rootfs image: image was not created by rootfs.flatten(...)");
+      throw new Error(
+        "invalid rootfs image: image was not created by rootfs.flatten(...)",
+      );
     }
     let offset = 0n;
     while (offset < image.sizeBytes) {
       options.signal?.throwIfAborted();
       const remaining = image.sizeBytes - offset;
-      const nextLength = Number(remaining < BigInt(chunkSize) ? remaining : BigInt(chunkSize));
-      yield await readBlockStoreBytes(storage.blockStore, storage.context, offset, nextLength);
+      const nextLength = Number(
+        remaining < BigInt(chunkSize) ? remaining : BigInt(chunkSize),
+      );
+      yield await readBlockStoreBytes(
+        storage.blockStore,
+        storage.context,
+        offset,
+        nextLength,
+      );
       offset += BigInt(nextLength);
     }
+  },
+};
+
+export const storage = {
+  file(options: {
+    readonly path: string;
+    readonly format: FileStorageFormat;
+    readonly blockSize: number;
+    readonly maxBytes: number;
+  }): FileStorageBlockStore {
+    validateFileStorageOptions(options);
+    return {
+      kind: "file-storage",
+      path: options.path,
+      format: options.format,
+      blockSize: options.blockSize,
+      maxBytes: options.maxBytes,
+      async list() {
+        throw new Error(
+          "storage.file(...) is only supported as native sandbox storage",
+        );
+      },
+      async read() {
+        throw new Error(
+          "storage.file(...) is only supported as native sandbox storage",
+        );
+      },
+      async write() {
+        throw new Error(
+          "storage.file(...) is only supported as native sandbox storage",
+        );
+      },
+      async flush() {},
+    };
+  },
+};
+
+export const mount = {
+  block(options: {
+    readonly source: FileStorageBlockStore;
+    readonly fstype: string;
+    readonly options: string;
+  }): SandboxBlockMountSource {
+    validateFileStorageOptions(options.source);
+    if (options.fstype.length === 0) {
+      throw new Error("invalid mount.block options: fstype must not be empty");
+    }
+    if (options.options.length === 0) {
+      throw new Error("invalid mount.block options: options must not be empty");
+    }
+    return {
+      kind: "block",
+      source: options.source,
+      fstype: options.fstype,
+      options: options.options,
+    };
   },
 };
 
@@ -745,7 +863,9 @@ function composeRootfs(options: {
   };
 }
 
-function virtualFs(fileSystem: SandboxPosixFileSystem): SandboxWritableFileSystemSource;
+function virtualFs(
+  fileSystem: SandboxPosixFileSystem,
+): SandboxWritableFileSystemSource;
 function virtualFs(fileSystem: SandboxFileSystem): SandboxFileSystemSource;
 function virtualFs(fileSystem: SandboxFileSystem): SandboxFileSystemSource {
   return {
@@ -768,7 +888,9 @@ export const network = {
   },
 };
 
-export function defineSandbox(options: SandboxDefinitionOptions): SandboxDefinition {
+export function defineSandbox(
+  options: SandboxDefinitionOptions,
+): SandboxDefinition {
   validateSandboxDefinitionOptions(options);
   return new DefinedSandbox(options);
 }
@@ -787,9 +909,10 @@ class DefinedSandbox implements SandboxDefinition {
 
   async boot(options: SandboxBootOptions = {}): Promise<SandboxInstance> {
     validateSandboxBootOptions(options);
-    const networkPolicy = this.#options.network === undefined
-      ? undefined
-      : createNetworkPolicyHookRegistration(this.#options.network);
+    const networkPolicy =
+      this.#options.network === undefined
+        ? undefined
+        : createNetworkPolicyHookRegistration(this.#options.network);
     const launchOptions = await toInternalSandboxOptions(
       this.#options,
       options,
@@ -797,7 +920,10 @@ class DefinedSandbox implements SandboxDefinition {
     );
     try {
       validateInternalSandboxOptions(launchOptions);
-      const hostOptions = toHostSpawnOptions(launchOptions, networkPolicy?.hooks ?? []);
+      const hostOptions = toHostSpawnOptions(
+        launchOptions,
+        networkPolicy?.hooks ?? [],
+      );
       const hostVm = await HostProcessSandboxVm.spawn(
         launchOptions,
         hostOptions,
@@ -849,7 +975,8 @@ class HostBackedSandboxVm implements SandboxVm {
     this.#rootExec = new ControlBackedSandboxExec(this.control, "/");
     if (hostVm.terminateHostForTest !== undefined) {
       this.diagnostics = {
-        terminateHostForTest: () => hostVm.terminateHostForTest?.() ?? Promise.resolve(),
+        terminateHostForTest: () =>
+          hostVm.terminateHostForTest?.() ?? Promise.resolve(),
         hostPid: () => {
           if (hostVm.hostPid === undefined) {
             throw new Error("sandbox host PID is not available");
@@ -872,7 +999,9 @@ class HostBackedSandboxVm implements SandboxVm {
         for (let attempt = 0; attempt < 2; attempt += 1) {
           const result = await this.#rootExec.exec("/bin/sync", []);
           if (result.exitCode !== 0) {
-            throw new Error(`sandbox close sync failed with exit code ${result.exitCode}: ${result.stderr}`);
+            throw new Error(
+              `sandbox close sync failed with exit code ${result.exitCode}: ${result.stderr}`,
+            );
           }
           if (attempt === 0) {
             await delay(100);
@@ -916,8 +1045,10 @@ class HostBackedSandboxVm implements SandboxVm {
     validateSandboxProcessArgs(args, "sandbox spawn");
     validateSandboxSpawnOptions(options);
     throwIfAborted(options.signal);
-    const process = new ControlBackedSandboxSpawn(this.control, this.#options.cwd)
-      .spawn(command, args, options);
+    const process = new ControlBackedSandboxSpawn(
+      this.control,
+      this.#options.cwd,
+    ).spawn(command, args, options);
     linkAbortSignal(options.signal, process);
     return process;
   }
@@ -939,8 +1070,10 @@ class HostBackedSandboxVm implements SandboxVm {
     validateSandboxProcessArgs(args, "sandbox pty");
     validateSandboxPtyOptions(ptyOptions);
     throwIfAborted(ptyOptions.signal);
-    const process = new ControlBackedSandboxSpawn(this.control, this.#options.cwd)
-      .pty(command, args, ptyOptions);
+    const process = new ControlBackedSandboxSpawn(
+      this.control,
+      this.#options.cwd,
+    ).pty(command, args, ptyOptions);
     linkAbortSignal(ptyOptions.signal, process);
     return process;
   }
@@ -948,7 +1081,10 @@ class HostBackedSandboxVm implements SandboxVm {
 
 function linkAbortSignal(
   signal: AbortSignal | undefined,
-  process: { readonly exit: Promise<unknown>; kill(signal?: SandboxSignal): void },
+  process: {
+    readonly exit: Promise<unknown>;
+    kill(signal?: SandboxSignal): void;
+  },
 ): void {
   if (signal === undefined) {
     return;
@@ -995,16 +1131,25 @@ class ControlBackedSandboxExec {
   ): Promise<SandboxExecResult> {
     args ??= [];
     const cwd = options.cwd ?? this.#cwd;
-    const env = cwd === undefined
-      ? options.env
-      : {
-          ...options.env,
-          SANDBOX_EXEC_CWD: cwd,
-          PWD: cwd,
-        };
-    const argv = cwd === undefined
-      ? [command, ...args]
-      : ["/bin/sh", "-lc", "cd \"$SANDBOX_EXEC_CWD\" && exec \"$@\"", "sandbox-exec", command, ...args];
+    const env =
+      cwd === undefined
+        ? options.env
+        : {
+            ...options.env,
+            SANDBOX_EXEC_CWD: cwd,
+            PWD: cwd,
+          };
+    const argv =
+      cwd === undefined
+        ? [command, ...args]
+        : [
+            "/bin/sh",
+            "-lc",
+            'cd "$SANDBOX_EXEC_CWD" && exec "$@"',
+            "sandbox-exec",
+            command,
+            ...args,
+          ];
     const result = await this.#control.exec({
       argv,
       env,
@@ -1017,7 +1162,6 @@ class ControlBackedSandboxExec {
       stderr: result.stderr,
     };
   }
-
 }
 
 class ControlBackedSandboxSpawn {
@@ -1036,16 +1180,25 @@ class ControlBackedSandboxSpawn {
   ): ControlBackedSandboxProcess {
     args ??= [];
     const cwd = options.cwd ?? this.#cwd;
-    const env = cwd === undefined
-      ? options.env
-      : {
-          ...options.env,
-          SANDBOX_EXEC_CWD: cwd,
-          PWD: cwd,
-        };
-    const argv = cwd === undefined
-      ? [command, ...args]
-      : ["/bin/sh", "-lc", "cd \"$SANDBOX_EXEC_CWD\" && exec \"$@\"", "sandbox-spawn", command, ...args];
+    const env =
+      cwd === undefined
+        ? options.env
+        : {
+            ...options.env,
+            SANDBOX_EXEC_CWD: cwd,
+            PWD: cwd,
+          };
+    const argv =
+      cwd === undefined
+        ? [command, ...args]
+        : [
+            "/bin/sh",
+            "-lc",
+            'cd "$SANDBOX_EXEC_CWD" && exec "$@"',
+            "sandbox-spawn",
+            command,
+            ...args,
+          ];
     return this.#control.spawn({
       argv,
       env,
@@ -1059,16 +1212,25 @@ class ControlBackedSandboxSpawn {
   ): ControlBackedSandboxPty {
     args ??= [];
     const cwd = options.cwd ?? this.#cwd;
-    const env = cwd === undefined
-      ? options.env
-      : {
-          ...options.env,
-          SANDBOX_EXEC_CWD: cwd,
-          PWD: cwd,
-        };
-    const argv = cwd === undefined
-      ? [command, ...args]
-      : ["/bin/sh", "-lc", "cd \"$SANDBOX_EXEC_CWD\" && exec \"$@\"", "sandbox-pty", command, ...args];
+    const env =
+      cwd === undefined
+        ? options.env
+        : {
+            ...options.env,
+            SANDBOX_EXEC_CWD: cwd,
+            PWD: cwd,
+          };
+    const argv =
+      cwd === undefined
+        ? [command, ...args]
+        : [
+            "/bin/sh",
+            "-lc",
+            'cd "$SANDBOX_EXEC_CWD" && exec "$@"',
+            "sandbox-pty",
+            command,
+            ...args,
+          ];
     return this.#control.pty({
       argv,
       env,
@@ -1082,28 +1244,32 @@ function toHostSpawnOptions(
   requestHeaderHooks: readonly SpawnHttpRequestHeadersHook[],
 ): HostSpawnSandboxOptions {
   if (
-    (requestHeaderHooks.length > 0 || options.network?.http !== undefined)
-    && options.network?.outbound === undefined
+    (requestHeaderHooks.length > 0 || options.network?.http !== undefined) &&
+    options.network?.outbound === undefined
   ) {
-    throw new Error("invalid sandbox options: network.outbound is required when HTTP interception is configured");
+    throw new Error(
+      "invalid sandbox options: network.outbound is required when HTTP interception is configured",
+    );
   }
-  const network = options.network === undefined && requestHeaderHooks.length === 0
-    ? undefined
-    : {
-      outbound: options.network?.outbound,
-      http: requestHeaderHooks.length === 0
-        && options.network?.http?.caCertificatePem === undefined
-        ? undefined
-        : {
-          caCertificatePem: options.network?.http?.caCertificatePem,
-          caPrivateKeyPem: options.network?.http?.caPrivateKeyPem,
-          requestHeaderHooks: requestHeaderHooks.map((hook) => ({
-            id: hook.id,
-            origin: hook.selector.origin,
-          })),
-        },
-      policy: options.network?.policy,
-    };
+  const network =
+    options.network === undefined && requestHeaderHooks.length === 0
+      ? undefined
+      : {
+          outbound: options.network?.outbound,
+          http:
+            requestHeaderHooks.length === 0 &&
+            options.network?.http?.caCertificatePem === undefined
+              ? undefined
+              : {
+                  caCertificatePem: options.network?.http?.caCertificatePem,
+                  caPrivateKeyPem: options.network?.http?.caPrivateKeyPem,
+                  requestHeaderHooks: requestHeaderHooks.map((hook) => ({
+                    id: hook.id,
+                    origin: hook.selector.origin,
+                  })),
+                },
+          policy: options.network?.policy,
+        };
 
   return {
     kernel: {
@@ -1121,6 +1287,21 @@ function toHostSpawnOptions(
     hostname: options.hostname,
     rootfs: options.rootfs,
     mounts: options.mounts?.map((mount) => {
+      if (mount.kind === "block") {
+        return {
+          kind: "block",
+          path: mount.path,
+          storage: {
+            kind: "file",
+            path: mount.source.path,
+            format: mount.source.format,
+            blockSize: mount.source.blockSize,
+            maxBytes: mount.source.maxBytes,
+          },
+          fstype: mount.fstype,
+          options: mount.options,
+        };
+      }
       return {
         kind: "virtual-fs",
         path: mount.path,
@@ -1143,7 +1324,17 @@ async function toInternalSandboxOptions(
     cwd: boot.cwd,
     hostname: boot.hostname ?? "sandbox",
     mounts: Object.entries(boot.mounts ?? {}).map(([path, source]) => {
+      if (source.kind === "block") {
+        return {
+          kind: "block",
+          path,
+          source: source.source,
+          fstype: source.fstype,
+          options: source.options,
+        };
+      }
       return {
+        kind: "virtual-fs",
         path,
         fileSystem: source.fileSystem,
       };
@@ -1152,7 +1343,9 @@ async function toInternalSandboxOptions(
   };
 }
 
-function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPolicyHookRegistration {
+function createNetworkPolicyHookRegistration(
+  policy: NetworkPolicy,
+): NetworkPolicyHookRegistration {
   const hook: HttpRequestMiddleware = async (request) => {
     void request;
   };
@@ -1184,8 +1377,18 @@ function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPoli
         policy: "deny",
         rules: [
           { action: "accept", scope: "public-internet", ports: [] },
-          { action: "accept", protocol: "tcp", cidr: "10.0.2.1/32", ports: [53] },
-          { action: "accept", protocol: "udp", cidr: "10.0.2.1/32", ports: [53] },
+          {
+            action: "accept",
+            protocol: "tcp",
+            cidr: "10.0.2.1/32",
+            ports: [53],
+          },
+          {
+            action: "accept",
+            protocol: "udp",
+            cidr: "10.0.2.1/32",
+            ports: [53],
+          },
         ],
       },
     },
@@ -1218,9 +1421,11 @@ function isLoopbackIp(ip: string): boolean {
 function isPrivateIp(ip: string): boolean {
   const ipv4 = parseIpv4(ip);
   if (ipv4 !== undefined) {
-    return ipv4[0] === 10
-      || (ipv4[0] === 172 && ipv4[1] >= 16 && ipv4[1] <= 31)
-      || (ipv4[0] === 192 && ipv4[1] === 168);
+    return (
+      ipv4[0] === 10 ||
+      (ipv4[0] === 172 && ipv4[1] >= 16 && ipv4[1] <= 31) ||
+      (ipv4[0] === 192 && ipv4[1] === 168)
+    );
   }
   return ipv6StartsWith(ip, "fc") || ipv6StartsWith(ip, "fd");
 }
@@ -1230,10 +1435,12 @@ function isLinkLocalIp(ip: string): boolean {
   if (ipv4 !== undefined) {
     return ipv4[0] === 169 && ipv4[1] === 254;
   }
-  return ipv6StartsWith(ip, "fe8")
-    || ipv6StartsWith(ip, "fe9")
-    || ipv6StartsWith(ip, "fea")
-    || ipv6StartsWith(ip, "feb");
+  return (
+    ipv6StartsWith(ip, "fe8") ||
+    ipv6StartsWith(ip, "fe9") ||
+    ipv6StartsWith(ip, "fea") ||
+    ipv6StartsWith(ip, "feb")
+  );
 }
 
 function isMulticastIp(ip: string): boolean {
@@ -1247,9 +1454,11 @@ function isMulticastIp(ip: string): boolean {
 function isDocumentationIp(ip: string): boolean {
   const ipv4 = parseIpv4(ip);
   if (ipv4 !== undefined) {
-    return (ipv4[0] === 192 && ipv4[1] === 0 && ipv4[2] === 2)
-      || (ipv4[0] === 198 && ipv4[1] === 51 && ipv4[2] === 100)
-      || (ipv4[0] === 203 && ipv4[1] === 0 && ipv4[2] === 113);
+    return (
+      (ipv4[0] === 192 && ipv4[1] === 0 && ipv4[2] === 2) ||
+      (ipv4[0] === 198 && ipv4[1] === 51 && ipv4[2] === 100) ||
+      (ipv4[0] === 203 && ipv4[1] === 0 && ipv4[2] === 113)
+    );
   }
   return normalizeIpv6(ip).startsWith("2001:db8:");
 }
@@ -1257,26 +1466,30 @@ function isDocumentationIp(ip: string): boolean {
 function isReservedIp(ip: string): boolean {
   const ipv4 = parseIpv4(ip);
   if (ipv4 !== undefined) {
-    return ipv4[0] === 0
-      || (ipv4[0] === 100 && ipv4[1] >= 64 && ipv4[1] <= 127)
-      || (ipv4[0] === 192 && ipv4[1] === 0 && ipv4[2] === 0)
-      || (ipv4[0] === 192 && ipv4[1] === 88 && ipv4[2] === 99)
-      || (ipv4[0] === 198 && (ipv4[1] === 18 || ipv4[1] === 19))
-      || ipv4[0] >= 240
-      || isDocumentationIp(ip);
+    return (
+      ipv4[0] === 0 ||
+      (ipv4[0] === 100 && ipv4[1] >= 64 && ipv4[1] <= 127) ||
+      (ipv4[0] === 192 && ipv4[1] === 0 && ipv4[2] === 0) ||
+      (ipv4[0] === 192 && ipv4[1] === 88 && ipv4[2] === 99) ||
+      (ipv4[0] === 198 && (ipv4[1] === 18 || ipv4[1] === 19)) ||
+      ipv4[0] >= 240 ||
+      isDocumentationIp(ip)
+    );
   }
   return normalizeIpv6(ip).startsWith("2001:db8:");
 }
 
 function isPublicInternetIp(ip: string): boolean {
-  return parseIpv4(ip) !== undefined
-    && !isLoopbackIp(ip)
-    && !isPrivateIp(ip)
-    && !isLinkLocalIp(ip)
-    && !isMulticastIp(ip)
-    && !isReservedIp(ip)
-    && !isDocumentationIp(ip)
-    && ip !== "255.255.255.255";
+  return (
+    parseIpv4(ip) !== undefined &&
+    !isLoopbackIp(ip) &&
+    !isPrivateIp(ip) &&
+    !isLinkLocalIp(ip) &&
+    !isMulticastIp(ip) &&
+    !isReservedIp(ip) &&
+    !isDocumentationIp(ip) &&
+    ip !== "255.255.255.255"
+  );
 }
 
 function parseIpv4(ip: string): [number, number, number, number] | undefined {
@@ -1292,7 +1505,7 @@ function parseIpv4(ip: string): [number, number, number, number] | undefined {
     return value <= 255 ? value : undefined;
   });
   return octets.every((part) => part !== undefined)
-    ? octets as [number, number, number, number]
+    ? (octets as [number, number, number, number])
     : undefined;
 }
 
@@ -1304,7 +1517,9 @@ function ipv6StartsWith(ip: string, prefix: string): boolean {
   return parseIpv4(ip) === undefined && normalizeIpv6(ip).startsWith(prefix);
 }
 
-async function lowerRootfs(rootfs: Rootfs): Promise<InternalSandboxOptions["rootfs"]> {
+async function lowerRootfs(
+  rootfs: Rootfs,
+): Promise<InternalSandboxOptions["rootfs"]> {
   switch (rootfs.kind) {
     case "built-in-rootfs": {
       return {
@@ -1329,6 +1544,21 @@ function lowerCowRootfs(
   writable: SandboxBlockStore,
   maxDirtyBytes: number,
 ): InternalSandboxOptions["rootfs"] {
+  if (isFileStorageBlockStore(writable)) {
+    return {
+      path: builtInRootfsPath(base.name),
+      readonly: false,
+      format: "qcow2",
+      storage: {
+        kind: "file",
+        path: writable.path,
+        format: writable.format,
+        blockSize: writable.blockSize,
+        maxBytes: writable.maxBytes,
+        maxDirtyBytes,
+      },
+    };
+  }
   return {
     path: builtInRootfsPath(base.name),
     readonly: false,
@@ -1395,10 +1625,14 @@ function validateRootfs(rootfs: Rootfs): void {
       return;
     case "cow-rootfs":
       if (rootfs.source?.kind !== "composed-rootfs") {
-        throw new Error("invalid sandbox definition: rootfs.cow source must be created with rootfs.compose(...)");
+        throw new Error(
+          "invalid sandbox definition: rootfs.cow source must be created with rootfs.compose(...)",
+        );
       }
       if (rootfs.source.base.kind !== "built-in-rootfs") {
-        throw new Error("invalid sandbox definition: rootfs.cow base must be created with rootfs.builtIn(...)");
+        throw new Error(
+          "invalid sandbox definition: rootfs.cow base must be created with rootfs.builtIn(...)",
+        );
       }
       validateBuiltInRootfsName(rootfs.source.base.name);
       validateBlockStore(rootfs.source.overlay);
@@ -1406,7 +1640,9 @@ function validateRootfs(rootfs: Rootfs): void {
       return;
     case "ephemeral-rootfs":
       if (rootfs.base?.kind !== "built-in-rootfs") {
-        throw new Error("invalid sandbox definition: rootfs.ephemeral base must be created with rootfs.builtIn(...)");
+        throw new Error(
+          "invalid sandbox definition: rootfs.ephemeral base must be created with rootfs.builtIn(...)",
+        );
       }
       validateBuiltInRootfsName(rootfs.base.name);
       validateEphemeralRootfs(rootfs);
@@ -1419,46 +1655,124 @@ function validateRootfs(rootfs: Rootfs): void {
 }
 
 function validateBlockStore(blockStore: SandboxBlockStore): void {
+  if (isFileStorageBlockStore(blockStore)) {
+    validateFileStorageOptions(blockStore);
+    return;
+  }
   if (!Number.isInteger(blockStore.blockSize) || blockStore.blockSize <= 0) {
-    throw new Error("invalid sandbox definition: rootfs COW block size must be a positive integer");
+    throw new Error(
+      "invalid sandbox definition: rootfs COW block size must be a positive integer",
+    );
   }
   if (blockStore.blockSize % 512 !== 0) {
-    throw new Error("invalid sandbox definition: rootfs COW block size must be a multiple of 512 bytes");
+    throw new Error(
+      "invalid sandbox definition: rootfs COW block size must be a multiple of 512 bytes",
+    );
   }
   if (typeof blockStore.list !== "function") {
-    throw new Error("invalid sandbox definition: rootfs COW block store must provide list()");
+    throw new Error(
+      "invalid sandbox definition: rootfs COW block store must provide list()",
+    );
   }
   if (typeof blockStore.read !== "function") {
-    throw new Error("invalid sandbox definition: rootfs COW block store must provide read()");
+    throw new Error(
+      "invalid sandbox definition: rootfs COW block store must provide read()",
+    );
   }
   if (typeof blockStore.write !== "function") {
-    throw new Error("invalid sandbox definition: rootfs COW block store must provide write()");
+    throw new Error(
+      "invalid sandbox definition: rootfs COW block store must provide write()",
+    );
   }
+}
+
+function validateFileStorageOptions(options: {
+  readonly path: string;
+  readonly format: string;
+  readonly blockSize: number;
+  readonly maxBytes: number;
+}): void {
+  if (options.format !== "raw-sparse") {
+    throw new Error("invalid storage.file options: format must be raw-sparse");
+  }
+  if (options.path.length === 0) {
+    throw new Error("invalid storage.file options: path must not be empty");
+  }
+  if (!Number.isInteger(options.blockSize) || options.blockSize <= 0) {
+    throw new Error(
+      "invalid storage.file options: blockSize must be a positive integer",
+    );
+  }
+  if (options.blockSize % 512 !== 0) {
+    throw new Error(
+      "invalid storage.file options: blockSize must be a multiple of 512 bytes",
+    );
+  }
+  if (!Number.isSafeInteger(options.maxBytes) || options.maxBytes <= 0) {
+    throw new Error(
+      "invalid storage.file options: maxBytes must be a positive safe integer",
+    );
+  }
+  if (options.maxBytes < options.blockSize) {
+    throw new Error(
+      "invalid storage.file options: maxBytes must be at least blockSize",
+    );
+  }
+  if (options.maxBytes % options.blockSize !== 0) {
+    throw new Error(
+      "invalid storage.file options: maxBytes must be a multiple of blockSize",
+    );
+  }
+}
+
+function isFileStorageBlockStore(
+  blockStore: SandboxBlockStore,
+): blockStore is FileStorageBlockStore {
+  return (blockStore as { readonly kind?: unknown }).kind === "file-storage";
 }
 
 function validateImageDestination(blockStore: SandboxBlockStore): void {
   if (!Number.isInteger(blockStore.blockSize) || blockStore.blockSize <= 0) {
-    throw new Error("invalid rootfs image destination: blockSize must be a positive integer");
+    throw new Error(
+      "invalid rootfs image destination: blockSize must be a positive integer",
+    );
   }
   if (blockStore.blockSize % 512 !== 0) {
-    throw new Error("invalid rootfs image destination: blockSize must be a positive multiple of 512 bytes");
+    throw new Error(
+      "invalid rootfs image destination: blockSize must be a positive multiple of 512 bytes",
+    );
   }
   if (typeof blockStore.list !== "function") {
-    throw new Error("invalid rootfs image destination: block store must provide list()");
+    throw new Error(
+      "invalid rootfs image destination: block store must provide list()",
+    );
   }
   if (typeof blockStore.read !== "function") {
-    throw new Error("invalid rootfs image destination: block store must provide read()");
+    throw new Error(
+      "invalid rootfs image destination: block store must provide read()",
+    );
   }
   if (typeof blockStore.write !== "function") {
-    throw new Error("invalid rootfs image destination: block store must provide write()");
+    throw new Error(
+      "invalid rootfs image destination: block store must provide write()",
+    );
   }
 }
 
-function validateQcow2Options(options: { readonly clusterSize?: number } | undefined): void {
+function validateQcow2Options(
+  options: { readonly clusterSize?: number } | undefined,
+): void {
   if (options?.clusterSize !== undefined) {
     const size = options.clusterSize;
-    if (!Number.isInteger(size) || size < 512 || size > 2 * 1024 * 1024 || (size & (size - 1)) !== 0) {
-      throw new Error("invalid rootfs QCOW2 options: clusterSize must be a power of two between 512 and 2097152 bytes");
+    if (
+      !Number.isInteger(size) ||
+      size < 512 ||
+      size > 2 * 1024 * 1024 ||
+      (size & (size - 1)) !== 0
+    ) {
+      throw new Error(
+        "invalid rootfs QCOW2 options: clusterSize must be a power of two between 512 and 2097152 bytes",
+      );
     }
   }
 }
@@ -1468,7 +1782,9 @@ function validateByteStreamChunkSize(chunkSize: number | undefined): number {
     return 1024 * 1024;
   }
   if (!Number.isSafeInteger(chunkSize) || chunkSize <= 0) {
-    throw new Error("invalid rootfs bytes options: chunkSize must be a positive safe integer");
+    throw new Error(
+      "invalid rootfs bytes options: chunkSize must be a positive safe integer",
+    );
   }
   return chunkSize;
 }
@@ -1490,9 +1806,17 @@ async function readBlockStoreBytes(
     const chunkEnd = chunkStart + BigInt(chunk.data.byteLength);
     const outputStart = offset > chunkStart ? Number(offset - chunkStart) : 0;
     const sourceStart = chunkStart > offset ? Number(chunkStart - offset) : 0;
-    const readable = Number((chunkEnd < offset + BigInt(length) ? chunkEnd : offset + BigInt(length)) - (chunkStart > offset ? chunkStart : offset));
+    const readable = Number(
+      (chunkEnd < offset + BigInt(length)
+        ? chunkEnd
+        : offset + BigInt(length)) -
+        (chunkStart > offset ? chunkStart : offset),
+    );
     if (readable > 0) {
-      output.set(chunk.data.subarray(outputStart, outputStart + readable), sourceStart);
+      output.set(
+        chunk.data.subarray(outputStart, outputStart + readable),
+        sourceStart,
+      );
     }
   }
   return output;
@@ -1502,11 +1826,18 @@ function validateCowMaxDirtyBytes(rootfs: CowRootfsConfig): void {
   if (rootfs.maxDirtyBytes === undefined) {
     return;
   }
-  if (!Number.isSafeInteger(rootfs.maxDirtyBytes) || rootfs.maxDirtyBytes <= 0) {
-    throw new Error("invalid sandbox definition: rootfs COW maxDirtyBytes must be a positive safe integer");
+  if (
+    !Number.isSafeInteger(rootfs.maxDirtyBytes) ||
+    rootfs.maxDirtyBytes <= 0
+  ) {
+    throw new Error(
+      "invalid sandbox definition: rootfs COW maxDirtyBytes must be a positive safe integer",
+    );
   }
   if (rootfs.maxDirtyBytes < rootfs.source.overlay.blockSize) {
-    throw new Error("invalid sandbox definition: rootfs COW maxDirtyBytes must be at least the COW block size");
+    throw new Error(
+      "invalid sandbox definition: rootfs COW maxDirtyBytes must be at least the COW block size",
+    );
   }
 }
 
@@ -1514,75 +1845,126 @@ function validateEphemeralRootfs(rootfs: EphemeralRootfsConfig): void {
   if (rootfs.maxDirtyBytes === undefined) {
     return;
   }
-  if (!Number.isSafeInteger(rootfs.maxDirtyBytes) || rootfs.maxDirtyBytes <= 0) {
-    throw new Error("invalid sandbox definition: ephemeral rootfs maxDirtyBytes must be a positive safe integer");
+  if (
+    !Number.isSafeInteger(rootfs.maxDirtyBytes) ||
+    rootfs.maxDirtyBytes <= 0
+  ) {
+    throw new Error(
+      "invalid sandbox definition: ephemeral rootfs maxDirtyBytes must be a positive safe integer",
+    );
   }
   if (rootfs.maxDirtyBytes < 65536) {
-    throw new Error("invalid sandbox definition: ephemeral rootfs maxDirtyBytes must be at least the COW block size");
+    throw new Error(
+      "invalid sandbox definition: ephemeral rootfs maxDirtyBytes must be at least the COW block size",
+    );
   }
 }
 
-function resolveCowMaxDirtyBytes(blockStore: SandboxBlockStore, maxDirtyBytes?: number): number {
+function resolveCowMaxDirtyBytes(
+  blockStore: SandboxBlockStore,
+  maxDirtyBytes?: number,
+): number {
   if (maxDirtyBytes !== undefined) {
     return maxDirtyBytes;
   }
-  return Math.ceil(DEFAULT_COW_MAX_DIRTY_BYTES / blockStore.blockSize) * blockStore.blockSize;
+  return (
+    Math.ceil(DEFAULT_COW_MAX_DIRTY_BYTES / blockStore.blockSize) *
+    blockStore.blockSize
+  );
 }
 
-function validateSandboxDefinitionOptions(options: SandboxDefinitionOptions): void {
+function validateSandboxDefinitionOptions(
+  options: SandboxDefinitionOptions,
+): void {
   validateRootfs(options.rootfs);
-  if (options.resources?.cpus !== undefined && (!Number.isInteger(options.resources.cpus) || options.resources.cpus <= 0)) {
-    throw new Error("invalid sandbox definition: resources.cpus must be a positive integer");
+  if (
+    options.resources?.cpus !== undefined &&
+    (!Number.isInteger(options.resources.cpus) || options.resources.cpus <= 0)
+  ) {
+    throw new Error(
+      "invalid sandbox definition: resources.cpus must be a positive integer",
+    );
   }
   if (options.resources?.cpus !== undefined && options.resources.cpus > 255) {
-    throw new Error("invalid sandbox definition: resources.cpus must be less than or equal to 255");
+    throw new Error(
+      "invalid sandbox definition: resources.cpus must be less than or equal to 255",
+    );
   }
   if (
-    options.resources?.memoryMiB !== undefined
-    && (!Number.isInteger(options.resources.memoryMiB) || options.resources.memoryMiB <= 0)
+    options.resources?.memoryMiB !== undefined &&
+    (!Number.isInteger(options.resources.memoryMiB) ||
+      options.resources.memoryMiB <= 0)
   ) {
-    throw new Error("invalid sandbox definition: resources.memoryMiB must be a positive integer");
+    throw new Error(
+      "invalid sandbox definition: resources.memoryMiB must be a positive integer",
+    );
   }
-  if (options.network !== undefined && options.network.kind !== "network-policy") {
-    throw new Error("invalid sandbox definition: network must be created with network.policy(...)");
+  if (
+    options.network !== undefined &&
+    options.network.kind !== "network-policy"
+  ) {
+    throw new Error(
+      "invalid sandbox definition: network must be created with network.policy(...)",
+    );
   }
 }
 
 function validateSandboxExecOptions(options: SandboxExecOptions): void {
   if (
-    options.timeoutMs !== undefined
-    && (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs <= 0)
+    options.timeoutMs !== undefined &&
+    (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs <= 0)
   ) {
-    throw new Error("invalid sandbox exec options: timeoutMs must be a positive safe integer");
+    throw new Error(
+      "invalid sandbox exec options: timeoutMs must be a positive safe integer",
+    );
   }
 }
 
 function validateSandboxSpawnOptions(_options: SandboxSpawnOptions): void {}
 
-function validateSandboxPtyOptions(options: SandboxPtyOptions | undefined): asserts options is SandboxPtyOptions {
+function validateSandboxPtyOptions(
+  options: SandboxPtyOptions | undefined,
+): asserts options is SandboxPtyOptions {
   if (options === undefined || options === null) {
     throw new Error("invalid sandbox pty options: size is required");
   }
   validatePtySize(options.size, "invalid sandbox pty options: size");
 }
 
-function validateSandboxProcessArgs(args: readonly string[], label: string): void {
+function validateSandboxProcessArgs(
+  args: readonly string[],
+  label: string,
+): void {
   if (!Array.isArray(args)) {
     throw new Error(`invalid ${label} arguments: args must be an array`);
   }
   for (const [index, arg] of args.entries()) {
     if (typeof arg !== "string") {
-      throw new Error(`invalid ${label} arguments: args[${index}] must be a string`);
+      throw new Error(
+        `invalid ${label} arguments: args[${index}] must be a string`,
+      );
     }
   }
 }
 
 function validatePtySize(size: SandboxPtySize, field: string): void {
-  if (!Number.isSafeInteger(size.rows) || size.rows <= 0 || size.rows > MAX_PTY_SIZE) {
-    throw new Error(`${field}.rows must be an integer between 1 and ${MAX_PTY_SIZE}`);
+  if (
+    !Number.isSafeInteger(size.rows) ||
+    size.rows <= 0 ||
+    size.rows > MAX_PTY_SIZE
+  ) {
+    throw new Error(
+      `${field}.rows must be an integer between 1 and ${MAX_PTY_SIZE}`,
+    );
   }
-  if (!Number.isSafeInteger(size.cols) || size.cols <= 0 || size.cols > MAX_PTY_SIZE) {
-    throw new Error(`${field}.cols must be an integer between 1 and ${MAX_PTY_SIZE}`);
+  if (
+    !Number.isSafeInteger(size.cols) ||
+    size.cols <= 0 ||
+    size.cols > MAX_PTY_SIZE
+  ) {
+    throw new Error(
+      `${field}.cols must be an integer between 1 and ${MAX_PTY_SIZE}`,
+    );
   }
 }
 
@@ -1600,13 +1982,29 @@ function validateSandboxBootOptions(options: SandboxBootOptions): void {
   for (const [path, source] of Object.entries(options.mounts ?? {})) {
     validateGuestPath(path, "mount.path");
     if (mountPaths.has(path)) {
-      throw new Error(`invalid sandbox boot options: duplicate mount path: ${path}`);
+      throw new Error(
+        `invalid sandbox boot options: duplicate mount path: ${path}`,
+      );
     }
-    if (
-      isSandboxWritableFileSystem(source.fileSystem)
-      && !isSandboxPosixFileSystem(source.fileSystem)
+    if (source.kind === "block") {
+      validateFileStorageOptions(source.source);
+      if (source.fstype.length === 0) {
+        throw new Error(
+          `invalid sandbox boot options: block mount fstype must not be empty: ${path}`,
+        );
+      }
+      if (source.options.length === 0) {
+        throw new Error(
+          `invalid sandbox boot options: block mount options must not be empty: ${path}`,
+        );
+      }
+    } else if (
+      isSandboxWritableFileSystem(source.fileSystem) &&
+      !isSandboxPosixFileSystem(source.fileSystem)
     ) {
-      throw new Error(`invalid sandbox boot options: writable mount must implement the POSIX filesystem interface: ${path}`);
+      throw new Error(
+        `invalid sandbox boot options: writable mount must implement the POSIX filesystem interface: ${path}`,
+      );
     }
     mountPaths.add(path);
   }
@@ -1620,20 +2018,30 @@ function validateHostname(hostname: string, field: string): void {
     throw new Error(`invalid sandbox boot options: ${field} must not be empty`);
   }
   if (hostname.length > 64) {
-    throw new Error(`invalid sandbox boot options: ${field} must be at most 64 characters`);
+    throw new Error(
+      `invalid sandbox boot options: ${field} must be at most 64 characters`,
+    );
   }
   if (!/^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/.test(hostname)) {
-    throw new Error(`invalid sandbox boot options: ${field} must be a valid hostname`);
+    throw new Error(
+      `invalid sandbox boot options: ${field} must be a valid hostname`,
+    );
   }
   for (const label of hostname.split(".")) {
     if (label.length === 0) {
-      throw new Error(`invalid sandbox boot options: ${field} must be a valid hostname`);
+      throw new Error(
+        `invalid sandbox boot options: ${field} must be a valid hostname`,
+      );
     }
     if (label.length > 63) {
-      throw new Error(`invalid sandbox boot options: ${field} labels must be at most 63 characters`);
+      throw new Error(
+        `invalid sandbox boot options: ${field} labels must be at most 63 characters`,
+      );
     }
     if (label.startsWith("-") || label.endsWith("-")) {
-      throw new Error(`invalid sandbox boot options: ${field} must be a valid hostname`);
+      throw new Error(
+        `invalid sandbox boot options: ${field} must be a valid hostname`,
+      );
     }
   }
 }
@@ -1649,13 +2057,20 @@ function validateInternalSandboxOptions(options: InternalSandboxOptions): void {
   for (const mount of options.mounts ?? []) {
     validateGuestPath(mount.path, "mount.path");
     if (mountPaths.has(mount.path)) {
-      throw new Error(`invalid sandbox options: duplicate mount path: ${mount.path}`);
+      throw new Error(
+        `invalid sandbox options: duplicate mount path: ${mount.path}`,
+      );
     }
     mountPaths.add(mount.path);
   }
 
-  if (options.network?.outbound?.policy !== undefined && options.network.outbound.policy !== "deny") {
-    throw new Error("invalid sandbox options: network.outbound.policy must be deny");
+  if (
+    options.network?.outbound?.policy !== undefined &&
+    options.network.outbound.policy !== "deny"
+  ) {
+    throw new Error(
+      "invalid sandbox options: network.outbound.policy must be deny",
+    );
   }
   for (const rule of options.network?.outbound?.rules ?? []) {
     if ("cidr" in rule) {
@@ -1673,24 +2088,36 @@ function validateGuestPath(path: string, field: "mount.path"): void {
     throw new Error(`invalid sandbox options: ${field} must not be root`);
   }
   if (path.includes("\0")) {
-    throw new Error(`invalid sandbox options: ${field} must not contain NUL bytes`);
+    throw new Error(
+      `invalid sandbox options: ${field} must not contain NUL bytes`,
+    );
   }
-  if (path.split("/").some((component) => component === "." || component === "..")) {
-    throw new Error(`invalid sandbox options: ${field} must not contain '.' or '..' components`);
+  if (
+    path.split("/").some((component) => component === "." || component === "..")
+  ) {
+    throw new Error(
+      `invalid sandbox options: ${field} must not contain '.' or '..' components`,
+    );
   }
 }
 
 function validateOutboundPorts(ports: readonly number[] | undefined): void {
   for (const port of ports ?? []) {
     if (!Number.isInteger(port) || port < 1 || port > 65_535) {
-      throw new Error(`invalid sandbox options: invalid outbound network port: ${port}`);
+      throw new Error(
+        `invalid sandbox options: invalid outbound network port: ${port}`,
+      );
     }
   }
 }
 
 function validateCidr(range: string): void {
   const [address, prefixText, extra] = range.split("/");
-  if (address === undefined || prefixText === undefined || extra !== undefined) {
+  if (
+    address === undefined ||
+    prefixText === undefined ||
+    extra !== undefined
+  ) {
     throw new Error(`invalid sandbox options: invalid CIDR range: ${range}`);
   }
 
@@ -1704,9 +2131,13 @@ function validateCidr(range: string): void {
       throw new Error(`invalid sandbox options: invalid CIDR prefix: ${range}`);
     }
     if (parseIpv6Address(address) === null) {
-      throw new Error(`invalid sandbox options: invalid CIDR address: ${range}`);
+      throw new Error(
+        `invalid sandbox options: invalid CIDR address: ${range}`,
+      );
     }
-    throw new Error(`invalid sandbox options: IPv6 outbound CIDR ranges are not supported yet: ${range}`);
+    throw new Error(
+      `invalid sandbox options: IPv6 outbound CIDR ranges are not supported yet: ${range}`,
+    );
   }
 
   if (prefix < 0 || prefix > 32) {
@@ -1750,17 +2181,23 @@ function parseIpv6Address(address: string): bigint | null {
     return null;
   }
 
-  const head = doubleColonParts[0] === "" ? [] : doubleColonParts[0]?.split(":") ?? [];
-  const tail = doubleColonParts.length === 1 || doubleColonParts[1] === ""
-    ? []
-    : doubleColonParts[1]?.split(":") ?? [];
+  const head =
+    doubleColonParts[0] === "" ? [] : (doubleColonParts[0]?.split(":") ?? []);
+  const tail =
+    doubleColonParts.length === 1 || doubleColonParts[1] === ""
+      ? []
+      : (doubleColonParts[1]?.split(":") ?? []);
   const hasCompression = doubleColonParts.length === 2;
   const missing = 8 - head.length - tail.length;
   if ((!hasCompression && missing !== 0) || (hasCompression && missing < 1)) {
     return null;
   }
 
-  const groups = [...head, ...Array<string>(hasCompression ? missing : 0).fill("0"), ...tail];
+  const groups = [
+    ...head,
+    ...Array<string>(hasCompression ? missing : 0).fill("0"),
+    ...tail,
+  ];
   if (groups.length !== 8) {
     return null;
   }

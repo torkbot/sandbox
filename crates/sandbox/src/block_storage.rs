@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -18,11 +18,295 @@ pub trait CowBlockStore: Send + Sync {
     fn flush(&self) -> io::Result<()>;
 }
 
+const FILE_COW_MAGIC: &[u8; 16] = b"SBOXCOWRAWSPRS1\0";
+const FILE_COW_HEADER_BYTES: u64 = 4096;
+const FILE_COW_EMPTY_SLOT: u64 = u64::MAX;
+
+#[derive(Debug)]
+pub struct FileCowBlockStore {
+    block_size: u64,
+    data_offset: u64,
+    state: Mutex<FileCowBlockStoreState>,
+}
+
+#[derive(Debug)]
+struct FileCowBlockStoreState {
+    file: File,
+    block_indices: Vec<u64>,
+}
+
+impl FileCowBlockStore {
+    pub fn open(path: &Path, block_size: u64, max_bytes: u64) -> io::Result<Self> {
+        validate_file_cow_shape(block_size, max_bytes)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        let slot_count = max_bytes / block_size;
+        let index_bytes = index_table_len(slot_count)?;
+        let data_offset = align_up(FILE_COW_HEADER_BYTES + index_bytes as u64, block_size)?;
+
+        if file.metadata()?.len() == 0 {
+            let block_indices = vec![FILE_COW_EMPTY_SLOT; slot_count as usize];
+            write_file_cow_header(&mut file, block_size, max_bytes, index_bytes as u64)?;
+            file.seek(SeekFrom::Start(FILE_COW_HEADER_BYTES))?;
+            write_index_table(&mut file, &block_indices)?;
+            file.flush()?;
+            Ok(Self {
+                block_size,
+                data_offset,
+                state: Mutex::new(FileCowBlockStoreState {
+                    file,
+                    block_indices,
+                }),
+            })
+        } else {
+            let (actual_block_size, actual_max_bytes, actual_index_bytes) =
+                read_file_cow_header(&mut file)?;
+            if actual_block_size != block_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "file COW block size does not match existing storage",
+                ));
+            }
+            if actual_max_bytes != max_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "file COW max bytes does not match existing storage",
+                ));
+            }
+            if actual_index_bytes != index_bytes as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "file COW index size is inconsistent",
+                ));
+            }
+            file.seek(SeekFrom::Start(FILE_COW_HEADER_BYTES))?;
+            let block_indices = read_index_table(&mut file, slot_count)?;
+            Ok(Self {
+                block_size,
+                data_offset,
+                state: Mutex::new(FileCowBlockStoreState {
+                    file,
+                    block_indices,
+                }),
+            })
+        }
+    }
+
+    fn slot_offset(&self, slot: usize) -> io::Result<u64> {
+        self.data_offset
+            .checked_add(
+                (slot as u64)
+                    .checked_mul(self.block_size)
+                    .ok_or_else(|| io::Error::other("file COW block offset overflow"))?,
+            )
+            .ok_or_else(|| io::Error::other("file COW block offset overflow"))
+    }
+
+    fn find_slot(block_indices: &[u64], block_index: u64) -> Option<usize> {
+        block_indices
+            .iter()
+            .position(|stored| *stored == block_index)
+    }
+
+    fn find_or_create_slot(block_indices: &mut [u64], block_index: u64) -> io::Result<usize> {
+        if let Some(slot) = Self::find_slot(block_indices, block_index) {
+            return Ok(slot);
+        }
+        let Some(slot) = block_indices
+            .iter()
+            .position(|stored| *stored == FILE_COW_EMPTY_SLOT)
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "file COW block store maxBytes exceeded",
+            ));
+        };
+        block_indices[slot] = block_index;
+        Ok(slot)
+    }
+}
+
+impl CowBlockStore for FileCowBlockStore {
+    fn block_size(&self) -> u64 {
+        self.block_size
+    }
+
+    fn list_blocks(&self) -> io::Result<HashSet<u64>> {
+        let state = self
+            .state
+            .lock()
+            .expect("file COW block store lock poisoned");
+        Ok(state
+            .block_indices
+            .iter()
+            .copied()
+            .filter(|index| *index != FILE_COW_EMPTY_SLOT)
+            .collect())
+    }
+
+    fn read_blocks(&self, start: u64, count: u64) -> io::Result<Vec<(u64, Vec<u8>)>> {
+        let end = start
+            .checked_add(count)
+            .ok_or_else(|| io::Error::other("file COW read range overflow"))?;
+        let mut state = self
+            .state
+            .lock()
+            .expect("file COW block store lock poisoned");
+        let mut chunks = Vec::new();
+        for index in start..end {
+            let Some(slot) = Self::find_slot(&state.block_indices, index) else {
+                continue;
+            };
+            let offset = self.slot_offset(slot)?;
+            let mut data = vec![0; self.block_size as usize];
+            state.file.seek(SeekFrom::Start(offset))?;
+            state.file.read_exact(&mut data)?;
+            chunks.push((index, data));
+        }
+        Ok(chunks)
+    }
+
+    fn write_blocks(&self, chunks: Vec<(u64, Vec<u8>)>) -> io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("file COW block store lock poisoned");
+        for (index, data) in chunks {
+            if data.len() > self.block_size as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "file COW block chunk exceeds block size",
+                ));
+            }
+            let slot = Self::find_or_create_slot(&mut state.block_indices, index)?;
+            let offset = self.slot_offset(slot)?;
+            let mut block = vec![0; self.block_size as usize];
+            block[..data.len()].copy_from_slice(&data);
+            state.file.seek(SeekFrom::Start(offset))?;
+            state.file.write_all(&block)?;
+        }
+        state.file.seek(SeekFrom::Start(FILE_COW_HEADER_BYTES))?;
+        let block_indices = state.block_indices.clone();
+        write_index_table(&mut state.file, &block_indices)?;
+        Ok(())
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        self.state
+            .lock()
+            .expect("file COW block store lock poisoned")
+            .file
+            .sync_all()
+    }
+}
+
 #[derive(Debug)]
 pub struct MemoryCowBlockStore {
     block_size: u64,
     max_bytes: u64,
     state: Mutex<MemoryCowBlockStoreState>,
+}
+
+fn validate_file_cow_shape(block_size: u64, max_bytes: u64) -> io::Result<()> {
+    if block_size == 0 || block_size % 512 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file COW block size must be a positive multiple of 512 bytes",
+        ));
+    }
+    if max_bytes < block_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file COW max bytes must be at least the block size",
+        ));
+    }
+    if max_bytes % block_size != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file COW max bytes must be a multiple of the block size",
+        ));
+    }
+    Ok(())
+}
+
+fn index_table_len(slots: u64) -> io::Result<usize> {
+    let bytes = slots.checked_mul(8).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "file COW index is too large")
+    })?;
+    usize::try_from(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file COW max bytes require an unsupported index size",
+        )
+    })
+}
+
+fn align_up(value: u64, alignment: u64) -> io::Result<u64> {
+    let remainder = value % alignment;
+    if remainder == 0 {
+        return Ok(value);
+    }
+    value
+        .checked_add(alignment - remainder)
+        .ok_or_else(|| io::Error::other("file COW header alignment overflow"))
+}
+
+fn write_file_cow_header(
+    file: &mut File,
+    block_size: u64,
+    max_bytes: u64,
+    index_bytes: u64,
+) -> io::Result<()> {
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(FILE_COW_MAGIC)?;
+    file.write_all(&block_size.to_le_bytes())?;
+    file.write_all(&max_bytes.to_le_bytes())?;
+    file.write_all(&index_bytes.to_le_bytes())?;
+    file.write_all(&[0; 4056])?;
+    Ok(())
+}
+
+fn read_file_cow_header(file: &mut File) -> io::Result<(u64, u64, u64)> {
+    let mut magic = [0; 16];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut magic)?;
+    if &magic != FILE_COW_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file COW storage has an unsupported format",
+        ));
+    }
+    Ok((read_u64(file)?, read_u64(file)?, read_u64(file)?))
+}
+
+fn read_u64(file: &mut File) -> io::Result<u64> {
+    let mut bytes = [0; 8];
+    file.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn write_index_table(file: &mut File, block_indices: &[u64]) -> io::Result<()> {
+    for index in block_indices {
+        file.write_all(&index.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn read_index_table(file: &mut File, slots: u64) -> io::Result<Vec<u64>> {
+    let mut block_indices = Vec::with_capacity(usize::try_from(slots).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file COW slot count is unsupported",
+        )
+    })?);
+    for _ in 0..slots {
+        block_indices.push(read_u64(file)?);
+    }
+    Ok(block_indices)
 }
 
 #[derive(Debug, Default)]
@@ -864,8 +1148,11 @@ mod tests {
     use std::future::Future;
     use std::pin::pin;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::task::{Context, Poll, Waker};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn memory_cow_block_store_lists_reads_and_replaces_blocks() {
@@ -912,6 +1199,52 @@ mod tests {
             store.read_blocks(2, 5).unwrap(),
             vec![(2, vec![3; 512]), (4, vec![2; 4096]), (6, vec![4; 512])],
         );
+    }
+
+    #[test]
+    fn file_cow_block_store_persists_blocks_and_zero_overrides() {
+        let path = temp_base_image_path();
+        let store = FileCowBlockStore::open(&path, 4096, 4096 * 8).unwrap();
+
+        store
+            .write_blocks(vec![(1, vec![7; 4096]), (3, vec![0; 4096])])
+            .unwrap();
+        store.flush().unwrap();
+        drop(store);
+
+        let reopened = FileCowBlockStore::open(&path, 4096, 4096 * 8).unwrap();
+        assert_eq!(reopened.list_blocks().unwrap(), HashSet::from([1, 3]));
+        assert_eq!(
+            reopened.read_blocks(0, 4).unwrap(),
+            vec![(1, vec![7; 4096]), (3, vec![0; 4096])],
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn file_cow_block_store_rejects_blocks_beyond_max_bytes() {
+        let path = temp_base_image_path();
+        let store = FileCowBlockStore::open(&path, 4096, 4096 * 2).unwrap();
+
+        store
+            .write_blocks(vec![(20, vec![1; 4096]), (40, vec![2; 4096])])
+            .unwrap();
+        let error = store.write_blocks(vec![(60, vec![3; 4096])]).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+        assert_eq!(store.list_blocks().unwrap(), HashSet::from([20, 40]));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn file_cow_block_store_rejects_mismatched_existing_shape() {
+        let path = temp_base_image_path();
+        FileCowBlockStore::open(&path, 4096, 4096 * 2).unwrap();
+
+        let error = FileCowBlockStore::open(&path, 8192, 8192 * 2).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        fs::remove_file(path).unwrap();
     }
 
     #[derive(Debug)]
@@ -1169,7 +1502,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        env::temp_dir().join(format!("sandbox-cow-block-storage-test-{nanos}.img"))
+        let counter = TEMP_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+        env::temp_dir().join(format!(
+            "sandbox-cow-block-storage-test-{nanos}-{counter}.img"
+        ))
     }
 
     fn block_on_ready<T>(future: impl Future<Output = T>) -> T {

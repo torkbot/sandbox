@@ -267,7 +267,27 @@ rootfs.cow({
 ```
 
 Mounts a built-in base rootfs through a writable copy-on-write block store. For
-offline image work, describe the same merged view without booting a VM:
+local file-backed persistence, use `storage.file(...)` as the writable store:
+
+```ts
+rootfs.cow({
+  base: rootfs.builtIn("alpine:3.23"),
+  writable: storage.file({
+    path: "/var/lib/my-agent/rootfs.cow",
+    format: "raw-sparse",
+    blockSize: 65536,
+    maxBytes: 4 * 1024 * 1024 * 1024,
+  }),
+});
+```
+
+`storage.file(...)` creates native file-backed COW storage. The `raw-sparse`
+format stores dirty rootfs blocks in a sparse host file with explicit block
+presence metadata, so written zero blocks remain distinct from missing overlay
+blocks. `maxBytes` caps stored dirty block data, not the guest-visible rootfs
+size.
+
+For offline image work, describe the same merged view without booting a VM:
 
 ```ts
 const source = rootfs.compose({
@@ -365,6 +385,24 @@ const mount = fs.virtual(workspaceFs);
 `fs.virtual(...)` adapts a compatible JavaScript filesystem for guest mounts.
 Sandbox mounts are host-implemented filesystems, not direct host directory
 mounts.
+
+```ts
+const data = mount.block({
+  source: storage.file({
+    path: "/var/lib/my-agent/data.cow",
+    format: "raw-sparse",
+    blockSize: 65536,
+    maxBytes: 8 * 1024 * 1024 * 1024,
+  }),
+  fstype: "ext4",
+  options: "rw",
+});
+```
+
+`mount.block(...)` attaches file-backed native block storage as an additional
+guest disk and asks sandbox init to mount it at the configured guest path. The
+caller supplies the filesystem type and mount options explicitly. Sandbox does
+not format the device or infer filesystem settings.
 
 ### Processes
 

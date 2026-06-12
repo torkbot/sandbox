@@ -91,7 +91,9 @@ export class HostProcessSandboxVm implements HostControlChannel {
       });
     }
     for (const mount of options.mounts ?? []) {
-      this.#hostFs.set(mount.path, mount.fileSystem);
+      if (mount.kind === "virtual-fs") {
+        this.#hostFs.set(mount.path, mount.fileSystem);
+      }
     }
     child.stdout.on("data", (chunk: Buffer) => {
       this.#receive(chunk);
@@ -1638,7 +1640,10 @@ function encodeHostSpawn(options: HostSpawnSandboxOptions): Uint8Array {
       ? undefined
       : {
         kind: options.rootfs.storage.kind,
+        ...("path" in options.rootfs.storage ? { path: options.rootfs.storage.path } : {}),
+        ...("format" in options.rootfs.storage ? { format: options.rootfs.storage.format } : {}),
         blockSize: options.rootfs.storage.blockSize,
+        ...("maxBytes" in options.rootfs.storage ? { maxBytes: options.rootfs.storage.maxBytes } : {}),
         maxDirtyBytes: options.rootfs.storage.maxDirtyBytes,
       },
     mounts: options.mounts ?? [],
