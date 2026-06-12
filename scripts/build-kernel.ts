@@ -1,6 +1,10 @@
-import { mkdir, copyFile, readFile, stat } from "node:fs/promises";
+import { mkdir, copyFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { spawn } from "node:child_process";
+import {
+  expectedKernelArtifactMetadata,
+  kernelMetadataFile,
+} from "./kernel-artifact-metadata.ts";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 const libkrunfwRoot = resolve(repoRoot, "deps/libkrunfw");
@@ -8,8 +12,19 @@ const libkrunfwRoot = resolve(repoRoot, "deps/libkrunfw");
 const arch = process.env.SANDBOX_KERNEL_ARCH ?? guestArch();
 const image = process.env.SANDBOX_KERNEL_BUILDER_IMAGE ?? "debian:bookworm";
 const outDir = resolve(repoRoot, process.env.SANDBOX_KERNEL_OUT_DIR ?? `dist/kernel/libkrunfw/${arch}`);
+const jobs = process.env.SANDBOX_KERNEL_JOBS ?? "4";
+
+if (!/^[1-9]\d*$/.test(jobs)) {
+  throw new Error(`SANDBOX_KERNEL_JOBS must be a positive integer: ${jobs}`);
+}
 
 await assertExists(resolve(libkrunfwRoot, "Makefile"));
+const metadata = await expectedKernelArtifactMetadata({ repoRoot, arch });
+const kernelTarball = `${metadata.kernelVersion}.tar.xz`;
+const kernelRemote = `https://cdn.kernel.org/pub/linux/kernel/v6.x/${kernelTarball}`;
+
+await rm(resolve(libkrunfwRoot, metadata.kernelBundle), { force: true });
+await rm(resolve(libkrunfwRoot, metadata.kernelVersion), { recursive: true, force: true });
 
 await run("docker", [
   "run",
@@ -24,17 +39,17 @@ await run("docker", [
   [
     "apt-get update",
     "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential bc bison ca-certificates cpio curl flex libelf-dev libssl-dev python3 python3-pyelftools xz-utils",
-    `make -j$(nproc) ARCH=${shellArg(arch)}`,
+    "mkdir -p tarballs",
+    `[ -s tarballs/${shellArg(kernelTarball)} ] || curl --fail --location --retry 3 --connect-timeout 30 --speed-time 60 --speed-limit 1024 ${shellArg(kernelRemote)} -o tarballs/${shellArg(kernelTarball)}`,
+    `make -j${shellArg(jobs)} ARCH=${shellArg(arch)}`,
   ].join(" && "),
 ]);
 
 await mkdir(outDir, { recursive: true });
 
-const kernelSourceDir = await kernelSourceDirFromMakefile();
-const kernelBinary = kernelBinaryForArch(arch, kernelSourceDir);
 const outputs = [
-  ["kernel.c", "kernel.c"],
-  [kernelBinary, kernelBinary],
+  [metadata.kernelBundle, metadata.kernelBundle],
+  [metadata.kernelBinary, metadata.kernelBinary],
 ] as const;
 
 for (const [source, destination] of outputs) {
@@ -44,6 +59,10 @@ for (const [source, destination] of outputs) {
   await mkdir(dirname(destinationPath), { recursive: true });
   await copyFile(sourcePath, destinationPath);
 }
+await writeFile(
+  resolve(outDir, kernelMetadataFile),
+  `${JSON.stringify(metadata, null, 2)}\n`,
+);
 
 console.log(`kernel artifacts written to ${outDir}`);
 
@@ -55,31 +74,6 @@ function guestArch(): string {
       return "x86_64";
     default:
       throw new Error(`unsupported host architecture for kernel build: ${process.arch}`);
-  }
-}
-
-async function kernelSourceDirFromMakefile(): Promise<string> {
-  const makefile = await readFile(resolve(libkrunfwRoot, "Makefile"), "utf8");
-  const match = /^KERNEL_VERSION\s*=\s*(\S+)\s*$/m.exec(makefile);
-  const kernelVersion = match?.[1];
-  if (!kernelVersion) {
-    throw new Error("deps/libkrunfw/Makefile does not define KERNEL_VERSION");
-  }
-  return kernelVersion;
-}
-
-function kernelBinaryForArch(value: string, kernelSourceDir: string): string {
-  switch (value) {
-    case "arm64":
-    case "aarch64":
-      return `${kernelSourceDir}/arch/arm64/boot/Image`;
-    case "x86_64":
-      return `${kernelSourceDir}/vmlinux`;
-    case "riscv":
-    case "riscv64":
-      return `${kernelSourceDir}/arch/riscv/boot/Image`;
-    default:
-      throw new Error(`unsupported guest architecture for kernel build: ${value}`);
   }
 }
 

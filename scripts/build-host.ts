@@ -1,6 +1,12 @@
 import { access } from "node:fs/promises";
 import { resolve } from "node:path";
 import { spawn } from "node:child_process";
+import {
+  assertKernelArtifactMetadataMatches,
+  expectedKernelArtifactMetadata,
+  metadataPathForKernelBundle,
+  readKernelArtifactMetadata,
+} from "./kernel-artifact-metadata.ts";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 const kernelBundle = resolve(
@@ -9,6 +15,10 @@ const kernelBundle = resolve(
 );
 
 await assertExists(kernelBundle);
+assertKernelArtifactMetadataMatches(
+  await readKernelArtifactMetadata(metadataPathForKernelBundle(kernelBundle)),
+  await expectedKernelArtifactMetadata({ repoRoot, arch: kernelArch() }),
+);
 
 await run("cargo", ["build", "-p", "sandbox-host", "--release"], {
   SANDBOX_KERNEL_BUNDLE_C: kernelBundle,

@@ -169,6 +169,50 @@ test("local release scripts build current rootfs before packaging platform packa
   }
 });
 
+test("local build scripts rebuild kernel before embedding host artifact", async () => {
+  const packageJson = JSON.parse(
+    await readFile(new URL("../../package.json", import.meta.url), "utf8"),
+  ) as { scripts?: Record<string, string> };
+
+  const buildScript = packageJson.scripts?.build ?? "";
+  const buildKernelInBuild = buildScript.indexOf("build:kernel");
+  const buildHostInBuild = buildScript.indexOf("build:host");
+
+  assert.notEqual(buildKernelInBuild, -1, "build should build the kernel artifact");
+  assert.notEqual(buildHostInBuild, -1, "build should build the host artifact");
+  assert.ok(buildKernelInBuild < buildHostInBuild, "build should build the kernel artifact before the host embeds it");
+
+  for (const scriptName of ["release:prepare", "release:pack"]) {
+    const script = packageJson.scripts?.[scriptName] ?? "";
+    const build = script.indexOf("node --run build");
+    const packageCurrentPlatform = script.indexOf("prepare-npm-packages.ts --version ${SANDBOX_RELEASE_VERSION:-0.0.0-dev} --platform --current");
+
+    assert.notEqual(build, -1, `${scriptName} should run the full build`);
+    assert.notEqual(packageCurrentPlatform, -1, `${scriptName} should package the current platform`);
+    assert.ok(
+      build < packageCurrentPlatform,
+      `${scriptName} should run the full build before packaging the current platform`,
+    );
+  }
+});
+
+test("host build validates kernel artifact metadata before Cargo embeds it", async () => {
+  const buildHost = await readFile(new URL("../../scripts/build-host.ts", import.meta.url), "utf8");
+  const buildKernel = await readFile(new URL("../../scripts/build-kernel.ts", import.meta.url), "utf8");
+  const fixtureCacheKeys = await readFile(new URL("../../scripts/fixture-cache-keys.ts", import.meta.url), "utf8");
+
+  assert.match(buildKernel, /kernelMetadataFile/);
+  assert.match(buildKernel, /expectedKernelArtifactMetadata/);
+  assert.match(buildKernel, /await rm\(resolve\(libkrunfwRoot, metadata\.kernelBundle\)/);
+  assert.match(buildKernel, /await rm\(resolve\(libkrunfwRoot, metadata\.kernelVersion\)/);
+  assert.match(buildKernel, /SANDBOX_KERNEL_JOBS/);
+  assert.match(buildKernel, /make -j/);
+  assert.match(buildHost, /readKernelArtifactMetadata/);
+  assert.match(buildHost, /assertKernelArtifactMetadataMatches/);
+  assert.match(buildHost, /expectedKernelArtifactMetadata/);
+  assert.match(fixtureCacheKeys, /kernel-artifact-metadata\.ts/);
+});
+
 test("default rootfs includes agent utility packages", async () => {
   const buildRootfsScript = await readFile(
     new URL("../../scripts/build-rootfs.ts", import.meta.url),

@@ -9,7 +9,7 @@
     "url": "https://github.com/torkbot/sandbox"
   },
   "scripts": {
-    "build": "npm run build:host && npm run build:ts",
+    "build": "npm run build:kernel && npm run build:host && npm run build:ts",
     "build:host": "node ./scripts/build-host.ts",
     "build:init": "node ./scripts/build-init.ts",
     "build:kernel": "node ./scripts/build-kernel.ts",
@@ -27,7 +27,7 @@
     "test:unit": "node --test tests/unit/*.test.ts",
     "typecheck": "tsgo --noEmit --pretty",
     "release:prepare": "node --run build && node --run build:init && node --run build:rootfs && node --run build:rootfs:qcow2 && node ./scripts/prepare-npm-packages.ts --version ${SANDBOX_RELEASE_VERSION:-0.0.0-dev} --clean --root && node ./scripts/prepare-npm-packages.ts --version ${SANDBOX_RELEASE_VERSION:-0.0.0-dev} --platform --current",
-    "release:pack": "npm run build:ts && node --run build:init && node --run build:rootfs && node --run build:rootfs:qcow2 && node ./scripts/prepare-npm-packages.ts --version ${SANDBOX_RELEASE_VERSION:-0.0.0-dev} --clean --root && node ./scripts/prepare-npm-packages.ts --version ${SANDBOX_RELEASE_VERSION:-0.0.0-dev} --platform --current && npm pack --dry-run ./dist/npm/sandbox && npm pack --dry-run ./dist/npm/sandbox-*",
+    "release:pack": "node --run build && node --run build:init && node --run build:rootfs && node --run build:rootfs:qcow2 && node ./scripts/prepare-npm-packages.ts --version ${SANDBOX_RELEASE_VERSION:-0.0.0-dev} --clean --root && node ./scripts/prepare-npm-packages.ts --version ${SANDBOX_RELEASE_VERSION:-0.0.0-dev} --platform --current && npm pack --dry-run ./dist/npm/sandbox && npm pack --dry-run ./dist/npm/sandbox-*",
     "prepublishOnly": "node --run release:prepare"
   },
   "devDependencies": {
