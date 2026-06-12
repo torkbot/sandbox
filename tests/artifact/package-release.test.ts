@@ -213,6 +213,25 @@ test("host build validates kernel artifact metadata before Cargo embeds it", asy
   assert.match(fixtureCacheKeys, /kernel-artifact-metadata\.ts/);
 });
 
+test("vendored kernel configs include Docker bridge xtables matches", async () => {
+  for (const arch of ["aarch64", "x86_64"]) {
+    const config = await readFile(
+      new URL(`../../deps/libkrunfw/config-libkrunfw_${arch}`, import.meta.url),
+      "utf8",
+    );
+
+    for (const option of [
+      "CONFIG_NETFILTER_XTABLES=y",
+      "CONFIG_NETFILTER_XT_TARGET_MASQUERADE=y",
+      "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y",
+      "CONFIG_NETFILTER_XT_MATCH_COMMENT=y",
+      "CONFIG_NETFILTER_XT_MATCH_CONNTRACK=y",
+    ]) {
+      assert.match(config, new RegExp(`^${option}$`, "m"));
+    }
+  }
+});
+
 test("default rootfs includes agent utility packages", async () => {
   const buildRootfsScript = await readFile(
     new URL("../../scripts/build-rootfs.ts", import.meta.url),
