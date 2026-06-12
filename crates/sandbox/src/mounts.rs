@@ -11,6 +11,7 @@ pub struct MountTable {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlannedMount {
     VirtualFs,
+    Block,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +26,7 @@ impl MountTable {
         for mount in mounts {
             let (path, planned) = match mount {
                 MountSpec::VirtualFs { path, .. } => (path.as_str(), PlannedMount::VirtualFs),
+                MountSpec::Block { path, .. } => (path.as_str(), PlannedMount::Block),
             };
 
             if path == "/" {

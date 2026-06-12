@@ -48,10 +48,30 @@ pub enum RootfsStorageSpec {
         block_size: u64,
         max_dirty_bytes: u64,
     },
+    File {
+        path: PathBuf,
+        format: FileStorageFormat,
+        block_size: u64,
+        max_bytes: u64,
+        max_dirty_bytes: u64,
+    },
     EphemeralCow {
         block_size: u64,
         max_dirty_bytes: u64,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileStorageFormat {
+    RawSparse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStorageSpec {
+    pub path: PathBuf,
+    pub format: FileStorageFormat,
+    pub block_size: u64,
+    pub max_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,7 +81,16 @@ pub enum RootfsFormat {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MountSpec {
-    VirtualFs { path: String, writable: bool },
+    VirtualFs {
+        path: String,
+        writable: bool,
+    },
+    Block {
+        path: String,
+        storage: FileStorageSpec,
+        fstype: String,
+        options: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,6 +329,35 @@ impl MountSpec {
                 path: input.path,
                 writable: input.writable.unwrap_or(false),
             }),
+            "block" => {
+                let storage = input
+                    .storage
+                    .ok_or_else(|| SpecError::new("mount.storage is required"))?;
+                let fstype = input
+                    .fstype
+                    .ok_or_else(|| SpecError::new("mount.fstype is required"))?;
+                if fstype.is_empty() {
+                    return Err(SpecError::new("mount.fstype must not be empty"));
+                }
+                let options = input
+                    .options
+                    .ok_or_else(|| SpecError::new("mount.options is required"))?;
+                if options.is_empty() {
+                    return Err(SpecError::new("mount.options must not be empty"));
+                }
+                Ok(Self::Block {
+                    path: input.path,
+                    storage: FileStorageSpec::parse(
+                        Some(storage.path),
+                        Some(storage.format),
+                        storage.block_size,
+                        Some(storage.max_bytes),
+                        "mount.storage",
+                    )?,
+                    fstype,
+                    options,
+                })
+            }
             other => Err(SpecError::new(format!("unsupported mount.kind: {other}"))),
         }
     }
@@ -355,7 +413,10 @@ fn validate_hostname(hostname: &str) -> Result<(), SpecError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootfsStorageSpecInput {
     pub kind: String,
+    pub path: Option<String>,
+    pub format: Option<String>,
     pub block_size: u64,
+    pub max_bytes: Option<u64>,
     pub max_dirty_bytes: u64,
 }
 
@@ -376,6 +437,22 @@ impl RootfsStorageSpec {
                 block_size: input.block_size,
                 max_dirty_bytes: input.max_dirty_bytes,
             },
+            "file" => {
+                let storage = FileStorageSpec::parse(
+                    input.path,
+                    input.format,
+                    input.block_size,
+                    input.max_bytes,
+                    "rootfs.storage",
+                )?;
+                Self::File {
+                    path: storage.path,
+                    format: storage.format,
+                    block_size: storage.block_size,
+                    max_bytes: storage.max_bytes,
+                    max_dirty_bytes: input.max_dirty_bytes,
+                }
+            }
             "ephemeral-cow" => Self::EphemeralCow {
                 block_size: input.block_size,
                 max_dirty_bytes: input.max_dirty_bytes,
@@ -389,11 +466,64 @@ impl RootfsStorageSpec {
     }
 }
 
+impl FileStorageSpec {
+    fn parse(
+        path: Option<String>,
+        format: Option<String>,
+        block_size: u64,
+        max_bytes: Option<u64>,
+        field: &str,
+    ) -> Result<Self, SpecError> {
+        let path = path.ok_or_else(|| SpecError::new(format!("{field}.path is required")))?;
+        if path.is_empty() {
+            return Err(SpecError::new(format!("{field}.path must not be empty")));
+        }
+        let format = match format.as_deref() {
+            Some("raw-sparse") => FileStorageFormat::RawSparse,
+            Some(other) => {
+                return Err(SpecError::new(format!(
+                    "unsupported {field}.format: {other}"
+                )));
+            }
+            None => return Err(SpecError::new(format!("{field}.format is required"))),
+        };
+        let max_bytes =
+            max_bytes.ok_or_else(|| SpecError::new(format!("{field}.maxBytes is required")))?;
+        if max_bytes < block_size {
+            return Err(SpecError::new(format!(
+                "{field}.maxBytes must be at least {field}.blockSize"
+            )));
+        }
+        if max_bytes % block_size != 0 {
+            return Err(SpecError::new(format!(
+                "{field}.maxBytes must be a multiple of {field}.blockSize"
+            )));
+        }
+        Ok(Self {
+            path: PathBuf::from(path),
+            format,
+            block_size,
+            max_bytes,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MountSpecInput {
     pub kind: String,
     pub path: String,
     pub writable: Option<bool>,
+    pub storage: Option<FileStorageSpecInput>,
+    pub fstype: Option<String>,
+    pub options: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStorageSpecInput {
+    pub path: String,
+    pub format: String,
+    pub block_size: u64,
+    pub max_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -444,7 +574,10 @@ mod tests {
         let mut input = valid_input();
         input.rootfs_storage = Some(RootfsStorageSpecInput {
             kind: "cow-block-store".to_string(),
+            path: None,
+            format: None,
             block_size: 4096,
+            max_bytes: None,
             max_dirty_bytes: 65536,
         });
 
@@ -464,7 +597,10 @@ mod tests {
         let mut input = valid_input();
         input.rootfs_storage = Some(RootfsStorageSpecInput {
             kind: "ephemeral-cow".to_string(),
+            path: None,
+            format: None,
             block_size: 65536,
+            max_bytes: None,
             max_dirty_bytes: 131072,
         });
 
@@ -480,11 +616,40 @@ mod tests {
     }
 
     #[test]
+    fn parses_file_rootfs_storage() {
+        let mut input = valid_input();
+        input.rootfs_storage = Some(RootfsStorageSpecInput {
+            kind: "file".to_string(),
+            path: Some("overlay.cow".to_string()),
+            format: Some("raw-sparse".to_string()),
+            block_size: 65536,
+            max_bytes: Some(1024 * 1024),
+            max_dirty_bytes: 131072,
+        });
+
+        let spec = MicroVmSpec::build(input).unwrap();
+
+        assert_eq!(
+            spec.rootfs.storage,
+            Some(RootfsStorageSpec::File {
+                path: PathBuf::from("overlay.cow"),
+                format: FileStorageFormat::RawSparse,
+                block_size: 65536,
+                max_bytes: 1024 * 1024,
+                max_dirty_bytes: 131072,
+            }),
+        );
+    }
+
+    #[test]
     fn rejects_cow_rootfs_storage_limit_below_block_size() {
         let mut input = valid_input();
         input.rootfs_storage = Some(RootfsStorageSpecInput {
             kind: "cow-block-store".to_string(),
+            path: None,
+            format: None,
             block_size: 4096,
+            max_bytes: None,
             max_dirty_bytes: 1024,
         });
 
@@ -503,6 +668,9 @@ mod tests {
             kind: "virtual-fs".to_string(),
             path: "/sandbox".to_string(),
             writable: Some(true),
+            storage: None,
+            fstype: None,
+            options: None,
         }];
         input.network_outbound = Some(OutboundSpec {
             policy: OutboundPolicy::Deny,
@@ -554,6 +722,41 @@ mod tests {
     }
 
     #[test]
+    fn parses_block_mounts() {
+        let mut input = valid_input();
+        input.mounts = vec![MountSpecInput {
+            kind: "block".to_string(),
+            path: "/mnt/data".to_string(),
+            writable: None,
+            storage: Some(FileStorageSpecInput {
+                path: "data.cow".to_string(),
+                format: "raw-sparse".to_string(),
+                block_size: 65536,
+                max_bytes: 1024 * 1024,
+            }),
+            fstype: Some("ext4".to_string()),
+            options: Some("rw".to_string()),
+        }];
+
+        let spec = MicroVmSpec::build(input).unwrap();
+
+        assert_eq!(
+            spec.mounts,
+            vec![MountSpec::Block {
+                path: "/mnt/data".to_string(),
+                storage: FileStorageSpec {
+                    path: PathBuf::from("data.cow"),
+                    format: FileStorageFormat::RawSparse,
+                    block_size: 65536,
+                    max_bytes: 1024 * 1024,
+                },
+                fstype: "ext4".to_string(),
+                options: "rw".to_string(),
+            }],
+        );
+    }
+
+    #[test]
     fn rejects_zero_vcpus() {
         let mut input = valid_input();
         input.vcpus = Some(0);
@@ -587,6 +790,9 @@ mod tests {
             kind: "virtual-fs".to_string(),
             path: "sandbox".to_string(),
             writable: None,
+            storage: None,
+            fstype: None,
+            options: None,
         }];
 
         let err = MicroVmSpec::build(input).unwrap_err();

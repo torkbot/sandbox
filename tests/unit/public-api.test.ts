@@ -3,8 +3,10 @@ import assert from "node:assert/strict";
 import {
   defineSandbox,
   fs,
+  mount,
   network,
   rootfs,
+  storage,
   type SandboxFileSystem,
   type SandboxBlockStore,
   type SandboxWritableFileSystem,
@@ -62,6 +64,88 @@ test("rootfs.cow accepts a composed rootfs source", () => {
     kind: "cow-rootfs",
     source,
   });
+});
+
+test("storage.file creates native file-backed block storage", () => {
+  const overlay = storage.file({
+    path: "/tmp/sandbox-overlay.cow",
+    format: "raw-sparse",
+    blockSize: 65536,
+    maxBytes: 1024 * 1024,
+  });
+
+  assert.deepEqual(rootfs.cow({
+    base: rootfs.builtIn("alpine:3.23"),
+    writable: overlay,
+    maxDirtyBytes: 128 * 1024,
+  }), {
+    kind: "cow-rootfs",
+    source: {
+      kind: "composed-rootfs",
+      base: rootfs.builtIn("alpine:3.23"),
+      overlay,
+    },
+    maxDirtyBytes: 128 * 1024,
+  });
+});
+
+test("storage.file requires explicit native file storage options", () => {
+  assert.throws(
+    () => storage.file({
+      path: "",
+      format: "raw-sparse",
+      blockSize: 65536,
+      maxBytes: 1024 * 1024,
+    }),
+    /invalid storage.file options: path must not be empty/,
+  );
+  assert.throws(
+    () => storage.file({
+      path: "/tmp/sandbox-overlay.cow",
+      format: "raw-sparse",
+      blockSize: 65536,
+      maxBytes: 1000,
+    }),
+    /invalid storage.file options: maxBytes must be at least blockSize/,
+  );
+});
+
+test("mount.block creates file-backed block mount sources", () => {
+  const source = storage.file({
+    path: "/tmp/data.cow",
+    format: "raw-sparse",
+    blockSize: 65536,
+    maxBytes: 1024 * 1024,
+  });
+
+  assert.deepEqual(mount.block({
+    source,
+    fstype: "ext4",
+    options: "rw",
+  }), {
+    kind: "block",
+    source,
+    fstype: "ext4",
+    options: "rw",
+  });
+});
+
+test("mount.block requires explicit filesystem and mount options", () => {
+  const source = storage.file({
+    path: "/tmp/data.cow",
+    format: "raw-sparse",
+    blockSize: 65536,
+    maxBytes: 1024 * 1024,
+  });
+
+  assert.throws(
+    () => mount.block({ source, fstype: "", options: "rw" }),
+    /invalid mount.block options: fstype must not be empty/,
+  );
+  assert.throws(
+    () => mount.block({ source, fstype: "ext4", options: "" }),
+    /invalid mount.block options: options must not be empty/,
+  );
 });
 
 test("rootfs.ephemeral makes writable rootfs persistence explicit", () => {

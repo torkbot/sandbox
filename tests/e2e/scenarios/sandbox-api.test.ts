@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import {
   defineSandbox,
   fs,
+  mount,
   network,
   rootfs,
+  storage,
   type SandboxBlockStore,
 } from "../../../src/index.ts";
 import { requireHostArtifact, requireVmLaunchSupport } from "../support/capabilities.ts";
@@ -816,6 +821,85 @@ test("COW rootfs round-trips rootfs mutations across instances", async (t) => {
   assert.equal(read.stdout, "persisted");
   assert.deepEqual(blockStore.observedBaseIdentities().length, 1);
   assert.match(blockStore.observedBaseIdentities()[0] ?? "", /built-in:alpine:3\.23:qcow2:/);
+});
+
+test("file-backed storage round-trips COW rootfs mutations across instances", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const dir = await mkdtemp(join(tmpdir(), "sandbox-file-storage-"));
+  t.after(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+  const overlay = storage.file({
+    path: join(dir, "rootfs.cow"),
+    format: "raw-sparse",
+    blockSize: 65536,
+    maxBytes: 64 * 1024 * 1024,
+  });
+  const sandboxDefinition = defineSandbox({
+    rootfs: rootfs.cow({
+      base: rootfs.builtIn("alpine:3.23"),
+      writable: overlay,
+      maxDirtyBytes: 128 * 1024,
+    }),
+  });
+
+  const first = await sandboxDefinition.boot();
+  try {
+    const write = await first.exec("/bin/sh", [
+      "-lc",
+      "printf '%s' file-backed > /root/file-storage-state.txt && sync",
+    ]);
+    assert.equal(write.exitCode, 0, write.stderr);
+  } finally {
+    await first.close();
+  }
+
+  await using second = await sandboxDefinition.boot();
+  const read = await second.exec("/bin/cat", ["/root/file-storage-state.txt"]);
+
+  assert.equal(read.exitCode, 0, read.stderr);
+  assert.equal(read.stdout, "file-backed");
+});
+
+test("file-backed block mounts are passed through init mount machinery", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const dir = await mkdtemp(join(tmpdir(), "sandbox-block-mount-"));
+  t.after(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.ephemeral({
+      base: rootfs.builtIn("alpine:3.23"),
+    }),
+  }).boot({
+    mounts: {
+      "/tmp/block": mount.block({
+        source: storage.file({
+          path: join(dir, "data.cow"),
+          format: "raw-sparse",
+          blockSize: 65536,
+          maxBytes: 64 * 1024 * 1024,
+        }),
+        fstype: "tmpfs",
+        options: "rw",
+      }),
+    },
+  });
+
+  const result = await sandbox.exec("/bin/sh", [
+    "-lc",
+    "awk '$2 == \"/tmp/block\" { print $3; exit }' /proc/mounts",
+  ]);
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "tmpfs");
 });
 
 test("COW rootfs can be flattened to a QCOW2 image stream", async (t) => {

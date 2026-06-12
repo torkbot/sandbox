@@ -14,8 +14,10 @@ use imago::{
 };
 
 use crate::MicroVmSpec;
-use crate::block_storage::{CowBlockStorage, CowBlockStore, MemoryCowBlockStore};
-use crate::config::{KernelFormat, RootfsFormat, RootfsStorageSpec};
+use crate::block_storage::{
+    BlockStoreImageStorage, CowBlockStorage, CowBlockStore, FileCowBlockStore, MemoryCowBlockStore,
+};
+use crate::config::{FileStorageSpec, KernelFormat, MountSpec, RootfsFormat, RootfsStorageSpec};
 use crate::control::INIT_CONTROL_PORT;
 use crate::http_flow::HttpInterceptRuntime;
 use crate::network::OutboundRulePlan;
@@ -97,6 +99,7 @@ impl KrunContext {
         context.apply_console_output()?;
         context.apply_kernel(spec)?;
         context.apply_rootfs(spec, &services)?;
+        context.apply_block_mounts(spec)?;
         context.apply_network(spec, &services)?;
         for device in virtual_fs {
             context.add_virtual_fs(device)?;
@@ -257,6 +260,14 @@ impl KrunContext {
                             })?;
                             (store, *max_dirty_bytes)
                         }
+                        RootfsStorageSpec::File {
+                            max_dirty_bytes, ..
+                        } => {
+                            let store = services.root_storage.clone().ok_or_else(|| {
+                                KrunError::new("root file block store missing", -libc::EINVAL)
+                            })?;
+                            (store, *max_dirty_bytes)
+                        }
                         RootfsStorageSpec::EphemeralCow {
                             block_size,
                             max_dirty_bytes,
@@ -333,6 +344,37 @@ impl KrunContext {
         }
     }
 
+    fn apply_block_mounts(&self, spec: &MicroVmSpec) -> Result<(), KrunError> {
+        let count = spec.mounts.iter().filter_map(block_mount_spec).count();
+        if count > 25 {
+            return Err(KrunError::new("too many block mounts", -libc::EINVAL));
+        }
+        for (index, mount) in spec.mounts.iter().filter_map(block_mount_spec).enumerate() {
+            let store = Arc::new(
+                FileCowBlockStore::open(
+                    &mount.storage.path,
+                    mount.storage.block_size,
+                    mount.storage.max_bytes,
+                )
+                .map_err(|_| KrunError::new("FileCowBlockStore::open", -libc::EIO))?,
+            );
+            let storage = BlockStoreImageStorage::new(store, mount.storage.max_bytes)
+                .map_err(|_| KrunError::new("BlockStoreImageStorage::new", -libc::EINVAL))?;
+            let disk = open_raw_disk(Box::new(storage), true)?;
+            check_krun(
+                "krun_add_storage_disk",
+                krun::krun_add_storage_disk(
+                    self.id,
+                    format!("mount{index}"),
+                    Arc::new(Mutex::new(disk)),
+                    false,
+                    sync_mode(),
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
     fn apply_init(
         &self,
         spec: &MicroVmSpec,
@@ -342,11 +384,16 @@ impl KrunContext {
         // krun_env while the kernel command line boots /sandbox-init directly.
         let exec_path = CString::new("/sandbox-init").unwrap();
         let encoded_mounts = encode_virtual_fs_mounts(virtual_fs);
+        let encoded_block_mounts = encode_block_mounts(spec);
         let mount_arg = CString::new(format!("--virtiofs-mounts={encoded_mounts}")).unwrap();
+        let block_mount_arg =
+            CString::new(format!("--block-mounts={encoded_block_mounts}")).unwrap();
         let hostname_arg = CString::new(format!("--hostname={}", spec.hostname)).unwrap();
         let http_network_arg = CString::new("--http-network").unwrap();
         let network_enabled = spec.network.is_some();
         let mount_env = CString::new(format!("SANDBOX_VIRTIOFS_MOUNTS={encoded_mounts}")).unwrap();
+        let block_mount_env =
+            CString::new(format!("SANDBOX_BLOCK_MOUNTS={encoded_block_mounts}")).unwrap();
         let hostname_env = CString::new(format!("SANDBOX_HOSTNAME={}", spec.hostname)).unwrap();
         let rootfs_readonly_env = CString::new(format!(
             "SANDBOX_ROOTFS_READONLY={}",
@@ -357,10 +404,12 @@ impl KrunContext {
         let mut argv = vec![
             exec_path.as_ptr(),
             mount_arg.as_ptr(),
+            block_mount_arg.as_ptr(),
             hostname_arg.as_ptr(),
         ];
         let mut envp = vec![
             mount_env.as_ptr(),
+            block_mount_env.as_ptr(),
             hostname_env.as_ptr(),
             rootfs_readonly_env.as_ptr(),
         ];
@@ -396,6 +445,53 @@ fn encode_virtual_fs_mounts(virtual_fs: &[VirtualFsDevice]) -> String {
         value.push_str(if device.readonly { "ro" } else { "rw" });
     }
     value
+}
+
+struct BlockMountRef<'a> {
+    path: &'a str,
+    storage: &'a FileStorageSpec,
+    fstype: &'a str,
+    options: &'a str,
+}
+
+fn block_mount_spec(mount: &MountSpec) -> Option<BlockMountRef<'_>> {
+    match mount {
+        MountSpec::Block {
+            path,
+            storage,
+            fstype,
+            options,
+        } => Some(BlockMountRef {
+            path,
+            storage,
+            fstype,
+            options,
+        }),
+        MountSpec::VirtualFs { .. } => None,
+    }
+}
+
+fn encode_block_mounts(spec: &MicroVmSpec) -> String {
+    let mut value = String::new();
+    for (index, mount) in spec.mounts.iter().filter_map(block_mount_spec).enumerate() {
+        if !value.is_empty() {
+            value.push(';');
+        }
+        let device = block_device_path(index);
+        value.push_str(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(device));
+        value.push(':');
+        value.push_str(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mount.path));
+        value.push(':');
+        value.push_str(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mount.fstype));
+        value.push(':');
+        value.push_str(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mount.options));
+    }
+    value
+}
+
+fn block_device_path(index: usize) -> String {
+    let suffix = char::from(b'b' + u8::try_from(index).expect("block mount index fits in u8"));
+    format!("/dev/vd{suffix}")
 }
 
 fn open_qcow2_disk(
