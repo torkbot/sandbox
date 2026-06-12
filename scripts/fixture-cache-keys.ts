@@ -11,7 +11,10 @@ const outputPath = process.env.GITHUB_OUTPUT;
 const kernelKeyHash = sha256Text([
   `runner-arch=${runnerArch}\n`,
   await git(["submodule", "status", "--recursive", "deps/libkrunfw"]),
-  await gitTrackedFileHashes(["scripts/build-kernel.ts"]),
+  await gitTrackedFileHashes([
+    "scripts/build-kernel.ts",
+    "scripts/kernel-artifact-metadata.ts",
+  ]),
 ].join(""));
 
 const initKeyHash = sha256Text([

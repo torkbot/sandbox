@@ -8,7 +8,7 @@ Sandbox should not load `libkrunfw` at runtime. The `torkbot/libkrunfw` fork is 
 
 The upstream Makefile currently:
 
-- downloads Linux `6.12.87`,
+- downloads Linux `6.12.91`,
 - applies patches from `patches/`,
 - uses the matching `config-libkrunfw_<arch>` file,
 - builds the kernel,
@@ -31,10 +31,13 @@ By default this runs `deps/libkrunfw` inside `debian:bookworm`, installs the Lin
 dist/kernel/libkrunfw/<arch>/
 ```
 
+`build:kernel` also writes `kernel-metadata.json` beside `kernel.c`. The metadata records the selected architecture, libkrunfw commit, kernel version, and a fingerprint of the kernel config, patches, and build wrapper. Before `build:host` embeds `kernel.c`, it verifies this metadata against the current checkout and fails closed if the kernel artifact is stale.
+
 Environment knobs:
 
 - `SANDBOX_KERNEL_ARCH`: guest architecture passed to the libkrunfw Makefile. Defaults to `arm64` on Apple Silicon and `x86_64` on x64 hosts.
 - `SANDBOX_KERNEL_BUILDER_IMAGE`: Docker image to use. Defaults to `debian:bookworm`.
+- `SANDBOX_KERNEL_JOBS`: kernel build parallelism. Defaults to `4` to avoid overcommitting memory in local Docker builders.
 - `SANDBOX_KERNEL_OUT_DIR`: host output directory. Defaults to `dist/kernel/libkrunfw/<arch>`.
 
 The build is intentionally not part of `spawnSandbox`. Runtime VM creation should receive a prebuilt kernel/rootfs artifact set.
@@ -59,6 +62,6 @@ The lowest-level runtime handoff is the generated `kernel.c` bundle, not the `li
 npm run build:host
 ```
 
-The build script expects the kernel bundle from `build:kernel` and passes it to Cargo as `SANDBOX_KERNEL_BUNDLE_C`. Cargo compiles the C kernel bundle into the crate and enables the `sandbox_static_kernel` cfg. At runtime, `sandbox-host` calls the raw kernel-bundle setter in the `torkbot/libkrun` fork with host address, guest load address, entry address, and size. Sandbox configures the guest kernel command line to boot `/sandbox-init` directly.
+The build script expects the kernel bundle and matching metadata from `build:kernel`, validates both, and passes the bundle to Cargo as `SANDBOX_KERNEL_BUNDLE_C`. Cargo compiles the C kernel bundle into the crate and enables the `sandbox_static_kernel` cfg. At runtime, `sandbox-host` calls the raw kernel-bundle setter in the `torkbot/libkrun` fork with host address, guest load address, entry address, and size. Sandbox configures the guest kernel command line to boot `/sandbox-init` directly.
 
 This avoids a runtime dependency on `libkrunfw` and avoids resolving a kernel path during VM creation. Paths remain build inputs and package artifacts only; VM instantiation should not require building or discovering kernels dynamically.
