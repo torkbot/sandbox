@@ -61,13 +61,19 @@ export interface InternalSandboxOptions {
     readonly path: string;
     readonly readonly?: boolean;
     readonly format: "qcow2";
-    readonly storage?: {
-      readonly kind: "cow-block-store";
-      readonly blockSize: number;
-      readonly maxDirtyBytes: number;
-      readonly blockStore: SandboxBlockStore;
-      readonly context: SandboxBlockStoreContext;
-    };
+    readonly storage?:
+      | {
+          readonly kind: "cow-block-store";
+          readonly blockSize: number;
+          readonly maxDirtyBytes: number;
+          readonly blockStore: SandboxBlockStore;
+          readonly context: SandboxBlockStoreContext;
+        }
+      | {
+          readonly kind: "ephemeral-cow";
+          readonly blockSize: number;
+          readonly maxDirtyBytes: number;
+        };
   };
   readonly mounts?: readonly InternalMount[];
   readonly network?: InternalNetworkConfig;

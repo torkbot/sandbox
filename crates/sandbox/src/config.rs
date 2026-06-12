@@ -48,6 +48,10 @@ pub enum RootfsStorageSpec {
         block_size: u64,
         max_dirty_bytes: u64,
     },
+    EphemeralCow {
+        block_size: u64,
+        max_dirty_bytes: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,27 +361,31 @@ pub struct RootfsStorageSpecInput {
 
 impl RootfsStorageSpec {
     fn parse(input: RootfsStorageSpecInput) -> Result<Self, SpecError> {
-        match input.kind.as_str() {
-            "cow-block-store" => {
-                if input.block_size == 0 || input.block_size % 512 != 0 {
-                    return Err(SpecError::new(
-                        "rootfs.storage.blockSize must be a positive multiple of 512",
-                    ));
-                }
-                if input.max_dirty_bytes < input.block_size {
-                    return Err(SpecError::new(
-                        "rootfs.storage.maxDirtyBytes must be at least rootfs.storage.blockSize",
-                    ));
-                }
-                Ok(Self::CowBlockStore {
-                    block_size: input.block_size,
-                    max_dirty_bytes: input.max_dirty_bytes,
-                })
-            }
-            other => Err(SpecError::new(format!(
-                "unsupported rootfs.storage.kind: {other}"
-            ))),
+        if input.block_size == 0 || input.block_size % 512 != 0 {
+            return Err(SpecError::new(
+                "rootfs.storage.blockSize must be a positive multiple of 512",
+            ));
         }
+        if input.max_dirty_bytes < input.block_size {
+            return Err(SpecError::new(
+                "rootfs.storage.maxDirtyBytes must be at least rootfs.storage.blockSize",
+            ));
+        }
+        Ok(match input.kind.as_str() {
+            "cow-block-store" => Self::CowBlockStore {
+                block_size: input.block_size,
+                max_dirty_bytes: input.max_dirty_bytes,
+            },
+            "ephemeral-cow" => Self::EphemeralCow {
+                block_size: input.block_size,
+                max_dirty_bytes: input.max_dirty_bytes,
+            },
+            other => {
+                return Err(SpecError::new(format!(
+                    "unsupported rootfs.storage.kind: {other}"
+                )));
+            }
+        })
     }
 }
 
@@ -447,6 +455,26 @@ mod tests {
             Some(RootfsStorageSpec::CowBlockStore {
                 block_size: 4096,
                 max_dirty_bytes: 65536,
+            }),
+        );
+    }
+
+    #[test]
+    fn parses_ephemeral_rootfs_storage_limits() {
+        let mut input = valid_input();
+        input.rootfs_storage = Some(RootfsStorageSpecInput {
+            kind: "ephemeral-cow".to_string(),
+            block_size: 65536,
+            max_dirty_bytes: 131072,
+        });
+
+        let spec = MicroVmSpec::build(input).unwrap();
+
+        assert_eq!(
+            spec.rootfs.storage,
+            Some(RootfsStorageSpec::EphemeralCow {
+                block_size: 65536,
+                max_dirty_bytes: 131072,
             }),
         );
     }

@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   defineSandbox,
   fs,
+  network,
   rootfs,
   type SandboxBlockStore,
 } from "../../../src/index.ts";
@@ -537,14 +538,13 @@ test("missing COW rootfs mount directories do not persist synthetic rootfs paths
   assert.equal(result.exitCode, 0, result.stderr);
 });
 
-test("ordered nested virtual mounts can use parent mount directories", async (t) => {
+test("ordered nested virtual mounts create child directories under parent mounts", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
   }
 
   const workspace = fs.memory({
     files: {
-      "/cache/.keep": "",
       "/note.txt": "workspace\n",
     },
   });
@@ -717,6 +717,72 @@ test("built-in rootfs exposes enough guest disk space for agent workloads", asyn
 
   assert.equal(result.exitCode, 0, result.stderr);
   assert.ok(Number(result.stdout.trim()) >= 6 * 1024 * 1024, result.stdout);
+});
+
+test("HTTP interception does not make built-in rootfs writable", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+    network: network.policy((conn) => {
+      conn.accept();
+    }),
+  }).boot();
+
+  const result = await sandbox.exec("/bin/sh", [
+    "-lc",
+    [
+      "set -eu",
+      "root_options=$(awk '$2 == \"/\" { print $4; exit }' /proc/mounts)",
+      "case \",$root_options,\" in *,ro,*) ;; *) echo \"root mount is writable: $root_options\"; exit 1 ;; esac",
+      "if touch /root/no-cow-probe 2>/tmp/no-cow-touch.err; then",
+      "  echo 'rootfs write unexpectedly succeeded'",
+      "  exit 1",
+      "fi",
+      "grep -qi 'read-only' /tmp/no-cow-touch.err",
+      "printf ok",
+    ].join("\n"),
+  ]);
+
+  assert.equal(result.exitCode, 0, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+  assert.equal(result.stdout, "ok");
+});
+
+test("ephemeral rootfs allows rootfs mutations only for the running instance", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const sandboxDefinition = defineSandbox({
+    rootfs: rootfs.ephemeral({
+      base: rootfs.builtIn("alpine:3.23"),
+      maxDirtyBytes: 128 * 1024,
+    }),
+  });
+
+  await using first = await sandboxDefinition.boot();
+  const write = await first.exec("/bin/sh", [
+    "-lc",
+    [
+      "set -eu",
+      "root_options=$(awk '$2 == \"/\" { print $4; exit }' /proc/mounts)",
+      "case \",$root_options,\" in *,rw,*) ;; *) echo \"root mount is not writable: $root_options\"; exit 1 ;; esac",
+      "printf '%s' transient > /root/ephemeral-state.txt",
+      "test \"$(cat /root/ephemeral-state.txt)\" = transient",
+    ].join("\n"),
+  ]);
+  assert.equal(write.exitCode, 0, `stdout:\n${write.stdout}\nstderr:\n${write.stderr}`);
+
+  await first.close();
+
+  await using second = await sandboxDefinition.boot();
+  const read = await second.exec("/bin/sh", [
+    "-lc",
+    "test ! -e /root/ephemeral-state.txt",
+  ]);
+  assert.equal(read.exitCode, 0, `stdout:\n${read.stdout}\nstderr:\n${read.stderr}`);
 });
 
 test("COW rootfs round-trips rootfs mutations across instances", async (t) => {

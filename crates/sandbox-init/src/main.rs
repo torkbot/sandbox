@@ -21,6 +21,7 @@ fn main() {
 
 fn run() -> Result<(), InitError> {
     mount_kernel_filesystems()?;
+    let root_readonly = configured_root_readonly()?;
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let hostname_env = std::env::var("SANDBOX_HOSTNAME").ok();
     let http_network_enabled = http_network_enabled(args.iter().map(String::as_str));
@@ -37,11 +38,12 @@ fn run() -> Result<(), InitError> {
         std::env::args().skip(1),
         std::env::var("SANDBOX_VIRTIOFS_MOUNTS").ok(),
     )?;
-    mount_internal_http_ca(&mounts)?;
-    mount_virtual_filesystems_before_http_ca(&mounts)?;
-    install_http_ca()?;
-    mount_virtual_filesystems_after_http_ca(&mounts)?;
-    let packet = init_ready_packet(true)?;
+    let mut mounted_virtual_paths = Vec::new();
+    mount_internal_http_ca(&mounts, &mut mounted_virtual_paths)?;
+    mount_virtual_filesystems_before_http_ca(&mounts, &mut mounted_virtual_paths)?;
+    install_http_ca(root_readonly)?;
+    mount_virtual_filesystems_after_http_ca(&mounts, &mut mounted_virtual_paths)?;
+    let packet = init_ready_packet(root_readonly)?;
     let mut control = connect_control()?;
     send_init_ready(&mut control, &packet)?;
     run_control_loop(&mut control)?;
@@ -496,6 +498,40 @@ fn mount_kernel_filesystems() -> Result<(), InitError> {
 }
 
 #[cfg(target_os = "linux")]
+fn configured_root_readonly() -> Result<bool, InitError> {
+    match std::env::var("SANDBOX_ROOTFS_READONLY") {
+        Ok(value) if value == "1" || value.eq_ignore_ascii_case("true") => Ok(true),
+        Ok(value) if value == "0" || value.eq_ignore_ascii_case("false") => Ok(false),
+        Ok(value) => Err(InitError(format!(
+            "invalid SANDBOX_ROOTFS_READONLY value: {value}"
+        ))),
+        Err(std::env::VarError::NotPresent) => root_mount_readonly(),
+        Err(error) => Err(InitError(format!("read SANDBOX_ROOTFS_READONLY: {error}"))),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn root_mount_readonly() -> Result<bool, InitError> {
+    let mounts = std::fs::read_to_string("/proc/mounts")
+        .map_err(|error| InitError(format!("read /proc/mounts: {error}")))?;
+    for line in mounts.lines() {
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.get(1) == Some(&"/") {
+            let options = fields.get(3).copied().unwrap_or_default();
+            return Ok(options.split(',').any(|option| option == "ro"));
+        }
+    }
+    Err(InitError(
+        "root mount not found in /proc/mounts".to_string(),
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configured_root_readonly() -> Result<bool, InitError> {
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
 fn create_standard_fd_links() -> Result<(), InitError> {
     create_symlink("/proc/self/fd", "/dev/fd")?;
     create_symlink("/proc/self/fd/0", "/dev/stdin")?;
@@ -594,34 +630,47 @@ fn set_directory_mode(path: &str, mode: u32) -> Result<(), InitError> {
 }
 
 #[cfg(target_os = "linux")]
-fn mount_internal_http_ca(mounts: &[VirtualFsMount]) -> Result<(), InitError> {
+fn mount_internal_http_ca(
+    mounts: &[VirtualFsMount],
+    mounted_virtual_paths: &mut Vec<std::path::PathBuf>,
+) -> Result<(), InitError> {
     let Some(mount) = mounts.iter().find(|mount| is_internal_http_ca_mount(mount)) else {
         return Ok(());
     };
-    ensure_mount_point(&mount.path)?;
-    mount_virtiofs(&mount.tag, &mount.path, mount.readonly)
+    ensure_mount_point(&mount.path, mounted_virtual_paths)?;
+    mount_virtiofs(&mount.tag, &mount.path, mount.readonly)?;
+    mounted_virtual_paths.push(std::path::PathBuf::from(&mount.path));
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn mount_virtual_filesystems_before_http_ca(mounts: &[VirtualFsMount]) -> Result<(), InitError> {
+fn mount_virtual_filesystems_before_http_ca(
+    mounts: &[VirtualFsMount],
+    mounted_virtual_paths: &mut Vec<std::path::PathBuf>,
+) -> Result<(), InitError> {
     for mount in mounts {
         if is_internal_http_ca_mount(mount) || hides_internal_http_ca_mount(&mount.path) {
             continue;
         }
-        ensure_mount_point(&mount.path)?;
+        ensure_mount_point(&mount.path, mounted_virtual_paths)?;
         mount_virtiofs(&mount.tag, &mount.path, mount.readonly)?;
+        mounted_virtual_paths.push(std::path::PathBuf::from(&mount.path));
     }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn mount_virtual_filesystems_after_http_ca(mounts: &[VirtualFsMount]) -> Result<(), InitError> {
+fn mount_virtual_filesystems_after_http_ca(
+    mounts: &[VirtualFsMount],
+    mounted_virtual_paths: &mut Vec<std::path::PathBuf>,
+) -> Result<(), InitError> {
     for mount in mounts {
         if is_internal_http_ca_mount(mount) || !hides_internal_http_ca_mount(&mount.path) {
             continue;
         }
-        ensure_mount_point(&mount.path)?;
+        ensure_mount_point(&mount.path, mounted_virtual_paths)?;
         mount_virtiofs(&mount.tag, &mount.path, mount.readonly)?;
+        mounted_virtual_paths.push(std::path::PathBuf::from(&mount.path));
     }
     Ok(())
 }
@@ -697,7 +746,10 @@ fn parse_virtual_fs_mount(mount: &str) -> Result<VirtualFsMount, InitError> {
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_mount_point(path: &str) -> Result<(), InitError> {
+fn ensure_mount_point(
+    path: &str,
+    mounted_virtual_paths: &[std::path::PathBuf],
+) -> Result<(), InitError> {
     use std::path::Path;
 
     if Path::new(path).is_dir() {
@@ -708,7 +760,7 @@ fn ensure_mount_point(path: &str) -> Result<(), InitError> {
             "virtual filesystem mount point is not a directory: {path}"
         )));
     }
-    ensure_mount_point_parent_is_ephemeral(path)?;
+    ensure_mount_point_parent_is_ephemeral(path, mounted_virtual_paths)?;
 
     std::fs::create_dir_all(path).map_err(|error| {
         InitError(format!(
@@ -726,10 +778,23 @@ fn ensure_mount_point(path: &str) -> Result<(), InitError> {
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_mount_point_parent_is_ephemeral(path: &str) -> Result<(), InitError> {
+fn ensure_mount_point_parent_is_ephemeral(
+    path: &str,
+    mounted_virtual_paths: &[std::path::PathBuf],
+) -> Result<(), InitError> {
     let parent = nearest_existing_ancestor(path)?;
+    if parent.starts_with("/run") || parent.starts_with("/tmp") || parent.starts_with("/dev/shm") {
+        return Ok(());
+    }
+    if mounted_virtual_paths
+        .iter()
+        .any(|mounted_path| parent.starts_with(mounted_path))
+    {
+        return Ok(());
+    }
+
     let fs_type = filesystem_type(&parent)?;
-    if fs_type == TMPFS_MAGIC || fs_type == FUSE_SUPER_MAGIC {
+    if fs_type == TMPFS_MAGIC {
         return Ok(());
     }
     Err(InitError(format!(
@@ -769,9 +834,6 @@ fn filesystem_type(path: &std::path::Path) -> Result<i128, InitError> {
 
 #[cfg(target_os = "linux")]
 const TMPFS_MAGIC: i128 = 0x0102_1994;
-
-#[cfg(target_os = "linux")]
-const FUSE_SUPER_MAGIC: i128 = 0x6573_5546;
 
 #[cfg(target_os = "linux")]
 fn mount_virtiofs(tag: &str, path: &str, readonly: bool) -> Result<(), InitError> {
@@ -834,17 +896,26 @@ struct VirtualFsMount {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn mount_internal_http_ca(_mounts: &[VirtualFsMount]) -> Result<(), InitError> {
+fn mount_internal_http_ca(
+    _mounts: &[VirtualFsMount],
+    _mounted_virtual_paths: &mut Vec<std::path::PathBuf>,
+) -> Result<(), InitError> {
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn mount_virtual_filesystems_before_http_ca(_mounts: &[VirtualFsMount]) -> Result<(), InitError> {
+fn mount_virtual_filesystems_before_http_ca(
+    _mounts: &[VirtualFsMount],
+    _mounted_virtual_paths: &mut Vec<std::path::PathBuf>,
+) -> Result<(), InitError> {
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn mount_virtual_filesystems_after_http_ca(_mounts: &[VirtualFsMount]) -> Result<(), InitError> {
+fn mount_virtual_filesystems_after_http_ca(
+    _mounts: &[VirtualFsMount],
+    _mounted_virtual_paths: &mut Vec<std::path::PathBuf>,
+) -> Result<(), InitError> {
     Ok(())
 }
 
@@ -1879,9 +1950,12 @@ fn signal_name(signal: i32) -> Option<&'static str> {
     }
 }
 
-fn install_http_ca() -> Result<(), InitError> {
+fn install_http_ca(root_readonly: bool) -> Result<(), InitError> {
     let certificate_path = std::path::Path::new("/run/sandbox/http-ca/http-ca.pem");
     if !certificate_path.exists() {
+        return Ok(());
+    }
+    if root_readonly {
         return Ok(());
     }
 

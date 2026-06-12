@@ -1,7 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
 import { appendFileSync, closeSync, mkdtempSync, openSync, readSync, rmSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Binary, BSON } from "bson";
 import { hostBinaryPath, macosHostSigningError } from "./artifacts.ts";
@@ -79,8 +78,12 @@ export class HostProcessSandboxVm implements HostControlChannel {
     this.#networkConnectionHook = networkConnectionHook;
     this.#consoleOutputPath = consoleOutputPath;
     this.#consoleOutputCleanupPath = consoleOutputCleanupPath;
-    this.#rootBlockStore = options.rootfs.storage?.blockStore;
-    this.#rootBlockStoreContext = options.rootfs.storage?.context;
+    this.#rootBlockStore = options.rootfs.storage?.kind === "cow-block-store"
+      ? options.rootfs.storage.blockStore
+      : undefined;
+    this.#rootBlockStoreContext = options.rootfs.storage?.kind === "cow-block-store"
+      ? options.rootfs.storage.context
+      : undefined;
     if (this.#rootBlockStore !== undefined && this.#rootBlockStoreContext !== undefined) {
       this.#blockStores.set("host.block", {
         blockStore: this.#rootBlockStore,
@@ -141,7 +144,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
         stdio: ["pipe", "pipe", "pipe"],
         env: {
           ...process.env,
-          SANDBOX_CONSOLE_OUTPUT: consoleOutput.path,
+          ...(consoleOutput === undefined ? {} : { SANDBOX_CONSOLE_OUTPUT: consoleOutput.path }),
         },
       });
       vm = new HostProcessSandboxVm(
@@ -149,8 +152,8 @@ export class HostProcessSandboxVm implements HostControlChannel {
         options,
         requestHeaderHooks,
         networkConnectionHook,
-        consoleOutput.path,
-        consoleOutput.cleanupPath,
+        consoleOutput?.path,
+        consoleOutput?.cleanupPath,
       );
       await Promise.race([
         once(child, "spawn"),
@@ -248,6 +251,13 @@ export class HostProcessSandboxVm implements HostControlChannel {
   writeControlPacket(packet: Uint8Array): void {
     this.#assertOpen();
     this.#writeToHost(packet);
+  }
+
+  hostPid(): number {
+    if (this.#child.pid === undefined) {
+      throw new Error("sandbox-host process has no PID");
+    }
+    return this.#child.pid;
   }
 
   async close(): Promise<void> {
@@ -1089,21 +1099,20 @@ function launchTimeoutMs(): number {
   return parsed;
 }
 
-function launchConsoleOutput(): { readonly path: string; readonly cleanupPath?: string } {
+function launchConsoleOutput(): { readonly path: string; readonly cleanupPath?: string } | undefined {
   const configured = process.env.SANDBOX_CONSOLE_OUTPUT;
-  if (configured !== undefined) {
-    try {
-      if (statSync(configured).isDirectory()) {
-        const outputPath = mkdtempSync(join(configured, "sandbox-console-"));
-        return { path: join(outputPath, "console.log") };
-      }
-    } catch {
-      // Non-existent configured paths are treated as explicit output files.
-    }
-    return { path: configured };
+  if (configured === undefined) {
+    return undefined;
   }
-  const cleanupPath = mkdtempSync(join(tmpdir(), "sandbox-console-"));
-  return { path: join(cleanupPath, "console.log"), cleanupPath };
+  try {
+    if (statSync(configured).isDirectory()) {
+      const outputPath = mkdtempSync(join(configured, "sandbox-console-"));
+      return { path: join(outputPath, "console.log") };
+    }
+  } catch {
+    // Non-existent configured paths are treated as explicit output files.
+  }
+  return { path: configured };
 }
 
 function hostExitMessage(exitText: string, stderr: string, consoleOutputPath: string | undefined): string {

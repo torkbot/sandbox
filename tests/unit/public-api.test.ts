@@ -64,6 +64,17 @@ test("rootfs.cow accepts a composed rootfs source", () => {
   });
 });
 
+test("rootfs.ephemeral makes writable rootfs persistence explicit", () => {
+  assert.deepEqual(rootfs.ephemeral({
+    base: rootfs.builtIn("alpine:3.23"),
+    maxDirtyBytes: 64 * 1024,
+  }), {
+    kind: "ephemeral-rootfs",
+    base: rootfs.builtIn("alpine:3.23"),
+    maxDirtyBytes: 64 * 1024,
+  });
+});
+
 test("rootfs.cow can be called without binding rootfs as this", () => {
   const blockStore = memoryBlockStore();
   const { cow } = rootfs;

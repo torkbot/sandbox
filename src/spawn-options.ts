@@ -20,7 +20,7 @@ export type HostSpawnSandboxOptions = {
     readonly readonly?: boolean;
     readonly format: "qcow2";
     readonly storage?: {
-      readonly kind: "cow-block-store";
+      readonly kind: "cow-block-store" | "ephemeral-cow";
       readonly blockSize: number;
       readonly maxDirtyBytes: number;
     };
