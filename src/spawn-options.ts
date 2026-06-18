@@ -19,17 +19,41 @@ export type HostSpawnSandboxOptions = {
     readonly path: string;
     readonly readonly?: boolean;
     readonly format: "qcow2";
-    readonly storage?: {
-      readonly kind: "cow-block-store" | "ephemeral-cow";
-      readonly blockSize: number;
-      readonly maxDirtyBytes: number;
-    };
+    readonly storage?:
+      | {
+          readonly kind: "cow-block-store" | "ephemeral-cow";
+          readonly blockSize: number;
+          readonly maxDirtyBytes: number;
+        }
+      | {
+          readonly kind: "file";
+          readonly path: string;
+          readonly format: "raw-sparse";
+          readonly blockSize: number;
+          readonly maxBytes: number;
+          readonly maxDirtyBytes: number;
+        };
   };
-  readonly mounts?: readonly {
-    readonly kind: "virtual-fs";
-    readonly path: string;
-    readonly writable?: boolean;
-  }[];
+  readonly mounts?: readonly (
+    | {
+        readonly kind: "virtual-fs";
+        readonly path: string;
+        readonly writable?: boolean;
+      }
+    | {
+        readonly kind: "block";
+        readonly path: string;
+        readonly storage: {
+          readonly kind: "file";
+          readonly path: string;
+          readonly format: "raw-sparse";
+          readonly blockSize: number;
+          readonly maxBytes: number;
+        };
+        readonly fstype: string;
+        readonly options: string;
+      }
+  )[];
   readonly network?: {
     readonly outbound?: {
       readonly policy: "deny";

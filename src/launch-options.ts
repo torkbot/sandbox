@@ -4,6 +4,7 @@ import type {
   NetworkConnectionRequestHandler,
   SandboxBlockStore,
   SandboxBlockStoreContext,
+  FileStorageBlockStore,
 } from "./index.ts";
 
 export interface SandboxHttpRequestSelector {
@@ -47,10 +48,19 @@ export interface InternalNetworkConfig {
   };
 }
 
-export interface InternalMount {
-  readonly path: string;
-  readonly fileSystem: SandboxFileSystem;
-}
+export type InternalMount =
+  | {
+      readonly kind: "virtual-fs";
+      readonly path: string;
+      readonly fileSystem: SandboxFileSystem;
+    }
+  | {
+      readonly kind: "block";
+      readonly path: string;
+      readonly source: FileStorageBlockStore;
+      readonly fstype: string;
+      readonly options: string;
+    };
 
 export interface InternalSandboxOptions {
   readonly resources?: {
@@ -72,6 +82,14 @@ export interface InternalSandboxOptions {
       | {
           readonly kind: "ephemeral-cow";
           readonly blockSize: number;
+          readonly maxDirtyBytes: number;
+        }
+      | {
+          readonly kind: "file";
+          readonly path: string;
+          readonly format: "raw-sparse";
+          readonly blockSize: number;
+          readonly maxBytes: number;
           readonly maxDirtyBytes: number;
         };
   };
