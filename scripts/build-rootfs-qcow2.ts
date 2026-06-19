@@ -1,6 +1,10 @@
-import { mkdir, stat } from "node:fs/promises";
+import { copyFile, mkdir, stat } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { spawn } from "node:child_process";
+import {
+  rootfsEnvironmentFactsArtifactName,
+  rootfsEnvironmentFactsManifestFile,
+} from "../src/environment-facts.ts";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 const sourceDir = resolve(repoRoot, process.env.SANDBOX_ROOTFS_SOURCE_DIR ?? "dist/rootfs/alpine-3.23");
@@ -58,6 +62,11 @@ await run("docker", [
 ]);
 
 console.log(`rootfs QCOW2 image written to ${outPath}`);
+await copyFile(
+  resolve(sourceDir, rootfsEnvironmentFactsManifestFile),
+  resolve(outDir, rootfsEnvironmentFactsArtifactName),
+);
+console.log(`rootfs environment facts written to ${resolve(outDir, rootfsEnvironmentFactsArtifactName)}`);
 
 async function assertDirectory(path: string): Promise<void> {
   try {

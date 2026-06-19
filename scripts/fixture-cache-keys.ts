@@ -34,6 +34,7 @@ const rootfsKeyHash = sha256Text([
   await gitTrackedFileHashes([
     "scripts/build-rootfs.ts",
     "scripts/build-rootfs-qcow2.ts",
+    "src/environment-facts.ts",
   ]),
 ].join(""));
 

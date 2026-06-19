@@ -6,6 +6,7 @@ import {
   network,
   rootfs,
   type SandboxBlockStore,
+  type SandboxEnvironmentFact,
 } from "../../../src/index.ts";
 import { requireHostArtifact, requireVmLaunchSupport } from "../support/capabilities.ts";
 
@@ -432,6 +433,104 @@ test("built-in agent rootfs includes common agent runtimes and CLIs", async (t) 
   assert.match(result.stdout, /^11\./m);
   assert.match(result.stdout, /^Python 3\./m);
   assert.match(result.stdout, /^pip /m);
+});
+
+test("environment facts can be recovered from a running VM", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.ephemeral({
+      base: rootfs.builtIn("alpine:3.23"),
+    }),
+    network: network.policy((conn) => {
+      conn.accept();
+    }),
+  }).boot();
+
+  const facts = await sandbox.environmentFacts();
+
+  assertIncludesFact(facts, {
+    source: "config",
+    topic: "rootfs",
+    relation: "write-mode",
+    value: "writable-ephemeral",
+  });
+  assertIncludesFact(facts, {
+    source: "config",
+    topic: "network-egress",
+    relation: "requires",
+    value: "policy-grant",
+  });
+  assertIncludesFact(facts, {
+    source: "guest",
+    topic: "distro",
+    relation: "is",
+    value: "alpine",
+  });
+  assertIncludesGuestDistroVersion(facts);
+  assertIncludesFact(facts, {
+    source: "guest",
+    topic: "package-manager",
+    relation: "is",
+    value: "apk",
+  });
+  assertIncludesFact(facts, {
+    source: "guest",
+    topic: "shell",
+    relation: "is",
+    value: "/bin/sh",
+  });
+  assertIncludesFact(facts, {
+    source: "guest",
+    topic: "command",
+    relation: "exists",
+    value: "git",
+  });
+  assertIncludesFact(facts, {
+    source: "guest",
+    topic: "rootfs",
+    relation: "mount-mode",
+    value: "read-write",
+  });
+});
+
+test("environment facts parse os-release as data", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.ephemeral({
+      base: rootfs.builtIn("alpine:3.23"),
+    }),
+  }).boot();
+
+  const write = await sandbox.exec("/bin/sh", [
+    "-lc",
+    "printf '%s\\n' 'ID=$(touch /tmp/os-release-executed)' 'VERSION_ID=3.23' >/etc/os-release",
+  ]);
+  assert.equal(
+    write.exitCode,
+    0,
+    `stdout:\n${write.stdout}\nstderr:\n${write.stderr}`,
+  );
+
+  await assert.rejects(
+    sandbox.environmentFacts(),
+    /unsupported guest distro environment fact/,
+  );
+
+  const check = await sandbox.exec("/bin/sh", [
+    "-lc",
+    "test ! -e /tmp/os-release-executed",
+  ]);
+  assert.equal(
+    check.exitCode,
+    0,
+    `stdout:\n${check.stdout}\nstderr:\n${check.stderr}`,
+  );
 });
 
 test("boot options provide instance-specific virtual mounts", async (t) => {
@@ -931,6 +1030,43 @@ function memoryBlockStore(): SandboxBlockStore & {
       return Array.from(blocks.keys());
     },
   };
+}
+
+function assertIncludesFact(
+  facts: readonly SandboxEnvironmentFact[],
+  expected: SandboxEnvironmentFact,
+): void {
+  assert.ok(
+    facts.some((fact) => {
+      return fact.source === expected.source
+        && fact.topic === expected.topic
+        && fact.relation === expected.relation
+        && fact.value === expected.value;
+    }),
+    `expected environment fact ${JSON.stringify(expected)} in ${JSON.stringify(facts)}`,
+  );
+}
+
+function assertIncludesGuestDistroVersion(
+  facts: readonly SandboxEnvironmentFact[],
+): void {
+  const fact = facts.find((candidate) => {
+    return candidate.source === "guest"
+      && candidate.topic === "distro-version"
+      && candidate.relation === "is";
+  });
+
+  assert.notEqual(
+    fact,
+    undefined,
+    `expected guest distro-version fact in ${JSON.stringify(facts)}`,
+  );
+
+  if (fact === undefined) {
+    throw new Error("expected guest distro-version fact");
+  }
+
+  assert.match(fact.value, /^3\.23(?:\.[0-9]+)?$/);
 }
 
 async function readStreamText(

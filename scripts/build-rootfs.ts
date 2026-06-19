@@ -2,40 +2,24 @@ import { chmod, copyFile, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { getgid, getuid } from "node:process";
+import {
+  builtInRootfsApkPackages,
+  builtInRootfsEnvironmentFactsManifest,
+  builtInRootfsGithubCliVersion,
+  rootfsEnvironmentFactsManifestFile,
+  type BuiltInRootfsName,
+} from "../src/environment-facts.ts";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 const image = process.env.SANDBOX_ROOTFS_IMAGE ?? "alpine:3.23";
+const rootfsName: BuiltInRootfsName = "alpine:3.23";
 const outDir = resolve(repoRoot, process.env.SANDBOX_ROOTFS_OUT_DIR ?? "dist/rootfs/alpine-3.23");
 const initPath = resolve(
   repoRoot,
   process.env.SANDBOX_INIT_BINARY_PATH ?? `dist/init/${guestTarget()}/sandbox-init`,
 );
-const agentPackages = [
-  "bash",
-  "ca-certificates",
-  "coreutils",
-  "curl",
-  "exiftool",
-  "ffmpeg",
-  "file",
-  "findutils",
-  "git",
-  "imagemagick",
-  "jq",
-  "less",
-  "nodejs-current",
-  "npm",
-  "openssh-client",
-  "poppler-utils",
-  "py3-pip",
-  "python3",
-  "ripgrep",
-  "tar",
-  "unzip",
-  "xz",
-  "zip",
-] as const;
-const githubCliVersion = "2.83.0";
+const agentPackages = builtInRootfsApkPackages(rootfsName);
+const githubCliVersion = builtInRootfsGithubCliVersion(rootfsName);
 
 await rm(outDir, { recursive: true, force: true });
 await mkdir(outDir, { recursive: true });
@@ -87,6 +71,10 @@ await mkdir(resolve(outDir, "sys"), { recursive: true });
 await mkdir(resolve(outDir, "tmp"), { recursive: true, mode: 0o1777 });
 await chmod(resolve(outDir, "tmp"), 0o1777);
 await mkdir(resolve(outDir, "workspace"), { recursive: true });
+await writeFile(
+  resolve(outDir, rootfsEnvironmentFactsManifestFile),
+  `${JSON.stringify(builtInRootfsEnvironmentFactsManifest(rootfsName), null, 2)}\n`,
+);
 
 console.log(`rootfs directory written to ${outDir}`);
 
