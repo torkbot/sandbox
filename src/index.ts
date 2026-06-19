@@ -2,6 +2,19 @@ import {
   builtInRootfsIdentity,
   builtInRootfsPath,
 } from "./artifacts.ts";
+import {
+  builtInRootfsEnvironmentCommandFacts,
+  builtInRootfsEnvironmentIdentityFacts,
+  type BuiltInRootfsName,
+  type SandboxDistroEnvironmentFact,
+  type SandboxDistroVersion,
+  type SandboxDistroVersionEnvironmentFact,
+  type SandboxEnvironmentFact,
+  type SandboxNetworkEgressEnvironmentFact,
+  type SandboxPackageManagerEnvironmentFact,
+  type SandboxRootfsEnvironmentFact,
+  type SandboxShellEnvironmentFact,
+} from "./environment-facts.ts";
 import { randomUUID } from "node:crypto";
 import { open } from "node:fs/promises";
 import { HostControlTransport } from "./control.ts";
@@ -21,6 +34,22 @@ import type {
   RegisteredNetworkConnectionHook,
   SandboxHttpRequestSelector,
 } from "./launch-options.ts";
+
+export type {
+  BuiltInRootfsName,
+  SandboxCommandEnvironmentFact,
+  SandboxDistroEnvironmentFact,
+  SandboxDistroVersion,
+  SandboxDistroVersionEnvironmentFact,
+  SandboxEnvironmentCommand,
+  SandboxEnvironmentFact,
+  SandboxEnvironmentFactSource,
+  SandboxNetworkEgressEnvironmentFact,
+  SandboxPackageManagerEnvironmentFact,
+  SandboxRootfsEnvironmentFact,
+  SandboxRootfsImageEnvironmentFact,
+  SandboxShellEnvironmentFact,
+} from "./environment-facts.ts";
 
 export type SandboxFileType = "file" | "directory" | "symlink";
 
@@ -122,8 +151,6 @@ export interface SandboxHttpRequest {
   };
 }
 
-export type BuiltInRootfsName = "alpine:3.23";
-
 export type BuiltInRootfsConfig = {
   readonly kind: "built-in-rootfs";
   readonly name: BuiltInRootfsName;
@@ -148,117 +175,6 @@ export type EphemeralRootfsConfig = {
 };
 
 export type Rootfs = BuiltInRootfsConfig | CowRootfsConfig | EphemeralRootfsConfig;
-
-export type SandboxEnvironmentFactSource = "config" | "guest";
-
-export type SandboxDistroVersion = "3.23" | `3.23.${number}`;
-
-/**
- * Commands that the current built-in agent rootfs intentionally exposes as
- * stable developer-facing tools. The list is affirmative rather than
- * exhaustive: absence from this union means the command is not part of this
- * metadata contract, not that the command cannot exist in the guest.
- */
-export type SandboxEnvironmentCommand =
-  | "bash"
-  | "curl"
-  | "git"
-  | "gh"
-  | "jq"
-  | "node"
-  | "npm"
-  | "pip3"
-  | "python3"
-  | "rg";
-
-export type SandboxDistroEnvironmentFact = {
-  readonly source: SandboxEnvironmentFactSource;
-  readonly topic: "distro";
-  readonly relation: "is";
-  readonly value: "alpine";
-};
-
-export type SandboxDistroVersionEnvironmentFact = {
-  readonly source: SandboxEnvironmentFactSource;
-  readonly topic: "distro-version";
-  readonly relation: "is";
-  readonly value: SandboxDistroVersion;
-};
-
-export type SandboxRootfsImageEnvironmentFact = {
-  readonly source: "config";
-  readonly topic: "rootfs-image";
-  readonly relation: "is";
-  readonly value: BuiltInRootfsName;
-};
-
-export type SandboxPackageManagerEnvironmentFact = {
-  readonly source: SandboxEnvironmentFactSource;
-  readonly topic: "package-manager";
-  readonly relation: "is";
-  readonly value: "apk";
-};
-
-export type SandboxShellEnvironmentFact = {
-  readonly source: SandboxEnvironmentFactSource;
-  readonly topic: "shell";
-  readonly relation: "is";
-  readonly value: "/bin/sh";
-};
-
-export type SandboxRootfsEnvironmentFact =
-  | {
-      readonly source: "config";
-      readonly topic: "rootfs";
-      readonly relation: "write-mode";
-      readonly value:
-        | "read-only"
-        | "writable-ephemeral"
-        | "writable-persistent-cow";
-    }
-  | {
-      readonly source: "guest";
-      readonly topic: "rootfs";
-      readonly relation: "mount-mode";
-      readonly value: "read-only" | "read-write";
-    };
-
-export type SandboxNetworkEgressEnvironmentFact =
-  | {
-      readonly source: "config";
-      readonly topic: "network-egress";
-      readonly relation: "is";
-      readonly value: "not-configured";
-    }
-  | {
-      readonly source: "config";
-      readonly topic: "network-egress";
-      readonly relation: "requires";
-      readonly value: "policy-grant";
-    };
-
-export type SandboxCommandEnvironmentFact = {
-  readonly source: "config";
-  readonly topic: "command";
-  readonly relation: "exists";
-  readonly value: SandboxEnvironmentCommand;
-};
-
-/**
- * Structured statement about a sandbox execution environment.
- *
- * Facts are intentionally small triples with required provenance so callers can
- * render them into prompts, logs, or policy decisions without parsing prose.
- */
-export type SandboxEnvironmentFact =
-  | SandboxDistroEnvironmentFact
-  | SandboxDistroVersionEnvironmentFact
-  | SandboxRootfsImageEnvironmentFact
-  | SandboxPackageManagerEnvironmentFact
-  | SandboxShellEnvironmentFact
-  | SandboxRootfsEnvironmentFact
-  | SandboxNetworkEgressEnvironmentFact
-  | SandboxCommandEnvironmentFact;
 
 export type Qcow2RootfsImage = {
   readonly kind: "rootfs-image";
@@ -887,71 +803,19 @@ export const network = {
   },
 };
 
-const ALPINE_323_COMMANDS = [
-  "bash",
-  "curl",
-  "git",
-  "gh",
-  "jq",
-  "node",
-  "npm",
-  "python3",
-  "pip3",
-  "rg",
-] as const satisfies readonly SandboxEnvironmentCommand[];
-
 function environmentFactsForDefinition(
   options: SandboxDefinitionOptions,
 ): readonly SandboxEnvironmentFact[] {
-  const facts: SandboxEnvironmentFact[] = [];
   const base = rootfsBase(options.rootfs);
+  const facts: SandboxEnvironmentFact[] = [
+    ...builtInRootfsEnvironmentIdentityFacts(base.name),
+  ];
 
-  facts.push({
-    source: "config",
-    topic: "rootfs-image",
-    relation: "is",
-    value: base.name,
-  });
-  facts.push({
-    source: "config",
-    topic: "distro",
-    relation: "is",
-    value: "alpine",
-  });
-  facts.push({
-    source: "config",
-    topic: "distro-version",
-    relation: "is",
-    value: "3.23",
-  });
-  facts.push({
-    source: "config",
-    topic: "package-manager",
-    relation: "is",
-    value: "apk",
-  });
-  facts.push({
-    source: "config",
-    topic: "shell",
-    relation: "is",
-    value: "/bin/sh",
-  });
   facts.push(configRootfsWriteFact(options.rootfs));
   facts.push(configNetworkEgressFact(options.network));
-  facts.push(...ALPINE_323_COMMANDS.map(configCommandFact));
+  facts.push(...builtInRootfsEnvironmentCommandFacts(base.name));
 
   return facts;
-}
-
-function configCommandFact(
-  value: SandboxEnvironmentCommand,
-): SandboxCommandEnvironmentFact {
-  return {
-    source: "config",
-    topic: "command",
-    relation: "exists",
-    value,
-  };
 }
 
 function rootfsBase(rootfs: Rootfs): BuiltInRootfsConfig {

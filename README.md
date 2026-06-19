@@ -269,9 +269,10 @@ The current built-in Alpine rootfs reports facts such as
 `package-manager is apk`, `shell is /bin/sh`, concrete `command exists ...`
 entries for `bash`, `curl`, `git`, `gh`, `jq`, `node`, `npm`, `python3`,
 `pip3`, and `rg`, rootfs write semantics, and policy-controlled network egress
-when `network.policy(...)` is configured. The booted instance additionally
-reports guest-observed distro, distro version, package-manager, shell, and root
-mount mode facts.
+when `network.policy(...)` is configured. Built-in image facts are sourced from
+the rootfs build definition. The booted instance additionally reports
+guest-observed distro, distro version, package-manager, shell, and root mount
+mode facts.
 
 ### `rootfs`
 

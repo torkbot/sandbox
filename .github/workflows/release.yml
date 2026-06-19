@@ -111,6 +111,7 @@ jobs:
           cp "${artifact_root}/sandbox-host" target/release/sandbox-host
           chmod 755 target/release/sandbox-host
           cp "${artifact_root}/rootfs/alpine-3.23.qcow2" dist/rootfs/alpine-3.23.qcow2
+          cp "${artifact_root}/rootfs/alpine-3.23.environment-facts.json" dist/rootfs/alpine-3.23.environment-facts.json
 
       - name: Prepare platform package
         run: node ./scripts/prepare-npm-packages.ts --version "$SANDBOX_RELEASE_VERSION" --platform --current

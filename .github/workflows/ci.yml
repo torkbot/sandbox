@@ -395,6 +395,7 @@ jobs:
           mkdir -p "${artifact_root}/rootfs"
           cp target/release/sandbox-host "${artifact_root}/sandbox-host"
           cp dist/rootfs/alpine-3.23.qcow2 "${artifact_root}/rootfs/alpine-3.23.qcow2"
+          cp dist/rootfs/alpine-3.23.environment-facts.json "${artifact_root}/rootfs/alpine-3.23.environment-facts.json"
           node ./scripts/release-artifact-manifest.ts write \
             --head-sha "${{ github.sha }}" \
             --platform "${{ matrix.platform }}" \
@@ -404,7 +405,8 @@ jobs:
             --init-key "${{ steps.fixture-cache-keys.outputs.init-key }}" \
             --rootfs-key "${{ steps.fixture-cache-keys.outputs.rootfs-key }}" \
             --file sandbox-host \
-            --file rootfs/alpine-3.23.qcow2
+            --file rootfs/alpine-3.23.qcow2 \
+            --file rootfs/alpine-3.23.environment-facts.json
 
       - name: Upload release platform artifact
         if: matrix.platform != 'darwin-arm64'
@@ -422,6 +424,7 @@ jobs:
           mkdir -p "${artifact_root}/rootfs"
           cp target/release/sandbox-host "${artifact_root}/sandbox-host"
           cp dist/rootfs/alpine-3.23.qcow2 "${artifact_root}/rootfs/alpine-3.23.qcow2"
+          cp dist/rootfs/alpine-3.23.environment-facts.json "${artifact_root}/rootfs/alpine-3.23.environment-facts.json"
           {
             printf 'kernel_key=%s\n' '${{ steps.fixture-cache-keys.outputs.kernel-key }}'
             printf 'init_key=%s\n' '${{ steps.fixture-cache-keys.outputs.init-key }}'
@@ -559,6 +562,7 @@ jobs:
           mkdir -p "${artifact_root}/rootfs"
           cp dist/signing/darwin-arm64/sandbox-host "${artifact_root}/sandbox-host"
           cp dist/signing/darwin-arm64/rootfs/alpine-3.23.qcow2 "${artifact_root}/rootfs/alpine-3.23.qcow2"
+          cp dist/signing/darwin-arm64/rootfs/alpine-3.23.environment-facts.json "${artifact_root}/rootfs/alpine-3.23.environment-facts.json"
           node ./scripts/release-artifact-manifest.ts write \
             --head-sha "${{ github.sha }}" \
             --platform darwin-arm64 \
@@ -572,7 +576,8 @@ jobs:
             --macos-notarization-submission-id "$notarization_submission_id" \
             --macos-notarization-status "$notarization_status" \
             --file sandbox-host \
-            --file rootfs/alpine-3.23.qcow2
+            --file rootfs/alpine-3.23.qcow2 \
+            --file rootfs/alpine-3.23.environment-facts.json
 
       - name: Upload release platform artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
