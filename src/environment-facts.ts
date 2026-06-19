@@ -89,7 +89,7 @@ export type SandboxNetworkEgressEnvironmentFact =
     };
 
 export type SandboxCommandEnvironmentFact = {
-  readonly source: "config";
+  readonly source: SandboxEnvironmentFactSource;
   readonly topic: "command";
   readonly relation: "exists";
   readonly value: SandboxEnvironmentCommand;
@@ -212,15 +212,6 @@ const alpine323ImageFacts = [
   ...alpine323ImageIdentityFacts,
   ...alpine323CommandFacts,
 ] as const satisfies readonly SandboxEnvironmentFact[];
-
-export function parseBuiltInRootfsName(value: string): BuiltInRootfsName {
-  switch (value) {
-    case "alpine:3.23":
-      return value;
-    default:
-      throw new Error(`unsupported built-in rootfs: ${value}`);
-  }
-}
 
 export function builtInRootfsApkPackages(
   name: BuiltInRootfsName,

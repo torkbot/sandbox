@@ -280,7 +280,9 @@ test("default rootfs includes agent utility packages", async () => {
   ]) {
     assert.ok(packages.includes(packageName), `expected rootfs package ${packageName}`);
   }
-  assert.match(buildRootfsScript, /builtInRootfsApkPackages\(image\)/);
+  assert.match(buildRootfsScript, /const image = process\.env\.SANDBOX_ROOTFS_IMAGE \?\? "alpine:3\.23"/);
+  assert.match(buildRootfsScript, /const rootfsName: BuiltInRootfsName = "alpine:3\.23"/);
+  assert.match(buildRootfsScript, /builtInRootfsApkPackages\(rootfsName\)/);
   assert.equal(builtInRootfsGithubCliVersion("alpine:3.23"), "2.83.0");
   assert.match(buildRootfsScript, /gh_\$\{githubCliVersion\}_linux_/);
 });
@@ -303,7 +305,7 @@ test("default rootfs facts are tied to rootfs build inputs", async () => {
     "utf8",
   );
 
-  assert.match(buildRootfsScript, /builtInRootfsEnvironmentFactsManifest\(image\)/);
+  assert.match(buildRootfsScript, /builtInRootfsEnvironmentFactsManifest\(rootfsName\)/);
   assert.match(buildQcow2Script, /rootfsEnvironmentFactsArtifactName/);
   assert.match(preparePackagesScript, /alpine-3\.23\.environment-facts\.json/);
   assert.match(ciWorkflow, /--file rootfs\/alpine-3\.23\.environment-facts\.json/);

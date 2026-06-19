@@ -484,10 +484,53 @@ test("environment facts can be recovered from a running VM", async (t) => {
   });
   assertIncludesFact(facts, {
     source: "guest",
+    topic: "command",
+    relation: "exists",
+    value: "git",
+  });
+  assertIncludesFact(facts, {
+    source: "guest",
     topic: "rootfs",
     relation: "mount-mode",
     value: "read-write",
   });
+});
+
+test("environment facts parse os-release as data", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.ephemeral({
+      base: rootfs.builtIn("alpine:3.23"),
+    }),
+  }).boot();
+
+  const write = await sandbox.exec("/bin/sh", [
+    "-lc",
+    "printf '%s\\n' 'ID=$(touch /tmp/os-release-executed)' 'VERSION_ID=3.23' >/etc/os-release",
+  ]);
+  assert.equal(
+    write.exitCode,
+    0,
+    `stdout:\n${write.stdout}\nstderr:\n${write.stderr}`,
+  );
+
+  await assert.rejects(
+    sandbox.environmentFacts(),
+    /unsupported guest distro environment fact/,
+  );
+
+  const check = await sandbox.exec("/bin/sh", [
+    "-lc",
+    "test ! -e /tmp/os-release-executed",
+  ]);
+  assert.equal(
+    check.exitCode,
+    0,
+    `stdout:\n${check.stdout}\nstderr:\n${check.stderr}`,
+  );
 });
 
 test("boot options provide instance-specific virtual mounts", async (t) => {

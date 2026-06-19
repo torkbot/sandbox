@@ -6,9 +6,11 @@ import {
   builtInRootfsEnvironmentCommandFacts,
   builtInRootfsEnvironmentIdentityFacts,
   type BuiltInRootfsName,
+  type SandboxCommandEnvironmentFact,
   type SandboxDistroEnvironmentFact,
   type SandboxDistroVersion,
   type SandboxDistroVersionEnvironmentFact,
+  type SandboxEnvironmentCommand,
   type SandboxEnvironmentFact,
   type SandboxNetworkEgressEnvironmentFact,
   type SandboxPackageManagerEnvironmentFact,
@@ -813,7 +815,9 @@ function environmentFactsForDefinition(
 
   facts.push(configRootfsWriteFact(options.rootfs));
   facts.push(configNetworkEgressFact(options.network));
-  facts.push(...builtInRootfsEnvironmentCommandFacts(base.name));
+  if (options.rootfs.kind === "built-in-rootfs") {
+    facts.push(...builtInRootfsEnvironmentCommandFacts(base.name));
+  }
 
   return facts;
 }
@@ -875,15 +879,36 @@ function configNetworkEgressFact(
   };
 }
 
+const GUEST_ENVIRONMENT_COMMANDS: readonly SandboxEnvironmentCommand[] =
+  builtInRootfsEnvironmentCommandFacts("alpine:3.23").map((fact) => fact.value);
+const GUEST_ENVIRONMENT_COMMAND_ARGS =
+  GUEST_ENVIRONMENT_COMMANDS.map(shellSingleQuote).join(" ");
+
 const GUEST_ENVIRONMENT_FACT_SCRIPT = [
   "set -eu",
-  ". /etc/os-release",
-  "printf 'distro=%s\\n' \"$ID\"",
-  "printf 'distro-version=%s\\n' \"$VERSION_ID\"",
+  "os_release_value() {",
+  "  awk -F= -v key=\"$1\" '",
+  "    $1 == key {",
+  "      value = substr($0, index($0, \"=\") + 1)",
+  "      if (value ~ /^\"/ && value ~ /\"$/) {",
+  "        value = substr(value, 2, length(value) - 2)",
+  "      }",
+  "      print value",
+  "      found = 1",
+  "      exit",
+  "    }",
+  "    END { if (found != 1) exit 1 }",
+  "  ' /etc/os-release",
+  "}",
+  "distro_id=$(os_release_value ID)",
+  "distro_version=$(os_release_value VERSION_ID)",
+  "printf 'distro=%s\\n' \"$distro_id\"",
+  "printf 'distro-version=%s\\n' \"$distro_version\"",
   "command -v apk >/dev/null 2>&1",
   "printf 'package-manager=apk\\n'",
   "test -x /bin/sh",
   "printf 'shell=/bin/sh\\n'",
+  `for sandbox_command in ${GUEST_ENVIRONMENT_COMMAND_ARGS}; do if command -v "$sandbox_command" >/dev/null 2>&1; then printf 'command=%s\\n' "$sandbox_command"; fi; done`,
   "root_options=$(awk '$2 == \"/\" { print $4; exit }' /proc/mounts)",
   [
     "case \",$root_options,\" in",
@@ -893,6 +918,10 @@ const GUEST_ENVIRONMENT_FACT_SCRIPT = [
     "esac",
   ].join(" "),
 ].join("\n");
+
+function shellSingleQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
 
 function parseGuestEnvironmentFacts(text: string): readonly SandboxEnvironmentFact[] {
   const facts: SandboxEnvironmentFact[] = [];
@@ -925,6 +954,9 @@ function parseGuestEnvironmentFacts(text: string): readonly SandboxEnvironmentFa
         break;
       case "rootfs":
         facts.push(guestRootfsMountFact(value));
+        break;
+      case "command":
+        facts.push(guestCommandFact(value));
         break;
       default:
         throw new Error(`unsupported sandbox environment fact key: ${key}`);
@@ -1001,6 +1033,25 @@ function guestRootfsMountFact(value: string): SandboxRootfsEnvironmentFact {
     relation: "mount-mode",
     value,
   };
+}
+
+function guestCommandFact(value: string): SandboxCommandEnvironmentFact {
+  if (!isSandboxEnvironmentCommand(value)) {
+    throw new Error(`unsupported guest command environment fact: ${value}`);
+  }
+
+  return {
+    source: "guest",
+    topic: "command",
+    relation: "exists",
+    value,
+  };
+}
+
+function isSandboxEnvironmentCommand(
+  value: string,
+): value is SandboxEnvironmentCommand {
+  return GUEST_ENVIRONMENT_COMMANDS.includes(value as SandboxEnvironmentCommand);
 }
 
 export function defineSandbox(options: SandboxDefinitionOptions): SandboxDefinition {

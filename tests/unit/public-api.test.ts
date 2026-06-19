@@ -141,66 +141,6 @@ test("defineSandbox exposes config-derived environment facts", () => {
       relation: "requires",
       value: "policy-grant",
     },
-    {
-      source: "config",
-      topic: "command",
-      relation: "exists",
-      value: "bash",
-    },
-    {
-      source: "config",
-      topic: "command",
-      relation: "exists",
-      value: "curl",
-    },
-    {
-      source: "config",
-      topic: "command",
-      relation: "exists",
-      value: "git",
-    },
-    {
-      source: "config",
-      topic: "command",
-      relation: "exists",
-      value: "gh",
-    },
-    {
-      source: "config",
-      topic: "command",
-      relation: "exists",
-      value: "jq",
-    },
-    {
-      source: "config",
-      topic: "command",
-      relation: "exists",
-      value: "node",
-    },
-    {
-      source: "config",
-      topic: "command",
-      relation: "exists",
-      value: "npm",
-    },
-    {
-      source: "config",
-      topic: "command",
-      relation: "exists",
-      value: "python3",
-    },
-    {
-      source: "config",
-      topic: "command",
-      relation: "exists",
-      value: "pip3",
-    },
-    {
-      source: "config",
-      topic: "command",
-      relation: "exists",
-      value: "rg",
-    },
   ]);
 });
 
@@ -227,11 +167,23 @@ test("environment facts distinguish rootfs and network semantics", () => {
     relation: "is",
     value: "not-configured",
   });
+  assertIncludesFact(readonlyFacts, {
+    source: "config",
+    topic: "command",
+    relation: "exists",
+    value: "git",
+  });
   assertIncludesFact(cowFacts, {
     source: "config",
     topic: "rootfs",
     relation: "write-mode",
     value: "writable-persistent-cow",
+  });
+  assertDoesNotIncludeFact(cowFacts, {
+    source: "config",
+    topic: "command",
+    relation: "exists",
+    value: "git",
   });
 });
 
@@ -562,6 +514,22 @@ function assertIncludesFact(
         && fact.value === expected.value;
     }),
     `expected environment fact ${JSON.stringify(expected)} in ${JSON.stringify(facts)}`,
+  );
+}
+
+function assertDoesNotIncludeFact(
+  facts: readonly SandboxEnvironmentFact[],
+  expected: SandboxEnvironmentFact,
+): void {
+  assert.equal(
+    facts.some((fact) => {
+      return fact.source === expected.source
+        && fact.topic === expected.topic
+        && fact.relation === expected.relation
+        && fact.value === expected.value;
+    }),
+    false,
+    `unexpected environment fact ${JSON.stringify(expected)} in ${JSON.stringify(facts)}`,
   );
 }
 

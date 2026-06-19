@@ -6,19 +6,20 @@ import {
   builtInRootfsApkPackages,
   builtInRootfsEnvironmentFactsManifest,
   builtInRootfsGithubCliVersion,
-  parseBuiltInRootfsName,
   rootfsEnvironmentFactsManifestFile,
+  type BuiltInRootfsName,
 } from "../src/environment-facts.ts";
 
 const repoRoot = resolve(import.meta.dirname, "..");
-const image = parseBuiltInRootfsName(process.env.SANDBOX_ROOTFS_IMAGE ?? "alpine:3.23");
+const image = process.env.SANDBOX_ROOTFS_IMAGE ?? "alpine:3.23";
+const rootfsName: BuiltInRootfsName = "alpine:3.23";
 const outDir = resolve(repoRoot, process.env.SANDBOX_ROOTFS_OUT_DIR ?? "dist/rootfs/alpine-3.23");
 const initPath = resolve(
   repoRoot,
   process.env.SANDBOX_INIT_BINARY_PATH ?? `dist/init/${guestTarget()}/sandbox-init`,
 );
-const agentPackages = builtInRootfsApkPackages(image);
-const githubCliVersion = builtInRootfsGithubCliVersion(image);
+const agentPackages = builtInRootfsApkPackages(rootfsName);
+const githubCliVersion = builtInRootfsGithubCliVersion(rootfsName);
 
 await rm(outDir, { recursive: true, force: true });
 await mkdir(outDir, { recursive: true });
@@ -72,7 +73,7 @@ await chmod(resolve(outDir, "tmp"), 0o1777);
 await mkdir(resolve(outDir, "workspace"), { recursive: true });
 await writeFile(
   resolve(outDir, rootfsEnvironmentFactsManifestFile),
-  `${JSON.stringify(builtInRootfsEnvironmentFactsManifest(image), null, 2)}\n`,
+  `${JSON.stringify(builtInRootfsEnvironmentFactsManifest(rootfsName), null, 2)}\n`,
 );
 
 console.log(`rootfs directory written to ${outDir}`);
