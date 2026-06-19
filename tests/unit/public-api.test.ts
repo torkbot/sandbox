@@ -7,6 +7,7 @@ import {
   rootfs,
   type SandboxFileSystem,
   type SandboxBlockStore,
+  type SandboxEnvironmentFact,
   type SandboxWritableFileSystem,
 } from "../../src/index.ts";
 
@@ -72,6 +73,165 @@ test("rootfs.ephemeral makes writable rootfs persistence explicit", () => {
     kind: "ephemeral-rootfs",
     base: rootfs.builtIn("alpine:3.23"),
     maxDirtyBytes: 64 * 1024,
+  });
+});
+
+test("defineSandbox exposes config-derived environment facts", () => {
+  const sandbox = defineSandbox({
+    rootfs: rootfs.ephemeral({
+      base: rootfs.builtIn("alpine:3.23"),
+    }),
+    network: network.policy((conn) => {
+      conn.accept();
+    }),
+  });
+
+  const facts = sandbox.environmentFacts();
+  const first = facts[0];
+
+  assert.notEqual(first, undefined);
+
+  if (first === undefined) {
+    throw new Error("expected at least one environment fact");
+  }
+
+  const typedFirst: SandboxEnvironmentFact = first;
+
+  assert.equal(typedFirst.source, "config");
+  assert.deepEqual(facts, [
+    {
+      source: "config",
+      topic: "rootfs-image",
+      relation: "is",
+      value: "alpine:3.23",
+    },
+    {
+      source: "config",
+      topic: "distro",
+      relation: "is",
+      value: "alpine",
+    },
+    {
+      source: "config",
+      topic: "distro-version",
+      relation: "is",
+      value: "3.23",
+    },
+    {
+      source: "config",
+      topic: "package-manager",
+      relation: "is",
+      value: "apk",
+    },
+    {
+      source: "config",
+      topic: "shell",
+      relation: "is",
+      value: "/bin/sh",
+    },
+    {
+      source: "config",
+      topic: "rootfs",
+      relation: "write-mode",
+      value: "writable-ephemeral",
+    },
+    {
+      source: "config",
+      topic: "network-egress",
+      relation: "requires",
+      value: "policy-grant",
+    },
+    {
+      source: "config",
+      topic: "command",
+      relation: "exists",
+      value: "bash",
+    },
+    {
+      source: "config",
+      topic: "command",
+      relation: "exists",
+      value: "curl",
+    },
+    {
+      source: "config",
+      topic: "command",
+      relation: "exists",
+      value: "git",
+    },
+    {
+      source: "config",
+      topic: "command",
+      relation: "exists",
+      value: "gh",
+    },
+    {
+      source: "config",
+      topic: "command",
+      relation: "exists",
+      value: "jq",
+    },
+    {
+      source: "config",
+      topic: "command",
+      relation: "exists",
+      value: "node",
+    },
+    {
+      source: "config",
+      topic: "command",
+      relation: "exists",
+      value: "npm",
+    },
+    {
+      source: "config",
+      topic: "command",
+      relation: "exists",
+      value: "python3",
+    },
+    {
+      source: "config",
+      topic: "command",
+      relation: "exists",
+      value: "pip3",
+    },
+    {
+      source: "config",
+      topic: "command",
+      relation: "exists",
+      value: "rg",
+    },
+  ]);
+});
+
+test("environment facts distinguish rootfs and network semantics", () => {
+  const readonlyFacts = defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).environmentFacts();
+  const cowFacts = defineSandbox({
+    rootfs: rootfs.cow({
+      base: rootfs.builtIn("alpine:3.23"),
+      writable: memoryBlockStore(),
+    }),
+  }).environmentFacts();
+
+  assertIncludesFact(readonlyFacts, {
+    source: "config",
+    topic: "rootfs",
+    relation: "write-mode",
+    value: "read-only",
+  });
+  assertIncludesFact(readonlyFacts, {
+    source: "config",
+    topic: "network-egress",
+    relation: "is",
+    value: "not-configured",
+  });
+  assertIncludesFact(cowFacts, {
+    source: "config",
+    topic: "rootfs",
+    relation: "write-mode",
+    value: "writable-persistent-cow",
   });
 });
 
@@ -389,6 +549,21 @@ test("network.policy creates an opaque connection policy", () => {
 
   assert.equal(policy.kind, "network-policy");
 });
+
+function assertIncludesFact(
+  facts: readonly SandboxEnvironmentFact[],
+  expected: SandboxEnvironmentFact,
+): void {
+  assert.ok(
+    facts.some((fact) => {
+      return fact.source === expected.source
+        && fact.topic === expected.topic
+        && fact.relation === expected.relation
+        && fact.value === expected.value;
+    }),
+    `expected environment fact ${JSON.stringify(expected)} in ${JSON.stringify(facts)}`,
+  );
+}
 
 function readOnlyFileSystem(): SandboxFileSystem {
   return {

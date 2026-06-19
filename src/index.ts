@@ -149,6 +149,117 @@ export type EphemeralRootfsConfig = {
 
 export type Rootfs = BuiltInRootfsConfig | CowRootfsConfig | EphemeralRootfsConfig;
 
+export type SandboxEnvironmentFactSource = "config" | "guest";
+
+export type SandboxDistroVersion = "3.23" | `3.23.${number}`;
+
+/**
+ * Commands that the current built-in agent rootfs intentionally exposes as
+ * stable developer-facing tools. The list is affirmative rather than
+ * exhaustive: absence from this union means the command is not part of this
+ * metadata contract, not that the command cannot exist in the guest.
+ */
+export type SandboxEnvironmentCommand =
+  | "bash"
+  | "curl"
+  | "git"
+  | "gh"
+  | "jq"
+  | "node"
+  | "npm"
+  | "pip3"
+  | "python3"
+  | "rg";
+
+export type SandboxDistroEnvironmentFact = {
+  readonly source: SandboxEnvironmentFactSource;
+  readonly topic: "distro";
+  readonly relation: "is";
+  readonly value: "alpine";
+};
+
+export type SandboxDistroVersionEnvironmentFact = {
+  readonly source: SandboxEnvironmentFactSource;
+  readonly topic: "distro-version";
+  readonly relation: "is";
+  readonly value: SandboxDistroVersion;
+};
+
+export type SandboxRootfsImageEnvironmentFact = {
+  readonly source: "config";
+  readonly topic: "rootfs-image";
+  readonly relation: "is";
+  readonly value: BuiltInRootfsName;
+};
+
+export type SandboxPackageManagerEnvironmentFact = {
+  readonly source: SandboxEnvironmentFactSource;
+  readonly topic: "package-manager";
+  readonly relation: "is";
+  readonly value: "apk";
+};
+
+export type SandboxShellEnvironmentFact = {
+  readonly source: SandboxEnvironmentFactSource;
+  readonly topic: "shell";
+  readonly relation: "is";
+  readonly value: "/bin/sh";
+};
+
+export type SandboxRootfsEnvironmentFact =
+  | {
+      readonly source: "config";
+      readonly topic: "rootfs";
+      readonly relation: "write-mode";
+      readonly value:
+        | "read-only"
+        | "writable-ephemeral"
+        | "writable-persistent-cow";
+    }
+  | {
+      readonly source: "guest";
+      readonly topic: "rootfs";
+      readonly relation: "mount-mode";
+      readonly value: "read-only" | "read-write";
+    };
+
+export type SandboxNetworkEgressEnvironmentFact =
+  | {
+      readonly source: "config";
+      readonly topic: "network-egress";
+      readonly relation: "is";
+      readonly value: "not-configured";
+    }
+  | {
+      readonly source: "config";
+      readonly topic: "network-egress";
+      readonly relation: "requires";
+      readonly value: "policy-grant";
+    };
+
+export type SandboxCommandEnvironmentFact = {
+  readonly source: "config";
+  readonly topic: "command";
+  readonly relation: "exists";
+  readonly value: SandboxEnvironmentCommand;
+};
+
+/**
+ * Structured statement about a sandbox execution environment.
+ *
+ * Facts are intentionally small triples with required provenance so callers can
+ * render them into prompts, logs, or policy decisions without parsing prose.
+ */
+export type SandboxEnvironmentFact =
+  | SandboxDistroEnvironmentFact
+  | SandboxDistroVersionEnvironmentFact
+  | SandboxRootfsImageEnvironmentFact
+  | SandboxPackageManagerEnvironmentFact
+  | SandboxShellEnvironmentFact
+  | SandboxRootfsEnvironmentFact
+  | SandboxNetworkEgressEnvironmentFact
+  | SandboxCommandEnvironmentFact;
+
 export type Qcow2RootfsImage = {
   readonly kind: "rootfs-image";
   readonly format: "qcow2";
@@ -497,6 +608,10 @@ export interface SandboxBootOptions {
 }
 
 export interface SandboxDefinition {
+  /**
+   * Returns facts recoverable from sandbox configuration without launching a VM.
+   */
+  environmentFacts(): readonly SandboxEnvironmentFact[];
   boot(options?: SandboxBootOptions): Promise<SandboxInstance>;
 }
 
@@ -566,6 +681,10 @@ export type SandboxSignal =
   | "SIGKILL";
 
 export interface SandboxInstance {
+  /**
+   * Returns config-derived facts plus facts observed from the running guest.
+   */
+  environmentFacts(): Promise<readonly SandboxEnvironmentFact[]>;
   exec(
     command: string,
     args?: readonly string[],
@@ -768,6 +887,258 @@ export const network = {
   },
 };
 
+const ALPINE_323_COMMANDS = [
+  "bash",
+  "curl",
+  "git",
+  "gh",
+  "jq",
+  "node",
+  "npm",
+  "python3",
+  "pip3",
+  "rg",
+] as const satisfies readonly SandboxEnvironmentCommand[];
+
+function environmentFactsForDefinition(
+  options: SandboxDefinitionOptions,
+): readonly SandboxEnvironmentFact[] {
+  const facts: SandboxEnvironmentFact[] = [];
+  const base = rootfsBase(options.rootfs);
+
+  facts.push({
+    source: "config",
+    topic: "rootfs-image",
+    relation: "is",
+    value: base.name,
+  });
+  facts.push({
+    source: "config",
+    topic: "distro",
+    relation: "is",
+    value: "alpine",
+  });
+  facts.push({
+    source: "config",
+    topic: "distro-version",
+    relation: "is",
+    value: "3.23",
+  });
+  facts.push({
+    source: "config",
+    topic: "package-manager",
+    relation: "is",
+    value: "apk",
+  });
+  facts.push({
+    source: "config",
+    topic: "shell",
+    relation: "is",
+    value: "/bin/sh",
+  });
+  facts.push(configRootfsWriteFact(options.rootfs));
+  facts.push(configNetworkEgressFact(options.network));
+  facts.push(...ALPINE_323_COMMANDS.map(configCommandFact));
+
+  return facts;
+}
+
+function configCommandFact(
+  value: SandboxEnvironmentCommand,
+): SandboxCommandEnvironmentFact {
+  return {
+    source: "config",
+    topic: "command",
+    relation: "exists",
+    value,
+  };
+}
+
+function rootfsBase(rootfs: Rootfs): BuiltInRootfsConfig {
+  switch (rootfs.kind) {
+    case "built-in-rootfs":
+      return rootfs;
+    case "cow-rootfs":
+      return rootfs.source.base;
+    case "ephemeral-rootfs":
+      return rootfs.base;
+  }
+}
+
+function configRootfsWriteFact(rootfs: Rootfs): SandboxRootfsEnvironmentFact {
+  switch (rootfs.kind) {
+    case "built-in-rootfs":
+      return {
+        source: "config",
+        topic: "rootfs",
+        relation: "write-mode",
+        value: "read-only",
+      };
+    case "cow-rootfs":
+      return {
+        source: "config",
+        topic: "rootfs",
+        relation: "write-mode",
+        value: "writable-persistent-cow",
+      };
+    case "ephemeral-rootfs":
+      return {
+        source: "config",
+        topic: "rootfs",
+        relation: "write-mode",
+        value: "writable-ephemeral",
+      };
+  }
+}
+
+function configNetworkEgressFact(
+  network: NetworkPolicy | undefined,
+): SandboxNetworkEgressEnvironmentFact {
+  if (network === undefined) {
+    return {
+      source: "config",
+      topic: "network-egress",
+      relation: "is",
+      value: "not-configured",
+    };
+  }
+
+  return {
+    source: "config",
+    topic: "network-egress",
+    relation: "requires",
+    value: "policy-grant",
+  };
+}
+
+const GUEST_ENVIRONMENT_FACT_SCRIPT = [
+  "set -eu",
+  ". /etc/os-release",
+  "printf 'distro=%s\\n' \"$ID\"",
+  "printf 'distro-version=%s\\n' \"$VERSION_ID\"",
+  "command -v apk >/dev/null 2>&1",
+  "printf 'package-manager=apk\\n'",
+  "test -x /bin/sh",
+  "printf 'shell=/bin/sh\\n'",
+  "root_options=$(awk '$2 == \"/\" { print $4; exit }' /proc/mounts)",
+  [
+    "case \",$root_options,\" in",
+    "*,rw,*) printf 'rootfs=read-write\\n' ;;",
+    "*,ro,*) printf 'rootfs=read-only\\n' ;;",
+    "*) echo \"unable to determine rootfs mount mode: $root_options\" >&2; exit 1 ;;",
+    "esac",
+  ].join(" "),
+].join("\n");
+
+function parseGuestEnvironmentFacts(text: string): readonly SandboxEnvironmentFact[] {
+  const facts: SandboxEnvironmentFact[] = [];
+
+  for (const line of text.split("\n")) {
+    if (line.length === 0) {
+      continue;
+    }
+
+    const separator = line.indexOf("=");
+    if (separator === -1) {
+      throw new Error(`invalid sandbox environment fact line: ${line}`);
+    }
+
+    const key = line.slice(0, separator);
+    const value = line.slice(separator + 1);
+
+    switch (key) {
+      case "distro":
+        facts.push(guestDistroFact(value));
+        break;
+      case "distro-version":
+        facts.push(guestDistroVersionFact(value));
+        break;
+      case "package-manager":
+        facts.push(guestPackageManagerFact(value));
+        break;
+      case "shell":
+        facts.push(guestShellFact(value));
+        break;
+      case "rootfs":
+        facts.push(guestRootfsMountFact(value));
+        break;
+      default:
+        throw new Error(`unsupported sandbox environment fact key: ${key}`);
+    }
+  }
+
+  return facts;
+}
+
+function guestDistroFact(value: string): SandboxDistroEnvironmentFact {
+  if (value !== "alpine") {
+    throw new Error(`unsupported guest distro environment fact: ${value}`);
+  }
+
+  return {
+    source: "guest",
+    topic: "distro",
+    relation: "is",
+    value,
+  };
+}
+
+function guestDistroVersionFact(value: string): SandboxDistroVersionEnvironmentFact {
+  if (!isSandboxDistroVersion(value)) {
+    throw new Error(`unsupported guest distro version environment fact: ${value}`);
+  }
+
+  return {
+    source: "guest",
+    topic: "distro-version",
+    relation: "is",
+    value,
+  };
+}
+
+function isSandboxDistroVersion(value: string): value is SandboxDistroVersion {
+  return value === "3.23" || /^3\.23\.[0-9]+$/.test(value);
+}
+
+function guestPackageManagerFact(value: string): SandboxPackageManagerEnvironmentFact {
+  if (value !== "apk") {
+    throw new Error(`unsupported guest package manager environment fact: ${value}`);
+  }
+
+  return {
+    source: "guest",
+    topic: "package-manager",
+    relation: "is",
+    value,
+  };
+}
+
+function guestShellFact(value: string): SandboxShellEnvironmentFact {
+  if (value !== "/bin/sh") {
+    throw new Error(`unsupported guest shell environment fact: ${value}`);
+  }
+
+  return {
+    source: "guest",
+    topic: "shell",
+    relation: "is",
+    value,
+  };
+}
+
+function guestRootfsMountFact(value: string): SandboxRootfsEnvironmentFact {
+  if (value !== "read-only" && value !== "read-write") {
+    throw new Error(`unsupported guest rootfs mount environment fact: ${value}`);
+  }
+
+  return {
+    source: "guest",
+    topic: "rootfs",
+    relation: "mount-mode",
+    value,
+  };
+}
+
 export function defineSandbox(options: SandboxDefinitionOptions): SandboxDefinition {
   validateSandboxDefinitionOptions(options);
   return new DefinedSandbox(options);
@@ -785,11 +1156,16 @@ class DefinedSandbox implements SandboxDefinition {
     this.#options = options;
   }
 
+  environmentFacts(): readonly SandboxEnvironmentFact[] {
+    return environmentFactsForDefinition(this.#options);
+  }
+
   async boot(options: SandboxBootOptions = {}): Promise<SandboxInstance> {
     validateSandboxBootOptions(options);
     const networkPolicy = this.#options.network === undefined
       ? undefined
       : createNetworkPolicyHookRegistration(this.#options.network);
+    const configEnvironmentFacts = environmentFactsForDefinition(this.#options);
     const launchOptions = await toInternalSandboxOptions(
       this.#options,
       options,
@@ -804,7 +1180,7 @@ class DefinedSandbox implements SandboxDefinition {
         new Map((networkPolicy?.hooks ?? []).map((hook) => [hook.id, hook])),
         networkPolicy?.connectionHook,
       );
-      return new HostBackedSandboxVm(hostVm, launchOptions);
+      return new HostBackedSandboxVm(hostVm, launchOptions, configEnvironmentFacts);
     } catch (error) {
       throw error;
     }
@@ -817,6 +1193,7 @@ class HostBackedSandboxVm implements SandboxVm {
   readonly #exec: ControlBackedSandboxExec;
   readonly #rootExec: ControlBackedSandboxExec;
   readonly #options: InternalSandboxOptions;
+  readonly #configEnvironmentFacts: readonly SandboxEnvironmentFact[];
 
   readonly #hostVm: {
     readonly hasControlSocket: boolean;
@@ -838,9 +1215,11 @@ class HostBackedSandboxVm implements SandboxVm {
       terminateHostForTest?(): Promise<void>;
     },
     options: InternalSandboxOptions,
+    configEnvironmentFacts: readonly SandboxEnvironmentFact[],
   ) {
     this.#hostVm = hostVm;
     this.#options = options;
+    this.#configEnvironmentFacts = configEnvironmentFacts;
     this.control = new HostControlTransport({
       connected: hostVm.hasControlSocket,
       channel: hostVm,
@@ -858,6 +1237,24 @@ class HostBackedSandboxVm implements SandboxVm {
         },
       };
     }
+  }
+
+  async environmentFacts(): Promise<readonly SandboxEnvironmentFact[]> {
+    const result = await this.#rootExec.exec("/bin/sh", [
+      "-lc",
+      GUEST_ENVIRONMENT_FACT_SCRIPT,
+    ]);
+
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `sandbox environment fact introspection failed with exit code ${result.exitCode}: ${result.stderr}`,
+      );
+    }
+
+    return [
+      ...this.#configEnvironmentFacts,
+      ...parseGuestEnvironmentFacts(result.stdout),
+    ];
   }
 
   async close(): Promise<void> {
