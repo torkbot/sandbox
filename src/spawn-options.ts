@@ -1,5 +1,18 @@
 import type { InternalOutboundNetworkRule } from "./launch-options.ts";
 
+export type HostSpawnMount =
+  | {
+      readonly kind: "virtual-fs";
+      readonly path: string;
+      readonly writable?: boolean;
+    }
+  | {
+      readonly kind: "host-directory";
+      readonly path: string;
+      readonly source: string;
+      readonly access: "ro" | "rw";
+    };
+
 export type HostSpawnSandboxOptions = {
   readonly name?: string;
   readonly hostname: string;
@@ -25,11 +38,7 @@ export type HostSpawnSandboxOptions = {
       readonly maxDirtyBytes: number;
     };
   };
-  readonly mounts?: readonly {
-    readonly kind: "virtual-fs";
-    readonly path: string;
-    readonly writable?: boolean;
-  }[];
+  readonly mounts?: readonly HostSpawnMount[];
   readonly network?: {
     readonly outbound?: {
       readonly policy: "deny";

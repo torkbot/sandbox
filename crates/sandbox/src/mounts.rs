@@ -11,6 +11,7 @@ pub struct MountTable {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlannedMount {
     VirtualFs,
+    HostDirectory,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +26,9 @@ impl MountTable {
         for mount in mounts {
             let (path, planned) = match mount {
                 MountSpec::VirtualFs { path, .. } => (path.as_str(), PlannedMount::VirtualFs),
+                MountSpec::HostDirectory { path, .. } => {
+                    (path.as_str(), PlannedMount::HostDirectory)
+                }
             };
 
             if path == "/" {

@@ -27,6 +27,17 @@ test("fs.virtual wraps user-space filesystems for mounts", () => {
   });
 });
 
+test("fs.bind creates an explicit host directory mount source", () => {
+  assert.deepEqual(fs.bind({
+    source: "/tmp/sandbox-workspace",
+    access: "ro",
+  }), {
+    kind: "host-directory",
+    source: "/tmp/sandbox-workspace",
+    access: "ro",
+  });
+});
+
 test("rootfs.cow couples a built-in base with writable block storage", () => {
   const blockStore = memoryBlockStore();
   const composed = rootfs.compose({

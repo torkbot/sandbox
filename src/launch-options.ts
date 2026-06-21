@@ -47,10 +47,18 @@ export interface InternalNetworkConfig {
   };
 }
 
-export interface InternalMount {
-  readonly path: string;
-  readonly fileSystem: SandboxFileSystem;
-}
+export type InternalMount =
+  | {
+      readonly kind: "virtual-fs";
+      readonly path: string;
+      readonly fileSystem: SandboxFileSystem;
+    }
+  | {
+      readonly kind: "host-directory";
+      readonly path: string;
+      readonly source: string;
+      readonly access: "ro" | "rw";
+    };
 
 export interface InternalSandboxOptions {
   readonly resources?: {

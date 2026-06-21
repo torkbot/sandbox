@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import {
   defineSandbox,
@@ -555,6 +558,45 @@ test("boot options provide instance-specific virtual mounts", async (t) => {
 
   assert.equal(result.exitCode, 0, result.stderr);
   assert.equal(result.stdout, "lane-private");
+});
+
+test("host directory bind mounts use native virtio-fs access modes", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const readOnlySource = await mkdtemp(join(tmpdir(), "sandbox-bind-ro-"));
+  const readWriteSource = await mkdtemp(join(tmpdir(), "sandbox-bind-rw-"));
+  t.after(async () => {
+    await rm(readOnlySource, { recursive: true, force: true });
+    await rm(readWriteSource, { recursive: true, force: true });
+  });
+  await writeFile(join(readOnlySource, "note.txt"), "from-host\n");
+  await writeFile(join(readWriteSource, "before.txt"), "before\n");
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot({
+    mounts: {
+      "/tmp/bind-ro": fs.bind({ source: readOnlySource, access: "ro" }),
+      "/tmp/bind-rw": fs.bind({ source: readWriteSource, access: "rw" }),
+    },
+  });
+
+  const result = await sandbox.exec("/bin/sh", [
+    "-lc",
+    [
+      "cat /tmp/bind-ro/note.txt",
+      "if sh -c 'printf blocked > /tmp/bind-ro/blocked.txt' 2>/tmp/ro.err; then exit 13; fi",
+      "cat /tmp/bind-rw/before.txt",
+      "printf from-guest > /tmp/bind-rw/after.txt",
+    ].join("\n"),
+  ]);
+
+  assert.equal(result.exitCode, 0, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+  assert.equal(result.stdout, "from-host\nbefore\n");
+  assert.equal(result.stderr, "");
+  assert.equal(await readFile(join(readWriteSource, "after.txt"), "utf8"), "from-guest");
 });
 
 test("missing writable mount directories are created before mounting virtual filesystems", async (t) => {
