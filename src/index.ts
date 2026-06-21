@@ -26,10 +26,11 @@ import {
   isSandboxPosixFileSystem,
   isSandboxWritableFileSystem,
 } from "./vfs.ts";
-import type { HostSpawnSandboxOptions } from "./spawn-options.ts";
+import type { HostSpawnMount, HostSpawnSandboxOptions } from "./spawn-options.ts";
 import type { ControlBackedSandboxProcess, ControlBackedSandboxPty, SandboxControl } from "./control.ts";
 import type { SandboxControlEvent } from "./control-codec.ts";
 import type {
+  InternalMount,
   InternalNetworkConfig,
   InternalSandboxOptions,
   RegisteredHttpRequestHeadersHook,
@@ -193,6 +194,14 @@ export type SandboxWritableFileSystemSource = {
   readonly kind: "virtual-fs";
   readonly fileSystem: SandboxPosixFileSystem;
 };
+
+export type SandboxHostDirectorySource = {
+  readonly kind: "host-directory";
+  readonly source: string;
+  readonly access: "ro" | "rw";
+};
+
+export type SandboxMountSource = SandboxFileSystemSource | SandboxHostDirectorySource;
 
 export type SandboxBlockRange = {
   readonly start: bigint;
@@ -520,7 +529,7 @@ export interface SandboxResourceLimits {
 }
 
 export interface SandboxBootOptions {
-  readonly mounts?: Readonly<Record<string, SandboxFileSystemSource>>;
+  readonly mounts?: Readonly<Record<string, SandboxMountSource>>;
   readonly cwd?: string;
   readonly hostname?: string;
 }
@@ -791,9 +800,18 @@ function virtualFs(fileSystem: SandboxFileSystem): SandboxFileSystemSource {
   };
 }
 
+function bindHostDirectory(options: { readonly source: string; readonly access: "ro" | "rw" }): SandboxHostDirectorySource {
+  return {
+    kind: "host-directory",
+    source: options.source,
+    access: options.access,
+  };
+}
+
 export const fs = {
   memory: createMemoryFileSystem,
   virtual: virtualFs,
+  bind: bindHostDirectory,
 };
 
 export const network = {
@@ -1432,13 +1450,7 @@ function toHostSpawnOptions(
     },
     hostname: options.hostname,
     rootfs: options.rootfs,
-    mounts: options.mounts?.map((mount) => {
-      return {
-        kind: "virtual-fs",
-        path: mount.path,
-        writable: isSandboxWritableFileSystem(mount.fileSystem),
-      };
-    }),
+    mounts: options.mounts?.map((mount) => lowerHostSpawnMount(mount)),
     network,
   };
 }
@@ -1455,13 +1467,46 @@ async function toInternalSandboxOptions(
     cwd: boot.cwd,
     hostname: boot.hostname ?? "sandbox",
     mounts: Object.entries(boot.mounts ?? {}).map(([path, source]) => {
-      return {
-        path,
-        fileSystem: source.fileSystem,
-      };
+      return lowerInternalMount(path, source);
     }),
     network,
   };
+}
+
+function lowerInternalMount(path: string, source: SandboxMountSource): InternalMount {
+  switch (source.kind) {
+    case "virtual-fs":
+      return {
+        kind: "virtual-fs",
+        path,
+        fileSystem: source.fileSystem,
+      };
+    case "host-directory":
+      return {
+        kind: "host-directory",
+        path,
+        source: source.source,
+        access: source.access,
+      };
+  }
+}
+
+function lowerHostSpawnMount(mount: InternalMount): HostSpawnMount {
+  switch (mount.kind) {
+    case "virtual-fs":
+      return {
+        kind: "virtual-fs",
+        path: mount.path,
+        writable: isSandboxWritableFileSystem(mount.fileSystem),
+      };
+    case "host-directory":
+      return {
+        kind: "host-directory",
+        path: mount.path,
+        source: mount.source,
+        access: mount.access,
+      };
+  }
 }
 
 function createNetworkPolicyHookRegistration(policy: NetworkPolicy): NetworkPolicyHookRegistration {
@@ -1915,15 +1960,32 @@ function validateSandboxBootOptions(options: SandboxBootOptions): void {
       throw new Error(`invalid sandbox boot options: duplicate mount path: ${path}`);
     }
     if (
+      source.kind === "virtual-fs"
+      &&
       isSandboxWritableFileSystem(source.fileSystem)
       && !isSandboxPosixFileSystem(source.fileSystem)
     ) {
       throw new Error(`invalid sandbox boot options: writable mount must implement the POSIX filesystem interface: ${path}`);
     }
+    if (source.kind === "host-directory") {
+      validateHostDirectorySource(source);
+    }
     mountPaths.add(path);
   }
   if (options.cwd !== undefined && !options.cwd.startsWith("/")) {
     throw new Error("invalid sandbox boot options: cwd must be absolute");
+  }
+}
+
+function validateHostDirectorySource(source: SandboxHostDirectorySource): void {
+  if (!source.source.startsWith("/")) {
+    throw new Error("invalid sandbox boot options: host directory source must be absolute");
+  }
+  if (source.source.includes("\0")) {
+    throw new Error("invalid sandbox boot options: host directory source must not contain NUL bytes");
+  }
+  if (source.access !== "ro" && source.access !== "rw") {
+    throw new Error("invalid sandbox boot options: host directory access must be 'ro' or 'rw'");
   }
 }
 
@@ -1962,6 +2024,9 @@ function validateInternalSandboxOptions(options: InternalSandboxOptions): void {
     validateGuestPath(mount.path, "mount.path");
     if (mountPaths.has(mount.path)) {
       throw new Error(`invalid sandbox options: duplicate mount path: ${mount.path}`);
+    }
+    if (mount.kind === "host-directory") {
+      validateHostDirectorySource(mount);
     }
     mountPaths.add(mount.path);
   }

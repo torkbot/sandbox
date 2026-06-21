@@ -191,6 +191,36 @@ test("boot rejects writable mounts without POSIX filesystem support", async () =
   );
 });
 
+test("boot rejects host directory mounts without absolute sources", async () => {
+  const sandbox = defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  });
+
+  await assert.rejects(
+    sandbox.boot({
+      mounts: {
+        "/mnt": fs.bind({ source: "workspace", access: "ro" }),
+      },
+    }),
+    /invalid sandbox boot options: host directory source must be absolute/,
+  );
+});
+
+test("boot rejects host directory mounts without explicit access", async () => {
+  const sandbox = defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  });
+
+  await assert.rejects(
+    sandbox.boot({
+      mounts: {
+        "/mnt": fs.bind({ source: "/tmp/workspace", access: "inherit" as "ro" }),
+      },
+    }),
+    /invalid sandbox boot options: host directory access must be 'ro' or 'rw'/,
+  );
+});
+
 function readOnlyFileSystem(): SandboxFileSystem {
   return {
     async stat() {

@@ -91,7 +91,9 @@ export class HostProcessSandboxVm implements HostControlChannel {
       });
     }
     for (const mount of options.mounts ?? []) {
-      this.#hostFs.set(mount.path, mount.fileSystem);
+      if (mount.kind === "virtual-fs") {
+        this.#hostFs.set(mount.path, mount.fileSystem);
+      }
     }
     child.stdout.on("data", (chunk: Buffer) => {
       this.#receive(chunk);

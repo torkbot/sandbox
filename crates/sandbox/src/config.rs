@@ -61,7 +61,21 @@ pub enum RootfsFormat {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MountSpec {
-    VirtualFs { path: String, writable: bool },
+    VirtualFs {
+        path: String,
+        writable: bool,
+    },
+    HostDirectory {
+        path: String,
+        source: PathBuf,
+        access: HostDirectoryAccess,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostDirectoryAccess {
+    ReadOnly,
+    ReadWrite,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,7 +314,41 @@ impl MountSpec {
                 path: input.path,
                 writable: input.writable.unwrap_or(false),
             }),
+            "host-directory" => {
+                let source = input
+                    .source
+                    .ok_or_else(|| SpecError::new("host-directory mount source is required"))?;
+                if source.is_empty() {
+                    return Err(SpecError::new(
+                        "host-directory mount source must not be empty",
+                    ));
+                }
+                let source = PathBuf::from(source);
+                if !source.is_absolute() {
+                    return Err(SpecError::new(
+                        "host-directory mount source must be absolute",
+                    ));
+                }
+                Ok(Self::HostDirectory {
+                    path: input.path,
+                    source,
+                    access: HostDirectoryAccess::parse(input.access.as_deref())?,
+                })
+            }
             other => Err(SpecError::new(format!("unsupported mount.kind: {other}"))),
+        }
+    }
+}
+
+impl HostDirectoryAccess {
+    fn parse(value: Option<&str>) -> Result<Self, SpecError> {
+        match value {
+            Some("ro") => Ok(Self::ReadOnly),
+            Some("rw") => Ok(Self::ReadWrite),
+            Some(other) => Err(SpecError::new(format!(
+                "unsupported host-directory mount access: {other}"
+            ))),
+            None => Err(SpecError::new("host-directory mount access is required")),
         }
     }
 }
@@ -394,6 +442,8 @@ pub struct MountSpecInput {
     pub kind: String,
     pub path: String,
     pub writable: Option<bool>,
+    pub source: Option<String>,
+    pub access: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -503,6 +553,8 @@ mod tests {
             kind: "virtual-fs".to_string(),
             path: "/sandbox".to_string(),
             writable: Some(true),
+            source: None,
+            access: None,
         }];
         input.network_outbound = Some(OutboundSpec {
             policy: OutboundPolicy::Deny,
@@ -554,6 +606,44 @@ mod tests {
     }
 
     #[test]
+    fn keeps_requested_host_directory_mount_shape() {
+        let mut input = valid_input();
+        input.mounts = vec![MountSpecInput {
+            kind: "host-directory".to_string(),
+            path: "/workspace".to_string(),
+            writable: None,
+            source: Some("/host/workspace".to_string()),
+            access: Some("rw".to_string()),
+        }];
+
+        let spec = MicroVmSpec::build(input).unwrap();
+
+        assert_eq!(
+            spec.mounts,
+            vec![MountSpec::HostDirectory {
+                path: "/workspace".to_string(),
+                source: PathBuf::from("/host/workspace"),
+                access: HostDirectoryAccess::ReadWrite,
+            }],
+        );
+    }
+
+    #[test]
+    fn rejects_host_directory_mounts_without_access() {
+        let mut input = valid_input();
+        input.mounts = vec![MountSpecInput {
+            kind: "host-directory".to_string(),
+            path: "/workspace".to_string(),
+            writable: None,
+            source: Some("/host/workspace".to_string()),
+            access: None,
+        }];
+
+        let err = MicroVmSpec::build(input).unwrap_err();
+        assert_eq!(err.to_string(), "host-directory mount access is required",);
+    }
+
+    #[test]
     fn rejects_zero_vcpus() {
         let mut input = valid_input();
         input.vcpus = Some(0);
@@ -587,6 +677,8 @@ mod tests {
             kind: "virtual-fs".to_string(),
             path: "sandbox".to_string(),
             writable: None,
+            source: None,
+            access: None,
         }];
 
         let err = MicroVmSpec::build(input).unwrap_err();

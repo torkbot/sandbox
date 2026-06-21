@@ -404,8 +404,18 @@ const mount = fs.virtual(workspaceFs);
 ```
 
 `fs.virtual(...)` adapts a compatible JavaScript filesystem for guest mounts.
-Sandbox mounts are host-implemented filesystems, not direct host directory
-mounts.
+Sandbox virtual mounts are host-implemented filesystems, not direct host
+directory mounts.
+
+```ts
+const source = fs.bind({
+  source: "/Users/alice/project",
+  access: "ro",
+});
+```
+
+`fs.bind(...)` mounts an absolute host directory through native virtio-fs. The
+`access` field is required and must be `"ro"` or `"rw"`.
 
 ### Processes
 

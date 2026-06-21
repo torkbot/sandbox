@@ -21,7 +21,10 @@ use sandbox::network_service::{
     NetworkPolicyRuntime, NetworkProtocol,
 };
 use sandbox::rootfs_image::{Qcow2FlattenOptions, flatten_rootfs_to_qcow2};
-use sandbox::runtime::{ControlSocket, HostServices, StartStatusObserver, VirtualFsDevice};
+use sandbox::runtime::{
+    ControlSocket, HostDirectoryFsDevice, HostServices, StartStatusObserver, VirtioFsDevice,
+    VirtualFsDevice,
+};
 
 mod host_vfs;
 
@@ -190,7 +193,7 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let virtual_fs = virtual_fs_devices(&spec, bridge.clone());
+    let virtual_fs = virtio_fs_devices(&spec, bridge.clone());
     let services = HostServices {
         http: http_intercept_runtime(&spec, bridge.clone())?,
         network_policy: network_policy_runtime(&spec, bridge.clone()),
@@ -721,22 +724,22 @@ fn encode_document_packet(document: &Document) -> io::Result<Vec<u8>> {
     Ok(packet)
 }
 
-fn virtual_fs_devices(
+fn virtio_fs_devices(
     spec: &sandbox::MicroVmSpec,
     bridge: std::sync::Arc<HostIoBridge>,
-) -> Vec<VirtualFsDevice> {
-    let mut devices: Vec<VirtualFsDevice> = spec
+) -> Vec<VirtioFsDevice> {
+    let mut devices: Vec<VirtioFsDevice> = spec
         .network
         .as_ref()
         .and_then(|network| network.http.as_ref())
         .and_then(|http| http.ca_certificate_pem.as_ref())
         .map(|certificate| {
-            vec![VirtualFsDevice {
+            vec![VirtioFsDevice::Virtual(VirtualFsDevice {
                 tag: "sandbox-http-ca".to_string(),
                 path: "/run/sandbox/http-ca".to_string(),
                 readonly: true,
                 backend: StaticFileVirtualFs::new("http-ca.pem", certificate.as_bytes().to_vec()),
-            }]
+            })]
         })
         .unwrap_or_default();
 
@@ -747,12 +750,25 @@ fn virtual_fs_devices(
             .filter_map(|(index, mount)| match mount {
                 MountSpec::VirtualFs { path, writable } => {
                     let tag = format!("vfs{index}");
-                    Some(VirtualFsDevice {
+                    Some(VirtioFsDevice::Virtual(VirtualFsDevice {
                         tag,
                         path: path.clone(),
                         readonly: !writable,
                         backend: NodeVirtualFs::new(path.clone(), bridge.clone()),
-                    })
+                    }))
+                }
+                MountSpec::HostDirectory {
+                    path,
+                    source,
+                    access,
+                } => {
+                    let tag = format!("vfs{index}");
+                    Some(VirtioFsDevice::HostDirectory(HostDirectoryFsDevice {
+                        tag,
+                        path: path.clone(),
+                        source: source.to_string_lossy().into_owned(),
+                        readonly: *access == sandbox::config::HostDirectoryAccess::ReadOnly,
+                    }))
                 }
             }),
     );
@@ -850,6 +866,8 @@ fn parse_mounts(values: &[bson::Bson]) -> Result<Vec<MountSpecInput>, Box<dyn st
                 kind: document.get_str("kind")?.to_string(),
                 path: document.get_str("path")?.to_string(),
                 writable: optional_bool(document, "writable"),
+                source: optional_string(document, "source"),
+                access: optional_string(document, "access"),
             })
         })
         .collect()

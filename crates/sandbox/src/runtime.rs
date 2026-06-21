@@ -70,14 +70,14 @@ impl KrunContext {
 
     pub fn create_with_virtual_fs(
         spec: &MicroVmSpec,
-        virtual_fs: &[VirtualFsDevice],
+        virtual_fs: &[VirtioFsDevice],
     ) -> Result<Self, KrunError> {
         Self::create_with_services(spec, virtual_fs, HostServices::default())
     }
 
     pub fn create_with_services(
         spec: &MicroVmSpec,
-        virtual_fs: &[VirtualFsDevice],
+        virtual_fs: &[VirtioFsDevice],
         services: HostServices,
     ) -> Result<Self, KrunError> {
         init_krun_logging();
@@ -99,22 +99,39 @@ impl KrunContext {
         context.apply_rootfs(spec, &services)?;
         context.apply_network(spec, &services)?;
         for device in virtual_fs {
-            context.add_virtual_fs(device)?;
+            context.add_virtio_fs(device)?;
         }
         context.apply_init(spec, virtual_fs)?;
         Ok(context)
     }
 
-    fn add_virtual_fs(&self, device: &VirtualFsDevice) -> Result<(), KrunError> {
-        check_krun(
-            "krun_add_virtual_virtiofs",
-            krun::krun_add_virtual_virtiofs(
-                self.id,
-                device.tag.clone(),
-                device.backend.clone(),
-                Some(1 << 29),
+    fn add_virtio_fs(&self, device: &VirtioFsDevice) -> Result<(), KrunError> {
+        match device {
+            VirtioFsDevice::Virtual(device) => check_krun(
+                "krun_add_virtual_virtiofs",
+                krun::krun_add_virtual_virtiofs(
+                    self.id,
+                    device.tag.clone(),
+                    device.backend.clone(),
+                    Some(1 << 29),
+                ),
             ),
-        )
+            VirtioFsDevice::HostDirectory(device) => {
+                let tag = CString::new(device.tag.as_str())
+                    .map_err(|_| KrunError::new("krun_add_virtiofs3", -libc::EINVAL))?;
+                let source = CString::new(device.source.as_str())
+                    .map_err(|_| KrunError::new("krun_add_virtiofs3", -libc::EINVAL))?;
+                check_krun("krun_add_virtiofs3", unsafe {
+                    krun::krun_add_virtiofs3(
+                        self.id,
+                        tag.as_ptr(),
+                        source.as_ptr(),
+                        1 << 29,
+                        device.readonly,
+                    )
+                })
+            }
+        }
     }
 
     fn apply_network(
@@ -336,7 +353,7 @@ impl KrunContext {
     fn apply_init(
         &self,
         spec: &MicroVmSpec,
-        virtual_fs: &[VirtualFsDevice],
+        virtual_fs: &[VirtioFsDevice],
     ) -> Result<(), KrunError> {
         // Keep exec metadata populated so libkrun serializes argv/env into
         // krun_env while the kernel command line boots /sandbox-init directly.
@@ -376,6 +393,11 @@ impl KrunContext {
     }
 }
 
+pub enum VirtioFsDevice {
+    Virtual(VirtualFsDevice),
+    HostDirectory(HostDirectoryFsDevice),
+}
+
 pub struct VirtualFsDevice {
     pub tag: String,
     pub path: String,
@@ -383,17 +405,47 @@ pub struct VirtualFsDevice {
     pub backend: Arc<dyn VirtioVirtualFsBackend>,
 }
 
-fn encode_virtual_fs_mounts(virtual_fs: &[VirtualFsDevice]) -> String {
+pub struct HostDirectoryFsDevice {
+    pub tag: String,
+    pub path: String,
+    pub source: String,
+    pub readonly: bool,
+}
+
+impl VirtioFsDevice {
+    fn tag(&self) -> &str {
+        match self {
+            Self::Virtual(device) => &device.tag,
+            Self::HostDirectory(device) => &device.tag,
+        }
+    }
+
+    fn path(&self) -> &str {
+        match self {
+            Self::Virtual(device) => &device.path,
+            Self::HostDirectory(device) => &device.path,
+        }
+    }
+
+    fn readonly(&self) -> bool {
+        match self {
+            Self::Virtual(device) => device.readonly,
+            Self::HostDirectory(device) => device.readonly,
+        }
+    }
+}
+
+fn encode_virtual_fs_mounts(virtual_fs: &[VirtioFsDevice]) -> String {
     let mut value = String::new();
     for device in virtual_fs {
         if !value.is_empty() {
             value.push(';');
         }
-        value.push_str(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&device.tag));
+        value.push_str(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(device.tag()));
         value.push(':');
-        value.push_str(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&device.path));
+        value.push_str(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(device.path()));
         value.push(':');
-        value.push_str(if device.readonly { "ro" } else { "rw" });
+        value.push_str(if device.readonly() { "ro" } else { "rw" });
     }
     value
 }
@@ -516,14 +568,14 @@ impl KrunVm {
 
     pub fn create_with_virtual_fs(
         spec: &MicroVmSpec,
-        virtual_fs: Vec<VirtualFsDevice>,
+        virtual_fs: Vec<VirtioFsDevice>,
     ) -> Result<Self, KrunError> {
         Self::create_with_services(spec, virtual_fs, HostServices::default())
     }
 
     pub fn create_with_services(
         spec: &MicroVmSpec,
-        virtual_fs: Vec<VirtualFsDevice>,
+        virtual_fs: Vec<VirtioFsDevice>,
         services: HostServices,
     ) -> Result<Self, KrunError> {
         let context = KrunContext::create_with_services(spec, &virtual_fs, services)?;
@@ -1078,12 +1130,12 @@ mod tests {
             }
         }
         let backend = Arc::new(crate::vfs::VirtualFsAdapter::new(Arc::new(EmptyFs)));
-        let encoded = encode_virtual_fs_mounts(&[VirtualFsDevice {
+        let encoded = encode_virtual_fs_mounts(&[VirtioFsDevice::Virtual(VirtualFsDevice {
             tag: "virtio=fs;tag".to_string(),
             path: "/mnt/with=equals;semicolon".to_string(),
             readonly: false,
             backend,
-        }]);
+        })]);
 
         assert_eq!(
             encoded,
