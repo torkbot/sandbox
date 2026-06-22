@@ -1,5 +1,8 @@
+use std::collections::HashSet;
 use std::fmt;
-use std::path::PathBuf;
+use std::fs;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MicroVmSpec {
@@ -69,6 +72,7 @@ pub enum MountSpec {
         path: String,
         source: PathBuf,
         access: HostDirectoryAccess,
+        mask: Option<HostDirectoryMask>,
     },
 }
 
@@ -76,6 +80,17 @@ pub enum MountSpec {
 pub enum HostDirectoryAccess {
     ReadOnly,
     ReadWrite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostDirectoryMask {
+    pub paths: Vec<String>,
+    pub storage: Option<HostDirectoryMaskStorage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostDirectoryMaskStorage {
+    pub source: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,10 +344,13 @@ impl MountSpec {
                         "host-directory mount source must be absolute",
                     ));
                 }
+                let access = HostDirectoryAccess::parse(input.access.as_deref())?;
+                let mask = HostDirectoryMask::parse(input.mask, access, &source)?;
                 Ok(Self::HostDirectory {
                     path: input.path,
                     source,
-                    access: HostDirectoryAccess::parse(input.access.as_deref())?,
+                    access,
+                    mask,
                 })
             }
             other => Err(SpecError::new(format!("unsupported mount.kind: {other}"))),
@@ -351,6 +369,269 @@ impl HostDirectoryAccess {
             None => Err(SpecError::new("host-directory mount access is required")),
         }
     }
+}
+
+impl HostDirectoryMask {
+    fn parse(
+        input: Option<HostDirectoryMaskInput>,
+        access: HostDirectoryAccess,
+        source: &Path,
+    ) -> Result<Option<Self>, SpecError> {
+        let Some(input) = input else {
+            return Ok(None);
+        };
+        if input.paths.is_empty() {
+            return Err(SpecError::new(
+                "host-directory mask paths must not be empty",
+            ));
+        }
+        let mut paths = Vec::with_capacity(input.paths.len());
+        for path in input.paths {
+            validate_host_directory_mask_path(&path)?;
+            if paths.contains(&path) {
+                return Err(SpecError::new(format!(
+                    "duplicate host-directory mask path: {path}"
+                )));
+            }
+            for existing in &paths {
+                if host_directory_mask_path_is_nested(existing, &path, source) {
+                    return Err(SpecError::new(format!(
+                        "nested host-directory mask path: {path}"
+                    )));
+                }
+            }
+            paths.push(path);
+        }
+
+        let storage = match (access, input.storage) {
+            (HostDirectoryAccess::ReadOnly, Some(_)) => {
+                return Err(SpecError::new(
+                    "read-only host-directory masks must not declare storage",
+                ));
+            }
+            (HostDirectoryAccess::ReadOnly, None) => None,
+            (HostDirectoryAccess::ReadWrite, Some(storage)) => {
+                Some(HostDirectoryMaskStorage::parse(storage)?)
+            }
+            (HostDirectoryAccess::ReadWrite, None) => {
+                return Err(SpecError::new(
+                    "writable host-directory masks require storage",
+                ));
+            }
+        };
+
+        if let Some(storage) = &storage {
+            validate_host_directory_mask_storage_isolated(source, &storage.source, &paths)?;
+        }
+
+        Ok(Some(Self { paths, storage }))
+    }
+}
+
+impl HostDirectoryMaskStorage {
+    fn parse(input: HostDirectoryMaskStorageInput) -> Result<Self, SpecError> {
+        let source = input
+            .source
+            .ok_or_else(|| SpecError::new("host-directory mask storage source is required"))?;
+        if source.is_empty() {
+            return Err(SpecError::new(
+                "host-directory mask storage source must not be empty",
+            ));
+        }
+        let source = PathBuf::from(source);
+        if !source.is_absolute() {
+            return Err(SpecError::new(
+                "host-directory mask storage source must be absolute",
+            ));
+        }
+        match input.access.as_deref() {
+            Some("rw") => Ok(Self { source }),
+            Some(_) | None => Err(SpecError::new(
+                "host-directory mask storage access must be rw",
+            )),
+        }
+    }
+}
+
+fn validate_host_directory_mask_path(path: &str) -> Result<(), SpecError> {
+    if !path.starts_with('/') {
+        return Err(SpecError::new("host-directory mask path must be absolute"));
+    }
+    if path == "/" {
+        return Err(SpecError::new("host-directory mask path must not be root"));
+    }
+    if path
+        .split('/')
+        .skip(1)
+        .any(|component| component.is_empty())
+    {
+        return Err(SpecError::new(
+            "host-directory mask path must not contain empty components",
+        ));
+    }
+    if path
+        .split('/')
+        .any(|component| component == "." || component == "..")
+    {
+        return Err(SpecError::new(
+            "host-directory mask path must not contain '.' or '..' components",
+        ));
+    }
+    Ok(())
+}
+
+fn host_directory_mask_path_is_nested(left: &str, right: &str, source: &Path) -> bool {
+    let case_insensitive = host_path_is_case_insensitive(source);
+    let left = left
+        .split('/')
+        .skip(1)
+        .map(|component| normalize_mask_component(component, case_insensitive))
+        .collect::<Vec<_>>();
+    let right = right
+        .split('/')
+        .skip(1)
+        .map(|component| normalize_mask_component(component, case_insensitive))
+        .collect::<Vec<_>>();
+    let shortest_len = left.len().min(right.len());
+    left.len() != right.len()
+        && left
+            .iter()
+            .take(shortest_len)
+            .zip(right.iter())
+            .all(|(left, right)| left == right)
+}
+
+fn normalize_mask_component(component: &str, case_insensitive: bool) -> String {
+    if case_insensitive {
+        component.to_ascii_lowercase()
+    } else {
+        component.to_string()
+    }
+}
+
+fn validate_host_directory_mask_storage_isolated(
+    source: &Path,
+    storage: &Path,
+    masks: &[String],
+) -> Result<(), SpecError> {
+    let source = realpath_or_resolve(source);
+    let storage = realpath_or_resolve(storage);
+    if path_inside_or_equal(&source, &storage) {
+        return Err(SpecError::new(
+            "host-directory mask storage source must not be inside the bind source",
+        ));
+    }
+    for mask in masks {
+        let upper_path = realpath_or_resolve(&storage.join(mask.trim_start_matches('/')));
+        if path_inside_or_equal(&source, &upper_path) {
+            return Err(SpecError::new(
+                "host-directory mask storage entries must not resolve inside the bind source",
+            ));
+        }
+    }
+    reject_mask_storage_hard_links(&source, &storage, masks)
+}
+
+fn realpath_or_resolve(path: &Path) -> PathBuf {
+    match fs::canonicalize(path) {
+        Ok(path) => path,
+        Err(_) => {
+            let Some(parent) = path.parent() else {
+                return path.to_path_buf();
+            };
+            if parent == path {
+                return path.to_path_buf();
+            }
+            let Some(name) = path.file_name() else {
+                return path.to_path_buf();
+            };
+            realpath_or_resolve(parent).join(name)
+        }
+    }
+}
+
+fn path_inside_or_equal(parent: &Path, child: &Path) -> bool {
+    child == parent || child.starts_with(parent)
+}
+
+fn reject_mask_storage_hard_links(
+    source: &Path,
+    storage: &Path,
+    masks: &[String],
+) -> Result<(), SpecError> {
+    let mut upper_inodes = HashSet::new();
+    for mask in masks {
+        collect_linked_regular_file_inodes(
+            &realpath_or_resolve(&storage.join(mask.trim_start_matches('/'))),
+            &mut upper_inodes,
+        );
+    }
+    if upper_inodes.is_empty() {
+        return Ok(());
+    }
+    if tree_contains_regular_file_inode(source, &upper_inodes) {
+        return Err(SpecError::new(
+            "host-directory mask storage entries must not hard-link to the bind source",
+        ));
+    }
+    Ok(())
+}
+
+fn collect_linked_regular_file_inodes(path: &Path, inodes: &mut HashSet<(u64, u64)>) {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.is_file() {
+        if metadata.nlink() > 1 {
+            inodes.insert((metadata.dev(), metadata.ino()));
+        }
+        return;
+    }
+    if !metadata.is_dir() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        collect_linked_regular_file_inodes(&entry.path(), inodes);
+    }
+}
+
+fn tree_contains_regular_file_inode(path: &Path, inodes: &HashSet<(u64, u64)>) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.is_file() {
+        return inodes.contains(&(metadata.dev(), metadata.ino()));
+    }
+    if !metadata.is_dir() {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|entry| tree_contains_regular_file_inode(&entry.path(), inodes))
+}
+
+#[cfg(target_os = "macos")]
+fn host_path_is_case_insensitive(path: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = realpath_or_resolve(path);
+    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let value = unsafe { libc::pathconf(path.as_ptr(), libc::_PC_CASE_SENSITIVE) };
+    value == 0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_path_is_case_insensitive(_path: &Path) -> bool {
+    false
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -444,6 +725,19 @@ pub struct MountSpecInput {
     pub writable: Option<bool>,
     pub source: Option<String>,
     pub access: Option<String>,
+    pub mask: Option<HostDirectoryMaskInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostDirectoryMaskInput {
+    pub paths: Vec<String>,
+    pub storage: Option<HostDirectoryMaskStorageInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostDirectoryMaskStorageInput {
+    pub source: Option<String>,
+    pub access: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -456,7 +750,34 @@ pub struct HttpSpecInput {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
+
+    struct TempTree {
+        path: PathBuf,
+    }
+
+    impl TempTree {
+        fn new(name: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "sandbox-config-{name}-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 
     fn valid_input() -> MicroVmSpecInput {
         MicroVmSpecInput {
@@ -555,6 +876,7 @@ mod tests {
             writable: Some(true),
             source: None,
             access: None,
+            mask: None,
         }];
         input.network_outbound = Some(OutboundSpec {
             policy: OutboundPolicy::Deny,
@@ -614,6 +936,7 @@ mod tests {
             writable: None,
             source: Some("/host/workspace".to_string()),
             access: Some("rw".to_string()),
+            mask: None,
         }];
 
         let spec = MicroVmSpec::build(input).unwrap();
@@ -624,7 +947,208 @@ mod tests {
                 path: "/workspace".to_string(),
                 source: PathBuf::from("/host/workspace"),
                 access: HostDirectoryAccess::ReadWrite,
+                mask: None,
             }],
+        );
+    }
+
+    #[test]
+    fn keeps_requested_host_directory_mask_shape() {
+        let mut input = valid_input();
+        input.mounts = vec![MountSpecInput {
+            kind: "host-directory".to_string(),
+            path: "/workspace".to_string(),
+            writable: None,
+            source: Some("/host/workspace".to_string()),
+            access: Some("rw".to_string()),
+            mask: Some(HostDirectoryMaskInput {
+                paths: vec![
+                    "/node_modules".to_string(),
+                    "/packages/a/node_modules".to_string(),
+                ],
+                storage: Some(HostDirectoryMaskStorageInput {
+                    source: Some("/host/mask-storage".to_string()),
+                    access: Some("rw".to_string()),
+                }),
+            }),
+        }];
+
+        let spec = MicroVmSpec::build(input).unwrap();
+
+        assert_eq!(
+            spec.mounts,
+            vec![MountSpec::HostDirectory {
+                path: "/workspace".to_string(),
+                source: PathBuf::from("/host/workspace"),
+                access: HostDirectoryAccess::ReadWrite,
+                mask: Some(HostDirectoryMask {
+                    paths: vec![
+                        "/node_modules".to_string(),
+                        "/packages/a/node_modules".to_string(),
+                    ],
+                    storage: Some(HostDirectoryMaskStorage {
+                        source: PathBuf::from("/host/mask-storage"),
+                    }),
+                }),
+            }],
+        );
+    }
+
+    #[test]
+    fn rejects_host_directory_mask_paths_with_empty_components() {
+        let mut input = valid_input();
+        input.mounts = vec![MountSpecInput {
+            kind: "host-directory".to_string(),
+            path: "/workspace".to_string(),
+            writable: None,
+            source: Some("/host/workspace".to_string()),
+            access: Some("ro".to_string()),
+            mask: Some(HostDirectoryMaskInput {
+                paths: vec!["/node_modules/".to_string()],
+                storage: None,
+            }),
+        }];
+
+        let err = MicroVmSpec::build(input).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "host-directory mask path must not contain empty components",
+        );
+    }
+
+    #[test]
+    fn rejects_nested_host_directory_mask_paths() {
+        let mut input = valid_input();
+        input.mounts = vec![MountSpecInput {
+            kind: "host-directory".to_string(),
+            path: "/workspace".to_string(),
+            writable: None,
+            source: Some("/host/workspace".to_string()),
+            access: Some("ro".to_string()),
+            mask: Some(HostDirectoryMaskInput {
+                paths: vec![
+                    "/node_modules".to_string(),
+                    "/node_modules/.bin".to_string(),
+                ],
+                storage: None,
+            }),
+        }];
+
+        let err = MicroVmSpec::build(input).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "nested host-directory mask path: /node_modules/.bin",
+        );
+    }
+
+    #[test]
+    fn preserves_case_sensitive_host_directory_mask_paths() {
+        let mut input = valid_input();
+        input.mounts = vec![MountSpecInput {
+            kind: "host-directory".to_string(),
+            path: "/workspace".to_string(),
+            writable: None,
+            source: Some("/host/workspace".to_string()),
+            access: Some("rw".to_string()),
+            mask: Some(HostDirectoryMaskInput {
+                paths: vec!["/Foo/bar".to_string(), "/foo".to_string()],
+                storage: None,
+            }),
+        }];
+
+        let err = MicroVmSpec::build(input).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "writable host-directory masks require storage",
+        );
+    }
+
+    #[test]
+    fn rejects_host_directory_mask_storage_inside_source() {
+        let source = TempTree::new("source");
+        let storage = source.path.join(".sandbox-mask");
+        let mut input = valid_input();
+        input.mounts = vec![MountSpecInput {
+            kind: "host-directory".to_string(),
+            path: "/workspace".to_string(),
+            writable: None,
+            source: Some(source.path.to_string_lossy().into_owned()),
+            access: Some("rw".to_string()),
+            mask: Some(HostDirectoryMaskInput {
+                paths: vec!["/node_modules".to_string()],
+                storage: Some(HostDirectoryMaskStorageInput {
+                    source: Some(storage.to_string_lossy().into_owned()),
+                    access: Some("rw".to_string()),
+                }),
+            }),
+        }];
+
+        let err = MicroVmSpec::build(input).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "host-directory mask storage source must not be inside the bind source",
+        );
+    }
+
+    #[test]
+    fn rejects_host_directory_mask_storage_entries_that_reenter_source() {
+        let root = TempTree::new("root");
+        let source = root.path.join("workspace");
+        fs::create_dir(&source).unwrap();
+        let mut input = valid_input();
+        input.mounts = vec![MountSpecInput {
+            kind: "host-directory".to_string(),
+            path: "/workspace".to_string(),
+            writable: None,
+            source: Some(source.to_string_lossy().into_owned()),
+            access: Some("rw".to_string()),
+            mask: Some(HostDirectoryMaskInput {
+                paths: vec!["/workspace".to_string()],
+                storage: Some(HostDirectoryMaskStorageInput {
+                    source: Some(root.path.to_string_lossy().into_owned()),
+                    access: Some("rw".to_string()),
+                }),
+            }),
+        }];
+
+        let err = MicroVmSpec::build(input).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "host-directory mask storage entries must not resolve inside the bind source",
+        );
+    }
+
+    #[test]
+    fn rejects_host_directory_mask_storage_hard_links_to_source() {
+        let source = TempTree::new("source");
+        let storage = TempTree::new("storage");
+        fs::write(source.path.join("lower.txt"), "lower").unwrap();
+        fs::create_dir(storage.path.join("node_modules")).unwrap();
+        fs::hard_link(
+            source.path.join("lower.txt"),
+            storage.path.join("node_modules").join("linked.txt"),
+        )
+        .unwrap();
+        let mut input = valid_input();
+        input.mounts = vec![MountSpecInput {
+            kind: "host-directory".to_string(),
+            path: "/workspace".to_string(),
+            writable: None,
+            source: Some(source.path.to_string_lossy().into_owned()),
+            access: Some("rw".to_string()),
+            mask: Some(HostDirectoryMaskInput {
+                paths: vec!["/node_modules".to_string()],
+                storage: Some(HostDirectoryMaskStorageInput {
+                    source: Some(storage.path.to_string_lossy().into_owned()),
+                    access: Some("rw".to_string()),
+                }),
+            }),
+        }];
+
+        let err = MicroVmSpec::build(input).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "host-directory mask storage entries must not hard-link to the bind source",
         );
     }
 
@@ -637,6 +1161,7 @@ mod tests {
             writable: None,
             source: Some("/host/workspace".to_string()),
             access: None,
+            mask: None,
         }];
 
         let err = MicroVmSpec::build(input).unwrap_err();
@@ -679,6 +1204,7 @@ mod tests {
             writable: None,
             source: None,
             access: None,
+            mask: None,
         }];
 
         let err = MicroVmSpec::build(input).unwrap_err();

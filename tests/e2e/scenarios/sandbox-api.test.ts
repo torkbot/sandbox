@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -597,6 +597,139 @@ test("host directory bind mounts use native virtio-fs access modes", async (t) =
   assert.equal(result.stdout, "from-host\nbefore\n");
   assert.equal(result.stderr, "");
   assert.equal(await readFile(join(readWriteSource, "after.txt"), "utf8"), "from-guest");
+});
+
+test("read-only host directory masks hide lower host entries", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const source = await mkdtemp(join(tmpdir(), "sandbox-mask-ro-"));
+  t.after(async () => {
+    await rm(source, { recursive: true, force: true });
+  });
+  await mkdir(join(source, "node_modules"));
+  await mkdir(join(source, ".git"));
+  await writeFile(join(source, "node_modules", "lower.txt"), "lower\n");
+  await writeFile(join(source, ".git", "config"), "lower-git\n");
+  await writeFile(join(source, "visible.txt"), "visible\n");
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot({
+    mounts: {
+      "/tmp/workspace": fs.bind({
+        source,
+        access: "ro",
+        mask: {
+          paths: ["/node_modules", "/.git"],
+          storage: undefined,
+        } as never,
+      }),
+    },
+  });
+
+  const result = await sandbox.exec("/bin/sh", [
+    "-lc",
+    [
+      "set -e",
+      "cat /tmp/workspace/visible.txt",
+      "test ! -e /tmp/workspace/node_modules",
+      "test ! -e /tmp/workspace/.git",
+      ...(process.platform === "darwin" ? ["test ! -e /tmp/workspace/.GIT"] : []),
+      "if ls -a /tmp/workspace | grep -E '^(node_modules|\\.git)$'; then exit 10; fi",
+      "if sh -c 'printf blocked > /tmp/workspace/node_modules' 2>/tmp/mask-ro.err; then exit 11; fi",
+    ].join("\n"),
+  ]);
+
+  assert.equal(result.exitCode, 0, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+  assert.equal(result.stdout, "visible\n");
+  assert.equal(result.stderr, "");
+});
+
+test("writable host directory masks store guest-created entries in host mask storage", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const source = await mkdtemp(join(tmpdir(), "sandbox-mask-rw-source-"));
+  const storage = await mkdtemp(join(tmpdir(), "sandbox-mask-rw-storage-"));
+  t.after(async () => {
+    await rm(source, { recursive: true, force: true });
+    await rm(storage, { recursive: true, force: true });
+  });
+  await mkdir(join(source, "node_modules"));
+  await mkdir(join(source, ".cache"));
+  await mkdir(join(source, "packages", "a", "node_modules"), { recursive: true });
+  await writeFile(join(source, "node_modules", "lower.txt"), "lower-root\n");
+  await writeFile(join(source, ".cache", "lower.txt"), "lower-cache\n");
+  await writeFile(join(source, "packages", "a", "node_modules", "lower.txt"), "lower-package\n");
+  await writeFile(join(source, "visible.txt"), "visible\n");
+  await writeFile(join(storage, "preexisting"), "upper-preexisting\n");
+  await writeFile(join(source, "preexisting"), "lower-preexisting\n");
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot({
+    mounts: {
+      "/tmp/workspace": fs.bind({
+        source,
+        access: "rw",
+        mask: {
+          paths: ["/node_modules", "/.cache", "/packages/a/node_modules", "/preexisting"],
+          storage: fs.bind({
+            source: storage,
+            access: "rw",
+          }),
+        },
+      }),
+    },
+  });
+
+  const result = await sandbox.exec("/bin/sh", [
+    "-lc",
+    [
+      "set -e",
+      "cat /tmp/workspace/visible.txt",
+      "test ! -e /tmp/workspace/node_modules",
+      "test ! -e /tmp/workspace/.cache",
+      "test ! -e /tmp/workspace/packages/a/node_modules",
+      ...(process.platform === "darwin"
+        ? ["if ls -a /tmp/workspace/Packages/A | grep -E '^node_modules$'; then exit 13; fi"]
+        : []),
+      "if ls -a /tmp/workspace | grep -E '^(node_modules|\\.cache)$'; then exit 10; fi",
+      "if ! ls -a /tmp/workspace | grep -q -E '^preexisting$'; then exit 12; fi",
+      "cat /tmp/workspace/preexisting",
+      "printf file-entry > /tmp/workspace/node_modules",
+      "test -f /tmp/workspace/node_modules",
+      "cat /tmp/workspace/node_modules",
+      "rm /tmp/workspace/node_modules",
+      "test ! -e /tmp/workspace/node_modules",
+      "if sh -c 'printf no-parent > /tmp/workspace/.cache/value.txt' 2>/tmp/mask-parent.err; then exit 11; fi",
+      "mkdir /tmp/workspace/node_modules",
+      "printf child > /tmp/workspace/node_modules/child.txt",
+      "mkdir /tmp/workspace/.cache",
+      "printf cached > /tmp/workspace/.cache/value.txt",
+      "mkdir /tmp/workspace/packages/a/node_modules",
+      "printf package > /tmp/workspace/packages/a/node_modules/pkg.txt",
+      "cat /tmp/workspace/node_modules/child.txt",
+      "cat /tmp/workspace/.cache/value.txt",
+      "cat /tmp/workspace/packages/a/node_modules/pkg.txt",
+    ].join("\n"),
+  ]);
+
+  assert.equal(result.exitCode, 0, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+  assert.equal(result.stdout, "visible\nupper-preexisting\nfile-entrychildcachedpackage");
+  assert.equal(result.stderr, "");
+  assert.equal(await readFile(join(source, "node_modules", "lower.txt"), "utf8"), "lower-root\n");
+  assert.equal(await readFile(join(source, ".cache", "lower.txt"), "utf8"), "lower-cache\n");
+  assert.equal(await readFile(join(source, "packages", "a", "node_modules", "lower.txt"), "utf8"), "lower-package\n");
+  assert.equal(await readFile(join(source, "preexisting"), "utf8"), "lower-preexisting\n");
+  assert.equal((await lstat(join(storage, "node_modules"))).isDirectory(), true);
+  assert.equal(await readFile(join(storage, "node_modules", "child.txt"), "utf8"), "child");
+  assert.equal(await readFile(join(storage, ".cache", "value.txt"), "utf8"), "cached");
+  assert.equal(await readFile(join(storage, "packages", "a", "node_modules", "pkg.txt"), "utf8"), "package");
+  assert.equal(await readFile(join(storage, "preexisting"), "utf8"), "upper-preexisting\n");
 });
 
 test("missing writable mount directories are created before mounting virtual filesystems", async (t) => {

@@ -18,7 +18,9 @@ import {
   type SandboxShellEnvironmentFact,
 } from "./environment-facts.ts";
 import { randomUUID } from "node:crypto";
+import { lstatSync, readdirSync, realpathSync } from "node:fs";
 import { open } from "node:fs/promises";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { HostControlTransport } from "./control.ts";
 import { HostProcessSandboxVm } from "./host-process.ts";
 import { createMemoryFileSystem } from "./memory-fs.ts";
@@ -195,13 +197,53 @@ export type SandboxWritableFileSystemSource = {
   readonly fileSystem: SandboxPosixFileSystem;
 };
 
-export type SandboxHostDirectorySource = {
+export type SandboxHostDirectoryMaskStorageSource = {
+  readonly kind: "host-directory";
+  readonly source: string;
+  readonly access: "rw";
+};
+
+export type SandboxReadOnlyHostDirectoryMask = {
+  readonly paths: readonly string[];
+};
+
+export type SandboxReadWriteHostDirectoryMask = {
+  readonly paths: readonly string[];
+  readonly storage: SandboxHostDirectoryMaskStorageSource;
+};
+
+export type SandboxReadOnlyHostDirectorySource = {
+  readonly kind: "host-directory";
+  readonly source: string;
+  readonly access: "ro";
+  readonly mask?: SandboxReadOnlyHostDirectoryMask;
+};
+
+export type SandboxReadWriteHostDirectorySource = {
+  readonly kind: "host-directory";
+  readonly source: string;
+  readonly access: "rw";
+  readonly mask?: SandboxReadWriteHostDirectoryMask;
+};
+
+export type SandboxHostDirectorySource = SandboxReadOnlyHostDirectorySource | SandboxReadWriteHostDirectorySource;
+
+export type SandboxMountSource = SandboxFileSystemSource | SandboxHostDirectorySource;
+
+type HostDirectorySourceForValidation = {
   readonly kind: "host-directory";
   readonly source: string;
   readonly access: "ro" | "rw";
+  readonly mask?: {
+    readonly paths: readonly string[];
+    readonly storage?: SandboxHostDirectoryMaskStorageSource;
+  };
 };
 
-export type SandboxMountSource = SandboxFileSystemSource | SandboxHostDirectorySource;
+type LoweredHostDirectoryMask = {
+  readonly paths: readonly string[];
+  readonly storage?: SandboxHostDirectoryMaskStorageSource;
+};
 
 export type SandboxBlockRange = {
   readonly start: bigint;
@@ -800,11 +842,38 @@ function virtualFs(fileSystem: SandboxFileSystem): SandboxFileSystemSource {
   };
 }
 
-function bindHostDirectory(options: { readonly source: string; readonly access: "ro" | "rw" }): SandboxHostDirectorySource {
+function bindHostDirectory(options: {
+  readonly source: string;
+  readonly access: "ro";
+  readonly mask?: SandboxReadOnlyHostDirectoryMask;
+}): SandboxReadOnlyHostDirectorySource;
+function bindHostDirectory(options: {
+  readonly source: string;
+  readonly access: "rw";
+  readonly mask?: SandboxReadWriteHostDirectoryMask;
+}): SandboxReadWriteHostDirectorySource;
+function bindHostDirectory(options: {
+  readonly source: string;
+  readonly access: "ro" | "rw";
+}): SandboxHostDirectorySource;
+function bindHostDirectory(options: {
+  readonly source: string;
+  readonly access: "ro" | "rw";
+  readonly mask?: SandboxReadOnlyHostDirectoryMask | SandboxReadWriteHostDirectoryMask;
+}): SandboxHostDirectorySource {
+  if (options.access === "ro") {
+    return {
+      kind: "host-directory",
+      source: options.source,
+      access: "ro",
+      ...(options.mask === undefined ? {} : { mask: options.mask as SandboxReadOnlyHostDirectoryMask }),
+    };
+  }
   return {
     kind: "host-directory",
     source: options.source,
-    access: options.access,
+    access: options.access as "rw",
+    ...(options.mask === undefined ? {} : { mask: options.mask as SandboxReadWriteHostDirectoryMask }),
   };
 }
 
@@ -1487,8 +1556,28 @@ function lowerInternalMount(path: string, source: SandboxMountSource): InternalM
         path,
         source: source.source,
         access: source.access,
+        mask: lowerHostDirectoryMask(source.mask),
       };
   }
+}
+
+function lowerHostDirectoryMask(mask: SandboxHostDirectorySource["mask"]): LoweredHostDirectoryMask | undefined {
+  if (mask === undefined) {
+    return undefined;
+  }
+  const storage = "storage" in mask ? mask.storage : undefined;
+  return {
+    paths: [...mask.paths],
+    ...(storage !== undefined
+      ? {
+        storage: {
+          kind: storage.kind,
+          source: storage.source,
+          access: storage.access,
+        },
+      }
+      : {}),
+  };
 }
 
 function lowerHostSpawnMount(mount: InternalMount): HostSpawnMount {
@@ -1505,6 +1594,7 @@ function lowerHostSpawnMount(mount: InternalMount): HostSpawnMount {
         path: mount.path,
         source: mount.source,
         access: mount.access,
+        mask: mount.mask,
       };
   }
 }
@@ -1977,7 +2067,7 @@ function validateSandboxBootOptions(options: SandboxBootOptions): void {
   }
 }
 
-function validateHostDirectorySource(source: SandboxHostDirectorySource): void {
+function validateHostDirectorySource(source: HostDirectorySourceForValidation): void {
   if (!source.source.startsWith("/")) {
     throw new Error("invalid sandbox boot options: host directory source must be absolute");
   }
@@ -1986,6 +2076,180 @@ function validateHostDirectorySource(source: SandboxHostDirectorySource): void {
   }
   if (source.access !== "ro" && source.access !== "rw") {
     throw new Error("invalid sandbox boot options: host directory access must be 'ro' or 'rw'");
+  }
+  validateHostDirectoryMask(source);
+}
+
+function validateHostDirectoryMask(source: HostDirectorySourceForValidation): void {
+  const mask = source.mask;
+  if (mask === undefined) {
+    return;
+  }
+  if (!Array.isArray(mask.paths) || mask.paths.length === 0) {
+    throw new Error("invalid sandbox boot options: host directory mask paths must not be empty");
+  }
+  const paths = new Set<string>();
+  for (const path of mask.paths) {
+    validateHostDirectoryMaskPath(path);
+    if (paths.has(path)) {
+      throw new Error(`invalid sandbox boot options: duplicate host directory mask path: ${path}`);
+    }
+    for (const existing of paths) {
+      if (isMaskPathNested(existing, path)) {
+        throw new Error(`invalid sandbox boot options: nested host directory mask path: ${path}`);
+      }
+    }
+    paths.add(path);
+  }
+  if (source.access === "ro") {
+    if ("storage" in mask && mask.storage !== undefined) {
+      throw new Error("invalid sandbox boot options: read-only host directory masks must not declare mask.storage");
+    }
+    return;
+  }
+  if (!("storage" in mask) || mask.storage === undefined) {
+    throw new Error("invalid sandbox boot options: writable host directory masks require mask.storage");
+  }
+  validateHostDirectoryMaskStorage(mask.storage);
+  const sourcePath = realpathOrResolve(source.source);
+  const storagePath = realpathOrResolve(mask.storage.source);
+  if (isPathInsideOrEqual(sourcePath, storagePath)) {
+    throw new Error("invalid sandbox boot options: host directory mask storage source must not be inside the bind source");
+  }
+  for (const path of mask.paths) {
+    const upperPath = realpathOrResolve(storagePath, path.slice(1));
+    if (isPathInsideOrEqual(sourcePath, upperPath)) {
+      throw new Error("invalid sandbox boot options: host directory mask storage entries must not resolve inside the bind source");
+    }
+  }
+  rejectMaskStorageHardLinks(sourcePath, storagePath, mask.paths);
+}
+
+function realpathOrResolve(path: string, ...paths: string[]): string {
+  const resolved = resolve(path, ...paths);
+  try {
+    return realpathSync.native(resolved);
+  } catch {
+    const parent = dirname(resolved);
+    if (parent === resolved) {
+      return resolved;
+    }
+    const canonicalParent = realpathOrResolve(parent);
+    return resolve(canonicalParent, relative(parent, resolved));
+  }
+}
+
+function isPathInsideOrEqual(parent: string, child: string): boolean {
+  const path = relative(parent, child);
+  return path === "" || (!path.startsWith("..") && !isAbsolute(path));
+}
+
+function isMaskPathNested(left: string, right: string): boolean {
+  const leftComponents = left.split("/").slice(1);
+  const rightComponents = right.split("/").slice(1);
+  const shortestLength = Math.min(leftComponents.length, rightComponents.length);
+  return (
+    leftComponents.slice(0, shortestLength).every((component, index) => component === rightComponents[index]) &&
+    leftComponents.length !== rightComponents.length
+  );
+}
+
+function rejectMaskStorageHardLinks(sourcePath: string, storagePath: string, maskPaths: readonly string[]): void {
+  const upperInodes = new Set<string>();
+  for (const maskPath of maskPaths) {
+    collectLinkedRegularFileInodes(realpathOrResolve(storagePath, maskPath.slice(1)), upperInodes);
+  }
+  if (upperInodes.size === 0) {
+    return;
+  }
+  if (treeContainsRegularFileInode(sourcePath, upperInodes)) {
+    throw new Error("invalid sandbox boot options: host directory mask storage entries must not hard-link to the bind source");
+  }
+}
+
+function collectLinkedRegularFileInodes(path: string, inodes: Set<string>): void {
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch {
+    return;
+  }
+  if (stat.isFile() && stat.nlink > 1) {
+    inodes.add(`${stat.dev}:${stat.ino}`);
+    return;
+  }
+  if (!stat.isDirectory()) {
+    return;
+  }
+  let entries;
+  try {
+    entries = readdirSync(path, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    collectLinkedRegularFileInodes(resolve(path, entry.name), inodes);
+  }
+}
+
+function treeContainsRegularFileInode(path: string, inodes: ReadonlySet<string>): boolean {
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch {
+    return false;
+  }
+  if (stat.isFile()) {
+    return inodes.has(`${stat.dev}:${stat.ino}`);
+  }
+  if (!stat.isDirectory()) {
+    return false;
+  }
+  let entries;
+  try {
+    entries = readdirSync(path, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  return entries.some((entry) => treeContainsRegularFileInode(resolve(path, entry.name), inodes));
+}
+
+function validateHostDirectoryMaskPath(path: string): void {
+  if (typeof path !== "string") {
+    throw new Error("invalid sandbox boot options: host directory mask path must be a string");
+  }
+  if (!path.startsWith("/")) {
+    throw new Error("invalid sandbox boot options: host directory mask path must be absolute");
+  }
+  if (path === "/") {
+    throw new Error("invalid sandbox boot options: host directory mask path must not be root");
+  }
+  if (path.includes("\0")) {
+    throw new Error("invalid sandbox boot options: host directory mask path must not contain NUL bytes");
+  }
+  if (path.split("/").slice(1).some((component) => component === "")) {
+    throw new Error("invalid sandbox boot options: host directory mask path must not contain empty components");
+  }
+  if (path.split("/").some((component) => component === "." || component === "..")) {
+    throw new Error("invalid sandbox boot options: host directory mask path must not contain '.' or '..' components");
+  }
+}
+
+function validateHostDirectoryMaskStorage(storage: SandboxHostDirectoryMaskStorageSource): void {
+  if (storage.kind !== "host-directory") {
+    throw new Error("invalid sandbox boot options: host directory mask storage must be created with fs.bind(...)");
+  }
+  if (!storage.source.startsWith("/")) {
+    throw new Error("invalid sandbox boot options: host directory mask storage source must be absolute");
+  }
+  if (storage.source.includes("\0")) {
+    throw new Error("invalid sandbox boot options: host directory mask storage source must not contain NUL bytes");
+  }
+  if (storage.access !== "rw") {
+    throw new Error("invalid sandbox boot options: host directory mask storage access must be 'rw'");
+  }
+  if ("mask" in storage && storage.mask !== undefined) {
+    throw new Error("invalid sandbox boot options: host directory mask storage must not declare mask");
   }
 }
 
