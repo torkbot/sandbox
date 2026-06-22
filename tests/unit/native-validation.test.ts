@@ -312,6 +312,31 @@ test("boot requires writable mask storage for writable host directory masks", as
   );
 });
 
+test("boot rejects writable mask storage that aliases the bind source", async () => {
+  const sandbox = defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  });
+
+  await assert.rejects(
+    sandbox.boot({
+      mounts: {
+        "/mnt": fs.bind({
+          source: "/tmp/workspace",
+          access: "rw",
+          mask: {
+            paths: ["/node_modules"],
+            storage: fs.bind({
+              source: "/tmp/workspace/.",
+              access: "rw",
+            }),
+          },
+        }),
+      },
+    }),
+    /invalid sandbox boot options: host directory mask storage source must not equal the bind source/,
+  );
+});
+
 test("boot rejects mask storage on read-only host directory masks", async () => {
   const sandbox = defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.23"),

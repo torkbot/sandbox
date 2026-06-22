@@ -10,10 +10,9 @@ use std::time::Instant;
 
 use base64::Engine;
 use imago::{
-    DynStorage, FormatAccess, Storage, StorageOpenOptions, SyncFormatAccess, qcow2::Qcow2, raw::Raw,
+    qcow2::Qcow2, raw::Raw, DynStorage, FormatAccess, Storage, StorageOpenOptions, SyncFormatAccess,
 };
 
-use crate::MicroVmSpec;
 use crate::block_storage::{CowBlockStorage, CowBlockStore, MemoryCowBlockStore};
 use crate::config::{KernelFormat, RootfsFormat, RootfsStorageSpec};
 use crate::control::INIT_CONTROL_PORT;
@@ -21,6 +20,7 @@ use crate::http_flow::HttpInterceptRuntime;
 use crate::network::OutboundRulePlan;
 use crate::network_service::{HostNetwork, MitmTlsConfig, NetworkPolicyRuntime};
 use crate::vfs::VirtioVirtualFsBackend;
+use crate::MicroVmSpec;
 
 #[derive(Debug)]
 pub struct KrunContext {
@@ -129,6 +129,7 @@ impl KrunContext {
                             Some(krun::FsPassthroughMaskConfig {
                                 paths: mask.paths.clone(),
                                 storage: mask.storage.clone(),
+                                case_insensitive: false,
                             }),
                         ),
                     );
@@ -822,7 +823,11 @@ fn cstring_path(operation: &'static str, path: &Path) -> Result<CString, KrunErr
 }
 
 fn sync_mode() -> u32 {
-    if cfg!(target_os = "macos") { 1 } else { 2 }
+    if cfg!(target_os = "macos") {
+        1
+    } else {
+        2
+    }
 }
 
 #[cfg(test)]

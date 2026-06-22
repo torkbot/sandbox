@@ -19,6 +19,7 @@ import {
 } from "./environment-facts.ts";
 import { randomUUID } from "node:crypto";
 import { open } from "node:fs/promises";
+import { resolve } from "node:path";
 import { HostControlTransport } from "./control.ts";
 import { HostProcessSandboxVm } from "./host-process.ts";
 import { createMemoryFileSystem } from "./memory-fs.ts";
@@ -1563,14 +1564,15 @@ function lowerHostDirectoryMask(mask: SandboxHostDirectorySource["mask"]): Lower
   if (mask === undefined) {
     return undefined;
   }
+  const storage = "storage" in mask ? mask.storage : undefined;
   return {
     paths: [...mask.paths],
-    ...("storage" in mask
+    ...(storage !== undefined
       ? {
         storage: {
-          kind: mask.storage.kind,
-          source: mask.storage.source,
-          access: mask.storage.access,
+          kind: storage.kind,
+          source: storage.source,
+          access: storage.access,
         },
       }
       : {}),
@@ -2103,6 +2105,9 @@ function validateHostDirectoryMask(source: HostDirectorySourceForValidation): vo
     throw new Error("invalid sandbox boot options: writable host directory masks require mask.storage");
   }
   validateHostDirectoryMaskStorage(mask.storage);
+  if (resolve(mask.storage.source) === resolve(source.source)) {
+    throw new Error("invalid sandbox boot options: host directory mask storage source must not equal the bind source");
+  }
 }
 
 function validateHostDirectoryMaskPath(path: string): void {

@@ -623,7 +623,8 @@ test("read-only host directory masks hide lower host entries", async (t) => {
         access: "ro",
         mask: {
           paths: ["/node_modules", "/.git"],
-        },
+          storage: undefined,
+        } as never,
       }),
     },
   });
@@ -635,6 +636,7 @@ test("read-only host directory masks hide lower host entries", async (t) => {
       "cat /tmp/workspace/visible.txt",
       "test ! -e /tmp/workspace/node_modules",
       "test ! -e /tmp/workspace/.git",
+      ...(process.platform === "darwin" ? ["test ! -e /tmp/workspace/.GIT"] : []),
       "if ls -a /tmp/workspace | grep -E '^(node_modules|\\.git)$'; then exit 10; fi",
       "if sh -c 'printf blocked > /tmp/workspace/node_modules' 2>/tmp/mask-ro.err; then exit 11; fi",
     ].join("\n"),
