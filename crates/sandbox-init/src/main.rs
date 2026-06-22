@@ -1,16 +1,23 @@
 use base64::Engine;
 #[cfg(target_os = "linux")]
 use sandbox_protocol::INIT_CONTROL_PORT;
-use sandbox_protocol::{ControlFrame, GuestPtySize, GuestSpawnStdio};
+use sandbox_protocol::{
+    ControlFrame, GuestFsDirectoryEntry, GuestFsEntryType, GuestFsError, GuestFsReadRange,
+    GuestFsResponseResult, GuestFsStat, GuestPtySize, GuestSpawnStdio,
+};
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
-use std::io::Write;
-#[cfg(target_os = "linux")]
-use std::sync::OnceLock;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
+
+const GUEST_FS_RESPONSE_PAYLOAD_LIMIT: u64 = 60 * 1024 * 1024;
+const GUEST_FS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 fn main() {
     if let Err(error) = run() {
@@ -82,11 +89,9 @@ fn active_children() -> &'static Mutex<HashSet<libc::pid_t>> {
 #[cfg(target_os = "linux")]
 fn start_orphan_reaper() {
     let _ = active_children();
-    std::thread::spawn(|| {
-        loop {
-            reap_orphaned_children();
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
+    std::thread::spawn(|| loop {
+        reap_orphaned_children();
+        std::thread::sleep(std::time::Duration::from_millis(100));
     });
 }
 
@@ -1117,8 +1122,21 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
             ControlFrame::GuestSpawnResize { id, rows, cols } => {
                 spawns.send(&id, SpawnControl::Resize(GuestPtySize { rows, cols }));
             }
+            request @ (ControlFrame::GuestFsStat { .. }
+            | ControlFrame::GuestFsReadDir { .. }
+            | ControlFrame::GuestFsReadFile { .. }
+            | ControlFrame::GuestFsWriteFile { .. }
+            | ControlFrame::GuestFsMkdir { .. }
+            | ControlFrame::GuestFsRemove { .. }
+            | ControlFrame::GuestFsRename { .. }) => {
+                let writer = writer.clone();
+                std::thread::spawn(move || {
+                    let _ = send_control_frame(&writer, handle_guest_fs_request(request));
+                });
+            }
             ControlFrame::InitReady { .. }
             | ControlFrame::GuestExecComplete { .. }
+            | ControlFrame::GuestFsResponse { .. }
             | ControlFrame::GuestSpawnStarted { .. }
             | ControlFrame::GuestSpawnStdout { .. }
             | ControlFrame::GuestSpawnStderr { .. }
@@ -1126,6 +1144,283 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
             | ControlFrame::GuestSpawnStreamsClosed { .. } => {}
         }
     }
+}
+
+fn handle_guest_fs_request(request: ControlFrame) -> ControlFrame {
+    let (id, result) = match request {
+        ControlFrame::GuestFsStat { id, path } => {
+            let result = guest_fs_stat(&path).map(GuestFsResponseResult::Stat);
+            (id, result)
+        }
+        ControlFrame::GuestFsReadDir { id, path } => {
+            let result = guest_fs_read_dir(&id, &path).map(GuestFsResponseResult::ReadDir);
+            (id, result)
+        }
+        ControlFrame::GuestFsReadFile { id, path, range } => {
+            let result = guest_fs_read_file(&path, range).map(GuestFsResponseResult::ReadFile);
+            (id, result)
+        }
+        ControlFrame::GuestFsWriteFile {
+            id,
+            path,
+            contents,
+            create_parents,
+        } => {
+            let result = guest_fs_write_file(&path, &contents, create_parents)
+                .map(|()| GuestFsResponseResult::Empty);
+            (id, result)
+        }
+        ControlFrame::GuestFsMkdir {
+            id,
+            path,
+            recursive,
+        } => {
+            let result = guest_fs_mkdir(&path, recursive).map(|()| GuestFsResponseResult::Empty);
+            (id, result)
+        }
+        ControlFrame::GuestFsRemove {
+            id,
+            path,
+            recursive,
+            force,
+        } => {
+            let result =
+                guest_fs_remove(&path, recursive, force).map(|()| GuestFsResponseResult::Empty);
+            (id, result)
+        }
+        ControlFrame::GuestFsRename { id, from, to } => {
+            let result = std::fs::rename(&from, &to)
+                .map_err(|error| fs_io_error(format!("rename {from} -> {to}"), error))
+                .map(|()| GuestFsResponseResult::Empty);
+            (id, result)
+        }
+        _ => unreachable!("non-filesystem control frame passed to filesystem handler"),
+    };
+    ControlFrame::GuestFsResponse {
+        id,
+        result: result.unwrap_or_else(|error| GuestFsResponseResult::Error(error)),
+    }
+}
+
+fn guest_fs_stat(path: &str) -> Result<GuestFsStat, GuestFsError> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| fs_io_error(format!("stat {path}"), error))?;
+    guest_fs_stat_from_metadata(metadata)
+}
+
+fn guest_fs_read_dir(id: &str, path: &str) -> Result<Vec<GuestFsDirectoryEntry>, GuestFsError> {
+    let entries =
+        std::fs::read_dir(path).map_err(|error| fs_io_error(format!("readDir {path}"), error))?;
+    let mut result = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| fs_io_error(format!("readDir {path}"), error))?;
+        let name_os = entry.file_name();
+        let name_bytes = name_os.as_bytes().to_vec();
+        let name = String::from_utf8_lossy(&name_bytes).into_owned();
+        let metadata = std::fs::symlink_metadata(entry.path())
+            .map_err(|error| fs_io_error(format!("readDir {path}/{name}"), error))?;
+        result.push(GuestFsDirectoryEntry {
+            name,
+            name_bytes,
+            stat: guest_fs_stat_from_metadata(metadata)?,
+        });
+    }
+    guest_fs_ensure_response_size(
+        ControlFrame::GuestFsResponse {
+            id: id.to_string(),
+            result: GuestFsResponseResult::ReadDir(result.clone()),
+        },
+        format!("readDir {path} response"),
+    )?;
+    Ok(result)
+}
+
+fn guest_fs_read_file(
+    path: &str,
+    range: Option<GuestFsReadRange>,
+) -> Result<Vec<u8>, GuestFsError> {
+    let metadata =
+        std::fs::metadata(path).map_err(|error| fs_io_error(format!("readFile {path}"), error))?;
+    if !metadata.is_file() {
+        return Err(GuestFsError {
+            message: format!("readFile {path}: path must reference a regular file"),
+            code: Some("EINVAL".to_string()),
+        });
+    }
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| fs_io_error(format!("readFile {path}"), error))?;
+    let read_limit = match range {
+        Some(range) => {
+            if range.length > GUEST_FS_RESPONSE_PAYLOAD_LIMIT {
+                return Err(fs_response_too_large(format!("readFile {path} response")));
+            }
+            file.seek(SeekFrom::Start(range.offset))
+                .map_err(|error| fs_io_error(format!("readFile {path}"), error))?;
+            range.length
+        }
+        None => GUEST_FS_RESPONSE_PAYLOAD_LIMIT + 1,
+    };
+    let mut contents = Vec::new();
+    file.take(read_limit)
+        .read_to_end(&mut contents)
+        .map_err(|error| fs_io_error(format!("readFile {path}"), error))?;
+    if contents.len() as u64 > GUEST_FS_RESPONSE_PAYLOAD_LIMIT {
+        return Err(fs_response_too_large(format!("readFile {path} response")));
+    }
+    Ok(contents)
+}
+
+fn guest_fs_write_file(
+    path: &str,
+    contents: &[u8],
+    create_parents: bool,
+) -> Result<(), GuestFsError> {
+    if create_parents {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| fs_io_error(format!("writeFile {path} parent"), error))?;
+        }
+    }
+    std::fs::write(path, contents).map_err(|error| fs_io_error(format!("writeFile {path}"), error))
+}
+
+fn guest_fs_mkdir(path: &str, recursive: bool) -> Result<(), GuestFsError> {
+    if recursive {
+        std::fs::create_dir_all(path).map_err(|error| fs_io_error(format!("mkdir {path}"), error))
+    } else {
+        std::fs::create_dir(path).map_err(|error| fs_io_error(format!("mkdir {path}"), error))
+    }
+}
+
+fn guest_fs_remove(path: &str, recursive: bool, force: bool) -> Result<(), GuestFsError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if force && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(fs_io_error(format!("remove {path}"), error)),
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        if recursive {
+            guest_fs_remove_result(path, force, std::fs::remove_dir_all(path))
+        } else {
+            guest_fs_remove_result(path, force, std::fs::remove_dir(path))
+        }
+    } else {
+        guest_fs_remove_result(path, force, std::fs::remove_file(path))
+    }
+}
+
+fn guest_fs_remove_result(
+    path: &str,
+    force: bool,
+    result: std::io::Result<()>,
+) -> Result<(), GuestFsError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if force && error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(fs_io_error(format!("remove {path}"), error)),
+    }
+}
+
+fn guest_fs_stat_from_metadata(metadata: std::fs::Metadata) -> Result<GuestFsStat, GuestFsError> {
+    let file_type = metadata.file_type();
+    let entry_type = if file_type.is_file() {
+        GuestFsEntryType::File
+    } else if file_type.is_dir() {
+        GuestFsEntryType::Directory
+    } else if file_type.is_symlink() {
+        GuestFsEntryType::Symlink
+    } else {
+        GuestFsEntryType::Other
+    };
+    let size_bytes = metadata.len();
+    if size_bytes > GUEST_FS_MAX_SAFE_INTEGER {
+        return Err(GuestFsError {
+            message: format!(
+                "stat sizeBytes {size_bytes} exceeds JavaScript safe integer limit {GUEST_FS_MAX_SAFE_INTEGER}",
+            ),
+            code: Some("EFBIG".to_string()),
+        });
+    }
+    Ok(GuestFsStat {
+        entry_type,
+        size_bytes,
+        modified_at_ms: modified_at_ms(&metadata)?,
+    })
+}
+
+fn modified_at_ms(metadata: &std::fs::Metadata) -> Result<i64, GuestFsError> {
+    let modified = metadata
+        .modified()
+        .map_err(|error| fs_io_error("stat modified time", error))?;
+    let millis = match modified.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => i128::try_from(duration.as_millis()).map_err(|_| GuestFsError {
+            message: "stat modified time exceeds i128".to_string(),
+            code: None,
+        })?,
+        Err(error) => {
+            let duration = error.duration();
+            -i128::try_from(duration.as_millis()).map_err(|_| GuestFsError {
+                message: "stat modified time exceeds i128".to_string(),
+                code: None,
+            })?
+        }
+    };
+    i64::try_from(millis).map_err(|_| GuestFsError {
+        message: "stat modified time exceeds i64 milliseconds".to_string(),
+        code: None,
+    })
+}
+
+fn fs_io_error(context: impl Into<String>, error: std::io::Error) -> GuestFsError {
+    GuestFsError {
+        message: format!("{}: {error}", context.into()),
+        code: fs_error_code(&error),
+    }
+}
+
+fn fs_response_too_large(context: impl Into<String>) -> GuestFsError {
+    GuestFsError {
+        message: format!(
+            "{} exceeds {} byte guest filesystem response limit",
+            context.into(),
+            GUEST_FS_RESPONSE_PAYLOAD_LIMIT,
+        ),
+        code: Some("EFBIG".to_string()),
+    }
+}
+
+fn guest_fs_ensure_response_size(
+    response: ControlFrame,
+    context: impl Into<String>,
+) -> Result<(), GuestFsError> {
+    let context = context.into();
+    let response = response.encode().map_err(|error| GuestFsError {
+        message: format!("{context}: {error}"),
+        code: None,
+    })?;
+    if response.len() as u64 > GUEST_FS_RESPONSE_PAYLOAD_LIMIT {
+        return Err(fs_response_too_large(context));
+    }
+    Ok(())
+}
+
+fn fs_error_code(error: &std::io::Error) -> Option<String> {
+    let errno = error.raw_os_error()?;
+    let code = match errno {
+        libc::ENOENT => "ENOENT",
+        libc::ENOTDIR => "ENOTDIR",
+        libc::EISDIR => "EISDIR",
+        libc::EEXIST => "EEXIST",
+        libc::ENOTEMPTY => "ENOTEMPTY",
+        libc::EACCES => "EACCES",
+        libc::EPERM => "EPERM",
+        libc::EROFS => "EROFS",
+        libc::EXDEV => "EXDEV",
+        libc::EINVAL => "EINVAL",
+        libc::EFBIG => "EFBIG",
+        _ => return None,
+    };
+    Some(code.to_string())
 }
 
 fn run_guest_spawn(

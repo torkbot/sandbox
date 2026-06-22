@@ -33,6 +33,83 @@ export type SandboxControlEvent =
   | {
       readonly type: "guest.spawn.streams.closed";
       readonly id: string;
+    }
+  | {
+      readonly type: "guest.fs.response";
+      readonly id: string;
+      readonly result:
+        | {
+            readonly ok: true;
+            readonly stat?: SandboxControlFsStat;
+            readonly entries?: readonly SandboxControlFsDirectoryEntry[];
+            readonly contents?: Uint8Array;
+          }
+        | {
+            readonly ok: false;
+            readonly error: {
+              readonly message: string;
+              readonly code?: string;
+            };
+          };
+    };
+
+export type SandboxControlFsStat = {
+  readonly type: "file" | "directory" | "symlink" | "other";
+  readonly sizeBytes: number;
+  readonly modifiedAtMs: number;
+};
+
+export type SandboxControlFsDirectoryEntry = {
+  readonly name: string;
+  readonly nameBytes: Uint8Array;
+  readonly stat: SandboxControlFsStat;
+};
+
+export type SandboxControlFsCommand =
+  | {
+      readonly type: "guest.fs.stat";
+      readonly id: string;
+      readonly path: string;
+    }
+  | {
+      readonly type: "guest.fs.readDir";
+      readonly id: string;
+      readonly path: string;
+    }
+  | {
+      readonly type: "guest.fs.readFile";
+      readonly id: string;
+      readonly path: string;
+      readonly range?: {
+        readonly offset: number;
+        readonly length: number;
+      };
+    }
+  | {
+      readonly type: "guest.fs.writeFile";
+      readonly id: string;
+      readonly path: string;
+      readonly contents: Uint8Array;
+      readonly createParents: boolean;
+    }
+  | {
+      readonly type: "guest.fs.mkdir";
+      readonly id: string;
+      readonly path: string;
+      readonly recursive: boolean;
+    }
+  | {
+      readonly type: "guest.fs.remove";
+      readonly id: string;
+      readonly path: string;
+      readonly recursive: boolean;
+      readonly force: boolean;
+    }
+  | {
+      readonly type: "guest.fs.rename";
+      readonly id: string;
+      readonly from: string;
+      readonly to: string;
     };
 
 export type SandboxControlCommand =
@@ -80,6 +157,7 @@ export type SandboxControlCommand =
       readonly rows: number;
       readonly cols: number;
     }
+  | SandboxControlFsCommand
 ;
 
 export function encodeControlCommand(command: SandboxControlCommand): Uint8Array {
@@ -132,6 +210,60 @@ export function encodeControlCommand(command: SandboxControlCommand): Uint8Array
         rows: command.rows,
         cols: command.cols,
       });
+    case "guest.fs.stat":
+      return encodePacket({
+        type: "guest.fs.stat",
+        id: command.id,
+        path: command.path,
+      });
+    case "guest.fs.readDir":
+      return encodePacket({
+        type: "guest.fs.readDir",
+        id: command.id,
+        path: command.path,
+      });
+    case "guest.fs.readFile":
+      return encodePacket({
+        type: "guest.fs.readFile",
+        id: command.id,
+        path: command.path,
+        ...(command.range === undefined
+          ? {}
+          : {
+              offset: command.range.offset,
+              length: command.range.length,
+            }),
+      });
+    case "guest.fs.writeFile":
+      return encodePacket({
+        type: "guest.fs.writeFile",
+        id: command.id,
+        path: command.path,
+        contents: new Binary(command.contents),
+        createParents: command.createParents,
+      });
+    case "guest.fs.mkdir":
+      return encodePacket({
+        type: "guest.fs.mkdir",
+        id: command.id,
+        path: command.path,
+        recursive: command.recursive,
+      });
+    case "guest.fs.remove":
+      return encodePacket({
+        type: "guest.fs.remove",
+        id: command.id,
+        path: command.path,
+        recursive: command.recursive,
+        force: command.force,
+      });
+    case "guest.fs.rename":
+      return encodePacket({
+        type: "guest.fs.rename",
+        id: command.id,
+        from: command.from,
+        to: command.to,
+      });
   }
 }
 
@@ -180,13 +312,25 @@ export function decodeControlEvent(packet: Uint8Array): SandboxControlEvent {
         type: "guest.spawn.streams.closed",
         id: readString(document, "id"),
       };
+    case "guest.fs.response":
+      return {
+        type: "guest.fs.response",
+        id: readString(document, "id"),
+        result: readFsResponseResult(document),
+      };
     default:
       throw new Error(`unknown control frame type: ${frameType}`);
   }
 }
 
 function encodePacket(document: Record<string, unknown>): Uint8Array {
-  const frame = BSON.serialize(document);
+  const frameSize = BSON.calculateObjectSize(document);
+  // BSON supports this option at runtime but omits it from the published type.
+  const frame = BSON.serialize(document, {
+    minInternalBufferSize: frameSize,
+  } as Parameters<typeof BSON.serialize>[1] & {
+    readonly minInternalBufferSize: number;
+  });
   const packet = new Uint8Array(4 + frame.byteLength);
   new DataView(packet.buffer, packet.byteOffset, 4).setUint32(0, frame.byteLength, true);
   packet.set(frame, 4);
@@ -260,4 +404,83 @@ function readBytes(document: Record<string, unknown>, key: string): Uint8Array {
     return value;
   }
   throw new Error(`control frame field must be binary: ${key}`);
+}
+
+function readFsResponseResult(document: Record<string, unknown>): Extract<SandboxControlEvent, { type: "guest.fs.response" }>["result"] {
+  const ok = readBoolean(document, "ok");
+  if (!ok) {
+    return {
+      ok: false,
+      error: {
+        message: readString(document, "error"),
+        ...optionalStringField(document, "code"),
+      },
+    };
+  }
+  return {
+    ok: true,
+    ...optionalFsStatField(document, "stat"),
+    ...optionalFsDirectoryEntriesField(document, "entries"),
+    ...optionalBytesField(document, "contents"),
+  };
+}
+
+function optionalFsStatField(document: Record<string, unknown>, key: string): Record<string, SandboxControlFsStat> {
+  const value = document[key];
+  if (value === undefined) {
+    return {};
+  }
+  return { [key]: readFsStat(value, key) };
+}
+
+function readFsStat(value: unknown, label: string): SandboxControlFsStat {
+  if (typeof value !== "object" || value === null || value instanceof Uint8Array || value instanceof Binary) {
+    throw new Error(`control frame field must be a document: ${label}`);
+  }
+  const document = value as Record<string, unknown>;
+  const type = readString(document, "type");
+  if (type !== "file" && type !== "directory" && type !== "symlink" && type !== "other") {
+    throw new Error(`control frame field has invalid filesystem type: ${label}.type`);
+  }
+  return {
+    type,
+    sizeBytes: readNumber(document, "sizeBytes"),
+    modifiedAtMs: readNumber(document, "modifiedAtMs"),
+  };
+}
+
+function optionalFsDirectoryEntriesField(
+  document: Record<string, unknown>,
+  key: string,
+): Record<string, readonly SandboxControlFsDirectoryEntry[]> {
+  const value = document[key];
+  if (value === undefined) {
+    return {};
+  }
+  if (!Array.isArray(value)) {
+    throw new Error(`control frame field must be an array: ${key}`);
+  }
+  return {
+    [key]: value.map((entry, index) => readFsDirectoryEntry(entry, `${key}[${index}]`)),
+  };
+}
+
+function readFsDirectoryEntry(value: unknown, label: string): SandboxControlFsDirectoryEntry {
+  if (typeof value !== "object" || value === null || value instanceof Uint8Array || value instanceof Binary) {
+    throw new Error(`control frame field must be a document: ${label}`);
+  }
+  const document = value as Record<string, unknown>;
+  return {
+    name: readString(document, "name"),
+    nameBytes: readBytes(document, "nameBytes"),
+    stat: readFsStat(document.stat, `${label}.stat`),
+  };
+}
+
+function optionalBytesField(document: Record<string, unknown>, key: string): Record<string, Uint8Array> {
+  const value = document[key];
+  if (value === undefined) {
+    return {};
+  }
+  return { [key]: readBytes(document, key) };
 }

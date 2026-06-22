@@ -168,6 +168,33 @@ target parent is on init-owned tmpfs or comes from an earlier virtual mount. On
 durable rootfs paths that cannot be created without changing rootfs or COW
 semantics, boot fails with the guest init error surfaced in the host exception.
 
+### Read and write the running guest
+
+Use `vm.fs` when the host needs to inspect or mutate the full composed guest
+filesystem after boot, including the rootfs and every mounted filesystem:
+
+```ts
+await using vm = await sandbox.boot();
+
+await vm.fs.writeFile("/tmp/task/input.txt", "hello world", {
+  createParents: true,
+});
+
+const chunk = await vm.fs.readFile("/tmp/task/input.txt", {
+  range: { offset: 6, length: 5 },
+});
+
+const entries = await vm.fs.readDir("/tmp/task");
+const published = new TextDecoder().decode(chunk);
+
+await vm.fs.rename("/tmp/task/input.txt", "/tmp/task/published.txt");
+```
+
+`readDir(...)` returns entry names, exact entry-name bytes, and metadata
+together, so callers do not need one `stat(...)` call per entry. `writeFile(...)`
+creates a missing file and replaces an existing file; `createParents` only
+controls whether missing parent directories are created first.
+
 ### Control network egress
 
 Networking is default-deny. Policy callbacks grant only the flows they accept:
@@ -451,6 +478,51 @@ Writable bind mounts require `mask.storage`, and that storage must also be a
 writable `fs.bind(...)` source. If the guest creates a masked path, Sandbox
 stores that guest-owned entry under the storage directory using the same
 mask-relative path, while the original host entry remains hidden and unchanged.
+
+### Guest filesystem
+
+Every booted sandbox exposes `vm.fs`, a small host API over the running guest's
+composed filesystem. Paths are absolute guest paths. Except for `/`, paths must
+not end in a trailing slash; this keeps symlink entries from being accidentally
+resolved as their directory targets by Linux path traversal.
+Safe inspection operations may target `/`, but mutation paths for `writeFile`,
+`mkdir`, `remove`, and `rename` must not be the guest root.
+
+```ts
+const stat = await vm.fs.stat("/workspace/package.json");
+const entries = await vm.fs.readDir("/workspace/src");
+const bytes = await vm.fs.readFile("/workspace/log.txt", {
+  range: { offset: 1024, length: 4096 },
+});
+
+await vm.fs.writeFile("/workspace/out/result.json", contents, {
+  createParents: true,
+});
+await vm.fs.mkdir("/workspace/cache/deep", { recursive: true });
+await vm.fs.remove("/workspace/cache", { recursive: true });
+await vm.fs.remove("/workspace/maybe-gone", { force: true });
+await vm.fs.rename("/workspace/out/result.tmp", "/workspace/out/result.json");
+```
+
+`stat(...)` reports the directory entry itself, including symlinks, rather than
+following symlink targets. `readFile(...)` reads the whole file unless a byte
+`range` with required `offset` and `length` is supplied. `writeFile(...)`
+creates or truncates the target file; the caller does not need to know whether
+the file already exists.
+
+`readDir(...)` includes each entry's `name`, exact `nameBytes`, and `stat` in one
+round trip. `name` is the normal UTF-8 filename for ordinary entries;
+`nameBytes` preserves the raw guest directory-entry bytes.
+
+For `remove(...)`, `recursive` permits deleting non-empty directories. `force`
+only suppresses a missing target; permission, read-only filesystem, type, and
+non-empty-directory errors are still returned.
+
+`rename(...)` is a single guest rename operation. It does not create missing
+parent directories, because doing so would turn a rename into multiple
+filesystem mutations and weaken the atomicity callers expect. The target parent
+must already exist; cross-filesystem renames may fail with the guest filesystem's
+native error.
 
 ### Processes
 

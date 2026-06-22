@@ -649,7 +649,94 @@ export type SandboxSignal =
   | "SIGTERM"
   | "SIGKILL";
 
+export type SandboxFsEntryType = "file" | "directory" | "symlink" | "other";
+
+export type SandboxFsStat = {
+  readonly type: SandboxFsEntryType;
+  readonly sizeBytes: number;
+  readonly modifiedAtMs: number;
+};
+
+export type SandboxFsDirectoryEntry = {
+  /**
+   * UTF-8 filename for ordinary entries. If the guest filename is not valid
+   * UTF-8, replacement characters are used and `nameBytes` remains exact.
+   */
+  readonly name: string;
+  /**
+   * Exact filename bytes as reported by the guest directory entry.
+   */
+  readonly nameBytes: Uint8Array;
+  readonly stat: SandboxFsStat;
+};
+
+export interface SandboxReadFileOptions {
+  readonly range?: {
+    readonly offset: number;
+    readonly length: number;
+  };
+}
+
+export interface SandboxWriteFileOptions {
+  readonly createParents?: boolean;
+}
+
+export interface SandboxMkdirOptions {
+  readonly recursive?: boolean;
+}
+
+export interface SandboxRemoveOptions {
+  readonly recursive?: boolean;
+  readonly force?: boolean;
+}
+
+export interface SandboxGuestFileSystem {
+  /**
+   * Returns metadata for an absolute guest path without following symlinks.
+   */
+  stat(path: string): Promise<SandboxFsStat>;
+  /**
+   * Lists a directory and includes metadata for each entry in the same guest
+   * round trip.
+   */
+  readDir(path: string): Promise<readonly SandboxFsDirectoryEntry[]>;
+  /**
+   * Reads a full file, or the byte range selected by `options.range`.
+   */
+  readFile(path: string, options?: SandboxReadFileOptions): Promise<Uint8Array>;
+  /**
+   * Creates or replaces a file. `createParents` creates missing parent
+   * directories before writing.
+   */
+  writeFile(path: string, contents: string | Uint8Array, options?: SandboxWriteFileOptions): Promise<void>;
+  /**
+   * Creates a directory. `recursive` matches `mkdir -p` semantics.
+   */
+  mkdir(path: string, options?: SandboxMkdirOptions): Promise<void>;
+  /**
+   * Removes a file, symlink, or directory. `recursive` permits non-empty
+   * directory trees. `force` suppresses missing-target errors only.
+   */
+  remove(path: string, options?: SandboxRemoveOptions): Promise<void>;
+  /**
+   * Renames a path in one guest operation. Parent directories are not created;
+   * the target parent must already exist.
+   */
+  rename(from: string, to: string): Promise<void>;
+}
+
+export class SandboxFileSystemError extends Error {
+  readonly code?: string;
+
+  constructor(message: string, code?: string) {
+    super(message);
+    this.name = "SandboxFileSystemError";
+    this.code = code;
+  }
+}
+
 export interface SandboxInstance {
+  readonly fs: SandboxGuestFileSystem;
   /**
    * Returns config-derived facts plus facts observed from the running guest.
    */
@@ -1192,6 +1279,7 @@ class DefinedSandbox implements SandboxDefinition {
 class HostBackedSandboxVm implements SandboxVm {
   readonly control: SandboxControl;
   readonly diagnostics?: SandboxDiagnostics;
+  readonly fs: SandboxGuestFileSystem;
   readonly #exec: ControlBackedSandboxExec;
   readonly #rootExec: ControlBackedSandboxExec;
   readonly #options: InternalSandboxOptions;
@@ -1226,6 +1314,7 @@ class HostBackedSandboxVm implements SandboxVm {
       connected: hostVm.hasControlSocket,
       channel: hostVm,
     });
+    this.fs = new ControlBackedSandboxGuestFileSystem(this.control);
     this.#exec = new ControlBackedSandboxExec(this.control, options.cwd);
     this.#rootExec = new ControlBackedSandboxExec(this.control, "/");
     if (hostVm.terminateHostForTest !== undefined) {
@@ -1375,6 +1464,112 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
     const error = new Error("sandbox spawn aborted");
     error.name = "AbortError";
     throw error;
+  }
+}
+
+class ControlBackedSandboxGuestFileSystem implements SandboxGuestFileSystem {
+  readonly #control: SandboxControl;
+
+  constructor(control: SandboxControl) {
+    this.#control = control;
+  }
+
+  async stat(path: string): Promise<SandboxFsStat> {
+    validateSandboxFsPath(path, "sandbox fs stat path");
+    const result = await this.#request({
+      type: "guest.fs.stat",
+      path,
+    });
+    if (result.stat === undefined) {
+      throw new Error("sandbox fs stat response missing stat");
+    }
+    return result.stat;
+  }
+
+  async readDir(path: string): Promise<readonly SandboxFsDirectoryEntry[]> {
+    validateSandboxFsPath(path, "sandbox fs readDir path");
+    const result = await this.#request({
+      type: "guest.fs.readDir",
+      path,
+    });
+    if (result.entries === undefined) {
+      throw new Error("sandbox fs readDir response missing entries");
+    }
+    return result.entries;
+  }
+
+  async readFile(path: string, options: SandboxReadFileOptions = {}): Promise<Uint8Array> {
+    validateSandboxFsPath(path, "sandbox fs readFile path");
+    validateSandboxFsOptions(options, "sandbox fs readFile options");
+    const range = optionalSandboxFsReadRange(options);
+    const result = await this.#request({
+      type: "guest.fs.readFile",
+      path,
+      ...(range === undefined ? {} : { range }),
+    });
+    if (result.contents === undefined) {
+      throw new Error("sandbox fs readFile response missing contents");
+    }
+    return result.contents;
+  }
+
+  async writeFile(
+    path: string,
+    contents: string | Uint8Array,
+    options: SandboxWriteFileOptions = {},
+  ): Promise<void> {
+    validateSandboxFsMutationPath(path, "sandbox fs writeFile path");
+    validateSandboxFsOptions(options, "sandbox fs writeFile options");
+    if (typeof contents !== "string" && !(contents instanceof Uint8Array)) {
+      throw new Error("invalid sandbox fs writeFile contents: contents must be a string or Uint8Array");
+    }
+    await this.#request({
+      type: "guest.fs.writeFile",
+      path,
+      contents: typeof contents === "string" ? new TextEncoder().encode(contents) : contents,
+      createParents: optionalSandboxFsBoolean(options, "createParents", "sandbox fs writeFile createParents"),
+    });
+  }
+
+  async mkdir(path: string, options: SandboxMkdirOptions = {}): Promise<void> {
+    validateSandboxFsMutationPath(path, "sandbox fs mkdir path");
+    validateSandboxFsOptions(options, "sandbox fs mkdir options");
+    await this.#request({
+      type: "guest.fs.mkdir",
+      path,
+      recursive: optionalSandboxFsBoolean(options, "recursive", "sandbox fs mkdir recursive"),
+    });
+  }
+
+  async remove(path: string, options: SandboxRemoveOptions = {}): Promise<void> {
+    validateSandboxFsMutationPath(path, "sandbox fs remove path");
+    validateSandboxFsOptions(options, "sandbox fs remove options");
+    await this.#request({
+      type: "guest.fs.remove",
+      path,
+      recursive: optionalSandboxFsBoolean(options, "recursive", "sandbox fs remove recursive"),
+      force: optionalSandboxFsBoolean(options, "force", "sandbox fs remove force"),
+    });
+  }
+
+  async rename(from: string, to: string): Promise<void> {
+    validateSandboxFsMutationPath(from, "sandbox fs rename from");
+    validateSandboxFsMutationPath(to, "sandbox fs rename to");
+    await this.#request({
+      type: "guest.fs.rename",
+      from,
+      to,
+    });
+  }
+
+  async #request(
+    command: Parameters<SandboxControl["requestFileSystem"]>[0],
+  ): Promise<Extract<Awaited<ReturnType<SandboxControl["requestFileSystem"]>>["result"], { ok: true }>> {
+    const response = await this.#control.requestFileSystem(command);
+    if (!response.result.ok) {
+      throw new SandboxFileSystemError(response.result.error.message, response.result.error.code);
+    }
+    return response.result;
   }
 }
 
@@ -2318,6 +2513,70 @@ function validateGuestPath(path: string, field: "mount.path"): void {
   }
   if (path.split("/").some((component) => component === "." || component === "..")) {
     throw new Error(`invalid sandbox options: ${field} must not contain '.' or '..' components`);
+  }
+}
+
+function validateSandboxFsPath(path: string, field: string): void {
+  if (typeof path !== "string") {
+    throw new Error(`invalid ${field}: path must be a string`);
+  }
+  if (!path.startsWith("/")) {
+    throw new Error(`invalid ${field}: path must be absolute`);
+  }
+  if (path.includes("\0")) {
+    throw new Error(`invalid ${field}: path must not contain NUL bytes`);
+  }
+  if (path.length > 1 && path.endsWith("/")) {
+    throw new Error(`invalid ${field}: path must not end with a trailing slash`);
+  }
+  if (path.split("/").some((component) => component === "." || component === "..")) {
+    throw new Error(`invalid ${field}: path must not contain '.' or '..' components`);
+  }
+}
+
+function validateSandboxFsMutationPath(path: string, field: string): void {
+  validateSandboxFsPath(path, field);
+  if (path === "/") {
+    throw new Error(`invalid ${field}: path must not be root`);
+  }
+}
+
+function validateSandboxFsOptions(options: unknown, field: string): asserts options is Record<string, unknown> {
+  if (typeof options !== "object" || options === null || Array.isArray(options)) {
+    throw new Error(`invalid ${field}: options must be an object`);
+  }
+}
+
+function optionalSandboxFsReadRange(options: Record<string, unknown>): { readonly offset: number; readonly length: number } | undefined {
+  const range = options.range;
+  if (range === undefined) {
+    return undefined;
+  }
+  if (typeof range !== "object" || range === null || Array.isArray(range)) {
+    throw new Error("invalid sandbox fs readFile range: range must be an object");
+  }
+  const document = range as Record<string, unknown>;
+  const offset = document.offset;
+  const length = document.length;
+  validateNonNegativeSafeInteger(offset, "sandbox fs readFile range offset");
+  validateNonNegativeSafeInteger(length, "sandbox fs readFile range length");
+  return { offset, length };
+}
+
+function optionalSandboxFsBoolean(options: Record<string, unknown>, key: string, field: string): boolean {
+  const value = options[key];
+  if (value === undefined) {
+    return false;
+  }
+  if (typeof value !== "boolean") {
+    throw new Error(`invalid ${field}: value must be a boolean`);
+  }
+  return value;
+}
+
+function validateNonNegativeSafeInteger(value: unknown, field: string): asserts value is number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`invalid ${field}: value must be a non-negative safe integer`);
   }
 }
 

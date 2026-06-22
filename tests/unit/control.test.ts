@@ -762,6 +762,67 @@ test("HostControlTransport rejects duplicate in-flight exec ids", async () => {
   await control.close();
 });
 
+test("HostControlTransport requestFileSystem waits for matching response", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const request = control.requestFileSystem({
+    type: "guest.fs.readFile",
+    path: "/tmp/input.txt",
+    range: { offset: 1, length: 3 },
+  });
+
+  const write = BSON.deserialize(channel.writes[0]!.subarray(4));
+  assert.equal(write.type, "guest.fs.readFile");
+  assert.equal(typeof write.id, "string");
+  assert.equal(write.path, "/tmp/input.txt");
+  assert.equal(write.offset, 1);
+  assert.equal(write.length, 3);
+
+  channel.packets.push(
+    encodePacket({
+      type: "guest.fs.response",
+      id: "unrelated",
+      ok: true,
+      contents: new Binary(new TextEncoder().encode("wrong")),
+    }),
+    encodePacket({
+      type: "guest.fs.response",
+      id: write.id,
+      ok: true,
+      contents: new Binary(new TextEncoder().encode("npu")),
+    }),
+  );
+
+  const response = await request;
+  assert.equal(response.type, "guest.fs.response");
+  assert.equal(response.id, write.id);
+  assert.equal(response.result.ok, true);
+  assert.deepEqual(
+    response.result.ok && response.result.contents !== undefined
+      ? [...response.result.contents]
+      : undefined,
+    [...new TextEncoder().encode("npu")],
+  );
+  await control.close();
+});
+
+test("HostControlTransport rejects pending filesystem requests on malformed frames", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const request = control.requestFileSystem({
+    type: "guest.fs.stat",
+    path: "/tmp/input.txt",
+  });
+
+  channel.packets.push(encodePacket({ type: "unknown.control.frame" }));
+
+  await assert.rejects(request, /unknown control frame type: unknown.control.frame/);
+  await assert.rejects(
+    control.requestFileSystem({ type: "guest.fs.stat", path: "/tmp/after-failure" }),
+    /sandbox control is closed/,
+  );
+});
+
 test("HostControlTransport closes and rejects pending execs on malformed frames", async () => {
   const channel = new MemoryControlChannel();
   const control = new HostControlTransport({ channel });

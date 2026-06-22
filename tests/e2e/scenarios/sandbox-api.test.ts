@@ -560,6 +560,171 @@ test("boot options provide instance-specific virtual mounts", async (t) => {
   assert.equal(result.stdout, "lane-private");
 });
 
+test("running sandbox exposes a remote-friendly guest filesystem API", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  await using sandbox = await defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  }).boot();
+
+  await sandbox.fs.writeFile("/tmp/vmfs/input.txt", "hello world", {
+    createParents: true,
+  });
+  assert.equal(
+    new TextDecoder().decode(await sandbox.fs.readFile("/tmp/vmfs/input.txt")),
+    "hello world",
+  );
+  assert.equal(
+    new TextDecoder().decode(await sandbox.fs.readFile("/tmp/vmfs/input.txt", {
+      range: { offset: 6, length: 5 },
+    })),
+    "world",
+  );
+  await assert.rejects(
+    () => sandbox.fs.writeFile("/tmp/vmfs/invalid.txt", "invalid", {
+      createParents: "true" as unknown as boolean,
+    }),
+    /invalid sandbox fs writeFile createParents: value must be a boolean/,
+  );
+  await assert.rejects(
+    () => sandbox.fs.mkdir("/tmp/vmfs/invalid", {
+      recursive: "true" as unknown as boolean,
+    }),
+    /invalid sandbox fs mkdir recursive: value must be a boolean/,
+  );
+  await assert.rejects(
+    () => sandbox.fs.remove("/tmp/vmfs/invalid", {
+      force: "true" as unknown as boolean,
+    }),
+    /invalid sandbox fs remove force: value must be a boolean/,
+  );
+  await assert.rejects(
+    () => sandbox.fs.remove("/tmp/vmfs/input.txt/", { force: true }),
+    /invalid sandbox fs remove path: path must not end with a trailing slash/,
+  );
+  await assert.rejects(
+    () => sandbox.fs.remove("/", { recursive: true }),
+    /invalid sandbox fs remove path: path must not be root/,
+  );
+  const validationFollowup = await sandbox.exec("/bin/sh", ["-lc", "printf ok"]);
+  assert.equal(validationFollowup.stdout, "ok");
+
+  await sandbox.exec("/bin/sh", ["-lc", "mkfifo /tmp/vmfs/pipe"]);
+  await assert.rejects(
+    () => sandbox.fs.readFile("/tmp/vmfs/pipe"),
+    (error) =>
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === "EINVAL",
+  );
+  const fifoFollowup = await sandbox.exec("/bin/sh", ["-lc", "printf ok"]);
+  assert.equal(fifoFollowup.stdout, "ok");
+
+  await sandbox.exec("/bin/sh", ["-lc", "dd if=/dev/zero of=/tmp/vmfs/large.bin bs=1M count=61 status=none"]);
+  await assert.rejects(
+    () => sandbox.fs.readFile("/tmp/vmfs/large.bin"),
+    (error) =>
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === "EFBIG",
+  );
+  assert.equal((await sandbox.fs.readFile("/tmp/vmfs/large.bin", {
+    range: { offset: 1024, length: 16 },
+  })).byteLength, 16);
+
+  await sandbox.exec("/bin/sh", ["-lc", "truncate -s 9007199254740992 /tmp/vmfs/huge-sparse.bin"]);
+  await assert.rejects(
+    () => sandbox.fs.stat("/tmp/vmfs/huge-sparse.bin"),
+    (error) =>
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === "EFBIG",
+  );
+  const hugeStatFollowup = await sandbox.exec("/bin/sh", ["-lc", "printf ok"]);
+  assert.equal(hugeStatFollowup.stdout, "ok");
+
+  await sandbox.fs.writeFile("/tmp/vmfs/list/a.txt", new TextEncoder().encode("alpha"), {
+    createParents: true,
+  });
+  await sandbox.fs.writeFile("/tmp/vmfs/list/b.txt", "beta");
+  await sandbox.fs.mkdir("/tmp/vmfs/list/subdir");
+
+  const entries = [...await sandbox.fs.readDir("/tmp/vmfs/list")]
+    .sort((left, right) => left.name.localeCompare(right.name));
+  assert.deepEqual(
+    entries.map((entry) => ({
+      name: entry.name,
+      type: entry.stat.type,
+    })),
+    [
+      { name: "a.txt", type: "file" },
+      { name: "b.txt", type: "file" },
+      { name: "subdir", type: "directory" },
+    ],
+  );
+  assert.equal(entries[0]?.stat.sizeBytes, 5);
+  assert.equal(entries[1]?.stat.sizeBytes, 4);
+  assert.equal(typeof entries[2]?.stat.sizeBytes, "number");
+  assert.equal(typeof entries[0]?.stat.modifiedAtMs, "number");
+  assert.deepEqual([...(entries[0]?.nameBytes ?? [])], [...new TextEncoder().encode("a.txt")]);
+
+  const stat = await sandbox.fs.stat("/tmp/vmfs/list/a.txt");
+  assert.equal(stat.type, "file");
+  assert.equal(stat.sizeBytes, 5);
+  assert.equal(typeof stat.modifiedAtMs, "number");
+
+  await sandbox.fs.mkdir("/tmp/vmfs/nonutf8");
+  await sandbox.exec("/bin/sh", [
+    "-lc",
+    "printf x > \"$(printf '/tmp/vmfs/nonutf8/name_\\377')\"",
+  ]);
+  const nonUtf8Entries = await sandbox.fs.readDir("/tmp/vmfs/nonutf8");
+  assert.equal(nonUtf8Entries.length, 1);
+  const nonUtf8Entry = nonUtf8Entries[0];
+  assert.ok(nonUtf8Entry);
+  assert.equal(nonUtf8Entry.stat.type, "file");
+  assert.equal(nonUtf8Entry.stat.sizeBytes, 1);
+  assert.deepEqual([...nonUtf8Entry.nameBytes], [...new TextEncoder().encode("name_"), 0xff]);
+
+  await sandbox.fs.mkdir("/tmp/vmfs/tree/deep", { recursive: true });
+  await sandbox.fs.writeFile("/tmp/vmfs/tree/deep/file.txt", "tree");
+  await assert.rejects(
+    () => sandbox.fs.remove("/tmp/vmfs/tree"),
+    (error) => typeof error === "object"
+      && error !== null
+      && "code" in error
+      && error.code === "ENOTEMPTY",
+  );
+  await sandbox.fs.remove("/tmp/vmfs/tree", { recursive: true });
+  await assert.rejects(
+    () => sandbox.fs.remove("/tmp/vmfs/tree"),
+    (error) => typeof error === "object"
+      && error !== null
+      && "code" in error
+      && error.code === "ENOENT",
+  );
+  await sandbox.fs.remove("/tmp/vmfs/tree", { force: true });
+
+  await sandbox.fs.writeFile("/tmp/vmfs/publish.tmp", "published");
+  await sandbox.fs.rename("/tmp/vmfs/publish.tmp", "/tmp/vmfs/publish.txt");
+  assert.equal(
+    new TextDecoder().decode(await sandbox.fs.readFile("/tmp/vmfs/publish.txt")),
+    "published",
+  );
+  await assert.rejects(
+    () => sandbox.fs.rename("/tmp/vmfs/publish.txt", "/tmp/vmfs/missing-parent/publish.txt"),
+    (error) => typeof error === "object"
+      && error !== null
+      && "code" in error
+      && error.code === "ENOENT",
+  );
+});
+
 test("host directory bind mounts use native virtio-fs access modes", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
