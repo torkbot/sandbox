@@ -312,7 +312,7 @@ test("boot requires writable mask storage for writable host directory masks", as
   );
 });
 
-test("boot rejects writable mask storage that aliases the bind source", async () => {
+test("boot rejects writable mask storage that resolves inside the bind source", async () => {
   const sandbox = defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.23"),
   });
@@ -333,7 +333,45 @@ test("boot rejects writable mask storage that aliases the bind source", async ()
         }),
       },
     }),
-    /invalid sandbox boot options: host directory mask storage source must not equal the bind source/,
+    /invalid sandbox boot options: host directory mask storage source must not be inside the bind source/,
+  );
+
+  await assert.rejects(
+    sandbox.boot({
+      mounts: {
+        "/mnt": fs.bind({
+          source: "/tmp/workspace",
+          access: "rw",
+          mask: {
+            paths: ["/node_modules"],
+            storage: fs.bind({
+              source: "/tmp/workspace/.sandbox-mask",
+              access: "rw",
+            }),
+          },
+        }),
+      },
+    }),
+    /invalid sandbox boot options: host directory mask storage source must not be inside the bind source/,
+  );
+
+  await assert.rejects(
+    sandbox.boot({
+      mounts: {
+        "/mnt": fs.bind({
+          source: "/tmp/workspace",
+          access: "rw",
+          mask: {
+            paths: ["/workspace"],
+            storage: fs.bind({
+              source: "/tmp",
+              access: "rw",
+            }),
+          },
+        }),
+      },
+    }),
+    /invalid sandbox boot options: host directory mask storage entries must not resolve inside the bind source/,
   );
 });
 

@@ -129,7 +129,6 @@ impl KrunContext {
                             Some(krun::FsPassthroughMaskConfig {
                                 paths: mask.paths.clone(),
                                 storage: mask.storage.clone(),
-                                case_insensitive: false,
                             }),
                         ),
                     );

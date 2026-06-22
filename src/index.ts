@@ -19,7 +19,7 @@ import {
 } from "./environment-facts.ts";
 import { randomUUID } from "node:crypto";
 import { open } from "node:fs/promises";
-import { resolve } from "node:path";
+import { isAbsolute, relative, resolve } from "node:path";
 import { HostControlTransport } from "./control.ts";
 import { HostProcessSandboxVm } from "./host-process.ts";
 import { createMemoryFileSystem } from "./memory-fs.ts";
@@ -2105,9 +2105,22 @@ function validateHostDirectoryMask(source: HostDirectorySourceForValidation): vo
     throw new Error("invalid sandbox boot options: writable host directory masks require mask.storage");
   }
   validateHostDirectoryMaskStorage(mask.storage);
-  if (resolve(mask.storage.source) === resolve(source.source)) {
-    throw new Error("invalid sandbox boot options: host directory mask storage source must not equal the bind source");
+  const sourcePath = resolve(source.source);
+  const storagePath = resolve(mask.storage.source);
+  if (isPathInsideOrEqual(sourcePath, storagePath)) {
+    throw new Error("invalid sandbox boot options: host directory mask storage source must not be inside the bind source");
   }
+  for (const path of mask.paths) {
+    const upperPath = resolve(storagePath, path.slice(1));
+    if (isPathInsideOrEqual(sourcePath, upperPath)) {
+      throw new Error("invalid sandbox boot options: host directory mask storage entries must not resolve inside the bind source");
+    }
+  }
+}
+
+function isPathInsideOrEqual(parent: string, child: string): boolean {
+  const path = relative(parent, child);
+  return path === "" || (!path.startsWith("..") && !isAbsolute(path));
 }
 
 function validateHostDirectoryMaskPath(path: string): void {
