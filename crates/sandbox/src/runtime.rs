@@ -117,6 +117,22 @@ impl KrunContext {
                 ),
             ),
             VirtioFsDevice::HostDirectory(device) => {
+                if let Some(mask) = &device.mask {
+                    return check_krun(
+                        "krun_add_virtiofs_masked",
+                        krun::krun_add_virtiofs_masked(
+                            self.id,
+                            device.tag.clone(),
+                            device.source.clone(),
+                            Some(1 << 29),
+                            device.readonly,
+                            Some(krun::FsPassthroughMaskConfig {
+                                paths: mask.paths.clone(),
+                                storage: mask.storage.clone(),
+                            }),
+                        ),
+                    );
+                }
                 let tag = CString::new(device.tag.as_str())
                     .map_err(|_| KrunError::new("krun_add_virtiofs3", -libc::EINVAL))?;
                 let source = CString::new(device.source.as_str())
@@ -410,6 +426,12 @@ pub struct HostDirectoryFsDevice {
     pub path: String,
     pub source: String,
     pub readonly: bool,
+    pub mask: Option<HostDirectoryMaskFsDevice>,
+}
+
+pub struct HostDirectoryMaskFsDevice {
+    pub paths: Vec<String>,
+    pub storage: Option<String>,
 }
 
 impl VirtioFsDevice {

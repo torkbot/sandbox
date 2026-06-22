@@ -58,6 +58,14 @@ export type InternalMount =
       readonly path: string;
       readonly source: string;
       readonly access: "ro" | "rw";
+      readonly mask?: {
+        readonly paths: readonly string[];
+        readonly storage?: {
+          readonly kind: "host-directory";
+          readonly source: string;
+          readonly access: "rw";
+        };
+      };
     };
 
 export interface InternalSandboxOptions {

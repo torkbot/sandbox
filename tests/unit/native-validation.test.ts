@@ -221,6 +221,122 @@ test("boot rejects host directory mounts without explicit access", async () => {
   );
 });
 
+test("boot rejects invalid host directory mask paths", async () => {
+  const sandbox = defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  });
+
+  await assert.rejects(
+    sandbox.boot({
+      mounts: {
+        "/mnt": fs.bind({
+          source: "/tmp/workspace",
+          access: "ro",
+          mask: {
+            paths: ["node_modules"],
+          },
+        }),
+      },
+    }),
+    /invalid sandbox boot options: host directory mask path must be absolute/,
+  );
+
+  await assert.rejects(
+    sandbox.boot({
+      mounts: {
+        "/mnt": fs.bind({
+          source: "/tmp/workspace",
+          access: "ro",
+          mask: {
+            paths: ["/"],
+          },
+        }),
+      },
+    }),
+    /invalid sandbox boot options: host directory mask path must not be root/,
+  );
+
+  await assert.rejects(
+    sandbox.boot({
+      mounts: {
+        "/mnt": fs.bind({
+          source: "/tmp/workspace",
+          access: "ro",
+          mask: {
+            paths: ["/node_modules/"],
+          },
+        }),
+      },
+    }),
+    /invalid sandbox boot options: host directory mask path must not contain empty components/,
+  );
+});
+
+test("boot requires writable mask storage for writable host directory masks", async () => {
+  const sandbox = defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  });
+
+  await assert.rejects(
+    sandbox.boot({
+      mounts: {
+        "/mnt": fs.bind({
+          source: "/tmp/workspace",
+          access: "rw",
+          mask: {
+            paths: ["/node_modules"],
+          } as never,
+        }),
+      },
+    }),
+    /invalid sandbox boot options: writable host directory masks require mask.storage/,
+  );
+
+  await assert.rejects(
+    sandbox.boot({
+      mounts: {
+        "/mnt": fs.bind({
+          source: "/tmp/workspace",
+          access: "rw",
+          mask: {
+            paths: ["/node_modules"],
+            storage: fs.bind({
+              source: "/tmp/mask-storage",
+              access: "ro",
+            }),
+          } as never,
+        }),
+      },
+    }),
+    /invalid sandbox boot options: host directory mask storage access must be 'rw'/,
+  );
+});
+
+test("boot rejects mask storage on read-only host directory masks", async () => {
+  const sandbox = defineSandbox({
+    rootfs: rootfs.builtIn("alpine:3.23"),
+  });
+
+  await assert.rejects(
+    sandbox.boot({
+      mounts: {
+        "/mnt": fs.bind({
+          source: "/tmp/workspace",
+          access: "ro",
+          mask: {
+            paths: ["/node_modules"],
+            storage: fs.bind({
+              source: "/tmp/mask-storage",
+              access: "rw",
+            }),
+          } as never,
+        }),
+      },
+    }),
+    /invalid sandbox boot options: read-only host directory masks must not declare mask.storage/,
+  );
+});
+
 function readOnlyFileSystem(): SandboxFileSystem {
   return {
     async stat() {

@@ -10,8 +10,9 @@ use bson::{Bson, Document, doc};
 use sandbox::block_storage::CowBlockStore;
 use sandbox::config::MountSpec;
 use sandbox::config::{
-    HttpRequestHeaderHookSpec, HttpSpecInput, MicroVmSpecInput, MountSpecInput, NetworkPolicySpec,
-    OutboundPolicy, OutboundRuleSpec, OutboundSpec, RootfsStorageSpecInput,
+    HostDirectoryMaskInput, HostDirectoryMaskStorageInput, HttpRequestHeaderHookSpec,
+    HttpSpecInput, MicroVmSpecInput, MountSpecInput, NetworkPolicySpec, OutboundPolicy,
+    OutboundRuleSpec, OutboundSpec, RootfsStorageSpecInput,
 };
 use sandbox::http_flow::{
     HookBackedHttpInterceptRuntime, HttpHookExecutor, InterceptedHttpRequest,
@@ -22,8 +23,8 @@ use sandbox::network_service::{
 };
 use sandbox::rootfs_image::{Qcow2FlattenOptions, flatten_rootfs_to_qcow2};
 use sandbox::runtime::{
-    ControlSocket, HostDirectoryFsDevice, HostServices, StartStatusObserver, VirtioFsDevice,
-    VirtualFsDevice,
+    ControlSocket, HostDirectoryFsDevice, HostDirectoryMaskFsDevice, HostServices,
+    StartStatusObserver, VirtioFsDevice, VirtualFsDevice,
 };
 
 mod host_vfs;
@@ -761,6 +762,7 @@ fn virtio_fs_devices(
                     path,
                     source,
                     access,
+                    mask,
                 } => {
                     let tag = format!("vfs{index}");
                     Some(VirtioFsDevice::HostDirectory(HostDirectoryFsDevice {
@@ -768,6 +770,13 @@ fn virtio_fs_devices(
                         path: path.clone(),
                         source: source.to_string_lossy().into_owned(),
                         readonly: *access == sandbox::config::HostDirectoryAccess::ReadOnly,
+                        mask: mask.as_ref().map(|mask| HostDirectoryMaskFsDevice {
+                            paths: mask.paths.clone(),
+                            storage: mask
+                                .storage
+                                .as_ref()
+                                .map(|storage| storage.source.to_string_lossy().into_owned()),
+                        }),
                     }))
                 }
             }),
@@ -868,9 +877,34 @@ fn parse_mounts(values: &[bson::Bson]) -> Result<Vec<MountSpecInput>, Box<dyn st
                 writable: optional_bool(document, "writable"),
                 source: optional_string(document, "source"),
                 access: optional_string(document, "access"),
+                mask: parse_host_directory_mask(optional_document(document, "mask")?)?,
             })
         })
         .collect()
+}
+
+fn parse_host_directory_mask(
+    document: Option<&Document>,
+) -> Result<Option<HostDirectoryMaskInput>, Box<dyn std::error::Error>> {
+    let Some(document) = document else {
+        return Ok(None);
+    };
+    let paths = document
+        .get_array("paths")?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| "mask.paths entries must be strings".into())
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+    let storage =
+        optional_document(document, "storage")?.map(|storage| HostDirectoryMaskStorageInput {
+            source: optional_string(storage, "source"),
+            access: optional_string(storage, "access"),
+        });
+    Ok(Some(HostDirectoryMaskInput { paths, storage }))
 }
 
 fn parse_network_outbound(
@@ -981,6 +1015,17 @@ fn parse_request_header_hooks(
 
 fn optional_string(document: &Document, key: &str) -> Option<String> {
     document.get_str(key).ok().map(str::to_string)
+}
+
+fn optional_document<'a>(
+    document: &'a Document,
+    key: &str,
+) -> Result<Option<&'a Document>, Box<dyn std::error::Error>> {
+    match document.get(key) {
+        None => Ok(None),
+        Some(Bson::Document(value)) => Ok(Some(value)),
+        Some(_) => Err(format!("{key} must be a document").into()),
+    }
 }
 
 fn optional_i32(document: &Document, key: &str) -> Option<i32> {

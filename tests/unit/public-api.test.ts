@@ -38,6 +38,45 @@ test("fs.bind creates an explicit host directory mount source", () => {
   });
 });
 
+test("fs.bind groups masked host paths under the bind source", () => {
+  const storage = fs.bind({
+    source: "/tmp/sandbox-mask-storage",
+    access: "rw",
+  });
+
+  assert.deepEqual(fs.bind({
+    source: "/tmp/sandbox-workspace",
+    access: "ro",
+    mask: {
+      paths: ["/node_modules", "/.git"],
+    },
+  }), {
+    kind: "host-directory",
+    source: "/tmp/sandbox-workspace",
+    access: "ro",
+    mask: {
+      paths: ["/node_modules", "/.git"],
+    },
+  });
+
+  assert.deepEqual(fs.bind({
+    source: "/tmp/sandbox-workspace",
+    access: "rw",
+    mask: {
+      paths: ["/node_modules"],
+      storage,
+    },
+  }), {
+    kind: "host-directory",
+    source: "/tmp/sandbox-workspace",
+    access: "rw",
+    mask: {
+      paths: ["/node_modules"],
+      storage,
+    },
+  });
+});
+
 test("rootfs.cow couples a built-in base with writable block storage", () => {
   const blockStore = memoryBlockStore();
   const composed = rootfs.compose({

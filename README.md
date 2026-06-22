@@ -417,6 +417,41 @@ const source = fs.bind({
 `fs.bind(...)` mounts an absolute host directory through native virtio-fs. The
 `access` field is required and must be `"ro"` or `"rw"`.
 
+```ts
+const source = fs.bind({
+  source: "/Users/alice/project",
+  access: "ro",
+  mask: {
+    paths: ["/node_modules", "/.git"],
+  },
+});
+```
+
+`mask` hides selected host paths from the guest. Mask paths are absolute inside
+the bound host directory. In a read-only bind mount, masked paths are simply
+absent from the guest.
+
+```ts
+const maskStorage = fs.bind({
+  source: "/tmp/sandbox-mask-storage/project",
+  access: "rw",
+});
+
+const source = fs.bind({
+  source: "/Users/alice/project",
+  access: "rw",
+  mask: {
+    paths: ["/node_modules"],
+    storage: maskStorage,
+  },
+});
+```
+
+Writable bind mounts require `mask.storage`, and that storage must also be a
+writable `fs.bind(...)` source. If the guest creates a masked path, Sandbox
+stores that guest-owned entry under the storage directory using the same
+mask-relative path, while the original host entry remains hidden and unchanged.
+
 ### Processes
 
 ```ts

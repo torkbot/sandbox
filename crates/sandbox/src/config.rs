@@ -69,6 +69,7 @@ pub enum MountSpec {
         path: String,
         source: PathBuf,
         access: HostDirectoryAccess,
+        mask: Option<HostDirectoryMask>,
     },
 }
 
@@ -76,6 +77,17 @@ pub enum MountSpec {
 pub enum HostDirectoryAccess {
     ReadOnly,
     ReadWrite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostDirectoryMask {
+    pub paths: Vec<String>,
+    pub storage: Option<HostDirectoryMaskStorage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostDirectoryMaskStorage {
+    pub source: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,10 +341,12 @@ impl MountSpec {
                         "host-directory mount source must be absolute",
                     ));
                 }
+                let access = HostDirectoryAccess::parse(input.access.as_deref())?;
                 Ok(Self::HostDirectory {
                     path: input.path,
                     source,
-                    access: HostDirectoryAccess::parse(input.access.as_deref())?,
+                    access,
+                    mask: HostDirectoryMask::parse(input.mask, access)?,
                 })
             }
             other => Err(SpecError::new(format!("unsupported mount.kind: {other}"))),
@@ -351,6 +365,103 @@ impl HostDirectoryAccess {
             None => Err(SpecError::new("host-directory mount access is required")),
         }
     }
+}
+
+impl HostDirectoryMask {
+    fn parse(
+        input: Option<HostDirectoryMaskInput>,
+        access: HostDirectoryAccess,
+    ) -> Result<Option<Self>, SpecError> {
+        let Some(input) = input else {
+            return Ok(None);
+        };
+        if input.paths.is_empty() {
+            return Err(SpecError::new(
+                "host-directory mask paths must not be empty",
+            ));
+        }
+        let mut paths = Vec::with_capacity(input.paths.len());
+        for path in input.paths {
+            validate_host_directory_mask_path(&path)?;
+            if paths.contains(&path) {
+                return Err(SpecError::new(format!(
+                    "duplicate host-directory mask path: {path}"
+                )));
+            }
+            paths.push(path);
+        }
+
+        let storage = match (access, input.storage) {
+            (HostDirectoryAccess::ReadOnly, Some(_)) => {
+                return Err(SpecError::new(
+                    "read-only host-directory masks must not declare storage",
+                ));
+            }
+            (HostDirectoryAccess::ReadOnly, None) => None,
+            (HostDirectoryAccess::ReadWrite, Some(storage)) => {
+                Some(HostDirectoryMaskStorage::parse(storage)?)
+            }
+            (HostDirectoryAccess::ReadWrite, None) => {
+                return Err(SpecError::new(
+                    "writable host-directory masks require storage",
+                ));
+            }
+        };
+
+        Ok(Some(Self { paths, storage }))
+    }
+}
+
+impl HostDirectoryMaskStorage {
+    fn parse(input: HostDirectoryMaskStorageInput) -> Result<Self, SpecError> {
+        let source = input
+            .source
+            .ok_or_else(|| SpecError::new("host-directory mask storage source is required"))?;
+        if source.is_empty() {
+            return Err(SpecError::new(
+                "host-directory mask storage source must not be empty",
+            ));
+        }
+        let source = PathBuf::from(source);
+        if !source.is_absolute() {
+            return Err(SpecError::new(
+                "host-directory mask storage source must be absolute",
+            ));
+        }
+        match input.access.as_deref() {
+            Some("rw") => Ok(Self { source }),
+            Some(_) | None => Err(SpecError::new(
+                "host-directory mask storage access must be rw",
+            )),
+        }
+    }
+}
+
+fn validate_host_directory_mask_path(path: &str) -> Result<(), SpecError> {
+    if !path.starts_with('/') {
+        return Err(SpecError::new("host-directory mask path must be absolute"));
+    }
+    if path == "/" {
+        return Err(SpecError::new("host-directory mask path must not be root"));
+    }
+    if path
+        .split('/')
+        .skip(1)
+        .any(|component| component.is_empty())
+    {
+        return Err(SpecError::new(
+            "host-directory mask path must not contain empty components",
+        ));
+    }
+    if path
+        .split('/')
+        .any(|component| component == "." || component == "..")
+    {
+        return Err(SpecError::new(
+            "host-directory mask path must not contain '.' or '..' components",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -442,6 +553,19 @@ pub struct MountSpecInput {
     pub kind: String,
     pub path: String,
     pub writable: Option<bool>,
+    pub source: Option<String>,
+    pub access: Option<String>,
+    pub mask: Option<HostDirectoryMaskInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostDirectoryMaskInput {
+    pub paths: Vec<String>,
+    pub storage: Option<HostDirectoryMaskStorageInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostDirectoryMaskStorageInput {
     pub source: Option<String>,
     pub access: Option<String>,
 }
@@ -555,6 +679,7 @@ mod tests {
             writable: Some(true),
             source: None,
             access: None,
+            mask: None,
         }];
         input.network_outbound = Some(OutboundSpec {
             policy: OutboundPolicy::Deny,
@@ -614,6 +739,7 @@ mod tests {
             writable: None,
             source: Some("/host/workspace".to_string()),
             access: Some("rw".to_string()),
+            mask: None,
         }];
 
         let spec = MicroVmSpec::build(input).unwrap();
@@ -624,7 +750,72 @@ mod tests {
                 path: "/workspace".to_string(),
                 source: PathBuf::from("/host/workspace"),
                 access: HostDirectoryAccess::ReadWrite,
+                mask: None,
             }],
+        );
+    }
+
+    #[test]
+    fn keeps_requested_host_directory_mask_shape() {
+        let mut input = valid_input();
+        input.mounts = vec![MountSpecInput {
+            kind: "host-directory".to_string(),
+            path: "/workspace".to_string(),
+            writable: None,
+            source: Some("/host/workspace".to_string()),
+            access: Some("rw".to_string()),
+            mask: Some(HostDirectoryMaskInput {
+                paths: vec![
+                    "/node_modules".to_string(),
+                    "/packages/a/node_modules".to_string(),
+                ],
+                storage: Some(HostDirectoryMaskStorageInput {
+                    source: Some("/host/mask-storage".to_string()),
+                    access: Some("rw".to_string()),
+                }),
+            }),
+        }];
+
+        let spec = MicroVmSpec::build(input).unwrap();
+
+        assert_eq!(
+            spec.mounts,
+            vec![MountSpec::HostDirectory {
+                path: "/workspace".to_string(),
+                source: PathBuf::from("/host/workspace"),
+                access: HostDirectoryAccess::ReadWrite,
+                mask: Some(HostDirectoryMask {
+                    paths: vec![
+                        "/node_modules".to_string(),
+                        "/packages/a/node_modules".to_string(),
+                    ],
+                    storage: Some(HostDirectoryMaskStorage {
+                        source: PathBuf::from("/host/mask-storage"),
+                    }),
+                }),
+            }],
+        );
+    }
+
+    #[test]
+    fn rejects_host_directory_mask_paths_with_empty_components() {
+        let mut input = valid_input();
+        input.mounts = vec![MountSpecInput {
+            kind: "host-directory".to_string(),
+            path: "/workspace".to_string(),
+            writable: None,
+            source: Some("/host/workspace".to_string()),
+            access: Some("ro".to_string()),
+            mask: Some(HostDirectoryMaskInput {
+                paths: vec!["/node_modules/".to_string()],
+                storage: None,
+            }),
+        }];
+
+        let err = MicroVmSpec::build(input).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "host-directory mask path must not contain empty components",
         );
     }
 
@@ -637,6 +828,7 @@ mod tests {
             writable: None,
             source: Some("/host/workspace".to_string()),
             access: None,
+            mask: None,
         }];
 
         let err = MicroVmSpec::build(input).unwrap_err();
@@ -679,6 +871,7 @@ mod tests {
             writable: None,
             source: None,
             access: None,
+            mask: None,
         }];
 
         let err = MicroVmSpec::build(input).unwrap_err();
