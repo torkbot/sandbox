@@ -1,13 +1,23 @@
 import type {
   SandboxControlCommand,
   SandboxControlEvent,
+  SandboxControlFsCommand,
 } from "./control-codec.ts";
 import {
   decodeControlEvent,
   encodeControlCommand,
 } from "./control-codec.ts";
 
+type SandboxControlFsRequest = SandboxControlFsCommand extends infer T
+  ? T extends SandboxControlFsCommand
+    ? Omit<T, "id">
+    : never
+  : never;
+
 export interface SandboxControl extends Transport<SandboxControlEvent, SandboxControlCommand> {
+  requestFileSystem(
+    command: SandboxControlFsRequest,
+  ): Promise<Extract<SandboxControlEvent, { type: "guest.fs.response" }>>;
   exec(input: {
     readonly id?: string;
     readonly argv: readonly string[];
@@ -62,6 +72,10 @@ export class HostControlTransport implements SandboxControl {
     exited: boolean;
     streamsClosed: boolean;
   }>();
+  readonly #pendingFileSystem = new Map<string, {
+    resolve(event: Extract<SandboxControlEvent, { type: "guest.fs.response" }>): void;
+    reject(error: unknown): void;
+  }>();
   #closed = false;
 
   constructor(options: {
@@ -90,6 +104,23 @@ export class HostControlTransport implements SandboxControl {
       throw new Error("sandbox control send is not connected yet");
     }
     this.#channel.writeControlPacket(encodeControlCommand(message));
+  }
+
+  async requestFileSystem(
+    command: SandboxControlFsRequest,
+  ): Promise<Extract<SandboxControlEvent, { type: "guest.fs.response" }>> {
+    this.#assertOpen();
+    const id = crypto.randomUUID();
+    const completion = new Promise<Extract<SandboxControlEvent, { type: "guest.fs.response" }>>((resolve, reject) => {
+      this.#pendingFileSystem.set(id, { resolve, reject });
+    });
+    try {
+      await this.send({ ...command, id } as SandboxControlFsCommand);
+    } catch (error) {
+      this.#pendingFileSystem.delete(id);
+      throw error;
+    }
+    return await completion;
   }
 
   async exec(input: {
@@ -238,6 +269,7 @@ export class HostControlTransport implements SandboxControl {
     this.#closed = true;
     this.#rejectPendingExec(new Error("sandbox control is closed"));
     this.#rejectPendingSpawn(new Error("sandbox control is closed"));
+    this.#rejectPendingFileSystem(new Error("sandbox control is closed"));
     this.#events.close();
   }
 
@@ -281,6 +313,15 @@ export class HostControlTransport implements SandboxControl {
       return;
     }
     this.#events.push(event);
+    if (event.type === "guest.fs.response") {
+      const pending = this.#pendingFileSystem.get(event.id);
+      if (pending === undefined) {
+        return;
+      }
+      this.#pendingFileSystem.delete(event.id);
+      pending.resolve(event);
+      return;
+    }
     if (event.type !== "guest.exec.complete") {
       this.#dispatchSpawnEvent(event);
       return;
@@ -337,6 +378,7 @@ export class HostControlTransport implements SandboxControl {
     this.#closed = true;
     this.#rejectPendingExec(error);
     this.#rejectPendingSpawn(error);
+    this.#rejectPendingFileSystem(error);
     this.#events.close(error);
   }
 
@@ -353,6 +395,13 @@ export class HostControlTransport implements SandboxControl {
       pending.process.fail(error);
     }
     this.#pendingSpawn.clear();
+  }
+
+  #rejectPendingFileSystem(error: unknown): void {
+    for (const pending of this.#pendingFileSystem.values()) {
+      pending.reject(error);
+    }
+    this.#pendingFileSystem.clear();
   }
 }
 

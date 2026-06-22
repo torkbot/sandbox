@@ -75,6 +75,45 @@ pub enum ControlFrame {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
     },
+    GuestFsStat {
+        id: String,
+        path: String,
+    },
+    GuestFsReadDir {
+        id: String,
+        path: String,
+    },
+    GuestFsReadFile {
+        id: String,
+        path: String,
+        range: Option<GuestFsReadRange>,
+    },
+    GuestFsWriteFile {
+        id: String,
+        path: String,
+        contents: Vec<u8>,
+        create_parents: bool,
+    },
+    GuestFsMkdir {
+        id: String,
+        path: String,
+        recursive: bool,
+    },
+    GuestFsRemove {
+        id: String,
+        path: String,
+        recursive: bool,
+        force: bool,
+    },
+    GuestFsRename {
+        id: String,
+        from: String,
+        to: String,
+    },
+    GuestFsResponse {
+        id: String,
+        result: GuestFsResponseResult,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +126,49 @@ pub enum GuestSpawnStdio {
 pub struct GuestPtySize {
     pub rows: u16,
     pub cols: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestFsReadRange {
+    pub offset: u64,
+    pub length: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestFsStat {
+    pub entry_type: GuestFsEntryType,
+    pub size_bytes: u64,
+    pub modified_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestFsEntryType {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestFsDirectoryEntry {
+    pub name: String,
+    pub name_bytes: Vec<u8>,
+    pub stat: GuestFsStat,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestFsError {
+    pub message: String,
+    pub code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuestFsResponseResult {
+    Stat(GuestFsStat),
+    ReadDir(Vec<GuestFsDirectoryEntry>),
+    ReadFile(Vec<u8>),
+    Empty,
+    Error(GuestFsError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,6 +327,89 @@ impl ControlFrame {
                     bytes: stderr.clone(),
                 },
             },
+            Self::GuestFsStat { id, path } => bson::doc! {
+                "type": "guest.fs.stat",
+                "id": id,
+                "path": path,
+            },
+            Self::GuestFsReadDir { id, path } => bson::doc! {
+                "type": "guest.fs.readDir",
+                "id": id,
+                "path": path,
+            },
+            Self::GuestFsReadFile { id, path, range } => {
+                let mut document = bson::doc! {
+                    "type": "guest.fs.readFile",
+                    "id": id,
+                    "path": path,
+                };
+                if let Some(range) = range {
+                    document.insert(
+                        "offset",
+                        i64::try_from(range.offset).map_err(|_| {
+                            ControlFrameError::new("guest.fs.readFile offset exceeds i64")
+                        })?,
+                    );
+                    document.insert(
+                        "length",
+                        i64::try_from(range.length).map_err(|_| {
+                            ControlFrameError::new("guest.fs.readFile length exceeds i64")
+                        })?,
+                    );
+                }
+                document
+            }
+            Self::GuestFsWriteFile {
+                id,
+                path,
+                contents,
+                create_parents,
+            } => bson::doc! {
+                "type": "guest.fs.writeFile",
+                "id": id,
+                "path": path,
+                "contents": bson::Binary {
+                    subtype: bson::spec::BinarySubtype::Generic,
+                    bytes: contents.clone(),
+                },
+                "createParents": *create_parents,
+            },
+            Self::GuestFsMkdir {
+                id,
+                path,
+                recursive,
+            } => bson::doc! {
+                "type": "guest.fs.mkdir",
+                "id": id,
+                "path": path,
+                "recursive": *recursive,
+            },
+            Self::GuestFsRemove {
+                id,
+                path,
+                recursive,
+                force,
+            } => bson::doc! {
+                "type": "guest.fs.remove",
+                "id": id,
+                "path": path,
+                "recursive": *recursive,
+                "force": *force,
+            },
+            Self::GuestFsRename { id, from, to } => bson::doc! {
+                "type": "guest.fs.rename",
+                "id": id,
+                "from": from,
+                "to": to,
+            },
+            Self::GuestFsResponse { id, result } => {
+                let mut document = bson::doc! {
+                    "type": "guest.fs.response",
+                    "id": id,
+                };
+                encode_guest_fs_response_result(&mut document, result)?;
+                document
+            }
         };
 
         document
@@ -429,6 +594,56 @@ impl ControlFrame {
                     .map_err(|_| ControlFrameError::new("guest.exec.complete missing stderr"))?
                     .to_vec(),
             }),
+            "guest.fs.stat" => Ok(Self::GuestFsStat {
+                id: read_required_string(&document, "id", "guest.fs.stat id")?,
+                path: read_required_string(&document, "path", "guest.fs.stat path")?,
+            }),
+            "guest.fs.readDir" => Ok(Self::GuestFsReadDir {
+                id: read_required_string(&document, "id", "guest.fs.readDir id")?,
+                path: read_required_string(&document, "path", "guest.fs.readDir path")?,
+            }),
+            "guest.fs.readFile" => Ok(Self::GuestFsReadFile {
+                id: read_required_string(&document, "id", "guest.fs.readFile id")?,
+                path: read_required_string(&document, "path", "guest.fs.readFile path")?,
+                range: read_optional_guest_fs_read_range(&document)?,
+            }),
+            "guest.fs.writeFile" => Ok(Self::GuestFsWriteFile {
+                id: read_required_string(&document, "id", "guest.fs.writeFile id")?,
+                path: read_required_string(&document, "path", "guest.fs.writeFile path")?,
+                contents: document
+                    .get_binary_generic("contents")
+                    .map_err(|_| ControlFrameError::new("guest.fs.writeFile missing contents"))?
+                    .to_vec(),
+                create_parents: document.get_bool("createParents").map_err(|_| {
+                    ControlFrameError::new("guest.fs.writeFile missing createParents")
+                })?,
+            }),
+            "guest.fs.mkdir" => Ok(Self::GuestFsMkdir {
+                id: read_required_string(&document, "id", "guest.fs.mkdir id")?,
+                path: read_required_string(&document, "path", "guest.fs.mkdir path")?,
+                recursive: document
+                    .get_bool("recursive")
+                    .map_err(|_| ControlFrameError::new("guest.fs.mkdir missing recursive"))?,
+            }),
+            "guest.fs.remove" => Ok(Self::GuestFsRemove {
+                id: read_required_string(&document, "id", "guest.fs.remove id")?,
+                path: read_required_string(&document, "path", "guest.fs.remove path")?,
+                recursive: document
+                    .get_bool("recursive")
+                    .map_err(|_| ControlFrameError::new("guest.fs.remove missing recursive"))?,
+                force: document
+                    .get_bool("force")
+                    .map_err(|_| ControlFrameError::new("guest.fs.remove missing force"))?,
+            }),
+            "guest.fs.rename" => Ok(Self::GuestFsRename {
+                id: read_required_string(&document, "id", "guest.fs.rename id")?,
+                from: read_required_string(&document, "from", "guest.fs.rename from")?,
+                to: read_required_string(&document, "to", "guest.fs.rename to")?,
+            }),
+            "guest.fs.response" => Ok(Self::GuestFsResponse {
+                id: read_required_string(&document, "id", "guest.fs.response id")?,
+                result: read_guest_fs_response_result(&document)?,
+            }),
             other => Err(ControlFrameError::new(format!(
                 "unknown control frame type: {other}"
             ))),
@@ -480,6 +695,194 @@ impl ControlFrame {
             .map_err(|error| ControlFrameError::new(error.to_string()))?;
         Self::decode(&frame)
     }
+}
+
+fn encode_guest_fs_response_result(
+    document: &mut bson::Document,
+    result: &GuestFsResponseResult,
+) -> Result<(), ControlFrameError> {
+    match result {
+        GuestFsResponseResult::Stat(stat) => {
+            document.insert("ok", true);
+            document.insert("stat", encode_guest_fs_stat(stat)?);
+        }
+        GuestFsResponseResult::ReadDir(entries) => {
+            document.insert("ok", true);
+            document.insert(
+                "entries",
+                entries
+                    .iter()
+                    .map(encode_guest_fs_directory_entry)
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        GuestFsResponseResult::ReadFile(contents) => {
+            document.insert("ok", true);
+            document.insert(
+                "contents",
+                bson::Binary {
+                    subtype: bson::spec::BinarySubtype::Generic,
+                    bytes: contents.clone(),
+                },
+            );
+        }
+        GuestFsResponseResult::Empty => {
+            document.insert("ok", true);
+        }
+        GuestFsResponseResult::Error(error) => {
+            document.insert("ok", false);
+            document.insert("error", error.message.clone());
+            if let Some(code) = &error.code {
+                document.insert("code", code.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn encode_guest_fs_directory_entry(
+    entry: &GuestFsDirectoryEntry,
+) -> Result<bson::Document, ControlFrameError> {
+    Ok(bson::doc! {
+        "name": entry.name.clone(),
+        "nameBytes": bson::Binary {
+            subtype: bson::spec::BinarySubtype::Generic,
+            bytes: entry.name_bytes.clone(),
+        },
+        "stat": encode_guest_fs_stat(&entry.stat)?,
+    })
+}
+
+fn encode_guest_fs_stat(stat: &GuestFsStat) -> Result<bson::Document, ControlFrameError> {
+    Ok(bson::doc! {
+        "type": stat.entry_type.as_str(),
+        "sizeBytes": i64::try_from(stat.size_bytes)
+            .map_err(|_| ControlFrameError::new("guest.fs stat sizeBytes exceeds i64"))?,
+        "modifiedAtMs": stat.modified_at_ms,
+    })
+}
+
+impl GuestFsEntryType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Directory => "directory",
+            Self::Symlink => "symlink",
+            Self::Other => "other",
+        }
+    }
+}
+
+fn read_required_string(
+    document: &bson::Document,
+    key: &str,
+    label: &str,
+) -> Result<String, ControlFrameError> {
+    document
+        .get_str(key)
+        .map(str::to_string)
+        .map_err(|_| ControlFrameError::new(format!("{label} missing")))
+}
+
+fn read_optional_guest_fs_read_range(
+    document: &bson::Document,
+) -> Result<Option<GuestFsReadRange>, ControlFrameError> {
+    let offset = read_optional_non_negative_u64(document, "offset", "guest.fs.readFile offset")?;
+    let length = read_optional_non_negative_u64(document, "length", "guest.fs.readFile length")?;
+    match (offset, length) {
+        (None, None) => Ok(None),
+        (Some(offset), Some(length)) => Ok(Some(GuestFsReadRange { offset, length })),
+        _ => Err(ControlFrameError::new(
+            "guest.fs.readFile range requires both offset and length",
+        )),
+    }
+}
+
+fn read_guest_fs_response_result(
+    document: &bson::Document,
+) -> Result<GuestFsResponseResult, ControlFrameError> {
+    let ok = document
+        .get_bool("ok")
+        .map_err(|_| ControlFrameError::new("guest.fs.response missing ok"))?;
+    if !ok {
+        return Ok(GuestFsResponseResult::Error(GuestFsError {
+            message: read_required_string(document, "error", "guest.fs.response error")?,
+            code: document.get_str("code").ok().map(str::to_string),
+        }));
+    }
+    if let Ok(stat) = document.get_document("stat") {
+        return Ok(GuestFsResponseResult::Stat(read_guest_fs_stat(
+            stat,
+            "guest.fs.response stat",
+        )?));
+    }
+    if let Ok(entries) = document.get_array("entries") {
+        return Ok(GuestFsResponseResult::ReadDir(
+            entries
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    let document = value.as_document().ok_or_else(|| {
+                        ControlFrameError::new(format!(
+                            "guest.fs.response entries[{index}] must be a document"
+                        ))
+                    })?;
+                    Ok(GuestFsDirectoryEntry {
+                        name: read_required_string(
+                            document,
+                            "name",
+                            &format!("guest.fs.response entries[{index}] name"),
+                        )?,
+                        name_bytes: document
+                            .get_binary_generic("nameBytes")
+                            .map(|bytes| bytes.to_vec())
+                            .map_err(|_| {
+                                ControlFrameError::new(format!(
+                                    "guest.fs.response entries[{index}] missing nameBytes"
+                                ))
+                            })?,
+                        stat: read_guest_fs_stat(
+                            document.get_document("stat").map_err(|_| {
+                                ControlFrameError::new(format!(
+                                    "guest.fs.response entries[{index}] missing stat"
+                                ))
+                            })?,
+                            &format!("guest.fs.response entries[{index}] stat"),
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ));
+    }
+    if let Ok(contents) = document.get_binary_generic("contents") {
+        return Ok(GuestFsResponseResult::ReadFile(contents.to_vec()));
+    }
+    Ok(GuestFsResponseResult::Empty)
+}
+
+fn read_guest_fs_stat(
+    document: &bson::Document,
+    label: &str,
+) -> Result<GuestFsStat, ControlFrameError> {
+    let entry_type = match document
+        .get_str("type")
+        .map_err(|_| ControlFrameError::new(format!("{label} missing type")))?
+    {
+        "file" => GuestFsEntryType::File,
+        "directory" => GuestFsEntryType::Directory,
+        "symlink" => GuestFsEntryType::Symlink,
+        "other" => GuestFsEntryType::Other,
+        other => {
+            return Err(ControlFrameError::new(format!(
+                "{label} has invalid type {other}"
+            )));
+        }
+    };
+    Ok(GuestFsStat {
+        entry_type,
+        size_bytes: read_non_negative_u64(document, "sizeBytes", &format!("{label} sizeBytes"))?,
+        modified_at_ms: read_i64(document, "modifiedAtMs", &format!("{label} modifiedAtMs"))?,
+    })
 }
 
 fn read_string_array(
@@ -586,6 +989,46 @@ fn read_u16(document: &bson::Document, key: &str, label: &str) -> Result<u16, Co
     u16::try_from(value).map_err(|_| ControlFrameError::new(format!("{label} must fit in u16")))
 }
 
+fn read_i64(document: &bson::Document, key: &str, label: &str) -> Result<i64, ControlFrameError> {
+    let Some(value) = document.get(key) else {
+        return Err(ControlFrameError::new(format!("{label} missing")));
+    };
+    read_bson_integer(value, label)
+}
+
+fn read_non_negative_u64(
+    document: &bson::Document,
+    key: &str,
+    label: &str,
+) -> Result<u64, ControlFrameError> {
+    let value = read_i64(document, key, label)?;
+    if value < 0 {
+        return Err(ControlFrameError::new(format!(
+            "{label} must be non-negative"
+        )));
+    }
+    u64::try_from(value).map_err(|_| ControlFrameError::new(format!("{label} must fit in u64")))
+}
+
+fn read_optional_non_negative_u64(
+    document: &bson::Document,
+    key: &str,
+    label: &str,
+) -> Result<Option<u64>, ControlFrameError> {
+    let Some(value) = document.get(key) else {
+        return Ok(None);
+    };
+    let value = read_bson_integer(value, label)?;
+    if value < 0 {
+        return Err(ControlFrameError::new(format!(
+            "{label} must be non-negative"
+        )));
+    }
+    u64::try_from(value)
+        .map(Some)
+        .map_err(|_| ControlFrameError::new(format!("{label} must fit in u64")))
+}
+
 fn read_optional_u64(
     document: &bson::Document,
     key: &str,
@@ -594,22 +1037,24 @@ fn read_optional_u64(
     let Some(value) = document.get(key) else {
         return Ok(None);
     };
-    let value = match value {
-        bson::Bson::Int32(value) => i64::from(*value),
-        bson::Bson::Int64(value) => *value,
-        bson::Bson::Double(value) if value.fract() == 0.0 => *value as i64,
-        _ => {
-            return Err(ControlFrameError::new(format!(
-                "{label} must be an integer"
-            )));
-        }
-    };
+    let value = read_bson_integer(value, label)?;
     if value <= 0 {
         return Err(ControlFrameError::new(format!("{label} must be positive")));
     }
     u64::try_from(value)
         .map(Some)
         .map_err(|_| ControlFrameError::new(format!("{label} must fit in u64")))
+}
+
+fn read_bson_integer(value: &bson::Bson, label: &str) -> Result<i64, ControlFrameError> {
+    match value {
+        bson::Bson::Int32(value) => Ok(i64::from(*value)),
+        bson::Bson::Int64(value) => Ok(*value),
+        bson::Bson::Double(value) if value.fract() == 0.0 => Ok(*value as i64),
+        _ => Err(ControlFrameError::new(format!(
+            "{label} must be an integer"
+        ))),
+    }
 }
 
 impl ControlFrameError {
@@ -733,6 +1178,87 @@ mod tests {
             },
             ControlFrame::GuestSpawnStreamsClosed {
                 id: "spawn".to_string(),
+            },
+        ];
+
+        for frame in frames {
+            let encoded = frame.encode().unwrap();
+            assert_eq!(ControlFrame::decode(&encoded).unwrap(), frame);
+        }
+    }
+
+    #[test]
+    fn round_trips_guest_fs_frames() {
+        let stat = GuestFsStat {
+            entry_type: GuestFsEntryType::File,
+            size_bytes: 5,
+            modified_at_ms: 1234,
+        };
+        let frames = [
+            ControlFrame::GuestFsStat {
+                id: "fs".to_string(),
+                path: "/tmp/file".to_string(),
+            },
+            ControlFrame::GuestFsReadDir {
+                id: "fs".to_string(),
+                path: "/tmp".to_string(),
+            },
+            ControlFrame::GuestFsReadFile {
+                id: "fs".to_string(),
+                path: "/tmp/file".to_string(),
+                range: Some(GuestFsReadRange {
+                    offset: 1,
+                    length: 3,
+                }),
+            },
+            ControlFrame::GuestFsWriteFile {
+                id: "fs".to_string(),
+                path: "/tmp/file".to_string(),
+                contents: b"hello".to_vec(),
+                create_parents: true,
+            },
+            ControlFrame::GuestFsMkdir {
+                id: "fs".to_string(),
+                path: "/tmp/dir".to_string(),
+                recursive: true,
+            },
+            ControlFrame::GuestFsRemove {
+                id: "fs".to_string(),
+                path: "/tmp/dir".to_string(),
+                recursive: true,
+                force: true,
+            },
+            ControlFrame::GuestFsRename {
+                id: "fs".to_string(),
+                from: "/tmp/a".to_string(),
+                to: "/tmp/b".to_string(),
+            },
+            ControlFrame::GuestFsResponse {
+                id: "fs".to_string(),
+                result: GuestFsResponseResult::Stat(stat.clone()),
+            },
+            ControlFrame::GuestFsResponse {
+                id: "fs".to_string(),
+                result: GuestFsResponseResult::ReadDir(vec![GuestFsDirectoryEntry {
+                    name: "file".to_string(),
+                    name_bytes: b"file".to_vec(),
+                    stat: stat.clone(),
+                }]),
+            },
+            ControlFrame::GuestFsResponse {
+                id: "fs".to_string(),
+                result: GuestFsResponseResult::ReadFile(b"hello".to_vec()),
+            },
+            ControlFrame::GuestFsResponse {
+                id: "fs".to_string(),
+                result: GuestFsResponseResult::Empty,
+            },
+            ControlFrame::GuestFsResponse {
+                id: "fs".to_string(),
+                result: GuestFsResponseResult::Error(GuestFsError {
+                    message: "missing".to_string(),
+                    code: Some("ENOENT".to_string()),
+                }),
             },
         ];
 

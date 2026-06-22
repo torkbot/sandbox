@@ -58,6 +58,87 @@ test("control command codec encodes guest exec abort commands", () => {
   });
 });
 
+test("control command codec encodes guest filesystem commands", () => {
+  assert.deepEqual(
+    BSON.deserialize(encodeControlCommand({
+      type: "guest.fs.readFile",
+      id: "read",
+      path: "/tmp/input.txt",
+      range: { offset: 6, length: 5 },
+    }).subarray(4)),
+    {
+      type: "guest.fs.readFile",
+      id: "read",
+      path: "/tmp/input.txt",
+      offset: 6,
+      length: 5,
+    },
+  );
+
+  assert.deepEqual(
+    BSON.deserialize(encodeControlCommand({
+      type: "guest.fs.writeFile",
+      id: "write",
+      path: "/tmp/output.txt",
+      contents: new TextEncoder().encode("contents"),
+      createParents: true,
+    }).subarray(4)),
+    {
+      type: "guest.fs.writeFile",
+      id: "write",
+      path: "/tmp/output.txt",
+      contents: new Binary(new TextEncoder().encode("contents")),
+      createParents: true,
+    },
+  );
+
+  const largeContents = new Uint8Array(18 * 1024 * 1024);
+  largeContents.fill(7);
+  const largeWrite = BSON.deserialize(encodeControlCommand({
+    type: "guest.fs.writeFile",
+    id: "large-write",
+    path: "/tmp/large.bin",
+    contents: largeContents,
+    createParents: false,
+  }).subarray(4));
+  assert.equal(largeWrite.type, "guest.fs.writeFile");
+  assert.equal(largeWrite.path, "/tmp/large.bin");
+  assert.ok(largeWrite.contents instanceof Binary);
+  assert.equal(largeWrite.contents.buffer.byteLength, largeContents.byteLength);
+
+  assert.deepEqual(
+    BSON.deserialize(encodeControlCommand({
+      type: "guest.fs.remove",
+      id: "remove",
+      path: "/tmp/tree",
+      recursive: true,
+      force: false,
+    }).subarray(4)),
+    {
+      type: "guest.fs.remove",
+      id: "remove",
+      path: "/tmp/tree",
+      recursive: true,
+      force: false,
+    },
+  );
+
+  assert.deepEqual(
+    BSON.deserialize(encodeControlCommand({
+      type: "guest.fs.rename",
+      id: "rename",
+      from: "/tmp/source",
+      to: "/tmp/target",
+    }).subarray(4)),
+    {
+      type: "guest.fs.rename",
+      id: "rename",
+      from: "/tmp/source",
+      to: "/tmp/target",
+    },
+  );
+});
+
 test("control event codec decodes init ready and binary exec output", () => {
   assert.deepEqual(
     decodeControlEvent(
@@ -135,6 +216,115 @@ test("control event codec decodes init ready and binary exec output", () => {
     },
   );
 
+});
+
+test("control event codec decodes guest filesystem responses", () => {
+  assert.deepEqual(
+    decodeControlEvent(
+      encodePacket({
+        type: "guest.fs.response",
+        id: "stat",
+        ok: true,
+        stat: {
+          type: "file",
+          sizeBytes: 7,
+          modifiedAtMs: 12_345,
+        },
+      }),
+    ),
+    {
+      type: "guest.fs.response",
+      id: "stat",
+      result: {
+        ok: true,
+        stat: {
+          type: "file",
+          sizeBytes: 7,
+          modifiedAtMs: 12_345,
+        },
+      },
+    },
+  );
+
+  assert.deepEqual(
+    decodeControlEvent(
+      encodePacket({
+        type: "guest.fs.response",
+        id: "list",
+        ok: true,
+        entries: [
+          {
+            name: "a.txt",
+            nameBytes: new Binary(new TextEncoder().encode("a.txt")),
+            stat: {
+              type: "file",
+              sizeBytes: 5,
+              modifiedAtMs: 1,
+            },
+          },
+        ],
+      }),
+    ),
+    {
+      type: "guest.fs.response",
+      id: "list",
+      result: {
+        ok: true,
+        entries: [
+          {
+            name: "a.txt",
+            nameBytes: Buffer.from("a.txt"),
+            stat: {
+              type: "file",
+              sizeBytes: 5,
+              modifiedAtMs: 1,
+            },
+          },
+        ],
+      },
+    },
+  );
+
+  const read = decodeControlEvent(
+    encodePacket({
+      type: "guest.fs.response",
+      id: "read",
+      ok: true,
+      contents: new Binary(new TextEncoder().encode("hello")),
+    }),
+  );
+  assert.equal(read.type, "guest.fs.response");
+  assert.equal(read.id, "read");
+  assert.equal(read.result.ok, true);
+  assert.deepEqual(
+    read.result.ok && read.result.contents !== undefined
+      ? [...read.result.contents]
+      : undefined,
+    [...new TextEncoder().encode("hello")],
+  );
+
+  assert.deepEqual(
+    decodeControlEvent(
+      encodePacket({
+        type: "guest.fs.response",
+        id: "missing",
+        ok: false,
+        error: "not found",
+        code: "ENOENT",
+      }),
+    ),
+    {
+      type: "guest.fs.response",
+      id: "missing",
+      result: {
+        ok: false,
+        error: {
+          message: "not found",
+          code: "ENOENT",
+        },
+      },
+    },
+  );
 });
 
 test("control event codec rejects malformed packets", () => {
