@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, rm, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   defineSandbox,
   fs,
@@ -270,6 +273,36 @@ test("boot rejects invalid host directory mask paths", async () => {
     }),
     /invalid sandbox boot options: host directory mask path must not contain empty components/,
   );
+
+  await assert.rejects(
+    sandbox.boot({
+      mounts: {
+        "/mnt": fs.bind({
+          source: "/tmp/workspace",
+          access: "ro",
+          mask: {
+            paths: ["/node_modules", "/node_modules/.bin"],
+          },
+        }),
+      },
+    }),
+    /invalid sandbox boot options: nested host directory mask path: \/node_modules\/\.bin/,
+  );
+
+  await assert.rejects(
+    sandbox.boot({
+      mounts: {
+        "/mnt": fs.bind({
+          source: "/tmp/workspace",
+          access: "ro",
+          mask: {
+            paths: ["/node_modules/.bin", "/node_modules"],
+          },
+        }),
+      },
+    }),
+    /invalid sandbox boot options: nested host directory mask path: \/node_modules/,
+  );
 });
 
 test("boot requires writable mask storage for writable host directory masks", async () => {
@@ -373,6 +406,33 @@ test("boot rejects writable mask storage that resolves inside the bind source", 
     }),
     /invalid sandbox boot options: host directory mask storage entries must not resolve inside the bind source/,
   );
+
+  const source = await mkdtemp(join(tmpdir(), "sandbox-mask-source-"));
+  const sourceLink = `${source}-link`;
+  await symlink(source, sourceLink);
+  try {
+    await assert.rejects(
+      sandbox.boot({
+        mounts: {
+          "/mnt": fs.bind({
+            source,
+            access: "rw",
+            mask: {
+              paths: ["/node_modules"],
+              storage: fs.bind({
+                source: sourceLink,
+                access: "rw",
+              }),
+            },
+          }),
+        },
+      }),
+      /invalid sandbox boot options: host directory mask storage source must not be inside the bind source/,
+    );
+  } finally {
+    await rm(sourceLink, { force: true });
+    await rm(source, { recursive: true, force: true });
+  }
 });
 
 test("boot rejects mask storage on read-only host directory masks", async () => {

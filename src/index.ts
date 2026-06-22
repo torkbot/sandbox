@@ -18,8 +18,9 @@ import {
   type SandboxShellEnvironmentFact,
 } from "./environment-facts.ts";
 import { randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { open } from "node:fs/promises";
-import { isAbsolute, relative, resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { HostControlTransport } from "./control.ts";
 import { HostProcessSandboxVm } from "./host-process.ts";
 import { createMemoryFileSystem } from "./memory-fs.ts";
@@ -2093,6 +2094,11 @@ function validateHostDirectoryMask(source: HostDirectorySourceForValidation): vo
     if (paths.has(path)) {
       throw new Error(`invalid sandbox boot options: duplicate host directory mask path: ${path}`);
     }
+    for (const existing of paths) {
+      if (isMaskPathNestedOrEqual(existing, path)) {
+        throw new Error(`invalid sandbox boot options: nested host directory mask path: ${path}`);
+      }
+    }
     paths.add(path);
   }
   if (source.access === "ro") {
@@ -2105,22 +2111,46 @@ function validateHostDirectoryMask(source: HostDirectorySourceForValidation): vo
     throw new Error("invalid sandbox boot options: writable host directory masks require mask.storage");
   }
   validateHostDirectoryMaskStorage(mask.storage);
-  const sourcePath = resolve(source.source);
-  const storagePath = resolve(mask.storage.source);
+  const sourcePath = realpathOrResolve(source.source);
+  const storagePath = realpathOrResolve(mask.storage.source);
   if (isPathInsideOrEqual(sourcePath, storagePath)) {
     throw new Error("invalid sandbox boot options: host directory mask storage source must not be inside the bind source");
   }
   for (const path of mask.paths) {
-    const upperPath = resolve(storagePath, path.slice(1));
+    const upperPath = realpathOrResolve(storagePath, path.slice(1));
     if (isPathInsideOrEqual(sourcePath, upperPath)) {
       throw new Error("invalid sandbox boot options: host directory mask storage entries must not resolve inside the bind source");
     }
   }
 }
 
+function realpathOrResolve(path: string, ...paths: string[]): string {
+  const resolved = resolve(path, ...paths);
+  try {
+    return realpathSync.native(resolved);
+  } catch {
+    const parent = dirname(resolved);
+    if (parent === resolved) {
+      return resolved;
+    }
+    const canonicalParent = realpathOrResolve(parent);
+    return resolve(canonicalParent, relative(parent, resolved));
+  }
+}
+
 function isPathInsideOrEqual(parent: string, child: string): boolean {
   const path = relative(parent, child);
   return path === "" || (!path.startsWith("..") && !isAbsolute(path));
+}
+
+function isMaskPathNestedOrEqual(left: string, right: string): boolean {
+  const leftComponents = left.split("/").slice(1).map((component) => component.toLowerCase());
+  const rightComponents = right.split("/").slice(1).map((component) => component.toLowerCase());
+  const shortestLength = Math.min(leftComponents.length, rightComponents.length);
+  return (
+    leftComponents.slice(0, shortestLength).every((component, index) => component === rightComponents[index]) &&
+    leftComponents.length !== rightComponents.length
+  );
 }
 
 function validateHostDirectoryMaskPath(path: string): void {
