@@ -631,6 +631,7 @@ test("read-only host directory masks hide lower host entries", async (t) => {
   const result = await sandbox.exec("/bin/sh", [
     "-lc",
     [
+      "set -e",
       "cat /tmp/workspace/visible.txt",
       "test ! -e /tmp/workspace/node_modules",
       "test ! -e /tmp/workspace/.git",
@@ -686,11 +687,13 @@ test("writable host directory masks store guest-created entries in host mask sto
   const result = await sandbox.exec("/bin/sh", [
     "-lc",
     [
+      "set -e",
       "cat /tmp/workspace/visible.txt",
       "test ! -e /tmp/workspace/node_modules",
       "test ! -e /tmp/workspace/.cache",
       "test ! -e /tmp/workspace/packages/a/node_modules",
       "if ls -a /tmp/workspace | grep -E '^(node_modules|\\.cache)$'; then exit 10; fi",
+      "if ! ls -a /tmp/workspace | grep -E '^preexisting$'; then exit 12; fi",
       "cat /tmp/workspace/preexisting",
       "printf file-entry > /tmp/workspace/node_modules",
       "test -f /tmp/workspace/node_modules",
