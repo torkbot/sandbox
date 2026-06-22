@@ -18,7 +18,7 @@ import {
   type SandboxShellEnvironmentFact,
 } from "./environment-facts.ts";
 import { randomUUID } from "node:crypto";
-import { realpathSync } from "node:fs";
+import { lstatSync, readdirSync, realpathSync } from "node:fs";
 import { open } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { HostControlTransport } from "./control.ts";
@@ -2095,7 +2095,7 @@ function validateHostDirectoryMask(source: HostDirectorySourceForValidation): vo
       throw new Error(`invalid sandbox boot options: duplicate host directory mask path: ${path}`);
     }
     for (const existing of paths) {
-      if (isMaskPathNestedOrEqual(existing, path)) {
+      if (isMaskPathNested(existing, path)) {
         throw new Error(`invalid sandbox boot options: nested host directory mask path: ${path}`);
       }
     }
@@ -2122,6 +2122,7 @@ function validateHostDirectoryMask(source: HostDirectorySourceForValidation): vo
       throw new Error("invalid sandbox boot options: host directory mask storage entries must not resolve inside the bind source");
     }
   }
+  rejectMaskStorageHardLinks(sourcePath, storagePath, mask.paths);
 }
 
 function realpathOrResolve(path: string, ...paths: string[]): string {
@@ -2143,14 +2144,74 @@ function isPathInsideOrEqual(parent: string, child: string): boolean {
   return path === "" || (!path.startsWith("..") && !isAbsolute(path));
 }
 
-function isMaskPathNestedOrEqual(left: string, right: string): boolean {
-  const leftComponents = left.split("/").slice(1).map((component) => component.toLowerCase());
-  const rightComponents = right.split("/").slice(1).map((component) => component.toLowerCase());
+function isMaskPathNested(left: string, right: string): boolean {
+  const leftComponents = left.split("/").slice(1);
+  const rightComponents = right.split("/").slice(1);
   const shortestLength = Math.min(leftComponents.length, rightComponents.length);
   return (
     leftComponents.slice(0, shortestLength).every((component, index) => component === rightComponents[index]) &&
     leftComponents.length !== rightComponents.length
   );
+}
+
+function rejectMaskStorageHardLinks(sourcePath: string, storagePath: string, maskPaths: readonly string[]): void {
+  const upperInodes = new Set<string>();
+  for (const maskPath of maskPaths) {
+    collectLinkedRegularFileInodes(realpathOrResolve(storagePath, maskPath.slice(1)), upperInodes);
+  }
+  if (upperInodes.size === 0) {
+    return;
+  }
+  if (treeContainsRegularFileInode(sourcePath, upperInodes)) {
+    throw new Error("invalid sandbox boot options: host directory mask storage entries must not hard-link to the bind source");
+  }
+}
+
+function collectLinkedRegularFileInodes(path: string, inodes: Set<string>): void {
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch {
+    return;
+  }
+  if (stat.isFile() && stat.nlink > 1) {
+    inodes.add(`${stat.dev}:${stat.ino}`);
+    return;
+  }
+  if (!stat.isDirectory()) {
+    return;
+  }
+  let entries;
+  try {
+    entries = readdirSync(path, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    collectLinkedRegularFileInodes(resolve(path, entry.name), inodes);
+  }
+}
+
+function treeContainsRegularFileInode(path: string, inodes: ReadonlySet<string>): boolean {
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch {
+    return false;
+  }
+  if (stat.isFile()) {
+    return inodes.has(`${stat.dev}:${stat.ino}`);
+  }
+  if (!stat.isDirectory()) {
+    return false;
+  }
+  let entries;
+  try {
+    entries = readdirSync(path, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  return entries.some((entry) => treeContainsRegularFileInode(resolve(path, entry.name), inodes));
 }
 
 function validateHostDirectoryMaskPath(path: string): void {

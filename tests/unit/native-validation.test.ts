@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, symlink } from "node:fs/promises";
+import { link, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -303,6 +303,21 @@ test("boot rejects invalid host directory mask paths", async () => {
     }),
     /invalid sandbox boot options: nested host directory mask path: \/node_modules/,
   );
+
+  await assert.rejects(
+    sandbox.boot({
+      mounts: {
+        "/mnt": fs.bind({
+          source: "/tmp/workspace",
+          access: "rw",
+          mask: {
+            paths: ["/Foo/bar", "/foo"],
+          } as never,
+        }),
+      },
+    }),
+    /invalid sandbox boot options: writable host directory masks require mask.storage/,
+  );
 });
 
 test("boot requires writable mask storage for writable host directory masks", async () => {
@@ -431,6 +446,42 @@ test("boot rejects writable mask storage that resolves inside the bind source", 
     );
   } finally {
     await rm(sourceLink, { force: true });
+    await rm(source, { recursive: true, force: true });
+  }
+});
+
+test("boot rejects writable mask storage entries hard-linked to the bind source", async () => {
+  const source = await mkdtemp(join(tmpdir(), "sandbox-mask-source-"));
+  const storage = await mkdtemp(join(tmpdir(), "sandbox-mask-storage-"));
+  try {
+    await writeFile(join(source, "lower.txt"), "lower");
+    await mkdir(join(storage, "node_modules"));
+    await link(join(source, "lower.txt"), join(storage, "node_modules", "linked.txt"));
+
+    const sandbox = defineSandbox({
+      rootfs: rootfs.builtIn("alpine:3.23"),
+    });
+
+    await assert.rejects(
+      sandbox.boot({
+        mounts: {
+          "/mnt": fs.bind({
+            source,
+            access: "rw",
+            mask: {
+              paths: ["/node_modules"],
+              storage: fs.bind({
+                source: storage,
+                access: "rw",
+              }),
+            },
+          }),
+        },
+      }),
+      /invalid sandbox boot options: host directory mask storage entries must not hard-link to the bind source/,
+    );
+  } finally {
+    await rm(storage, { recursive: true, force: true });
     await rm(source, { recursive: true, force: true });
   }
 });
