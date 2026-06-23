@@ -1,18 +1,21 @@
 use std::ffi::CString;
 use std::fmt;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, Once};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use base64::Engine;
 use imago::{
-    qcow2::Qcow2, raw::Raw, DynStorage, FormatAccess, Storage, StorageOpenOptions, SyncFormatAccess,
+    DenyImplicitOpenGate, DynStorage, FormatAccess, FormatCreateBuilder, FormatDriverBuilder,
+    Storage, StorageCreateOptions, StorageOpenOptions, SyncFormatAccess, qcow2::Qcow2, raw::Raw,
 };
 
+use crate::MicroVmSpec;
 use crate::block_storage::{CowBlockStorage, CowBlockStore, MemoryCowBlockStore};
 use crate::config::{KernelFormat, RootfsFormat, RootfsStorageSpec};
 use crate::control::INIT_CONTROL_PORT;
@@ -20,12 +23,49 @@ use crate::http_flow::HttpInterceptRuntime;
 use crate::network::OutboundRulePlan;
 use crate::network_service::{HostNetwork, MitmTlsConfig, NetworkPolicyRuntime};
 use crate::vfs::VirtioVirtualFsBackend;
-use crate::MicroVmSpec;
 
 #[derive(Debug)]
 pub struct KrunContext {
     id: u32,
     _networks: Vec<HostNetwork>,
+    _rootfs_overlay_lock: Option<RootfsOverlayLock>,
+}
+
+#[derive(Debug)]
+struct RootfsOverlayLock {
+    _file: fs::File,
+}
+
+impl RootfsOverlayLock {
+    fn acquire(overlay_path: &Path) -> Result<Self, KrunError> {
+        let lock_path = rootfs_overlay_lock_path(overlay_path);
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|_| KrunError::new("rootfs overlay lock open", -libc::EIO))?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            let errno = io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+            if errno == libc::EWOULDBLOCK || errno == libc::EAGAIN {
+                return Err(KrunError::new(
+                    "rootfs overlay is already in use",
+                    -libc::EBUSY,
+                ));
+            }
+            return Err(KrunError::new("rootfs overlay lock", -errno));
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+fn rootfs_overlay_lock_path(overlay_path: &Path) -> PathBuf {
+    let mut lock_path = overlay_path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    PathBuf::from(lock_path)
 }
 
 #[derive(Default, Clone)]
@@ -92,6 +132,7 @@ impl KrunContext {
         let mut context = Self {
             id: raw_id as u32,
             _networks: Vec::new(),
+            _rootfs_overlay_lock: None,
         };
         context.apply_vm_config(spec)?;
         context.apply_console_output()?;
@@ -266,20 +307,33 @@ impl KrunContext {
         }
     }
 
-    fn apply_rootfs(&self, spec: &MicroVmSpec, services: &HostServices) -> Result<(), KrunError> {
+    fn apply_rootfs(
+        &mut self,
+        spec: &MicroVmSpec,
+        services: &HostServices,
+    ) -> Result<(), KrunError> {
         match spec.rootfs.format {
             RootfsFormat::Qcow2 => {
-                let rootfs_trace = RootfsTrace::start(
-                    if spec.rootfs.storage.is_some() {
-                        "qcow2+cow"
-                    } else {
-                        "qcow2"
-                    },
-                    spec.rootfs.readonly,
-                );
+                let trace_format = match &spec.rootfs.storage {
+                    Some(RootfsStorageSpec::PersistentQcow2Overlay { .. }) => {
+                        "qcow2+persistent-overlay"
+                    }
+                    Some(_) => "qcow2+cow",
+                    None => "qcow2",
+                };
+                let rootfs_trace = RootfsTrace::start(trace_format, spec.rootfs.readonly);
                 cstring_path("rootfs.path", &spec.rootfs.path)?;
                 let writable = spec.rootfs.storage.is_some();
-                let disk = if let Some(storage_spec) = &spec.rootfs.storage {
+                let disk = if let Some(RootfsStorageSpec::PersistentQcow2Overlay { path }) =
+                    &spec.rootfs.storage
+                {
+                    cstring_path("rootfs.storage.path", path)?;
+                    let open_start = Instant::now();
+                    let (disk, lock) = open_persistent_qcow2_overlay(&spec.rootfs.path, path)?;
+                    self._rootfs_overlay_lock = Some(lock);
+                    rootfs_trace.stage("open_persistent_overlay", open_start);
+                    disk
+                } else if let Some(storage_spec) = &spec.rootfs.storage {
                     let (store, max_dirty_bytes): (Arc<dyn CowBlockStore>, u64) = match storage_spec
                     {
                         RootfsStorageSpec::CowBlockStore {
@@ -301,6 +355,7 @@ impl KrunContext {
                             ),
                             *max_dirty_bytes,
                         ),
+                        RootfsStorageSpec::PersistentQcow2Overlay { .. } => unreachable!(),
                     };
                     let open_start = Instant::now();
                     let storage = Box::<dyn DynStorage>::open_sync(
@@ -497,6 +552,108 @@ fn open_raw_disk(
     let raw = Raw::<Box<dyn DynStorage>>::open_image_sync(storage, writable)
         .map_err(|_| KrunError::new("Raw::open_image_sync", -libc::EIO))?;
     SyncFormatAccess::new(raw).map_err(|_| KrunError::new("SyncFormatAccess::new", -libc::EIO))
+}
+
+const PERSISTENT_QCOW2_OVERLAY_CLUSTER_SIZE: usize = 32768;
+
+fn open_persistent_qcow2_overlay(
+    base_path: &Path,
+    overlay_path: &Path,
+) -> Result<(SyncFormatAccess<Box<dyn DynStorage>>, RootfsOverlayLock), KrunError> {
+    let lock = RootfsOverlayLock::acquire(overlay_path)?;
+    let exists = match fs::metadata(overlay_path) {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                return Err(KrunError::new(
+                    "rootfs overlay path is not a file",
+                    -libc::EINVAL,
+                ));
+            }
+            true
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(_) => return Err(KrunError::new("rootfs overlay metadata", -libc::EIO)),
+    };
+
+    let disk = if exists {
+        open_existing_persistent_qcow2_overlay(base_path, overlay_path)?
+    } else {
+        match create_persistent_qcow2_overlay(base_path, overlay_path) {
+            Ok(disk) => disk,
+            Err(error) => {
+                let _ = fs::remove_file(overlay_path);
+                return Err(error);
+            }
+        }
+    };
+
+    Ok((disk, lock))
+}
+
+fn open_existing_persistent_qcow2_overlay(
+    base_path: &Path,
+    overlay_path: &Path,
+) -> Result<SyncFormatAccess<Box<dyn DynStorage>>, KrunError> {
+    let base = open_qcow2_backing_access(base_path)?;
+    let base_size = base.size();
+    let overlay_storage = Box::<dyn DynStorage>::open_sync(
+        StorageOpenOptions::new().filename(overlay_path).write(true),
+    )
+    .map_err(|_| KrunError::new("rootfs overlay storage open", -libc::EIO))?;
+    let overlay = Qcow2::<Box<dyn DynStorage>>::builder(overlay_storage)
+        .write(true)
+        .backing(Some(base))
+        .open_sync(DenyImplicitOpenGate::default())
+        .map_err(|_| KrunError::new("rootfs overlay qcow2 open", -libc::EIO))?;
+    let access = FormatAccess::new(overlay);
+    if access.size() != base_size {
+        return Err(KrunError::new(
+            "rootfs overlay size mismatch",
+            -libc::EINVAL,
+        ));
+    }
+    SyncFormatAccess::try_from(access)
+        .map_err(|_| KrunError::new("SyncFormatAccess::new", -libc::EIO))
+}
+
+fn create_persistent_qcow2_overlay(
+    base_path: &Path,
+    overlay_path: &Path,
+) -> Result<SyncFormatAccess<Box<dyn DynStorage>>, KrunError> {
+    let base = open_qcow2_backing_access(base_path)?;
+    let base_size = base.size();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .map_err(|_| KrunError::new("rootfs overlay create runtime", -libc::EIO))?;
+    let overlay_storage = runtime
+        .block_on(Box::<dyn DynStorage>::create_open(
+            StorageCreateOptions::new()
+                .filename(overlay_path)
+                .overwrite(false),
+        ))
+        .map_err(|_| KrunError::new("rootfs overlay storage create", -libc::EIO))?;
+    let base_header_path = base_path.to_string_lossy().into_owned();
+    let overlay = runtime
+        .block_on(
+            Qcow2::<Box<dyn DynStorage>>::create_builder(overlay_storage)
+                .size(base_size)
+                .cluster_size(PERSISTENT_QCOW2_OVERLAY_CLUSTER_SIZE)
+                .backing(base_header_path, "qcow2".to_string())
+                .create_open(DenyImplicitOpenGate::default(), |image| {
+                    Ok(Qcow2::<Box<dyn DynStorage>>::builder(image)
+                        .write(true)
+                        .backing(Some(base)))
+                }),
+        )
+        .map_err(|_| KrunError::new("rootfs overlay qcow2 create", -libc::EIO))?;
+    SyncFormatAccess::new(overlay).map_err(|_| KrunError::new("SyncFormatAccess::new", -libc::EIO))
+}
+
+fn open_qcow2_backing_access(path: &Path) -> Result<FormatAccess<Box<dyn DynStorage>>, KrunError> {
+    let storage =
+        Box::<dyn DynStorage>::open_sync(StorageOpenOptions::new().filename(path).write(false))
+            .map_err(|_| KrunError::new("Qcow2 backing storage open", -libc::EIO))?;
+    open_qcow2_access(storage, false)
 }
 
 fn init_krun_logging() {
@@ -822,11 +979,7 @@ fn cstring_path(operation: &'static str, path: &Path) -> Result<CString, KrunErr
 }
 
 fn sync_mode() -> u32 {
-    if cfg!(target_os = "macos") {
-        1
-    } else {
-        2
-    }
+    if cfg!(target_os = "macos") { 1 } else { 2 }
 }
 
 #[cfg(test)]
@@ -909,6 +1062,7 @@ mod tests {
         let mut context = KrunContext {
             id: 0,
             _networks: Vec::new(),
+            _rootfs_overlay_lock: None,
         };
 
         let error = context

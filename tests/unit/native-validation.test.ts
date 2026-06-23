@@ -17,7 +17,7 @@ test("defineSandbox rejects non-built-in rootfs objects", () => {
     () => defineSandbox({
       rootfs: { kind: "prebuilt-rootfs", path: "rootfs.qcow2", format: "qcow2" } as never,
     }),
-    /invalid sandbox definition: rootfs must be created with rootfs\.builtIn\(\.\.\.\), rootfs\.ephemeral\(\.\.\.\), or rootfs\.cow\(\.\.\.\)/,
+    /invalid sandbox definition: rootfs must be created with rootfs\.builtIn\(\.\.\.\), rootfs\.ephemeral\(\.\.\.\), rootfs\.cow\(\.\.\.\), or rootfs\.persistent\(\.\.\.\)/,
   );
 });
 
@@ -96,6 +96,39 @@ test("defineSandbox rejects invalid ephemeral rootfs", () => {
       }),
     }),
     /invalid sandbox definition: ephemeral rootfs maxDirtyBytes must be at least the COW block size/,
+  );
+});
+
+test("defineSandbox rejects invalid persistent rootfs", () => {
+  assert.throws(
+    () => defineSandbox({
+      rootfs: rootfs.persistent({
+        // @ts-expect-error invalid rootfs object exercises runtime validation.
+        base: { kind: "built-in-rootfs", name: "ubuntu:latest" },
+        path: "/tmp/sandbox-rootfs.qcow2",
+      }),
+    }),
+    /unsupported built-in rootfs: ubuntu:latest/,
+  );
+
+  assert.throws(
+    () => defineSandbox({
+      rootfs: rootfs.persistent({
+        base: rootfs.builtIn("alpine:3.23"),
+        path: "rootfs.qcow2",
+      }),
+    }),
+    /invalid sandbox definition: persistent rootfs path must be absolute/,
+  );
+
+  assert.throws(
+    () => defineSandbox({
+      rootfs: rootfs.persistent({
+        base: rootfs.builtIn("alpine:3.23"),
+        path: "/tmp/rootfs\0.qcow2",
+      }),
+    }),
+    /invalid sandbox definition: persistent rootfs path must not contain NUL bytes/,
   );
 });
 

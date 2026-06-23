@@ -143,6 +143,22 @@ const sandbox = defineSandbox({
 Attach a writable COW block store to at most one running sandbox instance at a
 time. Create one store per lane, or enforce exclusivity in your storage layer.
 
+Use `rootfs.persistent(...)` when the durable rootfs should live in a local
+QCOW2 overlay file instead of a JavaScript block store:
+
+```ts
+const sandbox = defineSandbox({
+  rootfs: rootfs.persistent({
+    base: rootfs.builtIn("alpine:3.23"),
+    path: "/absolute/project/.sandbox/rootfs.qcow2",
+  }),
+});
+```
+
+Sandbox creates the overlay on first boot and reuses it on later boots. The
+built-in rootfs stays read-only and can be shared by many VMs; only the selected
+overlay file is single-writer while a VM is running.
+
 ### Mount host-controlled data
 
 Mounts are per boot. They are guest-visible paths backed by TypeScript
@@ -307,8 +323,25 @@ rootfs.cow({
 });
 ```
 
-Mounts a built-in base rootfs through a writable copy-on-write block store. For
-offline image work, describe the same merged view without booting a VM:
+Mounts a built-in base rootfs through a writable copy-on-write block store.
+
+```ts
+rootfs.persistent({
+  base: rootfs.builtIn("alpine:3.23"),
+  path: "/absolute/project/.sandbox/rootfs.qcow2",
+});
+```
+
+Mounts a built-in base rootfs through a writable local QCOW2 overlay file. The
+`path` is required and must be absolute. If the file does not exist, Sandbox
+creates a sparse QCOW2 overlay backed by the built-in image; the parent
+directory must already exist. If the file already exists, Sandbox reuses it. The
+built-in artifact is opened read-only and is not locked, so many VMs can share
+the same base image. The overlay file path is locked for the VM lifetime;
+concurrent boots must use distinct overlay paths.
+
+For offline image work with block-store COW, describe the same merged view
+without booting a VM:
 
 ```ts
 const source = rootfs.compose({
@@ -328,9 +361,9 @@ for await (const chunk of rootfs.bytes(image)) {
 }
 ```
 
-`rootfs.ephemeral(...)` and `rootfs.cow(...)` both present a writable block
-rootfs without modifying the built-in artifact. `rootfs.cow(...)` normalizes
-through the same composed source used by
+`rootfs.ephemeral(...)`, `rootfs.cow(...)`, and `rootfs.persistent(...)` all
+present a writable rootfs without modifying the built-in artifact.
+`rootfs.cow(...)` normalizes through the same composed source used by
 `rootfs.flatten(...)`, so boot and image export share one base-plus-overlay
 contract. Clean base-image blocks are served from the built-in artifact. Dirty
 blocks are read lazily and flushed through your `SandboxBlockStore`.
@@ -339,6 +372,8 @@ before forcing a write to the block store during a VM run. For
 `rootfs.ephemeral(...)`, the same value is the native in-memory dirty block
 quota; guest writes beyond that budget fail instead of growing host memory
 without bound. When omitted, Sandbox uses a 64 MiB block-aligned default.
+`rootfs.persistent(...)` uses the native QCOW2 driver directly instead of a
+`SandboxBlockStore`; its overlay file is sparse and grows as the guest writes.
 
 `rootfs.flatten(...)` writes a standalone QCOW2 image into `dest`, using
 `dest` as random-access image-byte storage. `rootfs.bytes(...)` streams raw image
@@ -600,8 +635,8 @@ API:
 - Guest control traffic uses an fd-backed transport between the host and the
   custom Sandbox init process.
 - Host-implemented virtual filesystems are mounted into the guest.
-- Durable rootfs mutation is modeled as block-level copy-on-write storage, not
-  as a guest-visible POSIX filesystem.
+- Durable rootfs mutation is modeled as block-level copy-on-write storage or a
+  QCOW2 overlay file, not as a guest-visible POSIX filesystem.
 - Network egress is default-deny and policy-controlled.
 - HTTP request middleware is caller-provided JavaScript, while Sandbox owns
   interception, forwarding, and certificate plumbing.

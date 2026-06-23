@@ -126,6 +126,17 @@ test("rootfs.ephemeral makes writable rootfs persistence explicit", () => {
   });
 });
 
+test("rootfs.persistent creates a file-backed persistent built-in rootfs reference", () => {
+  assert.deepEqual(rootfs.persistent({
+    base: rootfs.builtIn("alpine:3.23"),
+    path: "/tmp/sandbox-rootfs.qcow2",
+  }), {
+    kind: "persistent-rootfs",
+    base: rootfs.builtIn("alpine:3.23"),
+    path: "/tmp/sandbox-rootfs.qcow2",
+  });
+});
+
 test("defineSandbox exposes config-derived environment facts", () => {
   const sandbox = defineSandbox({
     rootfs: rootfs.ephemeral({
@@ -204,6 +215,12 @@ test("environment facts distinguish rootfs and network semantics", () => {
       writable: memoryBlockStore(),
     }),
   }).environmentFacts();
+  const persistentFacts = defineSandbox({
+    rootfs: rootfs.persistent({
+      base: rootfs.builtIn("alpine:3.23"),
+      path: "/tmp/sandbox-rootfs.qcow2",
+    }),
+  }).environmentFacts();
 
   assertIncludesFact(readonlyFacts, {
     source: "config",
@@ -229,7 +246,19 @@ test("environment facts distinguish rootfs and network semantics", () => {
     relation: "write-mode",
     value: "writable-persistent-cow",
   });
+  assertIncludesFact(persistentFacts, {
+    source: "config",
+    topic: "rootfs",
+    relation: "write-mode",
+    value: "writable-persistent-file",
+  });
   assertDoesNotIncludeFact(cowFacts, {
+    source: "config",
+    topic: "command",
+    relation: "exists",
+    value: "git",
+  });
+  assertDoesNotIncludeFact(persistentFacts, {
     source: "config",
     topic: "command",
     relation: "exists",

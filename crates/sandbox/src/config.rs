@@ -55,6 +55,9 @@ pub enum RootfsStorageSpec {
         block_size: u64,
         max_dirty_bytes: u64,
     },
+    PersistentQcow2Overlay {
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -684,31 +687,46 @@ fn validate_hostname(hostname: &str) -> Result<(), SpecError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootfsStorageSpecInput {
     pub kind: String,
-    pub block_size: u64,
-    pub max_dirty_bytes: u64,
+    pub block_size: Option<u64>,
+    pub max_dirty_bytes: Option<u64>,
+    pub path: Option<String>,
 }
 
 impl RootfsStorageSpec {
     fn parse(input: RootfsStorageSpecInput) -> Result<Self, SpecError> {
-        if input.block_size == 0 || input.block_size % 512 != 0 {
-            return Err(SpecError::new(
-                "rootfs.storage.blockSize must be a positive multiple of 512",
-            ));
-        }
-        if input.max_dirty_bytes < input.block_size {
-            return Err(SpecError::new(
-                "rootfs.storage.maxDirtyBytes must be at least rootfs.storage.blockSize",
-            ));
-        }
         Ok(match input.kind.as_str() {
-            "cow-block-store" => Self::CowBlockStore {
-                block_size: input.block_size,
-                max_dirty_bytes: input.max_dirty_bytes,
-            },
-            "ephemeral-cow" => Self::EphemeralCow {
-                block_size: input.block_size,
-                max_dirty_bytes: input.max_dirty_bytes,
-            },
+            "cow-block-store" => {
+                let (block_size, max_dirty_bytes) = parse_rootfs_block_storage_limits(&input)?;
+                Self::CowBlockStore {
+                    block_size,
+                    max_dirty_bytes,
+                }
+            }
+            "ephemeral-cow" => {
+                let (block_size, max_dirty_bytes) = parse_rootfs_block_storage_limits(&input)?;
+                Self::EphemeralCow {
+                    block_size,
+                    max_dirty_bytes,
+                }
+            }
+            "persistent-qcow2-overlay" => {
+                let path = input
+                    .path
+                    .ok_or_else(|| SpecError::new("rootfs.storage.path is required"))?;
+                if path.is_empty() {
+                    return Err(SpecError::new("rootfs.storage.path must not be empty"));
+                }
+                if path.contains('\0') {
+                    return Err(SpecError::new(
+                        "rootfs.storage.path must not contain NUL bytes",
+                    ));
+                }
+                let path = PathBuf::from(path);
+                if !path.is_absolute() {
+                    return Err(SpecError::new("rootfs.storage.path must be absolute"));
+                }
+                Self::PersistentQcow2Overlay { path }
+            }
             other => {
                 return Err(SpecError::new(format!(
                     "unsupported rootfs.storage.kind: {other}"
@@ -716,6 +734,28 @@ impl RootfsStorageSpec {
             }
         })
     }
+}
+
+fn parse_rootfs_block_storage_limits(
+    input: &RootfsStorageSpecInput,
+) -> Result<(u64, u64), SpecError> {
+    let block_size = input
+        .block_size
+        .ok_or_else(|| SpecError::new("rootfs.storage.blockSize is required"))?;
+    let max_dirty_bytes = input
+        .max_dirty_bytes
+        .ok_or_else(|| SpecError::new("rootfs.storage.maxDirtyBytes is required"))?;
+    if block_size == 0 || block_size % 512 != 0 {
+        return Err(SpecError::new(
+            "rootfs.storage.blockSize must be a positive multiple of 512",
+        ));
+    }
+    if max_dirty_bytes < block_size {
+        return Err(SpecError::new(
+            "rootfs.storage.maxDirtyBytes must be at least rootfs.storage.blockSize",
+        ));
+    }
+    Ok((block_size, max_dirty_bytes))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -815,8 +855,9 @@ mod tests {
         let mut input = valid_input();
         input.rootfs_storage = Some(RootfsStorageSpecInput {
             kind: "cow-block-store".to_string(),
-            block_size: 4096,
-            max_dirty_bytes: 65536,
+            block_size: Some(4096),
+            max_dirty_bytes: Some(65536),
+            path: None,
         });
 
         let spec = MicroVmSpec::build(input).unwrap();
@@ -835,8 +876,9 @@ mod tests {
         let mut input = valid_input();
         input.rootfs_storage = Some(RootfsStorageSpecInput {
             kind: "ephemeral-cow".to_string(),
-            block_size: 65536,
-            max_dirty_bytes: 131072,
+            block_size: Some(65536),
+            max_dirty_bytes: Some(131072),
+            path: None,
         });
 
         let spec = MicroVmSpec::build(input).unwrap();
@@ -851,12 +893,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_persistent_qcow2_overlay_path() {
+        let mut input = valid_input();
+        input.rootfs_storage = Some(RootfsStorageSpecInput {
+            kind: "persistent-qcow2-overlay".to_string(),
+            block_size: None,
+            max_dirty_bytes: None,
+            path: Some("/tmp/rootfs.qcow2".to_string()),
+        });
+
+        let spec = MicroVmSpec::build(input).unwrap();
+
+        assert_eq!(
+            spec.rootfs.storage,
+            Some(RootfsStorageSpec::PersistentQcow2Overlay {
+                path: PathBuf::from("/tmp/rootfs.qcow2"),
+            }),
+        );
+    }
+
+    #[test]
     fn rejects_cow_rootfs_storage_limit_below_block_size() {
         let mut input = valid_input();
         input.rootfs_storage = Some(RootfsStorageSpecInput {
             kind: "cow-block-store".to_string(),
-            block_size: 4096,
-            max_dirty_bytes: 1024,
+            block_size: Some(4096),
+            max_dirty_bytes: Some(1024),
+            path: None,
         });
 
         let error = MicroVmSpec::build(input).unwrap_err();
@@ -865,6 +928,21 @@ mod tests {
             error.to_string(),
             "rootfs.storage.maxDirtyBytes must be at least rootfs.storage.blockSize",
         );
+    }
+
+    #[test]
+    fn rejects_relative_persistent_qcow2_overlay_path() {
+        let mut input = valid_input();
+        input.rootfs_storage = Some(RootfsStorageSpecInput {
+            kind: "persistent-qcow2-overlay".to_string(),
+            block_size: None,
+            max_dirty_bytes: None,
+            path: Some("rootfs.qcow2".to_string()),
+        });
+
+        let error = MicroVmSpec::build(input).unwrap_err();
+
+        assert_eq!(error.to_string(), "rootfs.storage.path must be absolute");
     }
 
     #[test]

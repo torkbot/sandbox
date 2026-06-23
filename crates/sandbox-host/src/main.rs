@@ -211,6 +211,7 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
                     )) as Arc<dyn CowBlockStore>)
                 }
                 sandbox::config::RootfsStorageSpec::EphemeralCow { .. } => None,
+                sandbox::config::RootfsStorageSpec::PersistentQcow2Overlay { .. } => None,
             }),
     };
     let mut vm = sandbox::runtime::KrunVm::create_with_services(&spec, virtual_fs, services)?;
@@ -844,10 +845,31 @@ fn parse_rootfs_storage(
     let Some(document) = document else {
         return Ok(None);
     };
+    let kind = document.get_str("kind")?.to_string();
+    match kind.as_str() {
+        "persistent-qcow2-overlay" => {
+            return Ok(Some(RootfsStorageSpecInput {
+                kind,
+                block_size: None,
+                max_dirty_bytes: None,
+                path: Some(document.get_str("path")?.to_string()),
+            }));
+        }
+        "cow-block-store" | "ephemeral-cow" => {}
+        _ => {
+            return Ok(Some(RootfsStorageSpecInput {
+                kind,
+                block_size: None,
+                max_dirty_bytes: None,
+                path: None,
+            }));
+        }
+    }
     Ok(Some(RootfsStorageSpecInput {
-        kind: document.get_str("kind")?.to_string(),
-        block_size: u64::try_from(document.get_i32("blockSize")?)?,
-        max_dirty_bytes: document_u64(document, "maxDirtyBytes")?,
+        kind,
+        block_size: Some(u64::try_from(document.get_i32("blockSize")?)?),
+        max_dirty_bytes: Some(document_u64(document, "maxDirtyBytes")?),
+        path: None,
     }))
 }
 
