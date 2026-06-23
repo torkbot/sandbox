@@ -1188,7 +1188,7 @@ class DefinedSandbox implements SandboxDefinition {
   }
 
   async boot(options: SandboxBootOptions = {}): Promise<SandboxInstance> {
-    validateSandboxBootOptions(options, this.#options.rootfs);
+    validateSandboxBootOptions(options);
     const networkPolicy = this.#options.network === undefined
       ? undefined
       : createNetworkPolicyHookRegistration(this.#options.network);
@@ -2122,7 +2122,7 @@ function validateBuiltInRootfsName(name: string): void {
   }
 }
 
-function validateSandboxBootOptions(options: SandboxBootOptions, rootfs: Rootfs): void {
+function validateSandboxBootOptions(options: SandboxBootOptions): void {
   if (options.hostname !== undefined) {
     validateHostname(options.hostname, "hostname");
   }
@@ -2145,123 +2145,9 @@ function validateSandboxBootOptions(options: SandboxBootOptions, rootfs: Rootfs)
     }
     mountPaths.add(path);
   }
-  validatePersistentRootfsHostMountIsolation(rootfs, options.mounts ?? {});
   if (options.cwd !== undefined && !options.cwd.startsWith("/")) {
     throw new Error("invalid sandbox boot options: cwd must be absolute");
   }
-}
-
-function validatePersistentRootfsHostMountIsolation(
-  rootfs: Rootfs,
-  mounts: Readonly<Record<string, SandboxMountSource>>,
-): void {
-  if (rootfs.kind !== "persistent-rootfs") {
-    return;
-  }
-  const overlayPath = persistentRootfsProtectedPath(rootfs.path, "overlay");
-  const protectedPaths = [
-    overlayPath,
-    persistentRootfsProtectedPath(persistentRootfsLockPath(rootfs.path), "overlay lock"),
-    persistentRootfsProtectedPath(persistentRootfsLockPath(overlayPath.canonicalPath), "overlay lock"),
-    persistentRootfsProtectedPath(persistentRootfsMetadataPath(rootfs.path), "overlay metadata"),
-    persistentRootfsProtectedPath(persistentRootfsMetadataPath(overlayPath.canonicalPath), "overlay metadata"),
-  ] satisfies readonly PersistentRootfsProtectedPath[];
-  for (const source of Object.values(mounts)) {
-    if (source.kind !== "host-directory" || source.access !== "rw") {
-      continue;
-    }
-    rejectHostDirectoryExposesPersistentRootfs(
-      source.source,
-      protectedPaths,
-      "host directory source",
-      source.mask?.paths ?? [],
-    );
-    const storage = source.mask !== undefined && "storage" in source.mask ? source.mask.storage : undefined;
-    if (storage !== undefined) {
-      rejectHostDirectoryExposesPersistentRootfs(
-        storage.source,
-        protectedPaths,
-        "host directory mask storage",
-        [],
-      );
-    }
-  }
-}
-
-type PersistentRootfsProtectedPath = {
-  readonly label: "overlay" | "overlay lock" | "overlay metadata";
-  readonly literalPath: string;
-  readonly canonicalPath: string;
-};
-
-function persistentRootfsProtectedPath(path: string, label: PersistentRootfsProtectedPath["label"]): PersistentRootfsProtectedPath {
-  return {
-    label,
-    literalPath: resolve(path),
-    canonicalPath: realpathOrResolve(path),
-  };
-}
-
-function rejectHostDirectoryExposesPersistentRootfs(
-  source: string,
-  protectedPaths: readonly PersistentRootfsProtectedPath[],
-  label: string,
-  maskPaths: readonly string[],
-): void {
-  const sourceLiteralPath = resolve(source);
-  const sourcePath = realpathOrResolve(source);
-  for (const protectedPath of protectedPaths) {
-    if (hostDirectoryExposesPersistentRootfsPath(sourceLiteralPath, sourcePath, protectedPath, maskPaths)) {
-      throw new Error(`invalid sandbox boot options: ${label} must not expose persistent rootfs ${protectedPath.label}`);
-    }
-  }
-}
-
-function persistentRootfsLockPath(path: string): string {
-  return `${path}.lock`;
-}
-
-function persistentRootfsMetadataPath(path: string): string {
-  return `${path}.metadata.json`;
-}
-
-function hostDirectoryExposesPersistentRootfsPath(
-  sourceLiteralPath: string,
-  sourcePath: string,
-  protectedPath: PersistentRootfsProtectedPath,
-  maskPaths: readonly string[],
-): boolean {
-  for (const candidate of uniquePaths([protectedPath.literalPath, protectedPath.canonicalPath])) {
-    const isUnderSource = isPathInsideOrEqual(sourceLiteralPath, candidate) || isPathInsideOrEqual(sourcePath, candidate);
-    if (isUnderSource && !persistentRootfsPathCoveredByHostDirectoryMask(sourceLiteralPath, sourcePath, candidate, maskPaths)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function persistentRootfsPathCoveredByHostDirectoryMask(
-  sourceLiteralPath: string,
-  sourcePath: string,
-  path: string,
-  maskPaths: readonly string[],
-): boolean {
-  for (const maskPath of maskPaths) {
-    const relativeMaskPath = maskPath.slice(1);
-    const maskLiteralFromLiteralSource = resolve(sourceLiteralPath, relativeMaskPath);
-    const maskLiteralFromCanonicalSource = resolve(sourcePath, relativeMaskPath);
-    if (
-      isPathInsideOrEqual(maskLiteralFromLiteralSource, path)
-      || isPathInsideOrEqual(maskLiteralFromCanonicalSource, path)
-    ) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function uniquePaths(paths: readonly string[]): readonly string[] {
-  return Array.from(new Set(paths));
 }
 
 function validateHostDirectorySource(source: HostDirectorySourceForValidation): void {

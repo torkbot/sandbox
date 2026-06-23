@@ -1291,6 +1291,8 @@ test("persistent rootfs locks only the selected overlay file", async (t) => {
 
   assert.equal((await lstat(firstOverlay)).isFile(), true);
   assert.equal((await lstat(secondOverlay)).isFile(), true);
+  await assert.rejects(lstat(`${firstOverlay}.lock`), { code: "ENOENT" });
+  await assert.rejects(lstat(`${secondOverlay}.lock`), { code: "ENOENT" });
 });
 
 test("persistent rootfs locks canonical overlay targets", async (t) => {

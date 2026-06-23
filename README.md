@@ -341,11 +341,16 @@ directory must already exist. If the file already exists, Sandbox reuses it. The
 built-in artifact is opened read-only and is not locked, so many VMs can share
 the same base image. Sandbox writes a `.metadata.json` sidecar beside the
 overlay and rejects reuse if the recorded built-in base identity no longer
-matches. The canonical overlay file path is locked for the VM lifetime;
-concurrent boots must use distinct overlay paths, and read-write host directory
-mounts must not expose the overlay or its lock file to the guest. If the overlay
-lives under a read-write project bind mount, hide it with a host-directory
-`mask.paths` entry such as `"/.sandbox"`.
+matches. The canonical overlay file path is locked for the VM lifetime, so
+concurrent boots must use distinct overlay paths.
+
+The overlay and `.metadata.json` sidecar are host-owned VM state. Keep them
+outside guest-writable host-directory mounts, or hide their containing directory
+with a host-directory `mask.paths` entry such as `"/.sandbox"`. Sandbox does not
+attempt to prove this for arbitrary host paths, symlinks, or mount layouts.
+Concurrent use is guarded with an advisory lock on the overlay file itself on
+filesystems that honor `flock`; other storage coordination is the caller's
+responsibility.
 
 For offline image work with block-store COW, describe the same merged view
 without booting a VM:

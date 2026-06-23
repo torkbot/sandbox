@@ -3,7 +3,6 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, Once};
@@ -37,18 +36,12 @@ pub struct KrunContext {
 struct RootfsOverlayLock {
     _file: fs::File,
     overlay_target: PathBuf,
+    existed: bool,
 }
 
 impl RootfsOverlayLock {
     fn acquire(overlay_path: &Path) -> Result<Self, KrunError> {
-        let overlay_target = rootfs_overlay_lock_target(overlay_path)?;
-        let lock_path = rootfs_overlay_lock_path(&overlay_target);
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .map_err(|_| KrunError::new("rootfs overlay lock open", -libc::EIO))?;
+        let (file, overlay_target, existed) = open_rootfs_overlay_lock_file(overlay_path)?;
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if result != 0 {
             let errno = io::Error::last_os_error()
@@ -65,33 +58,41 @@ impl RootfsOverlayLock {
         Ok(Self {
             _file: file,
             overlay_target,
+            existed,
         })
     }
 
     fn overlay_target(&self) -> &Path {
         &self.overlay_target
     }
+
+    fn existed(&self) -> bool {
+        self.existed
+    }
 }
 
-fn rootfs_overlay_lock_target(overlay_path: &Path) -> Result<PathBuf, KrunError> {
+fn open_rootfs_overlay_lock_file(
+    overlay_path: &Path,
+) -> Result<(fs::File, PathBuf, bool), KrunError> {
     match fs::symlink_metadata(overlay_path) {
         Ok(_) => {
-            let metadata = fs::metadata(overlay_path)
-                .map_err(|_| KrunError::new("rootfs overlay canonicalize", -libc::EIO))?;
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(overlay_path)
+                .map_err(|_| KrunError::new("rootfs overlay lock open", -libc::EIO))?;
+            let metadata = file
+                .metadata()
+                .map_err(|_| KrunError::new("rootfs overlay metadata", -libc::EIO))?;
             if !metadata.is_file() {
                 return Err(KrunError::new(
                     "rootfs overlay path is not a file",
                     -libc::EINVAL,
                 ));
             }
-            if metadata.nlink() > 1 {
-                return Err(KrunError::new(
-                    "rootfs overlay path must not have hard links",
-                    -libc::EINVAL,
-                ));
-            }
-            fs::canonicalize(overlay_path)
-                .map_err(|_| KrunError::new("rootfs overlay canonicalize", -libc::EIO))
+            let overlay_target = fs::canonicalize(overlay_path)
+                .map_err(|_| KrunError::new("rootfs overlay canonicalize", -libc::EIO))?;
+            Ok((file, overlay_target, true))
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let parent = overlay_path
@@ -102,16 +103,22 @@ fn rootfs_overlay_lock_target(overlay_path: &Path) -> Result<PathBuf, KrunError>
                 .ok_or_else(|| KrunError::new("rootfs overlay filename", -libc::EINVAL))?;
             let parent = fs::canonicalize(parent)
                 .map_err(|_| KrunError::new("rootfs overlay parent canonicalize", -libc::ENOENT))?;
-            Ok(parent.join(file_name))
+            let file = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(overlay_path)
+                .map_err(|error| {
+                    if error.kind() == io::ErrorKind::AlreadyExists {
+                        KrunError::new("rootfs overlay is already in use", -libc::EBUSY)
+                    } else {
+                        KrunError::new("rootfs overlay lock open", -libc::EIO)
+                    }
+                })?;
+            Ok((file, parent.join(file_name), false))
         }
         Err(_) => Err(KrunError::new("rootfs overlay metadata", -libc::EIO)),
     }
-}
-
-fn rootfs_overlay_lock_path(overlay_target: &Path) -> PathBuf {
-    let mut lock_path = overlay_target.as_os_str().to_os_string();
-    lock_path.push(".lock");
-    PathBuf::from(lock_path)
 }
 
 fn rootfs_overlay_metadata_path(overlay_target: &Path) -> PathBuf {
@@ -633,21 +640,7 @@ fn open_persistent_qcow2_overlay(
     expected_metadata: &PersistentQcow2OverlayMetadata,
 ) -> Result<(SyncFormatAccess<Box<dyn DynStorage>>, RootfsOverlayLock), KrunError> {
     let lock = RootfsOverlayLock::acquire(overlay_path)?;
-    let exists = match fs::metadata(overlay_path) {
-        Ok(metadata) => {
-            if !metadata.is_file() {
-                return Err(KrunError::new(
-                    "rootfs overlay path is not a file",
-                    -libc::EINVAL,
-                ));
-            }
-            true
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-        Err(_) => return Err(KrunError::new("rootfs overlay metadata", -libc::EIO)),
-    };
-
-    let disk = if exists {
+    let disk = if lock.existed() {
         validate_persistent_qcow2_overlay_metadata(lock.overlay_target(), expected_metadata)?;
         open_existing_persistent_qcow2_overlay(base_path, overlay_path)?
     } else {
@@ -766,7 +759,7 @@ fn create_persistent_qcow2_overlay(
         .block_on(Box::<dyn DynStorage>::create_open(
             StorageCreateOptions::new()
                 .filename(overlay_path)
-                .overwrite(false),
+                .overwrite(true),
         ))
         .map_err(|_| KrunError::new("rootfs overlay storage create", -libc::EIO))?;
     let base_header_path = base_path.to_string_lossy().into_owned();
@@ -1191,18 +1184,20 @@ mod tests {
     }
 
     #[test]
-    fn rootfs_overlay_lock_rejects_hard_linked_overlay_file() {
+    fn rootfs_overlay_lock_contends_across_hard_linked_overlay_file() {
         let tree = TempTree::new("overlay-lock-hard-link");
         let overlay = tree.path.join("rootfs.qcow2");
         let alias = tree.path.join("alias.qcow2");
         fs::write(&overlay, b"qcow2").unwrap();
         fs::hard_link(&overlay, &alias).unwrap();
 
-        let error = RootfsOverlayLock::acquire(&overlay).unwrap_err();
+        let first = RootfsOverlayLock::acquire(&overlay).unwrap();
+        let error = RootfsOverlayLock::acquire(&alias).unwrap_err();
 
+        assert_eq!(first.overlay_target(), fs::canonicalize(&overlay).unwrap());
         assert_eq!(
             error.to_string(),
-            "rootfs overlay path must not have hard links failed with -22",
+            "rootfs overlay is already in use failed with -16"
         );
     }
 
@@ -1214,10 +1209,7 @@ mod tests {
 
         let error = RootfsOverlayLock::acquire(&alias).unwrap_err();
 
-        assert_eq!(
-            error.to_string(),
-            "rootfs overlay canonicalize failed with -5"
-        );
+        assert_eq!(error.to_string(), "rootfs overlay lock open failed with -5");
     }
 
     #[test]
