@@ -47,6 +47,7 @@ try {
   await run("docker", ["rm", "-f", containerId], { allowFailure: true });
   await run("docker", ["rmi", "-f", tag], { allowFailure: true });
 }
+await rm(resolve(outDir, ".dockerenv"), { force: true });
 
 await writeFile(
   resolve(outDir, rootfsEnvironmentFactsManifestFile),
@@ -68,6 +69,7 @@ function environmentFactsManifest(id: string, imageName: string): RootfsEnvironm
       "bash",
       "curl",
       "git",
+      "gh",
       "jq",
       "node",
       "npm",

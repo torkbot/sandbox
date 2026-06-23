@@ -46,6 +46,10 @@ test("checked-in image manifests stay minimal and immutable", async () => {
     const dockerfile = await readFile(new URL(`../../images/${definition.id}/Dockerfile`, import.meta.url), "utf8");
     assert.match(dockerfile, /^ARG SOURCE_IMAGE$/m);
     assert.match(dockerfile, /^FROM \$\{SOURCE_IMAGE\}$/m);
+    if (definition.id.endsWith("-agent")) {
+      assert.match(dockerfile, /gh_2\.83\.0_linux_\$\{gh_arch\}\.tar\.gz/);
+      assert.match(dockerfile, /\/usr\/local\/bin\/gh/);
+    }
   }
 });
 
@@ -205,7 +209,7 @@ test("image release workflows are GitHub-state driven", async () => {
   assert.match(reconcileWorkflow, /image-manifest\.ts validate/);
   assert.match(reconcileWorkflow, /image-release-digest\.ts/);
   assert.match(reconcileWorkflow, /Release digest:/);
-  assert.match(reconcileWorkflow, /gh api "repos\/\$\{GITHUB_REPOSITORY\}\/releases\?per_page=100"/);
+  assert.match(reconcileWorkflow, /gh api --paginate "repos\/\$\{GITHUB_REPOSITORY\}\/releases\?per_page=100"/);
   assert.match(reconcileWorkflow, /gh release create/);
   assert.match(reconcileWorkflow, /--draft --prerelease/);
   assert.doesNotMatch(reconcileWorkflow, /ubuntu:lts|debian:stable|latest/);
@@ -215,4 +219,15 @@ test("image release workflows are GitHub-state driven", async () => {
   assert.match(publishWorkflow, /gh release download/);
   assert.match(publishWorkflow, /npm publish/);
   assert.match(publishWorkflow, /id-token: write/);
+});
+
+test("image rootfs builder preserves agent CLI facts and strips Docker markers", async () => {
+  const buildImageRootfsScript = await readFile(
+    new URL("../../scripts/build-image-rootfs.ts", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(buildImageRootfsScript, /"gh"/);
+  assert.match(buildImageRootfsScript, /configCommandFact/);
+  assert.match(buildImageRootfsScript, /resolve\(outDir, "\.dockerenv"\)/);
 });

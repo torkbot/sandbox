@@ -25,6 +25,13 @@ RUN apk add --no-cache \
     unzip \
     xz \
     zip \
+  && gh_arch="$(uname -m)" \
+  && case "$gh_arch" in x86_64) gh_arch=amd64 ;; aarch64) gh_arch=arm64 ;; *) echo "unsupported gh architecture: $gh_arch" >&2; exit 1 ;; esac \
+  && tmp="$(mktemp -d)" \
+  && curl -fsSL "https://github.com/cli/cli/releases/download/v2.83.0/gh_2.83.0_linux_${gh_arch}.tar.gz" -o "$tmp/gh.tar.gz" \
+  && tar -xzf "$tmp/gh.tar.gz" -C "$tmp" \
+  && install -m 0755 "$tmp/gh_2.83.0_linux_${gh_arch}/bin/gh" /usr/local/bin/gh \
+  && rm -rf "$tmp" \
   && mkdir -p /dev /proc /run /sandbox /sys /tmp /usr/lib/sandbox /workspace \
   && chmod 1777 /tmp \
   && printf '%s\n' \

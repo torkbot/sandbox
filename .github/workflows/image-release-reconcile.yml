@@ -139,7 +139,7 @@ jobs:
             --image "${{ matrix.image }}" \
             --artifact "x64=${x64_digest}" \
             --artifact "arm64=${arm64_digest}")"
-          existing_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq ".[] | select(.tag_name | startswith(\"image/${{ matrix.image }}/v\")) | select((.body // \"\") | contains(\"Release digest: ${release_digest}\")) | .tag_name" | sed -n '1p')"
+          existing_tag="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq ".[] | select(.tag_name | startswith(\"image/${{ matrix.image }}/v\")) | select((.body // \"\") | contains(\"Release digest: ${release_digest}\")) | .tag_name" | sed -n '1p')"
           echo "x64-digest=${x64_digest}" >> "$GITHUB_OUTPUT"
           echo "arm64-digest=${arm64_digest}" >> "$GITHUB_OUTPUT"
           echo "release-digest=${release_digest}" >> "$GITHUB_OUTPUT"

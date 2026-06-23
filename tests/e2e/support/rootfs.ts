@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { resolve } from "node:path";
+import type { TestContext } from "node:test";
 import { rootfs, type RootfsImageConfig } from "../../../src/index.ts";
 import type { RootfsEnvironmentFactsManifest } from "../../../src/environment-facts.ts";
 
@@ -14,6 +15,18 @@ let cachedTestRootfs: Promise<RootfsImageConfig> | undefined;
 export function testRootfsImage(): Promise<RootfsImageConfig> {
   cachedTestRootfs ??= loadTestRootfsImage();
   return cachedTestRootfs;
+}
+
+export async function testRootfsImageOrSkip(t: TestContext): Promise<RootfsImageConfig | undefined> {
+  try {
+    return await testRootfsImage();
+  } catch (error) {
+    if (isMissingFixture(error)) {
+      t.skip(error instanceof Error ? error.message : "test rootfs fixture is not built");
+      return undefined;
+    }
+    throw error;
+  }
 }
 
 async function loadTestRootfsImage(): Promise<RootfsImageConfig> {
@@ -45,6 +58,13 @@ async function readRootfsFactsManifest(path: string): Promise<RootfsEnvironmentF
     throw new Error(`unsupported rootfs facts manifest schema version: ${manifest.schemaVersion}`);
   }
   return manifest;
+}
+
+function isMissingFixture(error: unknown): boolean {
+  return typeof error === "object"
+    && error !== null
+    && "code" in error
+    && (error as { readonly code?: unknown }).code === "ENOENT";
 }
 
 function sha256File(path: string): Promise<string> {

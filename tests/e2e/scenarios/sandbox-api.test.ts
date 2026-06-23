@@ -13,14 +13,14 @@ import {
   type RootfsImageConfig,
 } from "../../../src/index.ts";
 import { requireHostArtifact, requireVmLaunchSupport } from "../support/capabilities.ts";
-import { testRootfsImage } from "../support/rootfs.ts";
+import { testRootfsImageOrSkip } from "../support/rootfs.ts";
 
 async function testRootfsForVmTest(t: TestContext): Promise<RootfsImageConfig | undefined> {
   if (!requireVmLaunchSupport(t)) {
     return undefined;
   }
 
-  return await testRootfsFixture(t);
+  return await testRootfsImageOrSkip(t);
 }
 
 async function testRootfsForHostArtifactTest(t: TestContext): Promise<RootfsImageConfig | undefined> {
@@ -28,26 +28,7 @@ async function testRootfsForHostArtifactTest(t: TestContext): Promise<RootfsImag
     return undefined;
   }
 
-  return await testRootfsFixture(t);
-}
-
-async function testRootfsFixture(t: TestContext): Promise<RootfsImageConfig | undefined> {
-  try {
-    return await testRootfsImage();
-  } catch (error) {
-    if (isMissingFixture(error)) {
-      t.skip(error instanceof Error ? error.message : "test rootfs fixture is not built");
-      return undefined;
-    }
-    throw error;
-  }
-}
-
-function isMissingFixture(error: unknown): boolean {
-  return typeof error === "object"
-    && error !== null
-    && "code" in error
-    && (error as { readonly code?: unknown }).code === "ENOENT";
+  return await testRootfsImageOrSkip(t);
 }
 
 test("new public API boots an external rootfs image and runs a process", async (t) => {
