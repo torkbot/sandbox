@@ -112,17 +112,17 @@ rootfs: rootfs.persistent({
 
 The native runtime creates a sparse QCOW2 overlay on first use and opens it with
 the built-in QCOW2 as an explicit read-only backing image. The built-in artifact
-is not locked. A small sidecar records the selected built-in base identity and
-digest so later boots fail closed if the overlay is reused with a different
-base. The selected canonical overlay path is locked for the VM lifetime, so many
-VMs may share one built-in base concurrently as long as each running VM uses a
-different overlay file. The overlay and metadata sidecar are host-owned VM
-state; callers must keep them outside guest-writable host-directory mounts or
-hide the containing directory with a host-directory mask. Sandbox does not try
-to prove that invariant across arbitrary host paths, symlinks, or mount layouts.
-Concurrent use is guarded with an advisory lock on the overlay file itself on
-filesystems that honor `flock`; other storage coordination is the caller's
-responsibility.
+is not locked. The overlay records the selected built-in base identity and
+digest in its QCOW2 backing metadata so later boots fail closed if the overlay
+is reused with a different base. The selected canonical overlay path is locked
+for the VM lifetime, so many VMs may share one built-in base concurrently as
+long as each running VM uses a different overlay file. The overlay is
+host-owned VM state; callers must keep it outside guest-writable host-directory
+mounts or hide the containing directory with a host-directory mask. Sandbox does
+not try to prove that invariant across arbitrary host paths, symlinks, or mount
+layouts. Concurrent use is guarded with an advisory lock on the overlay file
+itself on filesystems that honor `flock`; other storage coordination is the
+caller's responsibility.
 
 ## Networking
 

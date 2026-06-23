@@ -157,9 +157,9 @@ const sandbox = defineSandbox({
 
 Sandbox creates the overlay on first boot and reuses it on later boots. The
 built-in rootfs stays read-only and can be shared by many VMs; only the selected
-overlay file is single-writer while a VM is running. Sandbox also writes a small
-`rootfs.qcow2.metadata.json` sidecar beside the overlay and rejects reuse if it
-does not match the selected built-in base image.
+overlay file is single-writer while a VM is running. Sandbox records the
+selected built-in base identity in the QCOW2 header and rejects reuse if it does
+not match.
 
 ### Mount host-controlled data
 
@@ -339,18 +339,17 @@ Mounts a built-in base rootfs through a writable local QCOW2 overlay file. The
 creates a sparse QCOW2 overlay backed by the built-in image; the parent
 directory must already exist. If the file already exists, Sandbox reuses it. The
 built-in artifact is opened read-only and is not locked, so many VMs can share
-the same base image. Sandbox writes a `.metadata.json` sidecar beside the
-overlay and rejects reuse if the recorded built-in base identity no longer
-matches. The canonical overlay file path is locked for the VM lifetime, so
-concurrent boots must use distinct overlay paths.
+the same base image. Sandbox records the selected built-in base identity in the
+overlay QCOW2 header and rejects reuse if it no longer matches. The canonical
+overlay file path is locked for the VM lifetime, so concurrent boots must use
+distinct overlay paths.
 
-The overlay and `.metadata.json` sidecar are host-owned VM state. Keep them
-outside guest-writable host-directory mounts, or hide their containing directory
-with a host-directory `mask.paths` entry such as `"/.sandbox"`. Sandbox does not
-attempt to prove this for arbitrary host paths, symlinks, or mount layouts.
-Concurrent use is guarded with an advisory lock on the overlay file itself on
-filesystems that honor `flock`; other storage coordination is the caller's
-responsibility.
+The overlay file is host-owned VM state. Keep it outside guest-writable
+host-directory mounts, or hide its containing directory with a host-directory
+`mask.paths` entry such as `"/.sandbox"`. Sandbox does not attempt to prove this
+for arbitrary host paths, symlinks, or mount layouts. Concurrent use is guarded
+with an advisory lock on the overlay file itself on filesystems that honor
+`flock`; other storage coordination is the caller's responsibility.
 
 For offline image work with block-store COW, describe the same merged view
 without booting a VM:

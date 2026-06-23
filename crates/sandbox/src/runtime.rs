@@ -15,7 +15,6 @@ use imago::{
     DenyImplicitOpenGate, DynStorage, FormatAccess, FormatCreateBuilder, FormatDriverBuilder,
     Storage, StorageCreateOptions, StorageOpenOptions, SyncFormatAccess, qcow2::Qcow2, raw::Raw,
 };
-use serde::{Deserialize, Serialize};
 
 use crate::MicroVmSpec;
 use crate::block_storage::{CowBlockStorage, CowBlockStore, MemoryCowBlockStore};
@@ -147,20 +146,6 @@ fn open_rootfs_overlay_lock_file(
         }
         Err(_) => Err(KrunError::new("rootfs overlay metadata", -libc::EIO)),
     }
-}
-
-fn rootfs_overlay_metadata_path(overlay_target: &Path) -> PathBuf {
-    let mut metadata_path = overlay_target.as_os_str().to_os_string();
-    metadata_path.push(".metadata.json");
-    PathBuf::from(metadata_path)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PersistentQcow2OverlayMetadata {
-    schema_version: u32,
-    base_identity: String,
-    base_digest: String,
 }
 
 #[derive(Default, Clone)]
@@ -427,15 +412,10 @@ impl KrunContext {
                 {
                     cstring_path("rootfs.storage.path", path)?;
                     let open_start = Instant::now();
-                    let (disk, lock) = open_persistent_qcow2_overlay(
-                        &spec.rootfs.path,
-                        path,
-                        &PersistentQcow2OverlayMetadata {
-                            schema_version: 1,
-                            base_identity: base_identity.clone(),
-                            base_digest: base_digest.clone(),
-                        },
-                    )?;
+                    let backing_identity =
+                        persistent_qcow2_overlay_backing_identity(base_identity, base_digest);
+                    let (disk, lock) =
+                        open_persistent_qcow2_overlay(&spec.rootfs.path, path, &backing_identity)?;
                     self._rootfs_overlay_lock = Some(lock);
                     rootfs_trace.stage("open_persistent_overlay", open_start);
                     disk
@@ -665,25 +645,21 @@ const PERSISTENT_QCOW2_OVERLAY_CLUSTER_SIZE: usize = 32768;
 fn open_persistent_qcow2_overlay(
     base_path: &Path,
     overlay_path: &Path,
-    expected_metadata: &PersistentQcow2OverlayMetadata,
+    backing_identity: &str,
 ) -> Result<(SyncFormatAccess<Box<dyn DynStorage>>, RootfsOverlayLock), KrunError> {
     let lock = RootfsOverlayLock::acquire(overlay_path)?;
     let disk = if lock.existed() {
-        validate_persistent_qcow2_overlay_metadata(lock.overlay_target(), expected_metadata)?;
-        let disk = open_existing_persistent_qcow2_overlay(base_path, lock.overlay_target())?;
+        let disk = open_existing_persistent_qcow2_overlay(
+            base_path,
+            lock.overlay_target(),
+            backing_identity,
+        )?;
         lock.verify_target_unchanged()?;
         disk
     } else {
-        match create_persistent_qcow2_overlay(base_path, lock.overlay_target()) {
+        match create_persistent_qcow2_overlay(base_path, lock.overlay_target(), backing_identity) {
             Ok(disk) => {
                 if let Err(error) = lock.verify_target_unchanged() {
-                    let _ = fs::remove_file(lock.overlay_target());
-                    return Err(error);
-                }
-                if let Err(error) = write_persistent_qcow2_overlay_metadata(
-                    lock.overlay_target(),
-                    expected_metadata,
-                ) {
                     let _ = fs::remove_file(lock.overlay_target());
                     return Err(error);
                 }
@@ -699,53 +675,14 @@ fn open_persistent_qcow2_overlay(
     Ok((disk, lock))
 }
 
-fn validate_persistent_qcow2_overlay_metadata(
-    overlay_target: &Path,
-    expected: &PersistentQcow2OverlayMetadata,
-) -> Result<(), KrunError> {
-    let metadata_path = rootfs_overlay_metadata_path(overlay_target);
-    let data = fs::read(metadata_path)
-        .map_err(|_| KrunError::new("rootfs overlay metadata read", -libc::EINVAL))?;
-    let actual: PersistentQcow2OverlayMetadata = serde_json::from_slice(&data)
-        .map_err(|_| KrunError::new("rootfs overlay metadata parse", -libc::EINVAL))?;
-    if &actual != expected {
-        return Err(KrunError::new(
-            "rootfs overlay base identity mismatch",
-            -libc::EINVAL,
-        ));
-    }
-    Ok(())
-}
-
-fn write_persistent_qcow2_overlay_metadata(
-    overlay_target: &Path,
-    metadata: &PersistentQcow2OverlayMetadata,
-) -> Result<(), KrunError> {
-    let metadata_path = rootfs_overlay_metadata_path(overlay_target);
-    let data = serde_json::to_vec_pretty(metadata)
-        .map_err(|_| KrunError::new("rootfs overlay metadata encode", -libc::EIO))?;
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&metadata_path)
-        .map_err(|error| {
-            if error.kind() == io::ErrorKind::AlreadyExists {
-                KrunError::new("rootfs overlay metadata already exists", -libc::EEXIST)
-            } else {
-                KrunError::new("rootfs overlay metadata write", -libc::EIO)
-            }
-        })?;
-    if file.write_all(&data).is_err() {
-        let _ = fs::remove_file(metadata_path);
-        return Err(KrunError::new("rootfs overlay metadata write", -libc::EIO));
-    }
-    Ok(())
+fn persistent_qcow2_overlay_backing_identity(base_identity: &str, base_digest: &str) -> String {
+    format!("sandbox:persistent-rootfs-base:{base_identity}:sha256:{base_digest}")
 }
 
 fn open_existing_persistent_qcow2_overlay(
     base_path: &Path,
     overlay_path: &Path,
+    backing_identity: &str,
 ) -> Result<SyncFormatAccess<Box<dyn DynStorage>>, KrunError> {
     let base = open_qcow2_backing_access(base_path)?;
     let base_size = base.size();
@@ -758,7 +695,7 @@ fn open_existing_persistent_qcow2_overlay(
         .backing(Some(base))
         .open_sync(DenyImplicitOpenGate::default())
         .map_err(|_| KrunError::new("rootfs overlay qcow2 open", -libc::EIO))?;
-    validate_persistent_qcow2_overlay_backing_metadata(&overlay)?;
+    validate_persistent_qcow2_overlay_backing_metadata(&overlay, backing_identity)?;
     let access = FormatAccess::new(overlay);
     if access.size() != base_size {
         return Err(KrunError::new(
@@ -772,7 +709,14 @@ fn open_existing_persistent_qcow2_overlay(
 
 fn validate_persistent_qcow2_overlay_backing_metadata(
     overlay: &Qcow2<Box<dyn DynStorage>>,
+    backing_identity: &str,
 ) -> Result<(), KrunError> {
+    if overlay.implicit_backing_file().map(String::as_str) != Some(backing_identity) {
+        return Err(KrunError::new(
+            "rootfs overlay base identity mismatch",
+            -libc::EINVAL,
+        ));
+    }
     if overlay.implicit_backing_format().map(String::as_str) != Some("qcow2") {
         return Err(KrunError::new(
             "rootfs overlay backing format mismatch",
@@ -785,6 +729,7 @@ fn validate_persistent_qcow2_overlay_backing_metadata(
 fn create_persistent_qcow2_overlay(
     base_path: &Path,
     overlay_path: &Path,
+    backing_identity: &str,
 ) -> Result<SyncFormatAccess<Box<dyn DynStorage>>, KrunError> {
     let base = open_qcow2_backing_access(base_path)?;
     let base_size = base.size();
@@ -798,13 +743,12 @@ fn create_persistent_qcow2_overlay(
                 .overwrite(true),
         ))
         .map_err(|_| KrunError::new("rootfs overlay storage create", -libc::EIO))?;
-    let base_header_path = base_path.to_string_lossy().into_owned();
     let overlay = runtime
         .block_on(
             Qcow2::<Box<dyn DynStorage>>::create_builder(overlay_storage)
                 .size(base_size)
                 .cluster_size(PERSISTENT_QCOW2_OVERLAY_CLUSTER_SIZE)
-                .backing(base_header_path, "qcow2".to_string())
+                .backing(backing_identity.to_string(), "qcow2".to_string())
                 .create_open(DenyImplicitOpenGate::default(), |image| {
                     Ok(Qcow2::<Box<dyn DynStorage>>::builder(image)
                         .write(true)
@@ -1255,50 +1199,6 @@ mod tests {
         let error = RootfsOverlayLock::acquire(&alias).unwrap_err();
 
         assert_eq!(error.to_string(), "rootfs overlay lock open failed with -5");
-    }
-
-    #[test]
-    fn persistent_qcow2_overlay_metadata_write_rejects_existing_sidecar() {
-        let tree = TempTree::new("overlay-metadata-existing-sidecar");
-        let overlay = tree.path.join("rootfs.qcow2");
-        let metadata = rootfs_overlay_metadata_path(&overlay);
-        fs::write(&metadata, b"qcow2").unwrap();
-
-        let error = write_persistent_qcow2_overlay_metadata(
-            &overlay,
-            &PersistentQcow2OverlayMetadata {
-                schema_version: 1,
-                base_identity: "built-in:alpine:3.23:qcow2:test".to_string(),
-                base_digest: "a".repeat(64),
-            },
-        )
-        .unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "rootfs overlay metadata already exists failed with -17"
-        );
-        assert_eq!(fs::read(&metadata).unwrap(), b"qcow2");
-    }
-
-    #[test]
-    fn persistent_qcow2_overlay_metadata_write_uses_private_permissions() {
-        let tree = TempTree::new("overlay-metadata-private-mode");
-        let overlay = tree.path.join("rootfs.qcow2");
-        let metadata = rootfs_overlay_metadata_path(&overlay);
-
-        write_persistent_qcow2_overlay_metadata(
-            &overlay,
-            &PersistentQcow2OverlayMetadata {
-                schema_version: 1,
-                base_identity: "built-in:alpine:3.23:qcow2:test".to_string(),
-                base_digest: "a".repeat(64),
-            },
-        )
-        .unwrap();
-
-        let mode = fs::metadata(&metadata).unwrap().mode() & 0o777;
-        assert_eq!(mode, 0o600);
     }
 
     #[test]

@@ -1124,14 +1124,7 @@ test("persistent rootfs creates and reuses a QCOW2 overlay file", async (t) => {
 
   assert.equal((await lstat(overlayPath)).isFile(), true);
   await assertQcow2Magic(overlayPath);
-  const metadata = JSON.parse(await readFile(`${overlayPath}.metadata.json`, "utf8")) as {
-    readonly schemaVersion?: unknown;
-    readonly baseIdentity?: unknown;
-    readonly baseDigest?: unknown;
-  };
-  assert.equal(metadata.schemaVersion, 1);
-  assert.match(String(metadata.baseIdentity), /built-in:alpine:3\.23:qcow2:/);
-  assert.match(String(metadata.baseDigest), /^[0-9a-f]{64}$/);
+  await assert.rejects(lstat(`${overlayPath}.metadata.json`), { code: "ENOENT" });
 
   await using second = await sandboxDefinition.boot();
   const read = await second.exec("/bin/cat", ["/root/persistent-state.txt"]);
@@ -1160,16 +1153,7 @@ test("persistent rootfs rejects reuse when base metadata does not match", async 
   const first = await sandboxDefinition.boot();
   await first.close();
 
-  const metadataPath = `${overlayPath}.metadata.json`;
-  const metadata = JSON.parse(await readFile(metadataPath, "utf8")) as {
-    schemaVersion: number;
-    baseIdentity: string;
-    baseDigest: string;
-  };
-  await writeFile(metadataPath, JSON.stringify({
-    ...metadata,
-    baseDigest: "0".repeat(64),
-  }));
+  await corruptQcow2BackingFilename(overlayPath);
 
   await assert.rejects(
     sandboxDefinition.boot(),
@@ -1414,6 +1398,23 @@ async function assertQcow2Magic(path: string): Promise<void> {
     const { bytesRead } = await file.read(magic, 0, magic.byteLength, 0);
     assert.equal(bytesRead, magic.byteLength);
     assert.deepEqual(magic, new Uint8Array([0x51, 0x46, 0x49, 0xfb]));
+  } finally {
+    await file.close();
+  }
+}
+
+async function corruptQcow2BackingFilename(path: string): Promise<void> {
+  const file = await open(path, "r+");
+  try {
+    const header = Buffer.alloc(20);
+    const { bytesRead } = await file.read(header, 0, header.byteLength, 0);
+    assert.equal(bytesRead, header.byteLength);
+    assert.deepEqual(header.subarray(0, 4), Buffer.from([0x51, 0x46, 0x49, 0xfb]));
+    const backingOffset = Number(header.readBigUInt64BE(8));
+    const backingSize = header.readUInt32BE(16);
+    assert.ok(backingOffset > 0);
+    assert.ok(backingSize > 0);
+    await file.write(Buffer.alloc(backingSize, "x"), 0, backingSize, backingOffset);
   } finally {
     await file.close();
   }
