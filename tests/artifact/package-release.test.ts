@@ -198,6 +198,14 @@ test("local build scripts rebuild kernel and initrd before embedding host artifa
   }
 });
 
+test("init build restores Cargo target ownership before host build", async () => {
+  const buildInit = await readFile(new URL("../../scripts/build-init.ts", import.meta.url), "utf8");
+
+  assert.match(buildInit, /cargo build -p sandbox-init --release --target/);
+  assert.match(buildInit, /chown -R \$\{shellArg\(owner\)\} \/work\/target/);
+  assert.doesNotMatch(buildInit, /\/work\/target\/\$\{shellArg\(target\)\}/);
+});
+
 test("host build validates kernel artifact metadata before Cargo embeds it", async () => {
   const buildHost = await readFile(new URL("../../scripts/build-host.ts", import.meta.url), "utf8");
   const buildKernel = await readFile(new URL("../../scripts/build-kernel.ts", import.meta.url), "utf8");

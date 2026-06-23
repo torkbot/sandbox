@@ -7,6 +7,7 @@ const repoRoot = resolve(import.meta.dirname, "..");
 const target = process.env.SANDBOX_INIT_TARGET ?? guestTarget();
 const image = process.env.SANDBOX_INIT_BUILDER_IMAGE ?? "rust:1-bookworm";
 const outDir = resolve(repoRoot, process.env.SANDBOX_INIT_OUT_DIR ?? `dist/init/${target}`);
+const owner = `${getuid?.() ?? 0}:${getgid?.() ?? 0}`;
 
 await run("docker", [
   "run",
@@ -24,7 +25,7 @@ await run("docker", [
     "apt-get update",
     "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends musl-tools",
     `cargo build -p sandbox-init --release --target ${shellArg(target)}`,
-    `chown -R ${getuid?.() ?? 0}:${getgid?.() ?? 0} /work/target/${shellArg(target)}`,
+    `chown -R ${shellArg(owner)} /work/target`,
   ].join(" && "),
 ]);
 
