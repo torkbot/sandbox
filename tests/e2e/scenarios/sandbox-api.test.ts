@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { lstat, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import {
   defineSandbox,
   fs,
@@ -10,14 +10,49 @@ import {
   rootfs,
   type SandboxBlockStore,
   type SandboxEnvironmentFact,
+  type RootfsImageConfig,
 } from "../../../src/index.ts";
 import { requireHostArtifact, requireVmLaunchSupport } from "../support/capabilities.ts";
 import { testRootfsImage } from "../support/rootfs.ts";
 
-const testRootfs = await testRootfsImage();
+async function testRootfsForVmTest(t: TestContext): Promise<RootfsImageConfig | undefined> {
+  if (!requireVmLaunchSupport(t)) {
+    return undefined;
+  }
+
+  return await testRootfsFixture(t);
+}
+
+async function testRootfsForHostArtifactTest(t: TestContext): Promise<RootfsImageConfig | undefined> {
+  if (!requireHostArtifact(t)) {
+    return undefined;
+  }
+
+  return await testRootfsFixture(t);
+}
+
+async function testRootfsFixture(t: TestContext): Promise<RootfsImageConfig | undefined> {
+  try {
+    return await testRootfsImage();
+  } catch (error) {
+    if (isMissingFixture(error)) {
+      t.skip(error instanceof Error ? error.message : "test rootfs fixture is not built");
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+function isMissingFixture(error: unknown): boolean {
+  return typeof error === "object"
+    && error !== null
+    && "code" in error
+    && (error as { readonly code?: unknown }).code === "ENOENT";
+}
 
 test("new public API boots an external rootfs image and runs a process", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -37,7 +72,8 @@ test("new public API boots an external rootfs image and runs a process", async (
 });
 
 test("boot configures the default guest hostname", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -57,7 +93,8 @@ test("boot configures the default guest hostname", async (t) => {
 });
 
 test("boot accepts an instance-specific guest hostname", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -89,7 +126,8 @@ test("boot accepts an instance-specific guest hostname", async (t) => {
 });
 
 test("guest init provides baseline Linux facilities", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -160,7 +198,8 @@ test("guest init provides baseline Linux facilities", async (t) => {
 });
 
 test("buffered exec timeout terminates guest process", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -180,7 +219,8 @@ test("buffered exec timeout terminates guest process", async (t) => {
 });
 
 test("buffered exec abort terminates guest process and leaves control usable", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -201,7 +241,8 @@ test("buffered exec abort terminates guest process and leaves control usable", a
 });
 
 test("buffered exec abort terminates descendants holding output pipes open", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -228,7 +269,8 @@ test("buffered exec abort terminates descendants holding output pipes open", asy
 });
 
 test("buffered exec calls overlap without blocking the control plane", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -244,7 +286,8 @@ test("buffered exec calls overlap without blocking the control plane", async (t)
 });
 
 test("buffered exec timeout returns when descendant keeps output pipes open", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -267,7 +310,8 @@ test("buffered exec timeout returns when descendant keeps output pipes open", as
 });
 
 test("buffered exec closes stdin for commands that read input", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -283,7 +327,8 @@ test("buffered exec closes stdin for commands that read input", async (t) => {
 });
 
 test("spawn returns stream handles immediately and pipes guest stdio", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -308,7 +353,8 @@ test("spawn returns stream handles immediately and pipes guest stdio", async (t)
 });
 
 test("spawn kill terminates a long-lived guest process", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -324,7 +370,8 @@ test("spawn kill terminates a long-lived guest process", async (t) => {
 });
 
 test("spawn and pty honor already-aborted signals before launching", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -356,7 +403,8 @@ test("spawn and pty honor already-aborted signals before launching", async (t) =
 });
 
 test("pty runs an interactive terminal process with a required size", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -386,7 +434,8 @@ test("pty runs an interactive terminal process with a required size", async (t) 
 });
 
 test("buffered exec timeout includes output drain time", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -409,7 +458,8 @@ test("buffered exec timeout includes output drain time", async (t) => {
 });
 
 test("agent rootfs image includes common agent runtimes and CLIs", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -442,7 +492,8 @@ test("agent rootfs image includes common agent runtimes and CLIs", async (t) => 
 });
 
 test("environment facts can be recovered from a running VM", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -503,7 +554,8 @@ test("environment facts can be recovered from a running VM", async (t) => {
 });
 
 test("environment facts parse os-release as data", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -540,7 +592,8 @@ test("environment facts parse os-release as data", async (t) => {
 });
 
 test("boot options provide instance-specific virtual mounts", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -564,7 +617,8 @@ test("boot options provide instance-specific virtual mounts", async (t) => {
 });
 
 test("running sandbox exposes a remote-friendly guest filesystem API", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -729,7 +783,8 @@ test("running sandbox exposes a remote-friendly guest filesystem API", async (t)
 });
 
 test("host directory bind mounts use native virtio-fs access modes", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -768,7 +823,8 @@ test("host directory bind mounts use native virtio-fs access modes", async (t) =
 });
 
 test("read-only host directory masks hide lower host entries", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -816,7 +872,8 @@ test("read-only host directory masks hide lower host entries", async (t) => {
 });
 
 test("writable host directory masks store guest-created entries in host mask storage", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -901,7 +958,8 @@ test("writable host directory masks store guest-created entries in host mask sto
 });
 
 test("missing writable mount directories are created before mounting virtual filesystems", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -925,7 +983,8 @@ test("missing writable mount directories are created before mounting virtual fil
 });
 
 test("top-level read-only rootfs mount directories fail with actionable init output", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -947,7 +1006,8 @@ test("top-level read-only rootfs mount directories fail with actionable init out
 });
 
 test("missing COW rootfs mount directories do not persist synthetic rootfs paths", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -981,7 +1041,8 @@ test("missing COW rootfs mount directories do not persist synthetic rootfs paths
 });
 
 test("ordered nested virtual mounts create child directories under parent mounts", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -1014,7 +1075,8 @@ test("ordered nested virtual mounts create child directories under parent mounts
 });
 
 test("invalid rootfs mount targets fail with actionable init output", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -1036,7 +1098,8 @@ test("invalid rootfs mount targets fail with actionable init output", async (t) 
 });
 
 test("virtual memory mounts can be used as the boot cwd", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -1065,7 +1128,8 @@ test("virtual memory mounts can be used as the boot cwd", async (t) => {
 });
 
 test("virtual memory mounts support guest directory reads from root cwd", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -1094,7 +1158,8 @@ test("virtual memory mounts support guest directory reads from root cwd", async 
 });
 
 test("virtual memory mount paths may contain init delimiters", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -1127,7 +1192,8 @@ test("virtual memory mount paths may contain init delimiters", async (t) => {
 });
 
 test("boot cwd becomes the default process working directory", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -1144,7 +1210,8 @@ test("boot cwd becomes the default process working directory", async (t) => {
 });
 
 test("agent rootfs image exposes enough guest disk space for agent workloads", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -1162,7 +1229,8 @@ test("agent rootfs image exposes enough guest disk space for agent workloads", a
 });
 
 test("HTTP interception does not make read-only rootfs writable", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -1193,7 +1261,8 @@ test("HTTP interception does not make read-only rootfs writable", async (t) => {
 });
 
 test("ephemeral rootfs allows rootfs mutations only for the running instance", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -1228,7 +1297,8 @@ test("ephemeral rootfs allows rootfs mutations only for the running instance", a
 });
 
 test("COW rootfs round-trips rootfs mutations across instances", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -1261,7 +1331,8 @@ test("COW rootfs round-trips rootfs mutations across instances", async (t) => {
 });
 
 test("persistent rootfs creates and reuses a QCOW2 overlay file", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -1302,7 +1373,8 @@ test("persistent rootfs creates and reuses a QCOW2 overlay file", async (t) => {
 });
 
 test("persistent rootfs rejects reuse when base metadata does not match", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -1330,7 +1402,8 @@ test("persistent rootfs rejects reuse when base metadata does not match", async 
 });
 
 test("persistent rootfs can live under a masked read-write host directory mount", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -1391,7 +1464,8 @@ test("persistent rootfs can live under a masked read-write host directory mount"
 });
 
 test("persistent rootfs locks only the selected overlay file", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -1448,7 +1522,8 @@ test("persistent rootfs locks only the selected overlay file", async (t) => {
 });
 
 test("persistent rootfs locks canonical overlay targets", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -1487,7 +1562,8 @@ test("persistent rootfs locks canonical overlay targets", async (t) => {
 });
 
 test("COW rootfs can be flattened to a QCOW2 image stream", async (t) => {
-  if (!requireHostArtifact(t)) {
+  const testRootfs = await testRootfsForHostArtifactTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -1521,7 +1597,8 @@ test("COW rootfs can be flattened to a QCOW2 image stream", async (t) => {
 });
 
 test("COW rootfs close sync ignores the instance cwd", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 

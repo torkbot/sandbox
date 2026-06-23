@@ -96,8 +96,10 @@ fn run_stage0() -> Result<(), InitError> {
     move_mount("/proc", "/newroot/proc")?;
     move_mount("/sys", "/newroot/sys")?;
     move_mount("/dev", "/newroot/dev")?;
+    mount_fs("tmpfs", "/newroot/dev/shm", "tmpfs", 0)?;
+    set_directory_mode("/newroot/dev/shm", 0o1777)?;
     let stage1_path = "/newroot/dev/shm/sandbox-init";
-    std::fs::copy("/proc/self/exe", stage1_path)
+    std::fs::copy("/newroot/proc/self/exe", stage1_path)
         .map_err(|error| InitError(format!("copy stage1 init to {stage1_path}: {error}")))?;
     set_file_mode(stage1_path, 0o755)?;
     move_new_root()?;
