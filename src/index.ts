@@ -2165,37 +2165,104 @@ function validatePersistentRootfsHostMountIsolation(
   if (rootfs.kind !== "persistent-rootfs") {
     return;
   }
-  const overlayPath = realpathOrResolve(rootfs.path);
-  const lockPath = realpathOrResolve(persistentRootfsLockPath(rootfs.path));
+  const protectedPaths = [
+    persistentRootfsProtectedPath(rootfs.path, "overlay"),
+    persistentRootfsProtectedPath(persistentRootfsLockPath(rootfs.path), "overlay lock"),
+  ];
   for (const source of Object.values(mounts)) {
     if (source.kind !== "host-directory" || source.access !== "rw") {
       continue;
     }
-    rejectHostDirectoryExposesPersistentRootfs(source.source, overlayPath, lockPath, "host directory source");
+    rejectHostDirectoryExposesPersistentRootfs(
+      source.source,
+      protectedPaths,
+      "host directory source",
+      source.mask?.paths ?? [],
+    );
     const storage = source.mask !== undefined && "storage" in source.mask ? source.mask.storage : undefined;
     if (storage !== undefined) {
-      rejectHostDirectoryExposesPersistentRootfs(storage.source, overlayPath, lockPath, "host directory mask storage");
+      rejectHostDirectoryExposesPersistentRootfs(
+        storage.source,
+        protectedPaths,
+        "host directory mask storage",
+        [],
+      );
     }
   }
 }
 
+type PersistentRootfsProtectedPath = {
+  readonly label: "overlay" | "overlay lock";
+  readonly literalPath: string;
+  readonly canonicalPath: string;
+};
+
+function persistentRootfsProtectedPath(path: string, label: PersistentRootfsProtectedPath["label"]): PersistentRootfsProtectedPath {
+  return {
+    label,
+    literalPath: resolve(path),
+    canonicalPath: realpathOrResolve(path),
+  };
+}
+
 function rejectHostDirectoryExposesPersistentRootfs(
   source: string,
-  overlayPath: string,
-  lockPath: string,
+  protectedPaths: readonly PersistentRootfsProtectedPath[],
   label: string,
+  maskPaths: readonly string[],
 ): void {
+  const sourceLiteralPath = resolve(source);
   const sourcePath = realpathOrResolve(source);
-  if (isPathInsideOrEqual(sourcePath, overlayPath)) {
-    throw new Error(`invalid sandbox boot options: ${label} must not expose persistent rootfs overlay`);
-  }
-  if (isPathInsideOrEqual(sourcePath, lockPath)) {
-    throw new Error(`invalid sandbox boot options: ${label} must not expose persistent rootfs overlay lock`);
+  for (const protectedPath of protectedPaths) {
+    if (hostDirectoryExposesPersistentRootfsPath(sourceLiteralPath, sourcePath, protectedPath, maskPaths)) {
+      throw new Error(`invalid sandbox boot options: ${label} must not expose persistent rootfs ${protectedPath.label}`);
+    }
   }
 }
 
 function persistentRootfsLockPath(path: string): string {
   return `${path}.lock`;
+}
+
+function hostDirectoryExposesPersistentRootfsPath(
+  sourceLiteralPath: string,
+  sourcePath: string,
+  protectedPath: PersistentRootfsProtectedPath,
+  maskPaths: readonly string[],
+): boolean {
+  for (const candidate of uniquePaths([protectedPath.literalPath, protectedPath.canonicalPath])) {
+    const isUnderSource = isPathInsideOrEqual(sourceLiteralPath, candidate) || isPathInsideOrEqual(sourcePath, candidate);
+    if (isUnderSource && !persistentRootfsPathCoveredByHostDirectoryMask(sourceLiteralPath, sourcePath, candidate, maskPaths)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function persistentRootfsPathCoveredByHostDirectoryMask(
+  sourceLiteralPath: string,
+  sourcePath: string,
+  path: string,
+  maskPaths: readonly string[],
+): boolean {
+  for (const maskPath of maskPaths) {
+    const relativeMaskPath = maskPath.slice(1);
+    const maskLiteralFromLiteralSource = resolve(sourceLiteralPath, relativeMaskPath);
+    const maskLiteralFromCanonicalSource = resolve(sourcePath, relativeMaskPath);
+    const maskCanonicalPath = realpathOrResolve(maskLiteralFromCanonicalSource);
+    if (
+      isPathInsideOrEqual(maskLiteralFromLiteralSource, path)
+      || isPathInsideOrEqual(maskLiteralFromCanonicalSource, path)
+      || isPathInsideOrEqual(maskCanonicalPath, path)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function uniquePaths(paths: readonly string[]): readonly string[] {
+  return Array.from(new Set(paths));
 }
 
 function validateHostDirectorySource(source: HostDirectorySourceForValidation): void {

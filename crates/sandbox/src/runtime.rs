@@ -718,7 +718,7 @@ fn open_existing_persistent_qcow2_overlay(
         .backing(Some(base))
         .open_sync(DenyImplicitOpenGate::default())
         .map_err(|_| KrunError::new("rootfs overlay qcow2 open", -libc::EIO))?;
-    validate_persistent_qcow2_overlay_backing_metadata(&overlay, base_path)?;
+    validate_persistent_qcow2_overlay_backing_metadata(&overlay)?;
     let access = FormatAccess::new(overlay);
     if access.size() != base_size {
         return Err(KrunError::new(
@@ -732,15 +732,7 @@ fn open_existing_persistent_qcow2_overlay(
 
 fn validate_persistent_qcow2_overlay_backing_metadata(
     overlay: &Qcow2<Box<dyn DynStorage>>,
-    base_path: &Path,
 ) -> Result<(), KrunError> {
-    let expected_backing = base_path.to_string_lossy();
-    if overlay.implicit_backing_file().map(String::as_str) != Some(expected_backing.as_ref()) {
-        return Err(KrunError::new(
-            "rootfs overlay backing path mismatch",
-            -libc::EINVAL,
-        ));
-    }
     if overlay.implicit_backing_format().map(String::as_str) != Some("qcow2") {
         return Err(KrunError::new(
             "rootfs overlay backing format mismatch",

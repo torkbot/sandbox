@@ -280,6 +280,67 @@ test("boot rejects read-write host directory mounts that expose persistent rootf
   );
 });
 
+test("boot allows masked persistent rootfs files under read-write host directory mounts", async (t) => {
+  const workspace = await mkdtemp(join(tmpdir(), "sandbox-persistent-rootfs-masked-mount-"));
+  const maskStorage = await mkdtemp(join(tmpdir(), "sandbox-persistent-rootfs-mask-storage-"));
+  t.after(async () => {
+    await rm(workspace, { recursive: true, force: true });
+    await rm(maskStorage, { recursive: true, force: true });
+  });
+  await mkdir(join(workspace, ".sandbox"));
+  const sandbox = defineSandbox({
+    rootfs: rootfs.persistent({
+      base: rootfs.builtIn("alpine:3.23"),
+      path: join(workspace, ".sandbox", "rootfs.qcow2"),
+    }),
+  });
+
+  await assert.rejects(
+    sandbox.boot({
+      cwd: "relative",
+      mounts: {
+        "/workspace": fs.bind({
+          source: workspace,
+          access: "rw",
+          mask: {
+            paths: ["/.sandbox"],
+            storage: fs.bind({ source: maskStorage, access: "rw" }),
+          },
+        }),
+      },
+    }),
+    /invalid sandbox boot options: cwd must be absolute/,
+  );
+});
+
+test("boot rejects read-write host directory symlink aliases to persistent rootfs files", async (t) => {
+  const workspace = await mkdtemp(join(tmpdir(), "sandbox-persistent-rootfs-symlink-mount-"));
+  const storage = await mkdtemp(join(tmpdir(), "sandbox-persistent-rootfs-symlink-storage-"));
+  t.after(async () => {
+    await rm(workspace, { recursive: true, force: true });
+    await rm(storage, { recursive: true, force: true });
+  });
+  const overlayPath = join(storage, "rootfs.qcow2");
+  const overlayAlias = join(workspace, "rootfs.qcow2");
+  await writeFile(overlayPath, "");
+  await symlink(overlayPath, overlayAlias);
+  const sandbox = defineSandbox({
+    rootfs: rootfs.persistent({
+      base: rootfs.builtIn("alpine:3.23"),
+      path: overlayAlias,
+    }),
+  });
+
+  await assert.rejects(
+    sandbox.boot({
+      mounts: {
+        "/workspace": fs.bind({ source: workspace, access: "rw" }),
+      },
+    }),
+    /invalid sandbox boot options: host directory source must not expose persistent rootfs overlay/,
+  );
+});
+
 test("boot rejects invalid host directory mask paths", async () => {
   const sandbox = defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.23"),

@@ -1177,6 +1177,67 @@ test("persistent rootfs rejects reuse when base metadata does not match", async 
   );
 });
 
+test("persistent rootfs can live under a masked read-write host directory mount", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const workspace = await mkdtemp(join(tmpdir(), "sandbox-persistent-rootfs-masked-workspace-"));
+  const maskStorage = await mkdtemp(join(tmpdir(), "sandbox-persistent-rootfs-masked-storage-"));
+  t.after(async () => {
+    await rm(workspace, { recursive: true, force: true });
+    await rm(maskStorage, { recursive: true, force: true });
+  });
+  await mkdir(join(workspace, ".sandbox"));
+  await writeFile(join(workspace, "visible.txt"), "workspace-visible\n");
+  const overlayPath = join(workspace, ".sandbox", "rootfs.qcow2");
+  const sandboxDefinition = defineSandbox({
+    rootfs: rootfs.persistent({
+      base: rootfs.builtIn("alpine:3.23"),
+      path: overlayPath,
+    }),
+  });
+  const boot = {
+    mounts: {
+      "/tmp/workspace": fs.bind({
+        source: workspace,
+        access: "rw",
+        mask: {
+          paths: ["/.sandbox"],
+          storage: fs.bind({ source: maskStorage, access: "rw" }),
+        },
+      }),
+    },
+  };
+
+  const first = await sandboxDefinition.boot(boot);
+  try {
+    const write = await first.exec("/bin/sh", [
+      "-lc",
+      [
+        "set -e",
+        "cat /tmp/workspace/visible.txt",
+        "test ! -e /tmp/workspace/.sandbox",
+        "printf '%s' masked > /root/masked-persistent-state.txt",
+        "sync",
+      ].join("\n"),
+    ]);
+    assert.equal(write.exitCode, 0, `stdout:\n${write.stdout}\nstderr:\n${write.stderr}`);
+    assert.equal(write.stdout, "workspace-visible\n");
+  } finally {
+    await first.close();
+  }
+
+  assert.equal((await lstat(overlayPath)).isFile(), true);
+  assert.equal(await readFile(join(workspace, "visible.txt"), "utf8"), "workspace-visible\n");
+
+  await using second = await sandboxDefinition.boot(boot);
+  const read = await second.exec("/bin/cat", ["/root/masked-persistent-state.txt"]);
+
+  assert.equal(read.exitCode, 0, read.stderr);
+  assert.equal(read.stdout, "masked");
+});
+
 test("persistent rootfs locks only the selected overlay file", async (t) => {
   if (!requireVmLaunchSupport(t)) {
     return;
