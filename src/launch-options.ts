@@ -89,6 +89,12 @@ export interface InternalSandboxOptions {
           readonly kind: "ephemeral-cow";
           readonly blockSize: number;
           readonly maxDirtyBytes: number;
+        }
+      | {
+          readonly kind: "persistent-qcow2-overlay";
+          readonly path: string;
+          readonly baseIdentity: string;
+          readonly baseDigest: string;
         };
   };
   readonly mounts?: readonly InternalMount[];

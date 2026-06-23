@@ -65,6 +65,7 @@ export type SandboxRootfsEnvironmentFact =
       readonly value:
         | "read-only"
         | "writable-ephemeral"
+        | "writable-persistent-file"
         | "writable-persistent-cow";
     }
   | {

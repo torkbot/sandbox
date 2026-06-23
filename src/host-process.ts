@@ -1625,6 +1625,21 @@ class AsyncSignal {
 }
 
 function encodeHostSpawn(options: HostSpawnSandboxOptions): Uint8Array {
+  const rootfsStorage = options.rootfs.storage === undefined
+    ? undefined
+    : options.rootfs.storage.kind === "persistent-qcow2-overlay"
+      ? {
+        kind: options.rootfs.storage.kind,
+        path: options.rootfs.storage.path,
+        baseIdentity: options.rootfs.storage.baseIdentity,
+        baseDigest: options.rootfs.storage.baseDigest,
+      }
+      : {
+        kind: options.rootfs.storage.kind,
+        blockSize: options.rootfs.storage.blockSize,
+        maxDirtyBytes: options.rootfs.storage.maxDirtyBytes,
+      };
+
   return encodePacket({
     type: "host.spawn",
     name: options.name,
@@ -1636,13 +1651,7 @@ function encodeHostSpawn(options: HostSpawnSandboxOptions): Uint8Array {
     rootfsPath: options.rootfs.path,
     rootfsReadonly: options.rootfs.readonly,
     rootfsFormat: options.rootfs.format,
-    rootfsStorage: options.rootfs.storage === undefined
-      ? undefined
-      : {
-        kind: options.rootfs.storage.kind,
-        blockSize: options.rootfs.storage.blockSize,
-        maxDirtyBytes: options.rootfs.storage.maxDirtyBytes,
-      },
+    rootfsStorage,
     mounts: options.mounts ?? [],
     networkOutbound: options.network?.outbound,
     networkHttp: options.network?.http === undefined ? undefined : options.network.http,

@@ -17,8 +17,8 @@ import {
   type SandboxRootfsEnvironmentFact,
   type SandboxShellEnvironmentFact,
 } from "./environment-facts.ts";
-import { randomUUID } from "node:crypto";
-import { lstatSync, readdirSync, realpathSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { createReadStream, lstatSync, readdirSync, realpathSync } from "node:fs";
 import { open } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { HostControlTransport } from "./control.ts";
@@ -179,7 +179,13 @@ export type EphemeralRootfsConfig = {
   readonly maxDirtyBytes?: number;
 };
 
-export type Rootfs = BuiltInRootfsConfig | CowRootfsConfig | EphemeralRootfsConfig;
+export type PersistentRootfsConfig = {
+  readonly kind: "persistent-rootfs";
+  readonly base: BuiltInRootfsConfig;
+  readonly path: string;
+};
+
+export type Rootfs = BuiltInRootfsConfig | CowRootfsConfig | EphemeralRootfsConfig | PersistentRootfsConfig;
 
 export type Qcow2RootfsImage = {
   readonly kind: "rootfs-image";
@@ -817,6 +823,16 @@ export const rootfs = {
       ...(options.maxDirtyBytes === undefined ? {} : { maxDirtyBytes: options.maxDirtyBytes }),
     };
   },
+  persistent(options: {
+    readonly base: BuiltInRootfsConfig;
+    readonly path: string;
+  }): Rootfs {
+    return {
+      kind: "persistent-rootfs",
+      base: options.base,
+      path: options.path,
+    };
+  },
   async flatten(options: {
     readonly format: "qcow2";
     readonly source: BuiltInRootfsConfig | ComposedRootfsConfig;
@@ -1004,6 +1020,8 @@ function rootfsBase(rootfs: Rootfs): BuiltInRootfsConfig {
       return rootfs.source.base;
     case "ephemeral-rootfs":
       return rootfs.base;
+    case "persistent-rootfs":
+      return rootfs.base;
   }
 }
 
@@ -1029,6 +1047,13 @@ function configRootfsWriteFact(rootfs: Rootfs): SandboxRootfsEnvironmentFact {
         topic: "rootfs",
         relation: "write-mode",
         value: "writable-ephemeral",
+      };
+    case "persistent-rootfs":
+      return {
+        source: "config",
+        topic: "rootfs",
+        relation: "write-mode",
+        value: "writable-persistent-file",
       };
   }
 }
@@ -1963,6 +1988,8 @@ async function lowerRootfs(rootfs: Rootfs): Promise<InternalSandboxOptions["root
       );
     case "ephemeral-rootfs":
       return lowerEphemeralRootfs(rootfs.base, rootfs.maxDirtyBytes);
+    case "persistent-rootfs":
+      return lowerPersistentRootfs(rootfs.base, rootfs.path);
   }
 }
 
@@ -2002,6 +2029,43 @@ function lowerEphemeralRootfs(
       maxDirtyBytes: maxDirtyBytes ?? DEFAULT_COW_MAX_DIRTY_BYTES,
     },
   };
+}
+
+async function lowerPersistentRootfs(
+  base: BuiltInRootfsConfig,
+  path: string,
+): Promise<InternalSandboxOptions["rootfs"]> {
+  const basePath = builtInRootfsPath(base.name);
+  return {
+    path: basePath,
+    readonly: false,
+    format: "qcow2",
+    storage: {
+      kind: "persistent-qcow2-overlay",
+      path,
+      baseIdentity: builtInRootfsIdentity(base.name),
+      baseDigest: await builtInRootfsDigest(base.name, basePath),
+    },
+  };
+}
+
+function builtInRootfsDigest(name: BuiltInRootfsName, path: string): Promise<string> {
+  validateBuiltInRootfsName(name);
+  return sha256File(path);
+}
+
+function sha256File(path: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash("sha256");
+    const stream = createReadStream(path);
+    stream.on("data", (chunk) => {
+      hash.update(chunk);
+    });
+    stream.on("error", reject);
+    stream.on("end", () => {
+      resolve(hash.digest("hex"));
+    });
+  });
 }
 
 function createEphemeralCowBlockStore(): SandboxBlockStore {
@@ -2053,10 +2117,29 @@ function validateRootfs(rootfs: Rootfs): void {
       validateBuiltInRootfsName(rootfs.base.name);
       validateEphemeralRootfs(rootfs);
       return;
+    case "persistent-rootfs":
+      if (rootfs.base?.kind !== "built-in-rootfs") {
+        throw new Error("invalid sandbox definition: rootfs.persistent base must be created with rootfs.builtIn(...)");
+      }
+      validateBuiltInRootfsName(rootfs.base.name);
+      validatePersistentRootfs(rootfs);
+      return;
     default:
       throw new Error(
-        "invalid sandbox definition: rootfs must be created with rootfs.builtIn(...), rootfs.ephemeral(...), or rootfs.cow(...)",
+        "invalid sandbox definition: rootfs must be created with rootfs.builtIn(...), rootfs.ephemeral(...), rootfs.cow(...), or rootfs.persistent(...)",
       );
+  }
+}
+
+function validatePersistentRootfs(rootfs: PersistentRootfsConfig): void {
+  if (typeof rootfs.path !== "string" || rootfs.path.length === 0) {
+    throw new Error("invalid sandbox definition: persistent rootfs path must not be empty");
+  }
+  if (!isAbsolute(rootfs.path)) {
+    throw new Error("invalid sandbox definition: persistent rootfs path must be absolute");
+  }
+  if (rootfs.path.includes("\0")) {
+    throw new Error("invalid sandbox definition: persistent rootfs path must not contain NUL bytes");
   }
 }
 

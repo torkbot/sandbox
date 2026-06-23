@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -1257,6 +1257,232 @@ test("COW rootfs round-trips rootfs mutations across instances", async (t) => {
   assert.match(blockStore.observedBaseIdentities()[0] ?? "", /built-in:alpine:3\.23:qcow2:/);
 });
 
+test("persistent rootfs creates and reuses a QCOW2 overlay file", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const dir = await mkdtemp(join(tmpdir(), "sandbox-persistent-rootfs-"));
+  t.after(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+  const overlayPath = join(dir, "rootfs.qcow2");
+  const sandboxDefinition = defineSandbox({
+    rootfs: rootfs.persistent({
+      base: rootfs.builtIn("alpine:3.23"),
+      path: overlayPath,
+    }),
+  });
+
+  await assert.rejects(lstat(overlayPath), { code: "ENOENT" });
+
+  const first = await sandboxDefinition.boot();
+  try {
+    const write = await first.exec("/bin/sh", [
+      "-lc",
+      "printf '%s' persisted > /root/persistent-state.txt && sync",
+    ]);
+    assert.equal(write.exitCode, 0, write.stderr);
+  } finally {
+    await first.close();
+  }
+
+  assert.equal((await lstat(overlayPath)).isFile(), true);
+  await assertQcow2Magic(overlayPath);
+  await assert.rejects(lstat(`${overlayPath}.metadata.json`), { code: "ENOENT" });
+
+  await using second = await sandboxDefinition.boot();
+  const read = await second.exec("/bin/cat", ["/root/persistent-state.txt"]);
+
+  assert.equal(read.exitCode, 0, read.stderr);
+  assert.equal(read.stdout, "persisted");
+});
+
+test("persistent rootfs rejects reuse when base metadata does not match", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const dir = await mkdtemp(join(tmpdir(), "sandbox-persistent-rootfs-metadata-"));
+  t.after(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+  const overlayPath = join(dir, "rootfs.qcow2");
+  const sandboxDefinition = defineSandbox({
+    rootfs: rootfs.persistent({
+      base: rootfs.builtIn("alpine:3.23"),
+      path: overlayPath,
+    }),
+  });
+
+  const first = await sandboxDefinition.boot();
+  await first.close();
+
+  await corruptQcow2BackingFilename(overlayPath);
+
+  await assert.rejects(
+    sandboxDefinition.boot(),
+    /rootfs overlay base identity mismatch/,
+  );
+});
+
+test("persistent rootfs can live under a masked read-write host directory mount", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const workspace = await mkdtemp(join(tmpdir(), "sandbox-persistent-rootfs-masked-workspace-"));
+  const maskStorage = await mkdtemp(join(tmpdir(), "sandbox-persistent-rootfs-masked-storage-"));
+  t.after(async () => {
+    await rm(workspace, { recursive: true, force: true });
+    await rm(maskStorage, { recursive: true, force: true });
+  });
+  await mkdir(join(workspace, ".sandbox"));
+  await writeFile(join(workspace, "visible.txt"), "workspace-visible\n");
+  const overlayPath = join(workspace, ".sandbox", "rootfs.qcow2");
+  const sandboxDefinition = defineSandbox({
+    rootfs: rootfs.persistent({
+      base: rootfs.builtIn("alpine:3.23"),
+      path: overlayPath,
+    }),
+  });
+  const boot = {
+    mounts: {
+      "/tmp/workspace": fs.bind({
+        source: workspace,
+        access: "rw",
+        mask: {
+          paths: ["/.sandbox"],
+          storage: fs.bind({ source: maskStorage, access: "rw" }),
+        },
+      }),
+    },
+  };
+
+  const first = await sandboxDefinition.boot(boot);
+  try {
+    const write = await first.exec("/bin/sh", [
+      "-lc",
+      [
+        "set -e",
+        "cat /tmp/workspace/visible.txt",
+        "test ! -e /tmp/workspace/.sandbox",
+        "printf '%s' masked > /root/masked-persistent-state.txt",
+        "sync",
+      ].join("\n"),
+    ]);
+    assert.equal(write.exitCode, 0, `stdout:\n${write.stdout}\nstderr:\n${write.stderr}`);
+    assert.equal(write.stdout, "workspace-visible\n");
+  } finally {
+    await first.close();
+  }
+
+  assert.equal((await lstat(overlayPath)).isFile(), true);
+  assert.equal(await readFile(join(workspace, "visible.txt"), "utf8"), "workspace-visible\n");
+
+  await using second = await sandboxDefinition.boot(boot);
+  const read = await second.exec("/bin/cat", ["/root/masked-persistent-state.txt"]);
+
+  assert.equal(read.exitCode, 0, read.stderr);
+  assert.equal(read.stdout, "masked");
+});
+
+test("persistent rootfs locks only the selected overlay file", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const dir = await mkdtemp(join(tmpdir(), "sandbox-persistent-rootfs-lock-"));
+  t.after(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+  const firstOverlay = join(dir, "first.qcow2");
+  const secondOverlay = join(dir, "second.qcow2");
+  const firstDefinition = defineSandbox({
+    rootfs: rootfs.persistent({
+      base: rootfs.builtIn("alpine:3.23"),
+      path: firstOverlay,
+    }),
+  });
+  const secondDefinition = defineSandbox({
+    rootfs: rootfs.persistent({
+      base: rootfs.builtIn("alpine:3.23"),
+      path: secondOverlay,
+    }),
+  });
+
+  const first = await firstDefinition.boot();
+  try {
+    const write = await first.exec("/bin/sh", [
+      "-lc",
+      "printf '%s' first > /root/first-overlay.txt && sync",
+    ]);
+    assert.equal(write.exitCode, 0, write.stderr);
+
+    await assert.rejects(
+      firstDefinition.boot(),
+      /rootfs overlay is already in use|lock|busy|EBUSY/i,
+    );
+
+    const second = await secondDefinition.boot();
+    try {
+      const probe = await second.exec("/bin/sh", [
+        "-lc",
+        "test ! -e /root/first-overlay.txt && printf '%s' second > /root/second-overlay.txt && sync",
+      ]);
+      assert.equal(probe.exitCode, 0, `stdout:\n${probe.stdout}\nstderr:\n${probe.stderr}`);
+    } finally {
+      await second.close();
+    }
+  } finally {
+    await first.close();
+  }
+
+  assert.equal((await lstat(firstOverlay)).isFile(), true);
+  assert.equal((await lstat(secondOverlay)).isFile(), true);
+  await assert.rejects(lstat(`${firstOverlay}.lock`), { code: "ENOENT" });
+  await assert.rejects(lstat(`${secondOverlay}.lock`), { code: "ENOENT" });
+});
+
+test("persistent rootfs locks canonical overlay targets", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const dir = await mkdtemp(join(tmpdir(), "sandbox-persistent-rootfs-alias-"));
+  t.after(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+  const realDir = join(dir, "real");
+  const aliasDir = join(dir, "alias");
+  await mkdir(realDir);
+  await symlink(realDir, aliasDir);
+  const realOverlay = join(realDir, "rootfs.qcow2");
+  const aliasOverlay = join(aliasDir, "rootfs.qcow2");
+  const realDefinition = defineSandbox({
+    rootfs: rootfs.persistent({
+      base: rootfs.builtIn("alpine:3.23"),
+      path: realOverlay,
+    }),
+  });
+  const aliasDefinition = defineSandbox({
+    rootfs: rootfs.persistent({
+      base: rootfs.builtIn("alpine:3.23"),
+      path: aliasOverlay,
+    }),
+  });
+
+  const first = await realDefinition.boot();
+  try {
+    await assert.rejects(
+      aliasDefinition.boot(),
+      /rootfs overlay is already in use|lock|busy|EBUSY/i,
+    );
+  } finally {
+    await first.close();
+  }
+});
+
 test("COW rootfs can be flattened to a QCOW2 image stream", async (t) => {
   if (!requireHostArtifact(t)) {
     return;
@@ -1329,6 +1555,35 @@ test("COW rootfs close sync ignores the instance cwd", async (t) => {
   assert.equal(read.exitCode, 0, read.stderr);
   assert.equal(read.stdout, "cwd-independent");
 });
+
+async function assertQcow2Magic(path: string): Promise<void> {
+  const file = await open(path, "r");
+  try {
+    const magic = new Uint8Array(4);
+    const { bytesRead } = await file.read(magic, 0, magic.byteLength, 0);
+    assert.equal(bytesRead, magic.byteLength);
+    assert.deepEqual(magic, new Uint8Array([0x51, 0x46, 0x49, 0xfb]));
+  } finally {
+    await file.close();
+  }
+}
+
+async function corruptQcow2BackingFilename(path: string): Promise<void> {
+  const file = await open(path, "r+");
+  try {
+    const header = Buffer.alloc(20);
+    const { bytesRead } = await file.read(header, 0, header.byteLength, 0);
+    assert.equal(bytesRead, header.byteLength);
+    assert.deepEqual(header.subarray(0, 4), Buffer.from([0x51, 0x46, 0x49, 0xfb]));
+    const backingOffset = Number(header.readBigUInt64BE(8));
+    const backingSize = header.readUInt32BE(16);
+    assert.ok(backingOffset > 0);
+    assert.ok(backingSize > 0);
+    await file.write(Buffer.alloc(backingSize, "x"), 0, backingSize, backingOffset);
+  } finally {
+    await file.close();
+  }
+}
 
 function memoryBlockStore(): SandboxBlockStore & {
   observedBaseIdentities(): readonly string[];

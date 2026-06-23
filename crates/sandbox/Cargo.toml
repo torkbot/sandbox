@@ -20,6 +20,8 @@ rama-tcp = { git = "https://github.com/plabayo/rama", rev = "09ea1a0ff0cd5941ba6
 rama-net = { git = "https://github.com/plabayo/rama", rev = "09ea1a0ff0cd5941ba65421ff5b0f263f6cf5211", version = "0.3.0-rc1" }
 rama-tls-rustls = { git = "https://github.com/plabayo/rama", rev = "09ea1a0ff0cd5941ba65421ff5b0f263f6cf5211", version = "0.3.0-rc1", features = ["http", "ring"] }
 sandbox-protocol = { path = "../sandbox-protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-raw", "socket-tcp", "socket-udp"] }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std"] }
 rustls-native-certs = "0.8"

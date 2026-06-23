@@ -40,11 +40,18 @@ export type HostSpawnSandboxOptions = {
     readonly path: string;
     readonly readonly?: boolean;
     readonly format: "qcow2";
-    readonly storage?: {
-      readonly kind: "cow-block-store" | "ephemeral-cow";
-      readonly blockSize: number;
-      readonly maxDirtyBytes: number;
-    };
+    readonly storage?:
+      | {
+          readonly kind: "cow-block-store" | "ephemeral-cow";
+          readonly blockSize: number;
+          readonly maxDirtyBytes: number;
+        }
+      | {
+          readonly kind: "persistent-qcow2-overlay";
+          readonly path: string;
+          readonly baseIdentity: string;
+          readonly baseDigest: string;
+        };
   };
   readonly mounts?: readonly HostSpawnMount[];
   readonly network?: {

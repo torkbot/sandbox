@@ -85,9 +85,9 @@ Build the guest root filesystem before VM instantiation. The runtime API should 
 
 The build-time tooling can use a simple Docker image create/export/extract flow to shape the rootfs. That flow belongs in packaging or fixture-generation tools, not in the hot runtime path.
 
-The target shape is a single compressed QCOW2 artifact containing an ext4 guest filesystem, produced from that extracted rootfs with a build-time virtual size large enough for agent workloads. `rootfs.builtIn(...)` mounts that artifact read-only in the guest. Runtime writable root behavior must be explicit: `rootfs.cow(...)` mounts the same artifact read-write through host-side COW block storage.
+The target shape is a single compressed QCOW2 artifact containing an ext4 guest filesystem, produced from that extracted rootfs with a build-time virtual size large enough for agent workloads. `rootfs.builtIn(...)` mounts that artifact read-only in the guest. Runtime writable root behavior must be explicit: `rootfs.cow(...)` mounts the same artifact read-write through host-side COW block storage; `rootfs.persistent(...)` mounts it through a local writable QCOW2 overlay file.
 
-The first writable-root primitive is host-backed block COW:
+The host-backed block COW primitive is:
 
 ```ts
 rootfs: rootfs.cow({
@@ -100,6 +100,29 @@ rootfs: rootfs.cow({
 The JavaScript block store is an opaque fixed-size block overlay. It records mutations to the rootfs image byte space without knowing about QCOW2 internals or the guest filesystem. The native runtime owns the QCOW2 driver and exposes ext4 to the guest.
 The native COW layer batches dirty blocks up to `maxDirtyBytes` before forcing
 a write to the block store; omitted values use a 64 MiB block-aligned default.
+
+The local-file persistence primitive is:
+
+```ts
+rootfs: rootfs.persistent({
+  base: rootfs.builtIn("alpine:3.23"),
+  path: "/absolute/project/.sandbox/rootfs.qcow2",
+})
+```
+
+The native runtime creates a sparse QCOW2 overlay on first use and opens it with
+the built-in QCOW2 as an explicit read-only backing image. The built-in artifact
+is not locked. The overlay records the selected built-in base identity and
+digest in its QCOW2 backing metadata so later boots fail closed if the overlay
+is reused with a different base. The selected canonical overlay path is locked
+for the VM lifetime, so many VMs may share one built-in base concurrently as
+long as each running VM uses a different overlay file. The overlay is
+host-owned VM state; callers must keep it outside guest-writable host-directory
+mounts or hide the containing directory with a host-directory mask. Sandbox does
+not try to prove that invariant across arbitrary host paths, symlinks, or mount
+layouts. Concurrent use is guarded with an advisory lock on the overlay file
+itself on filesystems that honor `flock`; other storage coordination is the
+caller's responsibility.
 
 ## Networking
 
@@ -184,6 +207,7 @@ Sandbox needs small filesystem primitives:
 
 - `rootfs.builtIn(...)`: a supplied built-in QCOW2 root artifact mounted read-only in the guest.
 - `rootfs.cow(...)`: the same built-in QCOW2 root artifact mounted read-write through a host-side COW block store.
+- `rootfs.persistent(...)`: the same built-in QCOW2 root artifact mounted read-write through a local QCOW2 overlay file.
 - `mount(path, fs)`: a guest-visible mount boundary.
 - `virtualFs(...)` / `virtualFsMount(...)`: host Node.js callbacks implementing a guest-visible filesystem.
 
