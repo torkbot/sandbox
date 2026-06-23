@@ -3,9 +3,12 @@ use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(sandbox_static_kernel)");
+    println!("cargo:rustc-check-cfg=cfg(sandbox_static_initrd)");
     println!("cargo:rerun-if-env-changed=SANDBOX_KERNEL_BUNDLE_C");
+    println!("cargo:rerun-if-env-changed=SANDBOX_INITRD_IMAGE");
 
     let Ok(kernel_c) = env::var("SANDBOX_KERNEL_BUNDLE_C") else {
+        configure_initrd();
         return;
     };
 
@@ -24,4 +27,23 @@ fn main() {
 
     println!("cargo:rerun-if-changed={}", kernel_c.display());
     println!("cargo:rustc-cfg=sandbox_static_kernel");
+    configure_initrd();
+}
+
+fn configure_initrd() {
+    let Ok(initrd) = env::var("SANDBOX_INITRD_IMAGE") else {
+        return;
+    };
+
+    let initrd = PathBuf::from(initrd);
+    if !initrd.is_file() {
+        panic!(
+            "SANDBOX_INITRD_IMAGE must point to a generated initramfs cpio archive: {}",
+            initrd.display()
+        );
+    }
+
+    println!("cargo:rerun-if-changed={}", initrd.display());
+    println!("cargo:rustc-env=SANDBOX_INITRD_IMAGE={}", initrd.display());
+    println!("cargo:rustc-cfg=sandbox_static_initrd");
 }

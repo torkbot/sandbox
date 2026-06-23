@@ -1,11 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import {
-  builtInRootfsApkPackages,
-  builtInRootfsEnvironmentFacts,
-  builtInRootfsGithubCliVersion,
-} from "../../src/environment-facts.ts";
 
 test("release package manifest is the checked-in publish source", async () => {
   const releasePackageJson = JSON.parse(
@@ -135,8 +130,8 @@ test("release workflow packages main-built platform artifacts before publishing"
   assert.doesNotMatch(workflow, /SANDBOX_KERNEL_ARCH/);
   assert.doesNotMatch(workflow, /Download kernel artifact/);
   assert.doesNotMatch(workflow, /Download rootfs artifact/);
-  assert.match(workflow, /dist\/rootfs\/alpine-3\.23\.qcow2/);
-  assert.match(workflow, /dist\/rootfs\/alpine-3\.23\.environment-facts\.json/);
+  assert.doesNotMatch(workflow, /dist\/rootfs\/alpine-3\.23\.qcow2/);
+  assert.doesNotMatch(workflow, /dist\/rootfs\/alpine-3\.23-agent\.environment-facts\.json/);
   assert.doesNotMatch(workflow, /dist\/rootfs\/alpine-3\.23\.erofs/);
   assert.doesNotMatch(workflow, /dist\/rootfs\/alpine-3\.23\.ext4/);
   assert.doesNotMatch(workflow, /alpine-3\.20/);
@@ -156,37 +151,38 @@ test("release workflow packages main-built platform artifacts before publishing"
   assert.match(platformJob, /submodules: recursive/);
 });
 
-test("local release scripts build current rootfs before packaging platform packages", async () => {
+test("local release scripts package platform artifacts without rebuilding rootfs images", async () => {
   const packageJson = JSON.parse(
     await readFile(new URL("../../package.json", import.meta.url), "utf8"),
   ) as { scripts?: Record<string, string> };
 
   for (const scriptName of ["release:prepare", "release:pack"]) {
     const script = packageJson.scripts?.[scriptName] ?? "";
-    const buildRootfs = script.indexOf("node --run build:rootfs:qcow2");
     const packageCurrentPlatform = script.indexOf("prepare-npm-packages.ts --version ${SANDBOX_RELEASE_VERSION:-0.0.0-dev} --platform --current");
 
-    assert.notEqual(buildRootfs, -1, `${scriptName} should build the rootfs image`);
     assert.notEqual(packageCurrentPlatform, -1, `${scriptName} should package the current platform`);
-    assert.ok(
-      buildRootfs < packageCurrentPlatform,
-      `${scriptName} should build the rootfs image before packaging the platform package`,
-    );
+    assert.doesNotMatch(script, /build:rootfs/);
   }
 });
 
-test("local build scripts rebuild kernel before embedding host artifact", async () => {
+test("local build scripts rebuild kernel and initrd before embedding host artifact", async () => {
   const packageJson = JSON.parse(
     await readFile(new URL("../../package.json", import.meta.url), "utf8"),
   ) as { scripts?: Record<string, string> };
 
   const buildScript = packageJson.scripts?.build ?? "";
   const buildKernelInBuild = buildScript.indexOf("build:kernel");
+  const buildInitInBuild = buildScript.indexOf("build:init");
+  const buildInitrdInBuild = buildScript.indexOf("build:initrd");
   const buildHostInBuild = buildScript.indexOf("build:host");
 
   assert.notEqual(buildKernelInBuild, -1, "build should build the kernel artifact");
+  assert.notEqual(buildInitInBuild, -1, "build should build the init binary");
+  assert.notEqual(buildInitrdInBuild, -1, "build should build the initrd artifact");
   assert.notEqual(buildHostInBuild, -1, "build should build the host artifact");
   assert.ok(buildKernelInBuild < buildHostInBuild, "build should build the kernel artifact before the host embeds it");
+  assert.ok(buildInitInBuild < buildInitrdInBuild, "build should build the init binary before the initrd");
+  assert.ok(buildInitrdInBuild < buildHostInBuild, "build should build the initrd before the host embeds it");
 
   for (const scriptName of ["release:prepare", "release:pack"]) {
     const script = packageJson.scripts?.[scriptName] ?? "";
@@ -216,7 +212,9 @@ test("host build validates kernel artifact metadata before Cargo embeds it", asy
   assert.match(buildHost, /readKernelArtifactMetadata/);
   assert.match(buildHost, /assertKernelArtifactMetadataMatches/);
   assert.match(buildHost, /expectedKernelArtifactMetadata/);
+  assert.match(buildHost, /SANDBOX_INITRD_IMAGE/);
   assert.match(fixtureCacheKeys, /kernel-artifact-metadata\.ts/);
+  assert.match(fixtureCacheKeys, /scripts\/build-initrd\.ts/);
 });
 
 test("rootfs cache key tracks generated environment facts inputs", async () => {
@@ -252,7 +250,6 @@ test("default rootfs includes agent utility packages", async () => {
     new URL("../../scripts/build-rootfs.ts", import.meta.url),
     "utf8",
   );
-  const packages = builtInRootfsApkPackages("alpine:3.23");
 
   for (const packageName of [
     "bash",
@@ -278,13 +275,18 @@ test("default rootfs includes agent utility packages", async () => {
     "xz",
     "zip",
   ]) {
-    assert.ok(packages.includes(packageName), `expected rootfs package ${packageName}`);
+    assert.match(buildRootfsScript, new RegExp(`"${packageName}"`));
   }
   assert.match(buildRootfsScript, /const image = process\.env\.SANDBOX_ROOTFS_IMAGE \?\? "alpine:3\.23"/);
-  assert.match(buildRootfsScript, /const rootfsName: BuiltInRootfsName = "alpine:3\.23"/);
-  assert.match(buildRootfsScript, /builtInRootfsApkPackages\(rootfsName\)/);
-  assert.equal(builtInRootfsGithubCliVersion("alpine:3.23"), "2.83.0");
+  assert.match(buildRootfsScript, /const rootfsName = "alpine:3\.23-agent"/);
+  assert.match(buildRootfsScript, /const githubCliVersion = "2\.83\.0"/);
   assert.match(buildRootfsScript, /gh_\$\{githubCliVersion\}_linux_/);
+  for (const mountPoint of ["dev", "proc", "run", "sys", "tmp"]) {
+    assert.match(
+      buildRootfsScript,
+      new RegExp(`mkdir\\(resolve\\(outDir, "${mountPoint}"\\)`),
+    );
+  }
 });
 
 test("default rootfs facts are tied to rootfs build inputs", async () => {
@@ -305,25 +307,13 @@ test("default rootfs facts are tied to rootfs build inputs", async () => {
     "utf8",
   );
 
-  assert.match(buildRootfsScript, /builtInRootfsEnvironmentFactsManifest\(rootfsName\)/);
+  assert.match(buildRootfsScript, /const rootfsEnvironmentFactsManifest: RootfsEnvironmentFactsManifest/);
+  assert.match(buildRootfsScript, /configRootfsImageFact\(rootfsName\)/);
+  assert.match(buildRootfsScript, /configCommandFact/);
   assert.match(buildQcow2Script, /rootfsEnvironmentFactsArtifactName/);
-  assert.match(preparePackagesScript, /alpine-3\.23\.environment-facts\.json/);
-  assert.match(ciWorkflow, /--file rootfs\/alpine-3\.23\.environment-facts\.json/);
-  assert.deepEqual(
-    builtInRootfsEnvironmentFacts("alpine:3.23").filter((fact) => fact.topic === "command"),
-    [
-      { source: "config", topic: "command", relation: "exists", value: "bash" },
-      { source: "config", topic: "command", relation: "exists", value: "curl" },
-      { source: "config", topic: "command", relation: "exists", value: "git" },
-      { source: "config", topic: "command", relation: "exists", value: "gh" },
-      { source: "config", topic: "command", relation: "exists", value: "jq" },
-      { source: "config", topic: "command", relation: "exists", value: "node" },
-      { source: "config", topic: "command", relation: "exists", value: "npm" },
-      { source: "config", topic: "command", relation: "exists", value: "python3" },
-      { source: "config", topic: "command", relation: "exists", value: "pip3" },
-      { source: "config", topic: "command", relation: "exists", value: "rg" },
-    ],
-  );
+  assert.match(buildQcow2Script, /alpine-3\.23-agent\.environment-facts\.json/);
+  assert.doesNotMatch(preparePackagesScript, /alpine-3\.23.*environment-facts\.json/);
+  assert.doesNotMatch(ciWorkflow, /--file rootfs\/alpine-3\.23-agent\.environment-facts\.json/);
 });
 
 test("rootfs QCOW2 builder uses compressed images", async () => {
@@ -332,7 +322,7 @@ test("rootfs QCOW2 builder uses compressed images", async () => {
     "utf8",
   );
 
-  assert.match(buildQcow2Script, /SANDBOX_QCOW2_BUILDER_IMAGE \?\? "debian:bookworm"/);
+  assert.match(buildQcow2Script, /SANDBOX_QCOW2_BUILDER_IMAGE \?\? "debian:12"/);
   assert.match(buildQcow2Script, /decimalEnv\("SANDBOX_QCOW2_CLUSTER_SIZE", "32768"\)/);
   assert.match(buildQcow2Script, /sizeEnvKiB\("SANDBOX_ROOTFS_VIRTUAL_SIZE", "8gb"\)/);
   assert.match(buildQcow2Script, /rootfs contents exceed virtual image size/);

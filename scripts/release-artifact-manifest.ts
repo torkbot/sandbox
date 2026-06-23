@@ -14,7 +14,6 @@ type ReleaseArtifactManifest = {
   readonly fixtureKeys: {
     readonly kernel: string;
     readonly init: string;
-    readonly rootfs: string;
   };
   readonly macosSigning?: {
     readonly authority: string;
@@ -47,7 +46,6 @@ async function writeManifest(): Promise<void> {
   const baseDir = resolve(repoRoot, optionalArg("--base-dir") ?? ".");
   const kernelKey = requiredArg("--kernel-key");
   const initKey = requiredArg("--init-key");
-  const rootfsKey = requiredArg("--rootfs-key");
   const authority = optionalArg("--macos-codesign-authority");
   const teamIdentifier = optionalArg("--macos-codesign-team-identifier");
   const notarizationSubmissionId = optionalArg("--macos-notarization-submission-id");
@@ -74,7 +72,6 @@ async function writeManifest(): Promise<void> {
     fixtureKeys: {
       kernel: kernelKey,
       init: initKey,
-      rootfs: rootfsKey,
     },
     ...(authority !== undefined
       ? {

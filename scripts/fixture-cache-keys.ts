@@ -25,6 +25,7 @@ const initKeyHash = sha256Text([
     "crates/sandbox-init",
     "crates/sandbox-protocol",
     "scripts/build-init.ts",
+    "scripts/build-initrd.ts",
   ]),
 ].join(""));
 

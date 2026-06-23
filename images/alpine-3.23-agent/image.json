@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 1,
+  "imageName": "alpine:3.23-agent",
+  "source": "docker.io/library/alpine:3.23@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40",
+  "exportCompatibility": "0.1.0"
+}

@@ -11,10 +11,100 @@ import {
   type SandboxWritableFileSystem,
 } from "../../src/index.ts";
 
-test("rootfs.builtIn creates a typed built-in rootfs reference", () => {
-  assert.deepEqual(rootfs.builtIn("alpine:3.23"), {
-    kind: "built-in-rootfs",
-    name: "alpine:3.23",
+const testRootfs = rootfs.image({
+  name: "alpine:3.23-agent",
+  path: "/tmp/sandbox-rootfs-base.qcow2",
+  format: "qcow2",
+  architecture: process.arch,
+  digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  sizeBytes: 1024n,
+  facts: [
+    {
+      source: "config",
+      topic: "rootfs-image",
+      relation: "is",
+      value: "alpine:3.23-agent",
+    },
+    {
+      source: "config",
+      topic: "distro",
+      relation: "is",
+      value: "alpine",
+    },
+    {
+      source: "config",
+      topic: "distro-version",
+      relation: "is",
+      value: "3.23",
+    },
+    {
+      source: "config",
+      topic: "package-manager",
+      relation: "is",
+      value: "apk",
+    },
+    {
+      source: "config",
+      topic: "shell",
+      relation: "is",
+      value: "/bin/sh",
+    },
+    {
+      source: "config",
+      topic: "command",
+      relation: "exists",
+      value: "git",
+    },
+  ],
+});
+
+test("rootfs.image creates a typed external rootfs image descriptor", () => {
+  assert.deepEqual(testRootfs, {
+    kind: "rootfs-image",
+    name: "alpine:3.23-agent",
+    path: "/tmp/sandbox-rootfs-base.qcow2",
+    format: "qcow2",
+    architecture: process.arch,
+    digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    sizeBytes: 1024n,
+    facts: [
+      {
+        source: "config",
+        topic: "rootfs-image",
+        relation: "is",
+        value: "alpine:3.23-agent",
+      },
+      {
+        source: "config",
+        topic: "distro",
+        relation: "is",
+        value: "alpine",
+      },
+      {
+        source: "config",
+        topic: "distro-version",
+        relation: "is",
+        value: "3.23",
+      },
+      {
+        source: "config",
+        topic: "package-manager",
+        relation: "is",
+        value: "apk",
+      },
+      {
+        source: "config",
+        topic: "shell",
+        relation: "is",
+        value: "/bin/sh",
+      },
+      {
+        source: "config",
+        topic: "command",
+        relation: "exists",
+        value: "git",
+      },
+    ],
   });
 });
 
@@ -77,24 +167,21 @@ test("fs.bind groups masked host paths under the bind source", () => {
   });
 });
 
-test("rootfs.cow couples a built-in base with writable block storage", () => {
+test("rootfs.cow couples an immutable image base with writable block storage", () => {
   const blockStore = memoryBlockStore();
   const composed = rootfs.compose({
-    base: rootfs.builtIn("alpine:3.23"),
+    base: testRootfs,
     overlay: blockStore,
   });
 
   assert.deepEqual(composed, {
     kind: "composed-rootfs",
-    base: {
-      kind: "built-in-rootfs",
-      name: "alpine:3.23",
-    },
+    base: testRootfs,
     overlay: blockStore,
   });
 
   assert.deepEqual(rootfs.cow({
-    base: rootfs.builtIn("alpine:3.23"),
+    base: testRootfs,
     writable: blockStore,
   }), {
     kind: "cow-rootfs",
@@ -105,7 +192,7 @@ test("rootfs.cow couples a built-in base with writable block storage", () => {
 test("rootfs.cow accepts a composed rootfs source", () => {
   const blockStore = memoryBlockStore();
   const source = rootfs.compose({
-    base: rootfs.builtIn("alpine:3.23"),
+    base: testRootfs,
     overlay: blockStore,
   });
 
@@ -117,22 +204,22 @@ test("rootfs.cow accepts a composed rootfs source", () => {
 
 test("rootfs.ephemeral makes writable rootfs persistence explicit", () => {
   assert.deepEqual(rootfs.ephemeral({
-    base: rootfs.builtIn("alpine:3.23"),
+    base: testRootfs,
     maxDirtyBytes: 64 * 1024,
   }), {
     kind: "ephemeral-rootfs",
-    base: rootfs.builtIn("alpine:3.23"),
+    base: testRootfs,
     maxDirtyBytes: 64 * 1024,
   });
 });
 
-test("rootfs.persistent creates a file-backed persistent built-in rootfs reference", () => {
+test("rootfs.persistent creates a file-backed persistent image rootfs reference", () => {
   assert.deepEqual(rootfs.persistent({
-    base: rootfs.builtIn("alpine:3.23"),
+    base: testRootfs,
     path: "/tmp/sandbox-rootfs.qcow2",
   }), {
     kind: "persistent-rootfs",
-    base: rootfs.builtIn("alpine:3.23"),
+    base: testRootfs,
     path: "/tmp/sandbox-rootfs.qcow2",
   });
 });
@@ -140,7 +227,7 @@ test("rootfs.persistent creates a file-backed persistent built-in rootfs referen
 test("defineSandbox exposes config-derived environment facts", () => {
   const sandbox = defineSandbox({
     rootfs: rootfs.ephemeral({
-      base: rootfs.builtIn("alpine:3.23"),
+      base: testRootfs,
     }),
     network: network.policy((conn) => {
       conn.accept();
@@ -164,7 +251,7 @@ test("defineSandbox exposes config-derived environment facts", () => {
       source: "config",
       topic: "rootfs-image",
       relation: "is",
-      value: "alpine:3.23",
+      value: "alpine:3.23-agent",
     },
     {
       source: "config",
@@ -192,6 +279,12 @@ test("defineSandbox exposes config-derived environment facts", () => {
     },
     {
       source: "config",
+      topic: "command",
+      relation: "exists",
+      value: "git",
+    },
+    {
+      source: "config",
       topic: "rootfs",
       relation: "write-mode",
       value: "writable-ephemeral",
@@ -207,17 +300,17 @@ test("defineSandbox exposes config-derived environment facts", () => {
 
 test("environment facts distinguish rootfs and network semantics", () => {
   const readonlyFacts = defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).environmentFacts();
   const cowFacts = defineSandbox({
     rootfs: rootfs.cow({
-      base: rootfs.builtIn("alpine:3.23"),
+      base: testRootfs,
       writable: memoryBlockStore(),
     }),
   }).environmentFacts();
   const persistentFacts = defineSandbox({
     rootfs: rootfs.persistent({
-      base: rootfs.builtIn("alpine:3.23"),
+      base: testRootfs,
       path: "/tmp/sandbox-rootfs.qcow2",
     }),
   }).environmentFacts();
@@ -252,13 +345,13 @@ test("environment facts distinguish rootfs and network semantics", () => {
     relation: "write-mode",
     value: "writable-persistent-file",
   });
-  assertDoesNotIncludeFact(cowFacts, {
+  assertIncludesFact(cowFacts, {
     source: "config",
     topic: "command",
     relation: "exists",
     value: "git",
   });
-  assertDoesNotIncludeFact(persistentFacts, {
+  assertIncludesFact(persistentFacts, {
     source: "config",
     topic: "command",
     relation: "exists",
@@ -271,13 +364,13 @@ test("rootfs.cow can be called without binding rootfs as this", () => {
   const { cow } = rootfs;
 
   assert.deepEqual(cow({
-    base: rootfs.builtIn("alpine:3.23"),
+    base: testRootfs,
     writable: blockStore,
   }), {
     kind: "cow-rootfs",
     source: {
       kind: "composed-rootfs",
-      base: rootfs.builtIn("alpine:3.23"),
+      base: testRootfs,
       overlay: blockStore,
     },
   });
@@ -286,7 +379,7 @@ test("rootfs.cow can be called without binding rootfs as this", () => {
 test("rootfs.flatten requires an explicit destination block store", async () => {
   const blockStore = memoryBlockStore();
   const source = rootfs.compose({
-    base: rootfs.builtIn("alpine:3.23"),
+    base: testRootfs,
     overlay: blockStore,
   });
 
@@ -306,7 +399,7 @@ test("rootfs.flatten requires an explicit destination block store", async () => 
 test("rootfs.bytes validates byte stream options", async () => {
   await assert.rejects(
     async () => {
-      for await (const _chunk of rootfs.bytes(rootfs.builtIn("alpine:3.23"), {
+      for await (const _chunk of rootfs.bytes(testRootfs, {
         chunkSize: 0,
       })) {
         break;
@@ -476,7 +569,7 @@ test("fs.memory rejects directory renames into their own subtree", async () => {
 
 test("defineSandbox accepts resource limits", () => {
   const sandbox = defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     resources: {
       cpus: 2,
       memoryMiB: 1024,
@@ -488,7 +581,7 @@ test("defineSandbox accepts resource limits", () => {
 
 test("boot rejects invalid hostnames before runtime launch", async () => {
   const sandbox = defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   });
 
   await assert.rejects(
@@ -516,7 +609,7 @@ test("boot rejects invalid hostnames before runtime launch", async () => {
 test("defineSandbox accepts COW rootfs", () => {
   const sandbox = defineSandbox({
     rootfs: rootfs.cow({
-      base: rootfs.builtIn("alpine:3.23"),
+      base: testRootfs,
       writable: memoryBlockStore(),
       maxDirtyBytes: 64 * 1024,
     }),
@@ -529,7 +622,7 @@ test("defineSandbox rejects invalid COW rootfs block store", () => {
   assert.throws(
     () => defineSandbox({
       rootfs: rootfs.cow({
-        base: rootfs.builtIn("alpine:3.23"),
+        base: testRootfs,
         writable: {
           ...memoryBlockStore(),
           blockSize: 1_000,
@@ -542,7 +635,7 @@ test("defineSandbox rejects invalid COW rootfs block store", () => {
   assert.throws(
     () => defineSandbox({
       rootfs: rootfs.cow({
-        base: rootfs.builtIn("alpine:3.23"),
+        base: testRootfs,
         writable: memoryBlockStore(),
         maxDirtyBytes: 1024,
       }),

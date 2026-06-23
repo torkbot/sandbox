@@ -94,8 +94,8 @@ Runs with a real VM and explicit rootfs COW primitives.
 Evidence:
 
 - immutable root mode remains the default.
-- `rootfs.cow({ base: rootfs.builtIn(...), writable })` makes `/` writable through host-side block COW.
-- the built-in base image remains immutable after guest writes through the COW rootfs.
+- `rootfs.cow({ base: rootfs.image(...), writable })` makes `/` writable through host-side block COW.
+- the immutable base image remains unchanged after guest writes through the COW rootfs.
 - each block store owns the mutations for its VM instances.
 - `mount(path, fs)` creates a guest-visible mount boundary.
 - `binding(path, fs)` creates a host-side attachment point without a guest-visible mount boundary.
@@ -178,7 +178,7 @@ Detected capabilities:
 - Custom init: the Rust guest init from this repository runs as PID 1, performs setup, reports readiness, and supervises a test workload.
 - Static linking: linkage report shows no dynamic `libkrun` or `libkrunfw` dependency.
 - Immutable root: guest root writes fail unless an explicit COW root is configured.
-- Writable rootfs: explicit `rootfs.cow(...)` persists rootfs mutations in a host-side block store without mutating the built-in base image.
+- Writable rootfs: explicit `rootfs.cow(...)` persists rootfs mutations in a host-side block store without mutating the immutable base image.
 - Virtual filesystem: guest reads host-generated files and metadata through a mounted virtual tree.
 - HTTP interception: TLS traffic is intercepted with guest-trusted CA, request-header hooks mutate upstream headers only, credentials are not exposed to the guest, and forwarding is transparent.
 - Network policy: default-deny outbound rules block unmatched destinations with deterministic evidence before HTTP hook execution.
@@ -199,7 +199,7 @@ The runtime scenario files live under `tests/e2e/scenarios/` as `.test.ts` files
 
 - `boot-smoke.test.ts`: boots a VM, waits for `init.ready`, sends a control command, and checks command output.
 - `filesystem.test.ts`: boots with an immutable root and host-backed virtual filesystem using the same `stat` / `list` / `read` shape as TorkBot plugin filesystems.
-- `rootfs-shaping.test.ts`: expresses immutable built-in roots, explicit QCOW2 COW roots, block-store persistence, and guest-visible mount boundaries.
+- `rootfs-shaping.test.ts`: expresses immutable image roots, explicit QCOW2 COW roots, block-store persistence, and guest-visible mount boundaries.
 - `http-request-headers.test.ts`: injects internal CA trust, intercepts HTTP/HTTPS request headers, applies upstream-only credential mutations, and proves DNS-rebinding attempts do not receive credentials.
 - `network.test.ts`: covers transparent TCP interception, DNS behavior, default-deny outbound rules, IPv6 behavior, and non-HTTP denial.
 - `libkrun-contract.test.ts`: boots the VM with direct Rust init injection.
@@ -208,6 +208,7 @@ Cheap artifact tests live under `tests/artifact/`:
 
 - `linkage-and-signing.test.ts`: verifies static linkage, absence of dynamic libkrun/libkrunfw dependencies, selected artifacts, CI shape, and macOS HVF entitlement signing.
 - `libkrun-contract.test.ts`: verifies static libkrun integration contracts without booting a VM.
+- `image-release.test.ts`: verifies minimal immutable image definitions, timestamped image prerelease versions, generated image npm packages, and GitHub-driven image release workflows.
 
 Expensive build reproducibility tests live under `tests/reproducibility/` and run only through `npm run test:reproducibility`.
 

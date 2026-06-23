@@ -376,7 +376,10 @@ impl KrunContext {
 
     fn apply_kernel(&self, spec: &MicroVmSpec) -> Result<(), KrunError> {
         match spec.kernel.format {
-            KernelFormat::Auto | KernelFormat::Raw => apply_project_kernel(self.id),
+            KernelFormat::Auto | KernelFormat::Raw => {
+                apply_project_kernel(self.id)?;
+                apply_project_initrd(self.id)
+            }
             KernelFormat::Elf
             | KernelFormat::PeGz
             | KernelFormat::ImageGz
@@ -497,7 +500,7 @@ impl KrunContext {
                         "/dev/vda".to_string(),
                         "ext4".to_string(),
                         if spec.rootfs.readonly { "ro" } else { "rw" }.to_string(),
-                        "/sandbox-init".to_string(),
+                        project_init_path().to_string(),
                     ),
                 )?;
                 rootfs_trace.stage("set_direct_block_root", root_start);
@@ -513,8 +516,9 @@ impl KrunContext {
         virtual_fs: &[VirtioFsDevice],
     ) -> Result<(), KrunError> {
         // Keep exec metadata populated so libkrun serializes argv/env into
-        // krun_env while the kernel command line boots /sandbox-init directly.
-        let exec_path = CString::new("/sandbox-init").unwrap();
+        // krun_env while the kernel command line selects the project init.
+        let exec_path = CString::new(project_init_path()).unwrap();
+        let stage_arg = CString::new(format!("--stage={}", project_init_stage())).unwrap();
         let encoded_mounts = encode_virtual_fs_mounts(virtual_fs);
         let mount_arg = CString::new(format!("--virtiofs-mounts={encoded_mounts}")).unwrap();
         let hostname_arg = CString::new(format!("--hostname={}", spec.hostname)).unwrap();
@@ -530,6 +534,7 @@ impl KrunContext {
         let http_network_env = CString::new("SANDBOX_HTTP_NETWORK=1").unwrap();
         let mut argv = vec![
             exec_path.as_ptr(),
+            stage_arg.as_ptr(),
             mount_arg.as_ptr(),
             hostname_arg.as_ptr(),
         ];
@@ -839,6 +844,39 @@ fn apply_project_kernel(ctx_id: u32) -> Result<(), KrunError> {
 #[cfg(not(sandbox_static_kernel))]
 fn apply_project_kernel(_ctx_id: u32) -> Result<(), KrunError> {
     Ok(())
+}
+
+#[cfg(sandbox_static_initrd)]
+fn apply_project_initrd(ctx_id: u32) -> Result<(), KrunError> {
+    static INITRD: &[u8] = include_bytes!(env!("SANDBOX_INITRD_IMAGE"));
+    check_krun("krun_set_initrd_bundle_raw", unsafe {
+        krun::krun_set_initrd_bundle_raw(ctx_id, INITRD.as_ptr() as u64, INITRD.len())
+    })
+}
+
+#[cfg(not(sandbox_static_initrd))]
+fn apply_project_initrd(_ctx_id: u32) -> Result<(), KrunError> {
+    Ok(())
+}
+
+#[cfg(sandbox_static_initrd)]
+fn project_init_path() -> &'static str {
+    "/init"
+}
+
+#[cfg(not(sandbox_static_initrd))]
+fn project_init_path() -> &'static str {
+    "/sandbox-init"
+}
+
+#[cfg(sandbox_static_initrd)]
+fn project_init_stage() -> &'static str {
+    "0"
+}
+
+#[cfg(not(sandbox_static_initrd))]
+fn project_init_stage() -> &'static str {
+    "1"
 }
 
 #[cfg(sandbox_static_kernel)]

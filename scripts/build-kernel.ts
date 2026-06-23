@@ -10,7 +10,7 @@ const repoRoot = resolve(import.meta.dirname, "..");
 const libkrunfwRoot = resolve(repoRoot, "deps/libkrunfw");
 
 const arch = process.env.SANDBOX_KERNEL_ARCH ?? guestArch();
-const image = process.env.SANDBOX_KERNEL_BUILDER_IMAGE ?? "debian:bookworm";
+const image = process.env.SANDBOX_KERNEL_BUILDER_IMAGE ?? "debian:12";
 const outDir = resolve(repoRoot, process.env.SANDBOX_KERNEL_OUT_DIR ?? `dist/kernel/libkrunfw/${arch}`);
 const jobs = process.env.SANDBOX_KERNEL_JOBS ?? "4";
 

@@ -10,10 +10,10 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 const GUEST_FS_RESPONSE_PAYLOAD_LIMIT: u64 = 60 * 1024 * 1024;
@@ -27,6 +27,12 @@ fn main() {
 }
 
 fn run() -> Result<(), InitError> {
+    let stage = configured_stage(std::env::args().skip(1))?;
+    match stage {
+        InitStage::Stage0 => return run_stage0(),
+        InitStage::Stage1 => {}
+    }
+
     mount_kernel_filesystems()?;
     let root_readonly = configured_root_readonly()?;
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -55,6 +61,163 @@ fn run() -> Result<(), InitError> {
     send_init_ready(&mut control, &packet)?;
     run_control_loop(&mut control)?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitStage {
+    Stage0,
+    Stage1,
+}
+
+fn configured_stage(args: impl Iterator<Item = String>) -> Result<InitStage, InitError> {
+    let mut stage = None;
+    for arg in args {
+        let Some(value) = arg.strip_prefix("--stage=") else {
+            continue;
+        };
+        if stage.is_some() {
+            return Err(InitError("duplicate --stage argument".to_string()));
+        }
+        stage = Some(match value {
+            "0" => InitStage::Stage0,
+            "1" => InitStage::Stage1,
+            _ => return Err(InitError(format!("invalid --stage value: {value}"))),
+        });
+    }
+    stage.ok_or_else(|| InitError("--stage is required".to_string()))
+}
+
+#[cfg(target_os = "linux")]
+fn run_stage0() -> Result<(), InitError> {
+    use std::os::unix::process::CommandExt;
+
+    mount_kernel_filesystems()?;
+    mount_real_root()?;
+    move_mount("/proc", "/newroot/proc")?;
+    move_mount("/sys", "/newroot/sys")?;
+    move_mount("/dev", "/newroot/dev")?;
+    let stage1_path = "/newroot/dev/shm/sandbox-init";
+    std::fs::copy("/proc/self/exe", stage1_path)
+        .map_err(|error| InitError(format!("copy stage1 init to {stage1_path}: {error}")))?;
+    set_file_mode(stage1_path, 0o755)?;
+    move_new_root()?;
+    let args = stage1_args();
+    let error = std::process::Command::new("/dev/shm/sandbox-init")
+        .args(args)
+        .exec();
+    Err(InitError(format!("exec stage1 init: {error}")))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_stage0() -> Result<(), InitError> {
+    Err(InitError("stage 0 is only supported on Linux".to_string()))
+}
+
+#[cfg(target_os = "linux")]
+fn mount_real_root() -> Result<(), InitError> {
+    use std::ffi::CString;
+
+    std::fs::create_dir_all("/newroot")
+        .map_err(|error| InitError(format!("create /newroot: {error}")))?;
+    let source = CString::new("/dev/vda").unwrap();
+    let target = CString::new("/newroot").unwrap();
+    let fstype = CString::new("ext4").unwrap();
+    let readonly = configured_root_readonly()?;
+    let flags = if readonly { libc::MS_RDONLY } else { 0 };
+    let result = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            flags,
+            std::ptr::null(),
+        )
+    };
+    if result < 0 {
+        return Err(InitError::last_os("mount root block device"));
+    }
+    for mount_point in [
+        "/newroot/dev",
+        "/newroot/proc",
+        "/newroot/run",
+        "/newroot/sys",
+        "/newroot/tmp",
+    ] {
+        if !std::path::Path::new(mount_point).is_dir() {
+            return Err(InitError(format!(
+                "rootfs image must contain mount point {mount_point}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn move_mount(source: &str, target: &str) -> Result<(), InitError> {
+    use std::ffi::CString;
+
+    let source_cstr = CString::new(source)
+        .map_err(|_| InitError(format!("move mount source contains nul: {source}")))?;
+    let target_cstr = CString::new(target)
+        .map_err(|_| InitError(format!("move mount target contains nul: {target}")))?;
+    let result = unsafe {
+        libc::mount(
+            source_cstr.as_ptr(),
+            target_cstr.as_ptr(),
+            std::ptr::null(),
+            libc::MS_MOVE,
+            std::ptr::null(),
+        )
+    };
+    if result < 0 {
+        return Err(InitError::last_os(&format!(
+            "move mount {source} to {target}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn move_new_root() -> Result<(), InitError> {
+    use std::ffi::CString;
+
+    std::env::set_current_dir("/newroot")
+        .map_err(|error| InitError(format!("chdir /newroot: {error}")))?;
+    let source = CString::new(".").unwrap();
+    let target = CString::new("/").unwrap();
+    let result = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            libc::MS_MOVE,
+            std::ptr::null(),
+        )
+    };
+    if result < 0 {
+        return Err(InitError::last_os("move new root"));
+    }
+    let root = CString::new(".").unwrap();
+    if unsafe { libc::chroot(root.as_ptr()) } < 0 {
+        return Err(InitError::last_os("chroot new root"));
+    }
+    std::env::set_current_dir("/")
+        .map_err(|error| InitError(format!("chdir / after chroot: {error}")))?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn stage1_args() -> Vec<String> {
+    std::env::args()
+        .skip(1)
+        .map(|arg| {
+            if arg.starts_with("--stage=") {
+                "--stage=1".to_string()
+            } else {
+                arg
+            }
+        })
+        .collect()
 }
 
 type SetupTask = Box<dyn FnOnce() -> Result<(), InitError> + Send>;
@@ -89,9 +252,11 @@ fn active_children() -> &'static Mutex<HashSet<libc::pid_t>> {
 #[cfg(target_os = "linux")]
 fn start_orphan_reaper() {
     let _ = active_children();
-    std::thread::spawn(|| loop {
-        reap_orphaned_children();
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    std::thread::spawn(|| {
+        loop {
+            reap_orphaned_children();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     });
 }
 
@@ -628,6 +793,16 @@ fn mount_fs_with_allowed_errors(
 
 #[cfg(target_os = "linux")]
 fn set_directory_mode(path: &str, mode: u32) -> Result<(), InitError> {
+    set_permissions_mode(path, mode)
+}
+
+#[cfg(target_os = "linux")]
+fn set_file_mode(path: &str, mode: u32) -> Result<(), InitError> {
+    set_permissions_mode(path, mode)
+}
+
+#[cfg(target_os = "linux")]
+fn set_permissions_mode(path: &str, mode: u32) -> Result<(), InitError> {
     use std::os::unix::fs::PermissionsExt;
 
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))

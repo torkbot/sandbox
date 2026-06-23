@@ -67,7 +67,7 @@ The guest init is a first-class binary in this repo. It should:
    exposes the contract for installing a supplied public CA certificate. The
    host exposes the CA through an internal read-only virtiofs mount, then init
    installs it through the supplied rootfs' native trust-store mechanism.
-   Built-in rootfs launches that enable HTTP interception receive an ephemeral
+   Rootfs launches that enable HTTP interception receive an ephemeral
    writable COW view so this update is deterministic. If no supported native
    installer is present, init fails closed.
 3. Configure networking for the chosen mode.
@@ -77,7 +77,7 @@ The guest init is a first-class binary in this repo. It should:
 
 This is where project-specific behavior belongs. The Node-facing API should not rely on shelling into the guest after boot to repair missing setup.
 
-Sandbox boots the `sandbox-init` binary we build in this repository directly as PID 1. The `torkbot/libkrun` fork exposes the command-line override Sandbox needs for the QCOW2-backed root; project-specific control protocol and setup logic stays in `crates/sandbox-init`.
+Sandbox embeds the `sandbox-init` binary we build in this repository into an initramfs. The kernel boots that binary as stage 0, stage 0 mounts the caller-selected QCOW2 rootfs, and then the same init binary execs as stage 1 from tmpfs inside that rootfs. The `torkbot/libkrun` fork exposes the raw kernel and initrd bundle handoff Sandbox needs; project-specific control protocol and setup logic stays in `crates/sandbox-init`.
 
 ## Root Filesystem
 
@@ -85,13 +85,13 @@ Build the guest root filesystem before VM instantiation. The runtime API should 
 
 The build-time tooling can use a simple Docker image create/export/extract flow to shape the rootfs. That flow belongs in packaging or fixture-generation tools, not in the hot runtime path.
 
-The target shape is a single compressed QCOW2 artifact containing an ext4 guest filesystem, produced from that extracted rootfs with a build-time virtual size large enough for agent workloads. `rootfs.builtIn(...)` mounts that artifact read-only in the guest. Runtime writable root behavior must be explicit: `rootfs.cow(...)` mounts the same artifact read-write through host-side COW block storage; `rootfs.persistent(...)` mounts it through a local writable QCOW2 overlay file.
+The target shape is a single compressed QCOW2 artifact containing an ext4 guest filesystem, produced from that extracted rootfs with a build-time virtual size large enough for agent workloads. `rootfs.image(...)` describes that immutable artifact with a concrete name, absolute path, format, architecture, digest, size, and facts. Runtime writable root behavior must be explicit: `rootfs.cow(...)` mounts the same artifact read-write through host-side COW block storage; `rootfs.persistent(...)` mounts it through a local writable QCOW2 overlay file.
 
 The host-backed block COW primitive is:
 
 ```ts
 rootfs: rootfs.cow({
-  base: rootfs.builtIn("alpine:3.23"),
+  base: alpine323Agent,
   writable: blockStore,
   maxDirtyBytes: 64 * 1024 * 1024,
 })
@@ -105,24 +105,75 @@ The local-file persistence primitive is:
 
 ```ts
 rootfs: rootfs.persistent({
-  base: rootfs.builtIn("alpine:3.23"),
+  base: alpine323Agent,
   path: "/absolute/project/.sandbox/rootfs.qcow2",
 })
 ```
 
 The native runtime creates a sparse QCOW2 overlay on first use and opens it with
-the built-in QCOW2 as an explicit read-only backing image. The built-in artifact
-is not locked. The overlay records the selected built-in base identity and
+the selected base QCOW2 as an explicit read-only backing image. The base
+artifact is not locked. The overlay records the selected base identity and
 digest in its QCOW2 backing metadata so later boots fail closed if the overlay
 is reused with a different base. The selected canonical overlay path is locked
-for the VM lifetime, so many VMs may share one built-in base concurrently as
-long as each running VM uses a different overlay file. The overlay is
+for the VM lifetime, so many VMs may share one base concurrently as long as each
+running VM uses a different overlay file. The overlay is
 host-owned VM state; callers must keep it outside guest-writable host-directory
 mounts or hide the containing directory with a host-directory mask. Sandbox does
 not try to prove that invariant across arbitrary host paths, symlinks, or mount
 layouts. Concurrent use is guarded with an advisory lock on the overlay file
 itself on filesystems that honor `flock`; other storage coordination is the
 caller's responsibility.
+
+### Image Packages And Release Lifecycle
+
+Sandbox does not publish ordinary base images as part of the core
+`@torkbot/sandbox` package. The core package owns the kernel, initrd, host
+runtime, and TypeScript API. Rootfs images are separate npm packages such as
+`@torkbot/sandbox-image-alpine-3.23-agent`; callers choose and pin the image
+package they want.
+
+Checked-in image definitions live under `images/<image-id>/`. The essential
+maintainer-authored state is only:
+
+```json
+{
+  "schemaVersion": 1,
+  "imageName": "alpine:3.23-agent",
+  "source": "docker.io/library/alpine:3.23@sha256:...",
+  "exportCompatibility": "0.1.0"
+}
+```
+
+`source` is an exact upstream image tag plus digest. Convenience aliases such
+as `latest`, `stable`, `current`, or `lts` are not valid image state.
+`exportCompatibility` is the semver compatibility profile for the JavaScript
+module exported by the image package. It does not try to describe the image
+contents.
+
+Image package versions use the npm prerelease section to encode image content:
+
+```text
+0.1.0-image.20260623T142355Z.sha9c4f2a1b3c4d
+```
+
+The `0.1.0` prefix is the JavaScript export compatibility profile. The
+fixed-width UTC timestamp makes releases sort in maintainer-facing lists. The
+short `sha...` suffix is derived from the release-set digest; the full digest is
+recorded in the GitHub release notes and generated package metadata.
+
+Image releases are driven by GitHub state. A scheduled reconciler, with a
+manual `workflow_dispatch` fallback, builds the requested image set and creates
+a draft prerelease only when no existing image release already records the same
+release digest. Publishing that GitHub release is the edge-triggered action
+that publishes the generated npm packages. There is no local refresh step that
+maintainers must remember to run.
+
+The current builder backend uses repository-owned scripts around Docker export
+and QCOW2 conversion. That backend is intentionally behind scripts rather than
+part of the package contract. If we later build a native `sandbox-image` binary
+that can perform the full image build without external tools, it can replace
+the backend without changing `image.json`, npm package exports, or the
+GitHub-driven release lifecycle.
 
 ## Networking
 
@@ -205,9 +256,9 @@ Host networking must cover:
 
 Sandbox needs small filesystem primitives:
 
-- `rootfs.builtIn(...)`: a supplied built-in QCOW2 root artifact mounted read-only in the guest.
-- `rootfs.cow(...)`: the same built-in QCOW2 root artifact mounted read-write through a host-side COW block store.
-- `rootfs.persistent(...)`: the same built-in QCOW2 root artifact mounted read-write through a local QCOW2 overlay file.
+- `rootfs.image(...)`: a supplied immutable QCOW2 root artifact mounted read-only in the guest.
+- `rootfs.cow(...)`: the same immutable QCOW2 root artifact mounted read-write through a host-side COW block store.
+- `rootfs.persistent(...)`: the same immutable QCOW2 root artifact mounted read-write through a local QCOW2 overlay file.
 - `mount(path, fs)`: a guest-visible mount boundary.
 - `virtualFs(...)` / `virtualFsMount(...)`: host Node.js callbacks implementing a guest-visible filesystem.
 
@@ -262,7 +313,7 @@ The first helper protocol is deliberately small. Node starts `sandbox-host --std
 2. Build `sandbox-init` as a static guest binary and boot it directly with an explicit kernel/initramfs.
 3. Add a vsock control channel and adapt it to the TypeScript `Transport` interface.
 4. Add build-time Docker image export/extract rootfs tooling, then consume a prebuilt immutable read-only root volume at VM instantiation.
-5. Add `rootfs.cow({ base: rootfs.builtIn(...), writable })` so `/` can be writable while the built-in rootfs artifact remains immutable.
+5. Add `rootfs.cow({ base: rootfs.image(...), writable })` so `/` can be writable while the base rootfs artifact remains immutable.
 6. Add CA injection and Rust-owned HTTP request-header interception using Rama.
 7. Add a vhost-user filesystem backend for virtual and writable host-implemented guest mounts.
 8. Move any required libkrun changes into `torkbot/libkrun` and keep them upstream-shaped.
