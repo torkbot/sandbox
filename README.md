@@ -2,8 +2,8 @@
 
 Sandbox is a TypeScript-first Node.js library for running AI-agent work inside
 libkrun-backed microVMs. It gives agent builders a small API for booting
-isolated Linux workers, mounting host-controlled filesystems, persisting rootfs
-mutations, and enforcing explicit network egress policy.
+isolated Linux workers, mounting host-controlled filesystems, preserving machine
+state across boots, and enforcing explicit network egress policy.
 
 Use Sandbox when your agent needs to run tools, install packages, clone repos,
 execute untrusted code, or call external APIs without handing the guest broad
@@ -42,7 +42,7 @@ const workspace = fs.memory({
 });
 
 const writableRootfs: SandboxBlockStore = new BlobBackedBlockStore({
-  bucket: "agent-rootfs-overlays",
+  bucket: "agent-machines",
   keyPrefix: "lanes/github-worker",
 });
 
@@ -97,14 +97,14 @@ if (result.exitCode !== 0) {
 ```
 
 The guest gets a normal Linux environment. The host keeps control over the
-workspace contents, rootfs persistence, network decisions, and credential
+workspace contents, machine persistence, network decisions, and credential
 injection.
 
 ## Quick Paths
 
 ### Run one isolated command
 
-Use a built-in read-only rootfs and a memory-backed workspace:
+Use a built-in read-only Linux image and a memory-backed workspace:
 
 ```ts
 const workspace = fs.memory({
@@ -125,9 +125,9 @@ const result = await lane.exec("cat", ["hello.txt"]);
 
 ### Give an agent a durable machine
 
-Use `rootfs.cow(...)` when package installs and rootfs mutations should survive
-across boots. Sandbox owns the block-device protocol; your application owns the
-storage backend.
+Use `rootfs.cow(...)` when package installs, language toolchains, caches, and
+other machine changes should survive across boots. Sandbox owns the low-level
+disk protocol; your application owns where the changed bytes are stored.
 
 ```ts
 const source = rootfs.compose({
@@ -140,11 +140,12 @@ const sandbox = defineSandbox({
 });
 ```
 
-Attach a writable COW block store to at most one running sandbox instance at a
-time. Create one store per lane, or enforce exclusivity in your storage layer.
+Attach one writable storage backend to at most one running sandbox instance at a
+time. Create one backend per lane, or enforce exclusivity in your storage
+layer.
 
-Use `rootfs.persistent(...)` when the durable rootfs should live in a local
-QCOW2 overlay file instead of a JavaScript block store:
+Use `rootfs.persistent(...)` when the durable machine state should live in one
+local file on disk instead of in a JavaScript storage backend:
 
 ```ts
 const sandbox = defineSandbox({
@@ -155,11 +156,10 @@ const sandbox = defineSandbox({
 });
 ```
 
-Sandbox creates the overlay on first boot and reuses it on later boots. The
-built-in rootfs stays read-only and can be shared by many VMs; only the selected
-overlay file is single-writer while a VM is running. Sandbox records the
-selected built-in base identity in the QCOW2 header and rejects reuse if it does
-not match.
+Sandbox creates the state file on first boot and reuses it on later boots. The
+built-in Linux image stays read-only and can be shared by many VMs; only the
+selected state file is single-writer while a VM is running. Sandbox records
+which built-in image the file belongs to and rejects mismatched reuse.
 
 ### Mount host-controlled data
 
@@ -183,8 +183,8 @@ built-in default `sandbox`.
 Sandbox init creates missing mount target directories immediately before
 attaching each virtual filesystem, matching container runtime behavior when the
 target parent is on init-owned tmpfs or comes from an earlier virtual mount. On
-durable rootfs paths that cannot be created without changing rootfs or COW
-semantics, boot fails with the guest init error surfaced in the host exception.
+durable machine paths that cannot be created without changing saved machine
+state, boot fails with the guest init error surfaced in the host exception.
 
 ### Control network egress
 
@@ -296,13 +296,19 @@ availability, and root mount mode facts.
 
 ### `rootfs`
 
+In this API, `rootfs` means the Linux machine filesystem the guest boots with:
+system packages, language runtimes, caches, and files outside your explicit
+workspace mounts. Most harness code should choose whether that machine is
+read-only, temporary, saved through application storage, or saved in one local
+file.
+
 ```ts
 rootfs.builtIn("alpine:3.23");
 ```
 
-Selects a read-only built-in rootfs artifact. Built-in rootfs artifacts are
-prepared at build or install time; Sandbox does not pull container images or
-build root filesystems during `boot()`.
+Selects a built-in Linux filesystem image that the guest can read but not
+modify. Built-in images are prepared at build or install time; Sandbox does not
+pull container images or build root filesystems during `boot()`.
 
 ```ts
 rootfs.ephemeral({
@@ -311,11 +317,10 @@ rootfs.ephemeral({
 });
 ```
 
-Mounts a built-in base rootfs through a writable in-process copy-on-write block
-store. Clean base-image blocks are served from the built-in artifact, dirty
-blocks are kept by the native runtime, and all rootfs mutations are discarded
-when the sandbox instance exits. Use this when a command needs to mutate the
-machine rootfs but those mutations must not persist across boots.
+Gives the guest a writable machine for one boot. Changes are kept in memory by
+the native runtime and discarded when the sandbox instance exits. Use this when
+a command needs to install packages, write caches, or mutate the Linux machine,
+but those changes must not persist across boots.
 
 ```ts
 rootfs.cow({
@@ -325,7 +330,10 @@ rootfs.cow({
 });
 ```
 
-Mounts a built-in base rootfs through a writable copy-on-write block store.
+Gives the guest a writable machine whose changes are saved through your
+`SandboxBlockStore`. Use this when durable machine state belongs in your own
+storage service, such as object storage, a database-backed block store, or a
+per-agent lane store.
 
 ```ts
 rootfs.persistent({
@@ -334,25 +342,24 @@ rootfs.persistent({
 });
 ```
 
-Mounts a built-in base rootfs through a writable local QCOW2 overlay file. The
-`path` is required and must be absolute. If the file does not exist, Sandbox
-creates a sparse QCOW2 overlay backed by the built-in image; the parent
-directory must already exist. If the file already exists, Sandbox reuses it. The
-built-in artifact is opened read-only and is not locked, so many VMs can share
-the same base image. Sandbox records the selected built-in base identity in the
-overlay QCOW2 header and rejects reuse if it no longer matches. The canonical
-overlay file path is locked for the VM lifetime, so concurrent boots must use
-distinct overlay paths.
+Gives the guest a writable machine whose changes are saved in one local host
+file. The `path` is required and must be absolute. If the file does not exist,
+Sandbox creates it on first boot; the parent directory must already exist. If
+the file already exists, Sandbox reuses it. The built-in image is opened
+read-only and is not locked, so many VMs can share the same base image. Sandbox
+records which built-in image the state file belongs to and rejects reuse with a
+different base.
 
-The overlay file is host-owned VM state. Keep it outside guest-writable
+The state file is host-owned VM state. Keep it outside guest-writable
 host-directory mounts, or hide its containing directory with a host-directory
 `mask.paths` entry such as `"/.sandbox"`. Sandbox does not attempt to prove this
-for arbitrary host paths, symlinks, or mount layouts. Concurrent use is guarded
-with an advisory lock on the overlay file itself on filesystems that honor
-`flock`; other storage coordination is the caller's responsibility.
+for arbitrary host paths, symlinks, or mount layouts. The state file is locked
+for the VM lifetime on filesystems that honor advisory file locks; concurrent
+boots must use distinct state files unless the caller supplies stronger storage
+coordination.
 
-For offline image work with block-store COW, describe the same merged view
-without booting a VM:
+For offline image export, describe the same saved machine state without booting
+a VM:
 
 ```ts
 const source = rootfs.compose({
@@ -373,23 +380,25 @@ for await (const chunk of rootfs.bytes(image)) {
 ```
 
 `rootfs.ephemeral(...)`, `rootfs.cow(...)`, and `rootfs.persistent(...)` all
-present a writable rootfs without modifying the built-in artifact.
+present a writable Linux machine without modifying the built-in image.
 `rootfs.cow(...)` normalizes through the same composed source used by
-`rootfs.flatten(...)`, so boot and image export share one base-plus-overlay
-contract. Clean base-image blocks are served from the built-in artifact. Dirty
-blocks are read lazily and flushed through your `SandboxBlockStore`.
-`maxDirtyBytes` limits how many dirty COW block bytes the native runtime buffers
-before forcing a write to the block store during a VM run. For
-`rootfs.ephemeral(...)`, the same value is the native in-memory dirty block
-quota; guest writes beyond that budget fail instead of growing host memory
-without bound. When omitted, Sandbox uses a 64 MiB block-aligned default.
-`rootfs.persistent(...)` uses the native QCOW2 driver directly instead of a
-`SandboxBlockStore`; its overlay file is sparse and grows as the guest writes.
+`rootfs.flatten(...)`, so boot and image export share one contract: a read-only
+base plus saved changes. Unchanged data is served from the built-in image.
+Changed data is read lazily and flushed through your `SandboxBlockStore`.
+`maxDirtyBytes` limits how much changed data the native runtime buffers before
+forcing a write to the block store during a VM run. For
+`rootfs.ephemeral(...)`, the same value is the native in-memory change budget;
+guest writes beyond that budget fail instead of growing host memory without
+bound. When omitted, Sandbox uses a 64 MiB block-aligned default.
+`rootfs.persistent(...)` stores the saved changes directly in the local state
+file instead of a `SandboxBlockStore`; the file is sparse and grows as the guest
+writes.
 
-`rootfs.flatten(...)` writes a standalone QCOW2 image into `dest`, using
+`rootfs.flatten(...)` writes a standalone bootable disk image into `dest`, using
 `dest` as random-access image-byte storage. `rootfs.bytes(...)` streams raw image
 container bytes for a built-in image or a flattened image; it does not stream the
-filesystem contents inside the image.
+filesystem contents inside the image. The current export format is QCOW2, a
+sparse virtual-disk container understood by common VM tooling.
 
 ```ts
 interface SandboxBlockStore {
@@ -639,15 +648,15 @@ flow is not actually HTTP or HTTPS, it fails closed.
 Sandbox hides the kernel, init, transport, and host helper behind a TypeScript
 API:
 
-- The runtime boots a libkrun-backed microVM from a prebuilt rootfs artifact.
-- The built-in rootfs is a compressed QCOW2 image containing an ext4 guest
-  filesystem.
+- The runtime boots a libkrun-backed microVM from a prebuilt Linux image.
+- The built-in image contains the guest filesystem and common agent tooling.
 - A signed `sandbox-host` helper owns the Node/Rust/libkrun boundary.
 - Guest control traffic uses an fd-backed transport between the host and the
   custom Sandbox init process.
 - Host-implemented virtual filesystems are mounted into the guest.
-- Durable rootfs mutation is modeled as block-level copy-on-write storage or a
-  QCOW2 overlay file, not as a guest-visible POSIX filesystem.
+- Durable machine changes are saved below the guest filesystem layer, so callers
+  can persist package installs and caches without exposing host state as a
+  guest-writable POSIX filesystem.
 - Network egress is default-deny and policy-controlled.
 - HTTP request middleware is caller-provided JavaScript, while Sandbox owns
   interception, forwarding, and certificate plumbing.
