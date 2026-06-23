@@ -181,7 +181,7 @@ test("image package preparation emits a root package and architecture artifact p
   assert.equal(archPackage.version, version);
   assert.equal(archPackage.private, false);
   assert.equal(archPackage.main, "index.cjs");
-  assert.deepEqual(archPackage.os, ["linux"]);
+  assert.equal(archPackage.os, undefined);
   assert.deepEqual(archPackage.cpu, ["arm64"]);
   assert.equal((await stat(join(outDir, "sandbox-image-alpine-3.23-slim-arm64", "rootfs.qcow2"))).isFile(), true);
 

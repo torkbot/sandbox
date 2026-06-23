@@ -164,7 +164,6 @@ async function writeArchPackage(input: {
       access: "public",
     },
     main: "index.cjs",
-    os: ["linux"],
     cpu: [input.architecture],
     files: [
       "environment-facts.json",
