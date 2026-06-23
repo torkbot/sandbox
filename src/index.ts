@@ -1178,6 +1178,9 @@ function parseGuestEnvironmentFacts(text: string): readonly SandboxEnvironmentFa
 }
 
 function guestDistroFact(value: string): SandboxDistroEnvironmentFact {
+  if (!/^[a-z0-9._-]+$/.test(value)) {
+    throw new Error(`unsupported guest distro environment fact: ${value}`);
+  }
   return {
     source: "guest",
     topic: "distro",
