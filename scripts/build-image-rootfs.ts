@@ -48,6 +48,12 @@ try {
   await run("docker", ["rmi", "-f", tag], { allowFailure: true });
 }
 await rm(resolve(outDir, ".dockerenv"), { force: true });
+await mkdir(resolve(outDir, "etc"), { recursive: true });
+await writeFile(resolve(outDir, "etc/hostname"), "sandbox\n");
+await writeFile(
+  resolve(outDir, "etc/hosts"),
+  "127.0.0.1 localhost sandbox\n::1 localhost ip6-localhost ip6-loopback\n",
+);
 
 await writeFile(
   resolve(outDir, rootfsEnvironmentFactsManifestFile),

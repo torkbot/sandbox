@@ -1382,6 +1382,31 @@ test("persistent rootfs rejects reuse when base metadata does not match", async 
   );
 });
 
+test("persistent rootfs validates the base image digest before reuse", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const dir = await mkdtemp(join(tmpdir(), "sandbox-persistent-rootfs-digest-"));
+  t.after(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  await assert.rejects(
+    defineSandbox({
+      rootfs: rootfs.persistent({
+        base: {
+          ...testRootfs,
+          digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        },
+        path: join(dir, "rootfs.qcow2"),
+      }),
+    }).boot(),
+    /rootfs image digest mismatch/,
+  );
+});
+
 test("persistent rootfs can live under a masked read-write host directory mount", async (t) => {
   const testRootfs = await testRootfsForVmTest(t);
   if (testRootfs === undefined) {

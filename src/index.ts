@@ -9,7 +9,7 @@ import {
   type SandboxRootfsEnvironmentFact,
   type SandboxShellEnvironmentFact,
 } from "./environment-facts.ts";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, lstatSync, readdirSync, realpathSync } from "node:fs";
 import { open } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
@@ -2020,6 +2020,7 @@ async function lowerPersistentRootfs(
   base: RootfsImageConfig,
   path: string,
 ): Promise<InternalSandboxOptions["rootfs"]> {
+  await verifyRootfsImageDigest(base);
   return {
     path: base.path,
     readonly: false,
@@ -2216,6 +2217,24 @@ function rootfsImageIdentity(image: RootfsImageConfig): string {
 function rootfsImageDigestHex(image: RootfsImageConfig): string {
   validateRootfsImageDigest(image.digest, "rootfs image");
   return image.digest.slice("sha256:".length);
+}
+
+async function verifyRootfsImageDigest(image: RootfsImageConfig): Promise<void> {
+  const actualDigest = await sha256File(image.path);
+  if (actualDigest !== image.digest) {
+    throw new Error(`rootfs image digest mismatch for ${image.path}: expected ${image.digest}, got ${actualDigest}`);
+  }
+}
+
+async function sha256File(path: string): Promise<`sha256:${string}`> {
+  const hash = createHash("sha256");
+  await new Promise<void>((resolvePromise, reject) => {
+    const stream = createReadStream(path);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("error", reject);
+    stream.on("end", resolvePromise);
+  });
+  return `sha256:${hash.digest("hex")}`;
 }
 
 function isConvenienceImageAlias(name: string): boolean {

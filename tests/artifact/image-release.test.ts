@@ -250,6 +250,9 @@ test("image release workflows are GitHub-state driven", async () => {
 
   assert.match(reconcileWorkflow, /schedule:/);
   assert.match(reconcileWorkflow, /workflow_dispatch:/);
+  assert.match(reconcileWorkflow, /Verify image release source/);
+  assert.match(reconcileWorkflow, /\$GITHUB_REF" != "refs\/heads\/main"/);
+  assert.match(reconcileWorkflow, /image release source must be current origin\/main/);
   assert.match(reconcileWorkflow, /image:\n\s+description: Image id to reconcile, or all\n\s+type: string\n\s+required: true/);
   assert.match(reconcileWorkflow, /image-manifest\.ts validate/);
   assert.match(reconcileWorkflow, /image-release-digest\.ts/);
@@ -266,6 +269,8 @@ test("image release workflows are GitHub-state driven", async () => {
   assert.match(publishWorkflow, /release:\n\s+types:\n\s+- published/);
   assert.match(publishWorkflow, /startsWith\(github\.event\.release\.tag_name, 'image\/'\)/);
   assert.match(publishWorkflow, /gh release download/);
+  assert.match(publishWorkflow, /Validate release package assets/);
+  assert.match(publishWorkflow, /expected exactly one root, arm64, and x64 image package/);
   assert.match(publishWorkflow, /npm publish/);
   assert.match(publishWorkflow, /id-token: write/);
 
@@ -281,4 +286,6 @@ test("image rootfs builder preserves agent CLI facts and strips Docker markers",
   assert.match(buildImageRootfsScript, /"gh"/);
   assert.match(buildImageRootfsScript, /configCommandFact/);
   assert.match(buildImageRootfsScript, /resolve\(outDir, "\.dockerenv"\)/);
+  assert.match(buildImageRootfsScript, /resolve\(outDir, "etc\/hostname"\)/);
+  assert.match(buildImageRootfsScript, /127\.0\.0\.1 localhost sandbox/);
 });
