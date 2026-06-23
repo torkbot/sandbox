@@ -57,6 +57,8 @@ pub enum RootfsStorageSpec {
     },
     PersistentQcow2Overlay {
         path: PathBuf,
+        base_identity: String,
+        base_digest: String,
     },
 }
 
@@ -690,6 +692,8 @@ pub struct RootfsStorageSpecInput {
     pub block_size: Option<u64>,
     pub max_dirty_bytes: Option<u64>,
     pub path: Option<String>,
+    pub base_identity: Option<String>,
+    pub base_digest: Option<String>,
 }
 
 impl RootfsStorageSpec {
@@ -725,7 +729,27 @@ impl RootfsStorageSpec {
                 if !path.is_absolute() {
                     return Err(SpecError::new("rootfs.storage.path must be absolute"));
                 }
-                Self::PersistentQcow2Overlay { path }
+                let base_identity = input
+                    .base_identity
+                    .ok_or_else(|| SpecError::new("rootfs.storage.baseIdentity is required"))?;
+                if base_identity.is_empty() {
+                    return Err(SpecError::new(
+                        "rootfs.storage.baseIdentity must not be empty",
+                    ));
+                }
+                let base_digest = input
+                    .base_digest
+                    .ok_or_else(|| SpecError::new("rootfs.storage.baseDigest is required"))?;
+                if !is_sha256_hex_digest(&base_digest) {
+                    return Err(SpecError::new(
+                        "rootfs.storage.baseDigest must be a SHA-256 hex digest",
+                    ));
+                }
+                Self::PersistentQcow2Overlay {
+                    path,
+                    base_identity,
+                    base_digest,
+                }
             }
             other => {
                 return Err(SpecError::new(format!(
@@ -734,6 +758,10 @@ impl RootfsStorageSpec {
             }
         })
     }
+}
+
+fn is_sha256_hex_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn parse_rootfs_block_storage_limits(
@@ -858,6 +886,8 @@ mod tests {
             block_size: Some(4096),
             max_dirty_bytes: Some(65536),
             path: None,
+            base_identity: None,
+            base_digest: None,
         });
 
         let spec = MicroVmSpec::build(input).unwrap();
@@ -879,6 +909,8 @@ mod tests {
             block_size: Some(65536),
             max_dirty_bytes: Some(131072),
             path: None,
+            base_identity: None,
+            base_digest: None,
         });
 
         let spec = MicroVmSpec::build(input).unwrap();
@@ -900,6 +932,8 @@ mod tests {
             block_size: None,
             max_dirty_bytes: None,
             path: Some("/tmp/rootfs.qcow2".to_string()),
+            base_identity: Some("built-in:alpine:3.23:qcow2:test".to_string()),
+            base_digest: Some("a".repeat(64)),
         });
 
         let spec = MicroVmSpec::build(input).unwrap();
@@ -908,6 +942,8 @@ mod tests {
             spec.rootfs.storage,
             Some(RootfsStorageSpec::PersistentQcow2Overlay {
                 path: PathBuf::from("/tmp/rootfs.qcow2"),
+                base_identity: "built-in:alpine:3.23:qcow2:test".to_string(),
+                base_digest: "a".repeat(64),
             }),
         );
     }
@@ -920,6 +956,8 @@ mod tests {
             block_size: Some(4096),
             max_dirty_bytes: Some(1024),
             path: None,
+            base_identity: None,
+            base_digest: None,
         });
 
         let error = MicroVmSpec::build(input).unwrap_err();
@@ -938,11 +976,50 @@ mod tests {
             block_size: None,
             max_dirty_bytes: None,
             path: Some("rootfs.qcow2".to_string()),
+            base_identity: Some("built-in:alpine:3.23:qcow2:test".to_string()),
+            base_digest: Some("a".repeat(64)),
         });
 
         let error = MicroVmSpec::build(input).unwrap_err();
 
         assert_eq!(error.to_string(), "rootfs.storage.path must be absolute");
+    }
+
+    #[test]
+    fn rejects_persistent_qcow2_overlay_missing_base_identity() {
+        let mut input = valid_input();
+        input.rootfs_storage = Some(RootfsStorageSpecInput {
+            kind: "persistent-qcow2-overlay".to_string(),
+            block_size: None,
+            max_dirty_bytes: None,
+            path: Some("/tmp/rootfs.qcow2".to_string()),
+            base_identity: None,
+            base_digest: Some("a".repeat(64)),
+        });
+
+        let error = MicroVmSpec::build(input).unwrap_err();
+
+        assert_eq!(error.to_string(), "rootfs.storage.baseIdentity is required",);
+    }
+
+    #[test]
+    fn rejects_persistent_qcow2_overlay_invalid_base_digest() {
+        let mut input = valid_input();
+        input.rootfs_storage = Some(RootfsStorageSpecInput {
+            kind: "persistent-qcow2-overlay".to_string(),
+            block_size: None,
+            max_dirty_bytes: None,
+            path: Some("/tmp/rootfs.qcow2".to_string()),
+            base_identity: Some("built-in:alpine:3.23:qcow2:test".to_string()),
+            base_digest: Some("not-a-digest".to_string()),
+        });
+
+        let error = MicroVmSpec::build(input).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "rootfs.storage.baseDigest must be a SHA-256 hex digest",
+        );
     }
 
     #[test]

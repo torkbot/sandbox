@@ -157,7 +157,9 @@ const sandbox = defineSandbox({
 
 Sandbox creates the overlay on first boot and reuses it on later boots. The
 built-in rootfs stays read-only and can be shared by many VMs; only the selected
-overlay file is single-writer while a VM is running.
+overlay file is single-writer while a VM is running. Sandbox also writes a small
+`rootfs.qcow2.metadata.json` sidecar beside the overlay and rejects reuse if it
+does not match the selected built-in base image.
 
 ### Mount host-controlled data
 
@@ -337,8 +339,11 @@ Mounts a built-in base rootfs through a writable local QCOW2 overlay file. The
 creates a sparse QCOW2 overlay backed by the built-in image; the parent
 directory must already exist. If the file already exists, Sandbox reuses it. The
 built-in artifact is opened read-only and is not locked, so many VMs can share
-the same base image. The overlay file path is locked for the VM lifetime;
-concurrent boots must use distinct overlay paths.
+the same base image. Sandbox writes a `.metadata.json` sidecar beside the
+overlay and rejects reuse if the recorded built-in base identity no longer
+matches. The canonical overlay file path is locked for the VM lifetime;
+concurrent boots must use distinct overlay paths, and read-write host directory
+mounts must not expose the overlay or its lock file to the guest.
 
 For offline image work with block-store COW, describe the same merged view
 without booting a VM:

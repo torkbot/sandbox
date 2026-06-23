@@ -17,8 +17,8 @@ import {
   type SandboxRootfsEnvironmentFact,
   type SandboxShellEnvironmentFact,
 } from "./environment-facts.ts";
-import { randomUUID } from "node:crypto";
-import { lstatSync, readdirSync, realpathSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { createReadStream, lstatSync, readdirSync, realpathSync } from "node:fs";
 import { open } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { HostControlTransport } from "./control.ts";
@@ -1188,7 +1188,7 @@ class DefinedSandbox implements SandboxDefinition {
   }
 
   async boot(options: SandboxBootOptions = {}): Promise<SandboxInstance> {
-    validateSandboxBootOptions(options);
+    validateSandboxBootOptions(options, this.#options.rootfs);
     const networkPolicy = this.#options.network === undefined
       ? undefined
       : createNetworkPolicyHookRegistration(this.#options.network);
@@ -1836,19 +1836,48 @@ function lowerEphemeralRootfs(
   };
 }
 
-function lowerPersistentRootfs(
+async function lowerPersistentRootfs(
   base: BuiltInRootfsConfig,
   path: string,
-): InternalSandboxOptions["rootfs"] {
+): Promise<InternalSandboxOptions["rootfs"]> {
+  const basePath = builtInRootfsPath(base.name);
   return {
-    path: builtInRootfsPath(base.name),
+    path: basePath,
     readonly: false,
     format: "qcow2",
     storage: {
       kind: "persistent-qcow2-overlay",
       path,
+      baseIdentity: builtInRootfsIdentity(base.name),
+      baseDigest: await builtInRootfsDigest(base.name, basePath),
     },
   };
+}
+
+const builtInRootfsDigestCache = new Map<string, Promise<string>>();
+
+function builtInRootfsDigest(name: BuiltInRootfsName, path: string): Promise<string> {
+  const key = `${name}\0${path}`;
+  let digest = builtInRootfsDigestCache.get(key);
+  if (digest === undefined) {
+    digest = sha256File(path);
+    builtInRootfsDigestCache.set(key, digest);
+  }
+  return digest;
+}
+
+function sha256File(path: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash("sha256");
+    const stream = createReadStream(path);
+    stream.on("data", (chunk) => {
+      hash.update(chunk);
+    });
+    stream.on("error", reject);
+    stream.on("end", () => {
+      resolve(hash.digest("hex"));
+    });
+  });
 }
 
 function createEphemeralCowBlockStore(): SandboxBlockStore {
@@ -2100,7 +2129,7 @@ function validateBuiltInRootfsName(name: string): void {
   }
 }
 
-function validateSandboxBootOptions(options: SandboxBootOptions): void {
+function validateSandboxBootOptions(options: SandboxBootOptions, rootfs: Rootfs): void {
   if (options.hostname !== undefined) {
     validateHostname(options.hostname, "hostname");
   }
@@ -2123,9 +2152,50 @@ function validateSandboxBootOptions(options: SandboxBootOptions): void {
     }
     mountPaths.add(path);
   }
+  validatePersistentRootfsHostMountIsolation(rootfs, options.mounts ?? {});
   if (options.cwd !== undefined && !options.cwd.startsWith("/")) {
     throw new Error("invalid sandbox boot options: cwd must be absolute");
   }
+}
+
+function validatePersistentRootfsHostMountIsolation(
+  rootfs: Rootfs,
+  mounts: Readonly<Record<string, SandboxMountSource>>,
+): void {
+  if (rootfs.kind !== "persistent-rootfs") {
+    return;
+  }
+  const overlayPath = realpathOrResolve(rootfs.path);
+  const lockPath = realpathOrResolve(persistentRootfsLockPath(rootfs.path));
+  for (const source of Object.values(mounts)) {
+    if (source.kind !== "host-directory" || source.access !== "rw") {
+      continue;
+    }
+    rejectHostDirectoryExposesPersistentRootfs(source.source, overlayPath, lockPath, "host directory source");
+    const storage = source.mask !== undefined && "storage" in source.mask ? source.mask.storage : undefined;
+    if (storage !== undefined) {
+      rejectHostDirectoryExposesPersistentRootfs(storage.source, overlayPath, lockPath, "host directory mask storage");
+    }
+  }
+}
+
+function rejectHostDirectoryExposesPersistentRootfs(
+  source: string,
+  overlayPath: string,
+  lockPath: string,
+  label: string,
+): void {
+  const sourcePath = realpathOrResolve(source);
+  if (isPathInsideOrEqual(sourcePath, overlayPath)) {
+    throw new Error(`invalid sandbox boot options: ${label} must not expose persistent rootfs overlay`);
+  }
+  if (isPathInsideOrEqual(sourcePath, lockPath)) {
+    throw new Error(`invalid sandbox boot options: ${label} must not expose persistent rootfs overlay lock`);
+  }
+}
+
+function persistentRootfsLockPath(path: string): string {
+  return `${path}.lock`;
 }
 
 function validateHostDirectorySource(source: HostDirectorySourceForValidation): void {

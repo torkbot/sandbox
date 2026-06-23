@@ -257,6 +257,29 @@ test("boot rejects host directory mounts without explicit access", async () => {
   );
 });
 
+test("boot rejects read-write host directory mounts that expose persistent rootfs files", async (t) => {
+  const workspace = await mkdtemp(join(tmpdir(), "sandbox-persistent-rootfs-mount-"));
+  t.after(async () => {
+    await rm(workspace, { recursive: true, force: true });
+  });
+  await mkdir(join(workspace, ".sandbox"));
+  const sandbox = defineSandbox({
+    rootfs: rootfs.persistent({
+      base: rootfs.builtIn("alpine:3.23"),
+      path: join(workspace, ".sandbox", "rootfs.qcow2"),
+    }),
+  });
+
+  await assert.rejects(
+    sandbox.boot({
+      mounts: {
+        "/workspace": fs.bind({ source: workspace, access: "rw" }),
+      },
+    }),
+    /invalid sandbox boot options: host directory source must not expose persistent rootfs overlay/,
+  );
+});
+
 test("boot rejects invalid host directory mask paths", async () => {
   const sandbox = defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.23"),

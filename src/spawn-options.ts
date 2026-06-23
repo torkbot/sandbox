@@ -49,6 +49,8 @@ export type HostSpawnSandboxOptions = {
       | {
           readonly kind: "persistent-qcow2-overlay";
           readonly path: string;
+          readonly baseIdentity: string;
+          readonly baseDigest: string;
         };
   };
   readonly mounts?: readonly HostSpawnMount[];

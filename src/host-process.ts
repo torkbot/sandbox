@@ -1631,6 +1631,8 @@ function encodeHostSpawn(options: HostSpawnSandboxOptions): Uint8Array {
       ? {
         kind: options.rootfs.storage.kind,
         path: options.rootfs.storage.path,
+        baseIdentity: options.rootfs.storage.baseIdentity,
+        baseDigest: options.rootfs.storage.baseDigest,
       }
       : {
         kind: options.rootfs.storage.kind,

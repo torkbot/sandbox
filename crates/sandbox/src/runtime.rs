@@ -3,6 +3,7 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, Once};
@@ -14,6 +15,7 @@ use imago::{
     DenyImplicitOpenGate, DynStorage, FormatAccess, FormatCreateBuilder, FormatDriverBuilder,
     Storage, StorageCreateOptions, StorageOpenOptions, SyncFormatAccess, qcow2::Qcow2, raw::Raw,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::MicroVmSpec;
 use crate::block_storage::{CowBlockStorage, CowBlockStore, MemoryCowBlockStore};
@@ -34,11 +36,13 @@ pub struct KrunContext {
 #[derive(Debug)]
 struct RootfsOverlayLock {
     _file: fs::File,
+    overlay_target: PathBuf,
 }
 
 impl RootfsOverlayLock {
     fn acquire(overlay_path: &Path) -> Result<Self, KrunError> {
-        let lock_path = rootfs_overlay_lock_path(overlay_path);
+        let overlay_target = rootfs_overlay_lock_target(overlay_path)?;
+        let lock_path = rootfs_overlay_lock_path(&overlay_target);
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -58,14 +62,70 @@ impl RootfsOverlayLock {
             }
             return Err(KrunError::new("rootfs overlay lock", -errno));
         }
-        Ok(Self { _file: file })
+        Ok(Self {
+            _file: file,
+            overlay_target,
+        })
+    }
+
+    fn overlay_target(&self) -> &Path {
+        &self.overlay_target
     }
 }
 
-fn rootfs_overlay_lock_path(overlay_path: &Path) -> PathBuf {
-    let mut lock_path = overlay_path.as_os_str().to_os_string();
+fn rootfs_overlay_lock_target(overlay_path: &Path) -> Result<PathBuf, KrunError> {
+    match fs::symlink_metadata(overlay_path) {
+        Ok(_) => {
+            let metadata = fs::metadata(overlay_path)
+                .map_err(|_| KrunError::new("rootfs overlay canonicalize", -libc::EIO))?;
+            if !metadata.is_file() {
+                return Err(KrunError::new(
+                    "rootfs overlay path is not a file",
+                    -libc::EINVAL,
+                ));
+            }
+            if metadata.nlink() > 1 {
+                return Err(KrunError::new(
+                    "rootfs overlay path must not have hard links",
+                    -libc::EINVAL,
+                ));
+            }
+            fs::canonicalize(overlay_path)
+                .map_err(|_| KrunError::new("rootfs overlay canonicalize", -libc::EIO))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let parent = overlay_path
+                .parent()
+                .ok_or_else(|| KrunError::new("rootfs overlay parent", -libc::EINVAL))?;
+            let file_name = overlay_path
+                .file_name()
+                .ok_or_else(|| KrunError::new("rootfs overlay filename", -libc::EINVAL))?;
+            let parent = fs::canonicalize(parent)
+                .map_err(|_| KrunError::new("rootfs overlay parent canonicalize", -libc::ENOENT))?;
+            Ok(parent.join(file_name))
+        }
+        Err(_) => Err(KrunError::new("rootfs overlay metadata", -libc::EIO)),
+    }
+}
+
+fn rootfs_overlay_lock_path(overlay_target: &Path) -> PathBuf {
+    let mut lock_path = overlay_target.as_os_str().to_os_string();
     lock_path.push(".lock");
     PathBuf::from(lock_path)
+}
+
+fn rootfs_overlay_metadata_path(overlay_target: &Path) -> PathBuf {
+    let mut metadata_path = overlay_target.as_os_str().to_os_string();
+    metadata_path.push(".metadata.json");
+    PathBuf::from(metadata_path)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistentQcow2OverlayMetadata {
+    schema_version: u32,
+    base_identity: String,
+    base_digest: String,
 }
 
 #[derive(Default, Clone)]
@@ -324,12 +384,23 @@ impl KrunContext {
                 let rootfs_trace = RootfsTrace::start(trace_format, spec.rootfs.readonly);
                 cstring_path("rootfs.path", &spec.rootfs.path)?;
                 let writable = spec.rootfs.storage.is_some();
-                let disk = if let Some(RootfsStorageSpec::PersistentQcow2Overlay { path }) =
-                    &spec.rootfs.storage
+                let disk = if let Some(RootfsStorageSpec::PersistentQcow2Overlay {
+                    path,
+                    base_identity,
+                    base_digest,
+                }) = &spec.rootfs.storage
                 {
                     cstring_path("rootfs.storage.path", path)?;
                     let open_start = Instant::now();
-                    let (disk, lock) = open_persistent_qcow2_overlay(&spec.rootfs.path, path)?;
+                    let (disk, lock) = open_persistent_qcow2_overlay(
+                        &spec.rootfs.path,
+                        path,
+                        &PersistentQcow2OverlayMetadata {
+                            schema_version: 1,
+                            base_identity: base_identity.clone(),
+                            base_digest: base_digest.clone(),
+                        },
+                    )?;
                     self._rootfs_overlay_lock = Some(lock);
                     rootfs_trace.stage("open_persistent_overlay", open_start);
                     disk
@@ -559,6 +630,7 @@ const PERSISTENT_QCOW2_OVERLAY_CLUSTER_SIZE: usize = 32768;
 fn open_persistent_qcow2_overlay(
     base_path: &Path,
     overlay_path: &Path,
+    expected_metadata: &PersistentQcow2OverlayMetadata,
 ) -> Result<(SyncFormatAccess<Box<dyn DynStorage>>, RootfsOverlayLock), KrunError> {
     let lock = RootfsOverlayLock::acquire(overlay_path)?;
     let exists = match fs::metadata(overlay_path) {
@@ -576,18 +648,59 @@ fn open_persistent_qcow2_overlay(
     };
 
     let disk = if exists {
+        validate_persistent_qcow2_overlay_metadata(lock.overlay_target(), expected_metadata)?;
         open_existing_persistent_qcow2_overlay(base_path, overlay_path)?
     } else {
         match create_persistent_qcow2_overlay(base_path, overlay_path) {
-            Ok(disk) => disk,
+            Ok(disk) => {
+                if let Err(error) = write_persistent_qcow2_overlay_metadata(
+                    lock.overlay_target(),
+                    expected_metadata,
+                ) {
+                    let _ = fs::remove_file(overlay_path);
+                    let _ = fs::remove_file(rootfs_overlay_metadata_path(lock.overlay_target()));
+                    return Err(error);
+                }
+                disk
+            }
             Err(error) => {
                 let _ = fs::remove_file(overlay_path);
+                let _ = fs::remove_file(rootfs_overlay_metadata_path(lock.overlay_target()));
                 return Err(error);
             }
         }
     };
 
     Ok((disk, lock))
+}
+
+fn validate_persistent_qcow2_overlay_metadata(
+    overlay_target: &Path,
+    expected: &PersistentQcow2OverlayMetadata,
+) -> Result<(), KrunError> {
+    let metadata_path = rootfs_overlay_metadata_path(overlay_target);
+    let data = fs::read(metadata_path)
+        .map_err(|_| KrunError::new("rootfs overlay metadata read", -libc::EINVAL))?;
+    let actual: PersistentQcow2OverlayMetadata = serde_json::from_slice(&data)
+        .map_err(|_| KrunError::new("rootfs overlay metadata parse", -libc::EINVAL))?;
+    if &actual != expected {
+        return Err(KrunError::new(
+            "rootfs overlay base identity mismatch",
+            -libc::EINVAL,
+        ));
+    }
+    Ok(())
+}
+
+fn write_persistent_qcow2_overlay_metadata(
+    overlay_target: &Path,
+    metadata: &PersistentQcow2OverlayMetadata,
+) -> Result<(), KrunError> {
+    let metadata_path = rootfs_overlay_metadata_path(overlay_target);
+    let data = serde_json::to_vec_pretty(metadata)
+        .map_err(|_| KrunError::new("rootfs overlay metadata encode", -libc::EIO))?;
+    fs::write(metadata_path, data)
+        .map_err(|_| KrunError::new("rootfs overlay metadata write", -libc::EIO))
 }
 
 fn open_existing_persistent_qcow2_overlay(
@@ -605,6 +718,7 @@ fn open_existing_persistent_qcow2_overlay(
         .backing(Some(base))
         .open_sync(DenyImplicitOpenGate::default())
         .map_err(|_| KrunError::new("rootfs overlay qcow2 open", -libc::EIO))?;
+    validate_persistent_qcow2_overlay_backing_metadata(&overlay, base_path)?;
     let access = FormatAccess::new(overlay);
     if access.size() != base_size {
         return Err(KrunError::new(
@@ -614,6 +728,26 @@ fn open_existing_persistent_qcow2_overlay(
     }
     SyncFormatAccess::try_from(access)
         .map_err(|_| KrunError::new("SyncFormatAccess::new", -libc::EIO))
+}
+
+fn validate_persistent_qcow2_overlay_backing_metadata(
+    overlay: &Qcow2<Box<dyn DynStorage>>,
+    base_path: &Path,
+) -> Result<(), KrunError> {
+    let expected_backing = base_path.to_string_lossy();
+    if overlay.implicit_backing_file().map(String::as_str) != Some(expected_backing.as_ref()) {
+        return Err(KrunError::new(
+            "rootfs overlay backing path mismatch",
+            -libc::EINVAL,
+        ));
+    }
+    if overlay.implicit_backing_format().map(String::as_str) != Some("qcow2") {
+        return Err(KrunError::new(
+            "rootfs overlay backing format mismatch",
+            -libc::EINVAL,
+        ));
+    }
+    Ok(())
 }
 
 fn create_persistent_qcow2_overlay(
@@ -984,8 +1118,104 @@ fn sync_mode() -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs as unix_fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
     use crate::config::MicroVmSpecInput;
+
+    struct TempTree {
+        path: PathBuf,
+    }
+
+    impl TempTree {
+        fn new(name: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "sandbox-runtime-{name}-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn rootfs_overlay_lock_uses_canonical_target_for_missing_overlay() {
+        let tree = TempTree::new("overlay-lock-alias");
+        let real_dir = tree.path.join("real");
+        let alias_dir = tree.path.join("alias");
+        fs::create_dir(&real_dir).unwrap();
+        unix_fs::symlink(&real_dir, &alias_dir).unwrap();
+
+        let first = RootfsOverlayLock::acquire(&real_dir.join("rootfs.qcow2")).unwrap();
+        let error = RootfsOverlayLock::acquire(&alias_dir.join("rootfs.qcow2")).unwrap_err();
+        let expected_target = fs::canonicalize(&real_dir).unwrap().join("rootfs.qcow2");
+
+        assert_eq!(first.overlay_target(), expected_target.as_path());
+        assert_eq!(
+            error.to_string(),
+            "rootfs overlay is already in use failed with -16"
+        );
+    }
+
+    #[test]
+    fn rootfs_overlay_lock_uses_canonical_target_for_symlinked_overlay() {
+        let tree = TempTree::new("overlay-lock-file-alias");
+        let overlay = tree.path.join("rootfs.qcow2");
+        let alias = tree.path.join("alias.qcow2");
+        fs::write(&overlay, b"qcow2").unwrap();
+        unix_fs::symlink(&overlay, &alias).unwrap();
+
+        let first = RootfsOverlayLock::acquire(&overlay).unwrap();
+        let error = RootfsOverlayLock::acquire(&alias).unwrap_err();
+        let expected_target = fs::canonicalize(&overlay).unwrap();
+
+        assert_eq!(first.overlay_target(), expected_target.as_path());
+        assert_eq!(
+            error.to_string(),
+            "rootfs overlay is already in use failed with -16"
+        );
+    }
+
+    #[test]
+    fn rootfs_overlay_lock_rejects_hard_linked_overlay_file() {
+        let tree = TempTree::new("overlay-lock-hard-link");
+        let overlay = tree.path.join("rootfs.qcow2");
+        let alias = tree.path.join("alias.qcow2");
+        fs::write(&overlay, b"qcow2").unwrap();
+        fs::hard_link(&overlay, &alias).unwrap();
+
+        let error = RootfsOverlayLock::acquire(&overlay).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "rootfs overlay path must not have hard links failed with -22",
+        );
+    }
+
+    #[test]
+    fn rootfs_overlay_lock_rejects_dangling_symlink_overlay() {
+        let tree = TempTree::new("overlay-lock-dangling-symlink");
+        let alias = tree.path.join("alias.qcow2");
+        unix_fs::symlink(tree.path.join("missing.qcow2"), &alias).unwrap();
+
+        let error = RootfsOverlayLock::acquire(&alias).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "rootfs overlay canonicalize failed with -5"
+        );
+    }
 
     #[test]
     fn creates_configures_and_frees_krun_context() {

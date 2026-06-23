@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { lstat, mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -1124,12 +1124,57 @@ test("persistent rootfs creates and reuses a QCOW2 overlay file", async (t) => {
 
   assert.equal((await lstat(overlayPath)).isFile(), true);
   await assertQcow2Magic(overlayPath);
+  const metadata = JSON.parse(await readFile(`${overlayPath}.metadata.json`, "utf8")) as {
+    readonly schemaVersion?: unknown;
+    readonly baseIdentity?: unknown;
+    readonly baseDigest?: unknown;
+  };
+  assert.equal(metadata.schemaVersion, 1);
+  assert.match(String(metadata.baseIdentity), /built-in:alpine:3\.23:qcow2:/);
+  assert.match(String(metadata.baseDigest), /^[0-9a-f]{64}$/);
 
   await using second = await sandboxDefinition.boot();
   const read = await second.exec("/bin/cat", ["/root/persistent-state.txt"]);
 
   assert.equal(read.exitCode, 0, read.stderr);
   assert.equal(read.stdout, "persisted");
+});
+
+test("persistent rootfs rejects reuse when base metadata does not match", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const dir = await mkdtemp(join(tmpdir(), "sandbox-persistent-rootfs-metadata-"));
+  t.after(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+  const overlayPath = join(dir, "rootfs.qcow2");
+  const sandboxDefinition = defineSandbox({
+    rootfs: rootfs.persistent({
+      base: rootfs.builtIn("alpine:3.23"),
+      path: overlayPath,
+    }),
+  });
+
+  const first = await sandboxDefinition.boot();
+  await first.close();
+
+  const metadataPath = `${overlayPath}.metadata.json`;
+  const metadata = JSON.parse(await readFile(metadataPath, "utf8")) as {
+    schemaVersion: number;
+    baseIdentity: string;
+    baseDigest: string;
+  };
+  await writeFile(metadataPath, JSON.stringify({
+    ...metadata,
+    baseDigest: "0".repeat(64),
+  }));
+
+  await assert.rejects(
+    sandboxDefinition.boot(),
+    /rootfs overlay base identity mismatch/,
+  );
 });
 
 test("persistent rootfs locks only the selected overlay file", async (t) => {
@@ -1185,6 +1230,45 @@ test("persistent rootfs locks only the selected overlay file", async (t) => {
 
   assert.equal((await lstat(firstOverlay)).isFile(), true);
   assert.equal((await lstat(secondOverlay)).isFile(), true);
+});
+
+test("persistent rootfs locks canonical overlay targets", async (t) => {
+  if (!requireVmLaunchSupport(t)) {
+    return;
+  }
+
+  const dir = await mkdtemp(join(tmpdir(), "sandbox-persistent-rootfs-alias-"));
+  t.after(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+  const realDir = join(dir, "real");
+  const aliasDir = join(dir, "alias");
+  await mkdir(realDir);
+  await symlink(realDir, aliasDir);
+  const realOverlay = join(realDir, "rootfs.qcow2");
+  const aliasOverlay = join(aliasDir, "rootfs.qcow2");
+  const realDefinition = defineSandbox({
+    rootfs: rootfs.persistent({
+      base: rootfs.builtIn("alpine:3.23"),
+      path: realOverlay,
+    }),
+  });
+  const aliasDefinition = defineSandbox({
+    rootfs: rootfs.persistent({
+      base: rootfs.builtIn("alpine:3.23"),
+      path: aliasOverlay,
+    }),
+  });
+
+  const first = await realDefinition.boot();
+  try {
+    await assert.rejects(
+      aliasDefinition.boot(),
+      /rootfs overlay is already in use|lock|busy|EBUSY/i,
+    );
+  } finally {
+    await first.close();
+  }
 });
 
 test("COW rootfs can be flattened to a QCOW2 image stream", async (t) => {

@@ -112,9 +112,12 @@ rootfs: rootfs.persistent({
 
 The native runtime creates a sparse QCOW2 overlay on first use and opens it with
 the built-in QCOW2 as an explicit read-only backing image. The built-in artifact
-is not locked. The selected overlay path is locked for the VM lifetime, so many
+is not locked. A small sidecar records the selected built-in base identity and
+digest so later boots fail closed if the overlay is reused with a different
+base. The selected canonical overlay path is locked for the VM lifetime, so many
 VMs may share one built-in base concurrently as long as each running VM uses a
-different overlay file.
+different overlay file. Read-write host directory mounts cannot expose the
+overlay or its lock file to the guest.
 
 ## Networking
 

@@ -853,6 +853,8 @@ fn parse_rootfs_storage(
                 block_size: None,
                 max_dirty_bytes: None,
                 path: Some(document.get_str("path")?.to_string()),
+                base_identity: Some(document.get_str("baseIdentity")?.to_string()),
+                base_digest: Some(document.get_str("baseDigest")?.to_string()),
             }));
         }
         "cow-block-store" | "ephemeral-cow" => {}
@@ -862,6 +864,8 @@ fn parse_rootfs_storage(
                 block_size: None,
                 max_dirty_bytes: None,
                 path: None,
+                base_identity: None,
+                base_digest: None,
             }));
         }
     }
@@ -870,6 +874,8 @@ fn parse_rootfs_storage(
         block_size: Some(u64::try_from(document.get_i32("blockSize")?)?),
         max_dirty_bytes: Some(document_u64(document, "maxDirtyBytes")?),
         path: None,
+        base_identity: None,
+        base_digest: None,
     }))
 }
 
