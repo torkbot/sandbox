@@ -2,10 +2,12 @@ import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseImageSource, readImageDefinition } from "./image-manifest.ts";
+import { sha256File } from "./image-release-version.ts";
 
 export type ImageReleaseArtifactDigest = {
   readonly architecture: string;
-  readonly digest: `sha256:${string}`;
+  readonly rootfsDigest: `sha256:${string}`;
+  readonly factsDigest: `sha256:${string}`;
 };
 
 export async function imageReleaseDigest(input: {
@@ -21,8 +23,10 @@ export async function imageReleaseDigest(input: {
   }
   for (const artifact of artifacts) {
     assertArchitecture(artifact.architecture);
-    parseImageSource(`docker.io/library/sandbox:content@${artifact.digest}`);
+    assertSha256Digest(artifact.rootfsDigest);
+    assertSha256Digest(artifact.factsDigest);
   }
+  const packageGeneratorDigest = await sha256File(fileURLToPath(new URL("./prepare-image-npm-packages.ts", import.meta.url)));
 
   const canonical = JSON.stringify({
     schemaVersion: 1,
@@ -30,6 +34,8 @@ export async function imageReleaseDigest(input: {
     imageName: definition.manifest.imageName,
     source: definition.manifest.source,
     exportCompatibility: definition.manifest.exportCompatibility,
+    packageJson: definition.packageJson,
+    packageGeneratorDigest,
     artifacts,
   });
   return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
@@ -38,15 +44,20 @@ export async function imageReleaseDigest(input: {
 function parseArtifactDigest(value: string): ImageReleaseArtifactDigest {
   const separator = value.indexOf("=");
   if (separator === -1) {
-    throw new Error(`artifact digest must be <architecture>=<sha256:digest>: ${value}`);
+    throw new Error(`artifact digest must be <architecture>=<rootfs sha256:digest>,<facts sha256:digest>: ${value}`);
   }
   const architecture = value.slice(0, separator);
-  const digest = value.slice(separator + 1) as `sha256:${string}`;
+  const [rootfsDigest, factsDigest, extra] = value.slice(separator + 1).split(",");
+  if (rootfsDigest === undefined || factsDigest === undefined || extra !== undefined) {
+    throw new Error(`artifact digest must be <architecture>=<rootfs sha256:digest>,<facts sha256:digest>: ${value}`);
+  }
   assertArchitecture(architecture);
-  parseImageSource(`docker.io/library/sandbox:content@${digest}`);
+  assertSha256Digest(rootfsDigest);
+  assertSha256Digest(factsDigest);
   return {
     architecture,
-    digest,
+    rootfsDigest,
+    factsDigest,
   };
 }
 
@@ -54,6 +65,10 @@ function assertArchitecture(value: string): void {
   if (value !== "arm64" && value !== "x64") {
     throw new Error(`unsupported image architecture: ${value}`);
   }
+}
+
+function assertSha256Digest(value: string): asserts value is `sha256:${string}` {
+  parseImageSource(`docker.io/library/sandbox:content@${value}`);
 }
 
 function requiredArg(args: readonly string[], name: string): string {

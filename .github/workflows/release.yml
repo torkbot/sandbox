@@ -26,6 +26,7 @@ env:
 jobs:
   verify:
     name: Verify release gates
+    if: github.event_name != 'release' || !startsWith(github.event.release.tag_name, 'image/')
     runs-on: ubuntu-24.04
     outputs:
       target-sha: ${{ steps.release-target.outputs.target-sha }}

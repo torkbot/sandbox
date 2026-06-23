@@ -82,22 +82,60 @@ test("image prerelease versions sort by fixed-width UTC timestamp before digest"
 });
 
 test("image release digest is stable for the same multi-architecture content", async () => {
+  const digestScript = await readFile(
+    new URL("../../scripts/image-release-digest.ts", import.meta.url),
+    "utf8",
+  );
   const first = await imageReleaseDigest({
     imageId: "alpine-3.23-slim",
     artifacts: [
-      { architecture: "arm64", digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
-      { architecture: "x64", digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+      {
+        architecture: "arm64",
+        rootfsDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        factsDigest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      },
+      {
+        architecture: "x64",
+        rootfsDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        factsDigest: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      },
     ],
   });
   const second = await imageReleaseDigest({
     imageId: "alpine-3.23-slim",
     artifacts: [
-      { architecture: "x64", digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
-      { architecture: "arm64", digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+      {
+        architecture: "x64",
+        rootfsDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        factsDigest: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      },
+      {
+        architecture: "arm64",
+        rootfsDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        factsDigest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      },
+    ],
+  });
+  const changedFacts = await imageReleaseDigest({
+    imageId: "alpine-3.23-slim",
+    artifacts: [
+      {
+        architecture: "arm64",
+        rootfsDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        factsDigest: "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      },
+      {
+        architecture: "x64",
+        rootfsDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        factsDigest: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      },
     ],
   });
 
   assert.equal(first, second);
+  assert.notEqual(first, changedFacts);
+  assert.match(digestScript, /packageJson/);
+  assert.match(digestScript, /prepare-image-npm-packages\.ts/);
 });
 
 test("image package preparation emits a root package and architecture artifact package", async () => {
@@ -107,23 +145,26 @@ test("image package preparation emits a root package and architecture artifact p
   const outDir = join(tempRoot, "npm");
 
   await writeFile(rootfsPath, "rootfs bytes\n");
-  await writeFile(
-    factsPath,
-    `${JSON.stringify({
-      schemaVersion: 1,
-      rootfs: "alpine:3.23-slim",
-      facts: [
-        { source: "config", topic: "rootfs-image", relation: "is", value: "alpine:3.23-slim" },
-      ],
-    }, null, 2)}\n`,
-  );
+  const factsJson = `${JSON.stringify({
+    schemaVersion: 1,
+    rootfs: "alpine:3.23-slim",
+    facts: [
+      { source: "config", topic: "rootfs-image", relation: "is", value: "alpine:3.23-slim" },
+    ],
+  }, null, 2)}\n`;
+  await writeFile(factsPath, factsJson);
 
   const rootfsDigest = `sha256:${createHash("sha256").update("rootfs bytes\n").digest("hex")}` as const;
+  const factsDigest = `sha256:${createHash("sha256").update(factsJson).digest("hex")}` as const;
   const releaseDigest = await imageReleaseDigest({
     imageId: "alpine-3.23-slim",
     artifacts: [
-      { architecture: "arm64", digest: rootfsDigest },
-      { architecture: "x64", digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+      { architecture: "arm64", rootfsDigest, factsDigest },
+      {
+        architecture: "x64",
+        rootfsDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        factsDigest: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      },
     ],
   });
   const version = imageReleaseVersion({
@@ -202,12 +243,20 @@ test("image release workflows are GitHub-state driven", async () => {
     new URL("../../.github/workflows/image-release-publish.yml", import.meta.url),
     "utf8",
   );
+  const releaseWorkflow = await readFile(
+    new URL("../../.github/workflows/release.yml", import.meta.url),
+    "utf8",
+  );
 
   assert.match(reconcileWorkflow, /schedule:/);
   assert.match(reconcileWorkflow, /workflow_dispatch:/);
   assert.match(reconcileWorkflow, /image:\n\s+description: Image id to reconcile, or all\n\s+type: string\n\s+required: true/);
   assert.match(reconcileWorkflow, /image-manifest\.ts validate/);
   assert.match(reconcileWorkflow, /image-release-digest\.ts/);
+  assert.match(reconcileWorkflow, /environment-facts\.json/);
+  assert.match(reconcileWorkflow, /--artifact "x64=\$\{x64_digest\},\$\{x64_facts_digest\}"/);
+  assert.match(reconcileWorkflow, /--artifact "arm64=\$\{arm64_digest\},\$\{arm64_facts_digest\}"/);
+  assert.doesNotMatch(reconcileWorkflow, /path: dist\/image-release\/\$\{\{ matrix\.image \}\}\/\$\{\{ matrix\.architecture \}\}\n/);
   assert.match(reconcileWorkflow, /Release digest:/);
   assert.match(reconcileWorkflow, /gh api --paginate "repos\/\$\{GITHUB_REPOSITORY\}\/releases\?per_page=100"/);
   assert.match(reconcileWorkflow, /gh release create/);
@@ -219,6 +268,8 @@ test("image release workflows are GitHub-state driven", async () => {
   assert.match(publishWorkflow, /gh release download/);
   assert.match(publishWorkflow, /npm publish/);
   assert.match(publishWorkflow, /id-token: write/);
+
+  assert.match(releaseWorkflow, /!startsWith\(github\.event\.release\.tag_name, 'image\/'\)/);
 });
 
 test("image rootfs builder preserves agent CLI facts and strips Docker markers", async () => {

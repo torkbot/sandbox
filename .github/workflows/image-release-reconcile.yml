@@ -90,7 +90,10 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: image-rootfs-${{ matrix.image }}-${{ matrix.architecture }}
-          path: dist/image-release/${{ matrix.image }}/${{ matrix.architecture }}
+          path: |
+            dist/image-release/${{ matrix.image }}/${{ matrix.architecture }}/rootfs.qcow2
+            dist/image-release/${{ matrix.image }}/${{ matrix.architecture }}/environment-facts.json
+            dist/image-release/${{ matrix.image }}/${{ matrix.architecture }}/rootfs.digest
           if-no-files-found: error
 
   draft-release:
@@ -135,10 +138,12 @@ jobs:
           set -euo pipefail
           x64_digest="$(cat "dist/image-release/${{ matrix.image }}/x64/rootfs.digest")"
           arm64_digest="$(cat "dist/image-release/${{ matrix.image }}/arm64/rootfs.digest")"
+          x64_facts_digest="$(node --input-type=module -e 'import { sha256File } from "./scripts/image-release-version.ts"; console.log(await sha256File(process.argv[1]));' "dist/image-release/${{ matrix.image }}/x64/environment-facts.json")"
+          arm64_facts_digest="$(node --input-type=module -e 'import { sha256File } from "./scripts/image-release-version.ts"; console.log(await sha256File(process.argv[1]));' "dist/image-release/${{ matrix.image }}/arm64/environment-facts.json")"
           release_digest="$(node ./scripts/image-release-digest.ts \
             --image "${{ matrix.image }}" \
-            --artifact "x64=${x64_digest}" \
-            --artifact "arm64=${arm64_digest}")"
+            --artifact "x64=${x64_digest},${x64_facts_digest}" \
+            --artifact "arm64=${arm64_digest},${arm64_facts_digest}")"
           existing_tag="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq ".[] | select(.tag_name | startswith(\"image/${{ matrix.image }}/v\")) | select((.body // \"\") | contains(\"Release digest: ${release_digest}\")) | .tag_name" | sed -n '1p')"
           echo "x64-digest=${x64_digest}" >> "$GITHUB_OUTPUT"
           echo "arm64-digest=${arm64_digest}" >> "$GITHUB_OUTPUT"
