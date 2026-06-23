@@ -651,14 +651,12 @@ fn open_persistent_qcow2_overlay(
                     expected_metadata,
                 ) {
                     let _ = fs::remove_file(overlay_path);
-                    let _ = fs::remove_file(rootfs_overlay_metadata_path(lock.overlay_target()));
                     return Err(error);
                 }
                 disk
             }
             Err(error) => {
                 let _ = fs::remove_file(overlay_path);
-                let _ = fs::remove_file(rootfs_overlay_metadata_path(lock.overlay_target()));
                 return Err(error);
             }
         }
@@ -695,7 +693,7 @@ fn write_persistent_qcow2_overlay_metadata(
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
-        .open(metadata_path)
+        .open(&metadata_path)
         .map_err(|error| {
             if error.kind() == io::ErrorKind::AlreadyExists {
                 KrunError::new("rootfs overlay metadata already exists", -libc::EEXIST)
@@ -703,8 +701,11 @@ fn write_persistent_qcow2_overlay_metadata(
                 KrunError::new("rootfs overlay metadata write", -libc::EIO)
             }
         })?;
-    file.write_all(&data)
-        .map_err(|_| KrunError::new("rootfs overlay metadata write", -libc::EIO))
+    if file.write_all(&data).is_err() {
+        let _ = fs::remove_file(metadata_path);
+        return Err(KrunError::new("rootfs overlay metadata write", -libc::EIO));
+    }
+    Ok(())
 }
 
 fn open_existing_persistent_qcow2_overlay(
