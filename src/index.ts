@@ -1854,16 +1854,9 @@ async function lowerPersistentRootfs(
   };
 }
 
-const builtInRootfsDigestCache = new Map<string, Promise<string>>();
-
 function builtInRootfsDigest(name: BuiltInRootfsName, path: string): Promise<string> {
-  const key = `${name}\0${path}`;
-  let digest = builtInRootfsDigestCache.get(key);
-  if (digest === undefined) {
-    digest = sha256File(path);
-    builtInRootfsDigestCache.set(key, digest);
-  }
-  return digest;
+  validateBuiltInRootfsName(name);
+  return sha256File(path);
 }
 
 function sha256File(path: string): Promise<string> {
@@ -2165,10 +2158,14 @@ function validatePersistentRootfsHostMountIsolation(
   if (rootfs.kind !== "persistent-rootfs") {
     return;
   }
+  const overlayPath = persistentRootfsProtectedPath(rootfs.path, "overlay");
   const protectedPaths = [
-    persistentRootfsProtectedPath(rootfs.path, "overlay"),
+    overlayPath,
     persistentRootfsProtectedPath(persistentRootfsLockPath(rootfs.path), "overlay lock"),
-  ];
+    persistentRootfsProtectedPath(persistentRootfsLockPath(overlayPath.canonicalPath), "overlay lock"),
+    persistentRootfsProtectedPath(persistentRootfsMetadataPath(rootfs.path), "overlay metadata"),
+    persistentRootfsProtectedPath(persistentRootfsMetadataPath(overlayPath.canonicalPath), "overlay metadata"),
+  ] satisfies readonly PersistentRootfsProtectedPath[];
   for (const source of Object.values(mounts)) {
     if (source.kind !== "host-directory" || source.access !== "rw") {
       continue;
@@ -2192,7 +2189,7 @@ function validatePersistentRootfsHostMountIsolation(
 }
 
 type PersistentRootfsProtectedPath = {
-  readonly label: "overlay" | "overlay lock";
+  readonly label: "overlay" | "overlay lock" | "overlay metadata";
   readonly literalPath: string;
   readonly canonicalPath: string;
 };
@@ -2224,6 +2221,10 @@ function persistentRootfsLockPath(path: string): string {
   return `${path}.lock`;
 }
 
+function persistentRootfsMetadataPath(path: string): string {
+  return `${path}.metadata.json`;
+}
+
 function hostDirectoryExposesPersistentRootfsPath(
   sourceLiteralPath: string,
   sourcePath: string,
@@ -2249,11 +2250,9 @@ function persistentRootfsPathCoveredByHostDirectoryMask(
     const relativeMaskPath = maskPath.slice(1);
     const maskLiteralFromLiteralSource = resolve(sourceLiteralPath, relativeMaskPath);
     const maskLiteralFromCanonicalSource = resolve(sourcePath, relativeMaskPath);
-    const maskCanonicalPath = realpathOrResolve(maskLiteralFromCanonicalSource);
     if (
       isPathInsideOrEqual(maskLiteralFromLiteralSource, path)
       || isPathInsideOrEqual(maskLiteralFromCanonicalSource, path)
-      || isPathInsideOrEqual(maskCanonicalPath, path)
     ) {
       return true;
     }

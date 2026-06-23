@@ -341,6 +341,108 @@ test("boot rejects read-write host directory symlink aliases to persistent rootf
   );
 });
 
+test("boot rejects read-write host directory mounts that expose canonical persistent rootfs locks", async (t) => {
+  const aliasDir = await mkdtemp(join(tmpdir(), "sandbox-persistent-rootfs-canonical-lock-alias-"));
+  const targetDir = await mkdtemp(join(tmpdir(), "sandbox-persistent-rootfs-canonical-lock-target-"));
+  const maskStorage = await mkdtemp(join(tmpdir(), "sandbox-persistent-rootfs-canonical-lock-mask-"));
+  t.after(async () => {
+    await rm(aliasDir, { recursive: true, force: true });
+    await rm(targetDir, { recursive: true, force: true });
+    await rm(maskStorage, { recursive: true, force: true });
+  });
+  const overlayPath = join(targetDir, "rootfs.qcow2");
+  const overlayAlias = join(aliasDir, "rootfs.qcow2");
+  await writeFile(overlayPath, "");
+  await symlink(overlayPath, overlayAlias);
+  const sandbox = defineSandbox({
+    rootfs: rootfs.persistent({
+      base: rootfs.builtIn("alpine:3.23"),
+      path: overlayAlias,
+    }),
+  });
+
+  await assert.rejects(
+    sandbox.boot({
+      mounts: {
+        "/target": fs.bind({
+          source: targetDir,
+          access: "rw",
+          mask: {
+            paths: ["/rootfs.qcow2"],
+            storage: fs.bind({ source: maskStorage, access: "rw" }),
+          },
+        }),
+      },
+    }),
+    /invalid sandbox boot options: host directory source must not expose persistent rootfs overlay lock/,
+  );
+});
+
+test("boot rejects read-write host directory mounts that expose persistent rootfs metadata", async (t) => {
+  const workspace = await mkdtemp(join(tmpdir(), "sandbox-persistent-rootfs-metadata-mount-"));
+  const maskStorage = await mkdtemp(join(tmpdir(), "sandbox-persistent-rootfs-metadata-mask-"));
+  t.after(async () => {
+    await rm(workspace, { recursive: true, force: true });
+    await rm(maskStorage, { recursive: true, force: true });
+  });
+  await mkdir(join(workspace, ".sandbox"));
+  const sandbox = defineSandbox({
+    rootfs: rootfs.persistent({
+      base: rootfs.builtIn("alpine:3.23"),
+      path: join(workspace, ".sandbox", "rootfs.qcow2"),
+    }),
+  });
+
+  await assert.rejects(
+    sandbox.boot({
+      mounts: {
+        "/workspace": fs.bind({
+          source: workspace,
+          access: "rw",
+          mask: {
+            paths: ["/.sandbox/rootfs.qcow2", "/.sandbox/rootfs.qcow2.lock"],
+            storage: fs.bind({ source: maskStorage, access: "rw" }),
+          },
+        }),
+      },
+    }),
+    /invalid sandbox boot options: host directory source must not expose persistent rootfs overlay metadata/,
+  );
+});
+
+test("boot rejects symlinked mask paths as persistent rootfs coverage", async (t) => {
+  const workspace = await mkdtemp(join(tmpdir(), "sandbox-persistent-rootfs-symlink-mask-"));
+  const maskStorage = await mkdtemp(join(tmpdir(), "sandbox-persistent-rootfs-symlink-mask-storage-"));
+  t.after(async () => {
+    await rm(workspace, { recursive: true, force: true });
+    await rm(maskStorage, { recursive: true, force: true });
+  });
+  await mkdir(join(workspace, ".sandbox"));
+  await symlink(join(workspace, ".sandbox"), join(workspace, "masklink"));
+  const sandbox = defineSandbox({
+    rootfs: rootfs.persistent({
+      base: rootfs.builtIn("alpine:3.23"),
+      path: join(workspace, ".sandbox", "rootfs.qcow2"),
+    }),
+  });
+
+  await assert.rejects(
+    sandbox.boot({
+      mounts: {
+        "/workspace": fs.bind({
+          source: workspace,
+          access: "rw",
+          mask: {
+            paths: ["/masklink"],
+            storage: fs.bind({ source: maskStorage, access: "rw" }),
+          },
+        }),
+      },
+    }),
+    /invalid sandbox boot options: host directory source must not expose persistent rootfs overlay/,
+  );
+});
+
 test("boot rejects invalid host directory mask paths", async () => {
   const sandbox = defineSandbox({
     rootfs: rootfs.builtIn("alpine:3.23"),

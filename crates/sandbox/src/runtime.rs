@@ -699,7 +699,18 @@ fn write_persistent_qcow2_overlay_metadata(
     let metadata_path = rootfs_overlay_metadata_path(overlay_target);
     let data = serde_json::to_vec_pretty(metadata)
         .map_err(|_| KrunError::new("rootfs overlay metadata encode", -libc::EIO))?;
-    fs::write(metadata_path, data)
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(metadata_path)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                KrunError::new("rootfs overlay metadata already exists", -libc::EEXIST)
+            } else {
+                KrunError::new("rootfs overlay metadata write", -libc::EIO)
+            }
+        })?;
+    file.write_all(&data)
         .map_err(|_| KrunError::new("rootfs overlay metadata write", -libc::EIO))
 }
 
@@ -1207,6 +1218,30 @@ mod tests {
             error.to_string(),
             "rootfs overlay canonicalize failed with -5"
         );
+    }
+
+    #[test]
+    fn persistent_qcow2_overlay_metadata_write_rejects_existing_sidecar() {
+        let tree = TempTree::new("overlay-metadata-existing-sidecar");
+        let overlay = tree.path.join("rootfs.qcow2");
+        let metadata = rootfs_overlay_metadata_path(&overlay);
+        fs::write(&metadata, b"qcow2").unwrap();
+
+        let error = write_persistent_qcow2_overlay_metadata(
+            &overlay,
+            &PersistentQcow2OverlayMetadata {
+                schema_version: 1,
+                base_identity: "built-in:alpine:3.23:qcow2:test".to_string(),
+                base_digest: "a".repeat(64),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "rootfs overlay metadata already exists failed with -17"
+        );
+        assert_eq!(fs::read(&metadata).unwrap(), b"qcow2");
     }
 
     #[test]
