@@ -341,6 +341,29 @@ test("image release workflows are GitHub-state driven", async () => {
   assert.match(releaseWorkflow, /!startsWith\(github\.event\.release\.tag_name, 'image\/'\)/);
 });
 
+test("local image package bootstrap publishes release assets and documents trusted publishing setup", async () => {
+  const packageJson = JSON.parse(
+    await readFile(new URL("../../package.json", import.meta.url), "utf8"),
+  ) as {
+    readonly scripts: Record<string, string>;
+  };
+  const localPublishScript = await readFile(
+    new URL("../../scripts/publish-image-packages-local.ts", import.meta.url),
+    "utf8",
+  );
+
+  assert.equal(packageJson.scripts["images:publish-local"], "node ./scripts/publish-image-packages-local.ts");
+  assert.match(localPublishScript, /gh", \[\s*"release",\s*"download"/);
+  assert.match(localPublishScript, /npm", \[\s*"publish"/);
+  assert.match(localPublishScript, /"--tag",\s*"image"/);
+  assert.match(localPublishScript, /"--access",\s*"public"/);
+  assert.match(localPublishScript, /npm", \[\s*"whoami"/);
+  assert.match(localPublishScript, /rerun with --yes/);
+  assert.match(localPublishScript, /Trusted publishing cannot be configured by the npm CLI/);
+  assert.match(localPublishScript, /workflowFilename: "image-release-publish\.yml"/);
+  assert.match(localPublishScript, /allowedAction: "npm publish"/);
+});
+
 test("image rootfs builder preserves agent CLI facts and strips Docker markers", async () => {
   const buildImageRootfsScript = await readFile(
     new URL("../../scripts/build-image-rootfs.ts", import.meta.url),
