@@ -17,6 +17,13 @@ import {
   type ImageReleaseVersionInput,
 } from "../../scripts/image-release-version.ts";
 import { imageReleaseDigest } from "../../scripts/image-release-digest.ts";
+import {
+  assertImageReleaseAssets,
+  expectedImagePackageNames,
+  imageReleaseMatchesSelection,
+  imageReleaseNeedsPublish,
+  parseImageReleaseTag,
+} from "../../scripts/image-release-publish-matrix.ts";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(import.meta.dirname, "../..");
@@ -136,6 +143,53 @@ test("image release digest is stable for the same multi-architecture content", a
   assert.notEqual(first, changedFacts);
   assert.match(digestScript, /packageJson/);
   assert.match(digestScript, /prepare-image-npm-packages\.ts/);
+});
+
+test("image publish matrix selects ready unpublished image releases", async () => {
+  const release = {
+    tag_name: "image/alpine-3.23-slim/v0.1.0-image.20260624T002044Z.sha57c1eece389c",
+    draft: false,
+    prerelease: true,
+    published_at: "2026-06-24T00:30:05Z",
+    assets: [
+      {
+        name: "torkbot-sandbox-image-alpine-3.23-slim-0.1.0-image.20260624T002044Z.sha57c1eece389c.tgz",
+        state: "uploaded",
+      },
+      {
+        name: "torkbot-sandbox-image-alpine-3.23-slim-arm64-0.1.0-image.20260624T002044Z.sha57c1eece389c.tgz",
+        state: "uploaded",
+      },
+      {
+        name: "torkbot-sandbox-image-alpine-3.23-slim-x64-0.1.0-image.20260624T002044Z.sha57c1eece389c.tgz",
+        state: "uploaded",
+      },
+    ],
+  };
+
+  assert.deepEqual(parseImageReleaseTag(release.tag_name), {
+    image: "alpine-3.23-slim",
+    version: "0.1.0-image.20260624T002044Z.sha57c1eece389c",
+  });
+  assert.deepEqual(expectedImagePackageNames({ image: "alpine-3.23-slim" }), [
+    "@torkbot/sandbox-image-alpine-3.23-slim",
+    "@torkbot/sandbox-image-alpine-3.23-slim-arm64",
+    "@torkbot/sandbox-image-alpine-3.23-slim-x64",
+  ]);
+  assert.doesNotThrow(() => assertImageReleaseAssets(release));
+  assert.equal(imageReleaseMatchesSelection(release, "all"), true);
+  assert.equal(imageReleaseMatchesSelection(release, "alpine-3.23-slim"), true);
+  assert.equal(imageReleaseMatchesSelection(release, "debian-13-slim"), false);
+  assert.equal(imageReleaseMatchesSelection({ ...release, draft: true }, "all"), false);
+  assert.equal(imageReleaseMatchesSelection({ ...release, published_at: null }, "all"), false);
+
+  const missingOne = async (url: string): Promise<Response> => {
+    return new Response(null, { status: url.includes("-x64/") ? 404 : 200 });
+  };
+  const allPublished = async (): Promise<Response> => new Response(null, { status: 200 });
+
+  assert.equal(await imageReleaseNeedsPublish({ release, fetch: missingOne as typeof fetch }), true);
+  assert.equal(await imageReleaseNeedsPublish({ release, fetch: allPublished as typeof fetch }), false);
 });
 
 test("image package preparation emits a root package and architecture artifact package", async () => {
@@ -268,12 +322,18 @@ test("image release workflows are GitHub-state driven", async () => {
 
   assert.match(publishWorkflow, /release:\n\s+types:\n\s+- published/);
   assert.match(publishWorkflow, /workflow_dispatch:/);
-  assert.match(publishWorkflow, /tag:\n\s+description: Image release tag to publish\n\s+type: string\n\s+required: true/);
-  assert.match(publishWorkflow, /startsWith\(github\.event\.release\.tag_name \|\| inputs\.tag, 'image\/'\)/);
-  assert.match(publishWorkflow, /IMAGE_RELEASE_TAG: \$\{\{ github\.event\.release\.tag_name \|\| inputs\.tag \}\}/);
+  assert.match(publishWorkflow, /image:\n\s+description: Image id to publish, or all\n\s+type: string\n\s+required: true\n\s+default: all/);
+  assert.match(publishWorkflow, /Select image releases to publish/);
+  assert.match(publishWorkflow, /image-release-publish-matrix\.ts --image "\$IMAGE_RELEASE_IMAGE"/);
+  assert.match(publishWorkflow, /image-release-publish-matrix\.ts --tag "\$IMAGE_RELEASE_TAG"/);
+  assert.match(publishWorkflow, /matrix: \$\{\{ fromJson\(needs\.select\.outputs\.matrix\) \}\}/);
+  assert.match(publishWorkflow, /IMAGE_RELEASE_TAG: \$\{\{ matrix\.tag \}\}/);
   assert.match(publishWorkflow, /gh release download/);
   assert.match(publishWorkflow, /Validate release package assets/);
   assert.match(publishWorkflow, /expected exactly one root, arm64, and x64 image package/);
+  assert.match(publishWorkflow, /tar -xOf "\$tarball" package\/package\.json/);
+  assert.match(publishWorkflow, /npm view "\$package_spec" version/);
+  assert.match(publishWorkflow, /already published %s/);
   assert.match(publishWorkflow, /--tag image --provenance --access public/);
   assert.match(publishWorkflow, /npm publish/);
   assert.match(publishWorkflow, /id-token: write/);
