@@ -74,6 +74,24 @@ async function execFileChecked(
   });
 }
 
+async function execFileInteractive(command: string, args: readonly string[]): Promise<void> {
+  const { spawn } = await import("node:child_process");
+  console.log(`$ ${[command, ...args].join(" ")}`);
+  await new Promise<void>((resolvePromise, reject) => {
+    const child = spawn(command, [...args], {
+      stdio: "inherit",
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(`${command} ${args.join(" ")} failed with exit code ${code ?? "unknown"}`));
+        return;
+      }
+      resolvePromise();
+    });
+  });
+}
+
 async function npmPackageVersionExists(packageSpec: string): Promise<boolean> {
   try {
     await execFileChecked("npm", ["view", packageSpec, "version"], { quiet: true });
@@ -164,7 +182,7 @@ async function publishRelease(input: {
         continue;
       }
       console.log(`publishing ${packageSpec}`);
-      await execFileChecked("npm", [
+      await execFileInteractive("npm", [
         "publish",
         tarball,
         "--tag",

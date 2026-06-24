@@ -354,7 +354,8 @@ test("local image package bootstrap publishes release assets and documents trust
 
   assert.equal(packageJson.scripts["images:publish-local"], "node ./scripts/publish-image-packages-local.ts");
   assert.match(localPublishScript, /gh", \[\s*"release",\s*"download"/);
-  assert.match(localPublishScript, /npm", \[\s*"publish"/);
+  assert.match(localPublishScript, /function execFileInteractive|const child = spawn/);
+  assert.match(localPublishScript, /execFileInteractive\("npm", \[\s*"publish"/);
   assert.match(localPublishScript, /"--tag",\s*"image"/);
   assert.match(localPublishScript, /"--access",\s*"public"/);
   assert.match(localPublishScript, /npm", \[\s*"whoami"/);
