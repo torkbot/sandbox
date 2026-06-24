@@ -6,20 +6,74 @@ on:
       - published
   workflow_dispatch:
     inputs:
-      tag:
-        description: Image release tag to publish
+      image:
+        description: Image id to publish, or all
         type: string
         required: true
+        default: all
 
 permissions:
   contents: read
   id-token: write
 
 jobs:
-  publish:
-    name: Publish image packages to npm
-    if: startsWith(github.event.release.tag_name || inputs.tag, 'image/')
+  select:
+    name: Select image releases to publish
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'image/')
     runs-on: ubuntu-24.04
+    outputs:
+      count: ${{ steps.matrix.outputs.count }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24
+
+      - name: Select image release event
+        if: github.event_name == 'release'
+        id: release-matrix
+        run: node ./scripts/image-release-publish-matrix.ts --tag "$IMAGE_RELEASE_TAG"
+        env:
+          IMAGE_RELEASE_TAG: ${{ github.event.release.tag_name }}
+
+      - name: Select requested image releases
+        if: github.event_name == 'workflow_dispatch'
+        id: dispatch-matrix
+        run: node ./scripts/image-release-publish-matrix.ts --image "$IMAGE_RELEASE_IMAGE"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          IMAGE_RELEASE_IMAGE: ${{ inputs.image }}
+
+      - name: Write selected matrix
+        id: matrix
+        run: |
+          set -euo pipefail
+          if [ -n "$RELEASE_COUNT" ]; then
+            printf 'count=%s\n' "$RELEASE_COUNT" >> "$GITHUB_OUTPUT"
+            printf 'matrix=%s\n' "$RELEASE_MATRIX" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          printf 'count=%s\n' "$DISPATCH_COUNT" >> "$GITHUB_OUTPUT"
+          printf 'matrix=%s\n' "$DISPATCH_MATRIX" >> "$GITHUB_OUTPUT"
+        env:
+          RELEASE_COUNT: ${{ steps.release-matrix.outputs.count }}
+          RELEASE_MATRIX: ${{ steps.release-matrix.outputs.matrix }}
+          DISPATCH_COUNT: ${{ steps.dispatch-matrix.outputs.count }}
+          DISPATCH_MATRIX: ${{ steps.dispatch-matrix.outputs.matrix }}
+
+  publish:
+    name: Publish image packages to npm (${{ matrix.image }})
+    needs: select
+    if: needs.select.outputs.count != '0'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.select.outputs.matrix) }}
 
     steps:
       - name: Set up Node.js
@@ -34,7 +88,7 @@ jobs:
           gh release download "$IMAGE_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "*.tgz" --dir dist/npm
         env:
           GH_TOKEN: ${{ github.token }}
-          IMAGE_RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          IMAGE_RELEASE_TAG: ${{ matrix.tag }}
 
       - name: Validate release package assets
         run: |
@@ -59,17 +113,37 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          for tarball in dist/npm/*-arm64-*.tgz dist/npm/*-x64-*.tgz; do
+          publish_tarball() {
+            local tarball="$1"
+            local package_spec
+            package_spec="$(tar -xOf "$tarball" package/package.json | node --input-type=module -e 'let input = ""; process.stdin.on("data", (chunk) => input += chunk); process.stdin.on("end", () => { const pkg = JSON.parse(input); console.log(`${pkg.name}@${pkg.version}`); });')"
+            if npm view "$package_spec" version >/dev/null 2>&1; then
+              printf 'already published %s\n' "$package_spec"
+              return
+            fi
             npm publish "$tarball" --tag image --provenance --access public
+          }
+          for tarball in dist/npm/*-arm64-*.tgz dist/npm/*-x64-*.tgz; do
+            publish_tarball "$tarball"
           done
 
       - name: Publish root image package
         run: |
           set -euo pipefail
           shopt -s nullglob
+          publish_tarball() {
+            local tarball="$1"
+            local package_spec
+            package_spec="$(tar -xOf "$tarball" package/package.json | node --input-type=module -e 'let input = ""; process.stdin.on("data", (chunk) => input += chunk); process.stdin.on("end", () => { const pkg = JSON.parse(input); console.log(`${pkg.name}@${pkg.version}`); });')"
+            if npm view "$package_spec" version >/dev/null 2>&1; then
+              printf 'already published %s\n' "$package_spec"
+              return
+            fi
+            npm publish "$tarball" --tag image --provenance --access public
+          }
           for tarball in dist/npm/*.tgz; do
             case "$tarball" in
               *-arm64-*.tgz|*-x64-*.tgz) continue ;;
             esac
-            npm publish "$tarball" --tag image --provenance --access public
+            publish_tarball "$tarball"
           done
