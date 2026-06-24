@@ -267,10 +267,14 @@ test("image release workflows are GitHub-state driven", async () => {
   assert.doesNotMatch(reconcileWorkflow, /ubuntu:lts|debian:stable|latest/);
 
   assert.match(publishWorkflow, /release:\n\s+types:\n\s+- published/);
-  assert.match(publishWorkflow, /startsWith\(github\.event\.release\.tag_name, 'image\/'\)/);
+  assert.match(publishWorkflow, /workflow_dispatch:/);
+  assert.match(publishWorkflow, /tag:\n\s+description: Image release tag to publish\n\s+type: string\n\s+required: true/);
+  assert.match(publishWorkflow, /startsWith\(github\.event\.release\.tag_name \|\| inputs\.tag, 'image\/'\)/);
+  assert.match(publishWorkflow, /IMAGE_RELEASE_TAG: \$\{\{ github\.event\.release\.tag_name \|\| inputs\.tag \}\}/);
   assert.match(publishWorkflow, /gh release download/);
   assert.match(publishWorkflow, /Validate release package assets/);
   assert.match(publishWorkflow, /expected exactly one root, arm64, and x64 image package/);
+  assert.match(publishWorkflow, /--tag image --provenance --access public/);
   assert.match(publishWorkflow, /npm publish/);
   assert.match(publishWorkflow, /id-token: write/);
 
