@@ -1,4 +1,4 @@
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { spawn } from "node:child_process";
@@ -48,6 +48,7 @@ try {
   await run("docker", ["rmi", "-f", tag], { allowFailure: true });
 }
 await rm(resolve(outDir, ".dockerenv"), { force: true });
+await pruneRootfs(outDir);
 await mkdir(resolve(outDir, "etc"), { recursive: true });
 await writeFile(resolve(outDir, "etc/hostname"), "sandbox\n");
 await writeFile(
@@ -61,6 +62,53 @@ await writeFile(
 );
 
 console.log(`image rootfs directory written to ${outDir}`);
+
+async function pruneRootfs(root: string): Promise<void> {
+  await Promise.all([
+    removePaths(root, [
+      "etc/apk/cache",
+      "root/.cache",
+      "root/.npm",
+      "usr/share/bug",
+      "usr/share/doc",
+      "usr/share/info",
+      "usr/share/lintian",
+      "usr/share/locale",
+      "usr/share/man",
+      "usr/local/include/node",
+      "usr/local/share/doc",
+      "usr/local/share/man",
+      "var/cache/apk",
+      "var/cache/apt/archives",
+      "var/lib/apt/lists",
+    ]),
+    removeContents(root, [
+      "tmp",
+      "var/log",
+      "var/tmp",
+    ]),
+  ]);
+}
+
+async function removePaths(root: string, paths: readonly string[]): Promise<void> {
+  await Promise.all(paths.map((path) => rm(resolve(root, path), { recursive: true, force: true })));
+}
+
+async function removeContents(root: string, paths: readonly string[]): Promise<void> {
+  await Promise.all(paths.map(async (path) => {
+    const dir = resolve(root, path);
+    let entries: string[];
+    try {
+      entries = await readdir(dir);
+    } catch (error) {
+      if (typeof error === "object" && error !== null && "code" in error && (error as { readonly code?: unknown }).code === "ENOENT") {
+        return;
+      }
+      throw error;
+    }
+    await Promise.all(entries.map((entry) => rm(resolve(dir, entry), { recursive: true, force: true })));
+  }));
+}
 
 function environmentFactsManifest(id: string, imageName: string): RootfsEnvironmentFactsManifest {
   const facts: SandboxEnvironmentFact[] = [
