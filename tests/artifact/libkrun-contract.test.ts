@@ -29,3 +29,14 @@ test("virtual filesystem operations use libkrun virtual filesystem traits", asyn
   assert.match(hostVfs, /Arc<dyn VirtioVirtualFsBackend>/);
   assert.match(hostVfs, /impl sandbox::vfs::HostVirtualFileSystem for NodeVirtualFs/);
 });
+
+test("bundled kernels can unpack the sandbox-owned initramfs", async () => {
+  for (const arch of ["aarch64", "x86_64"]) {
+    const config = await readFile(
+      new URL(`../../deps/libkrunfw/config-libkrunfw_${arch}`, import.meta.url),
+      "utf8",
+    );
+
+    assert.match(config, /^CONFIG_BLK_DEV_INITRD=y$/m);
+  }
+});

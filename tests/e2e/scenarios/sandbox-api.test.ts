@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { lstat, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import {
   defineSandbox,
   fs,
@@ -10,16 +10,35 @@ import {
   rootfs,
   type SandboxBlockStore,
   type SandboxEnvironmentFact,
+  type RootfsImageConfig,
 } from "../../../src/index.ts";
 import { requireHostArtifact, requireVmLaunchSupport } from "../support/capabilities.ts";
+import { testRootfsImageOrSkip } from "../support/rootfs.ts";
 
-test("new public API boots a built-in rootfs and runs a process", async (t) => {
+async function testRootfsForVmTest(t: TestContext): Promise<RootfsImageConfig | undefined> {
   if (!requireVmLaunchSupport(t)) {
+    return undefined;
+  }
+
+  return await testRootfsImageOrSkip(t);
+}
+
+async function testRootfsForHostArtifactTest(t: TestContext): Promise<RootfsImageConfig | undefined> {
+  if (!requireHostArtifact(t)) {
+    return undefined;
+  }
+
+  return await testRootfsImageOrSkip(t);
+}
+
+test("new public API boots an external rootfs image and runs a process", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot();
 
   const result = await sandbox.exec("/bin/sh", ["-lc", "printf '%s' ready"]);
@@ -34,12 +53,13 @@ test("new public API boots a built-in rootfs and runs a process", async (t) => {
 });
 
 test("boot configures the default guest hostname", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot();
 
   const result = await sandbox.exec("/bin/sh", ["-lc", "hostname && cat /etc/hostname"]);
@@ -54,12 +74,13 @@ test("boot configures the default guest hostname", async (t) => {
 });
 
 test("boot accepts an instance-specific guest hostname", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot({
     hostname: "agent-42",
   });
@@ -86,12 +107,13 @@ test("boot accepts an instance-specific guest hostname", async (t) => {
 });
 
 test("guest init provides baseline Linux facilities", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot();
 
   const result = await sandbox.exec("/bin/sh", ["-lc", [
@@ -157,12 +179,13 @@ test("guest init provides baseline Linux facilities", async (t) => {
 });
 
 test("buffered exec timeout terminates guest process", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot();
 
   const result = await sandbox.exec("/bin/sh", ["-lc", "sleep 5"], {
@@ -177,12 +200,13 @@ test("buffered exec timeout terminates guest process", async (t) => {
 });
 
 test("buffered exec abort terminates guest process and leaves control usable", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot();
 
   const abort = new AbortController();
@@ -198,12 +222,13 @@ test("buffered exec abort terminates guest process and leaves control usable", a
 });
 
 test("buffered exec abort terminates descendants holding output pipes open", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot();
 
   const marker = "/tmp/abort-descendant-survived";
@@ -225,12 +250,13 @@ test("buffered exec abort terminates descendants holding output pipes open", asy
 });
 
 test("buffered exec calls overlap without blocking the control plane", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot();
 
   const slow = sandbox.exec("/bin/sh", ["-lc", "sleep 1; printf slow"]);
@@ -241,12 +267,13 @@ test("buffered exec calls overlap without blocking the control plane", async (t)
 });
 
 test("buffered exec timeout returns when descendant keeps output pipes open", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot();
 
   const started = Date.now();
@@ -264,12 +291,13 @@ test("buffered exec timeout returns when descendant keeps output pipes open", as
 });
 
 test("buffered exec closes stdin for commands that read input", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot();
 
   const result = await sandbox.exec("/bin/cat");
@@ -280,12 +308,13 @@ test("buffered exec closes stdin for commands that read input", async (t) => {
 });
 
 test("spawn returns stream handles immediately and pipes guest stdio", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot();
 
   const child = sandbox.spawn("/bin/sh", [
@@ -305,12 +334,13 @@ test("spawn returns stream handles immediately and pipes guest stdio", async (t)
 });
 
 test("spawn kill terminates a long-lived guest process", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot();
 
   const child = sandbox.spawn("/bin/sleep", ["30"]);
@@ -321,12 +351,13 @@ test("spawn kill terminates a long-lived guest process", async (t) => {
 });
 
 test("spawn and pty honor already-aborted signals before launching", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot();
 
   const controller = new AbortController();
@@ -353,12 +384,13 @@ test("spawn and pty honor already-aborted signals before launching", async (t) =
 });
 
 test("pty runs an interactive terminal process with a required size", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot();
 
   const term = sandbox.pty("/bin/sh", [
@@ -383,12 +415,13 @@ test("pty runs an interactive terminal process with a required size", async (t) 
 });
 
 test("buffered exec timeout includes output drain time", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot();
 
   const started = Date.now();
@@ -405,13 +438,14 @@ test("buffered exec timeout includes output drain time", async (t) => {
   assert.ok(elapsedMs < 2_000, `timeout returned after ${elapsedMs}ms`);
 });
 
-test("built-in agent rootfs includes common agent runtimes and CLIs", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+test("agent rootfs image includes common agent runtimes and CLIs", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot();
 
   const result = await sandbox.exec("/bin/sh", [
@@ -439,13 +473,14 @@ test("built-in agent rootfs includes common agent runtimes and CLIs", async (t) 
 });
 
 test("environment facts can be recovered from a running VM", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   await using sandbox = await defineSandbox({
     rootfs: rootfs.ephemeral({
-      base: rootfs.builtIn("alpine:3.23"),
+      base: testRootfs,
     }),
     network: network.policy((conn) => {
       conn.accept();
@@ -500,13 +535,14 @@ test("environment facts can be recovered from a running VM", async (t) => {
 });
 
 test("environment facts parse os-release as data", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   await using sandbox = await defineSandbox({
     rootfs: rootfs.ephemeral({
-      base: rootfs.builtIn("alpine:3.23"),
+      base: testRootfs,
     }),
   }).boot();
 
@@ -537,7 +573,8 @@ test("environment facts parse os-release as data", async (t) => {
 });
 
 test("boot options provide instance-specific virtual mounts", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -547,7 +584,7 @@ test("boot options provide instance-specific virtual mounts", async (t) => {
     },
   });
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot({
     mounts: {
       "/mnt": fs.virtual(laneFs),
@@ -561,12 +598,13 @@ test("boot options provide instance-specific virtual mounts", async (t) => {
 });
 
 test("running sandbox exposes a remote-friendly guest filesystem API", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot();
 
   await sandbox.fs.writeFile("/tmp/vmfs/input.txt", "hello world", {
@@ -726,7 +764,8 @@ test("running sandbox exposes a remote-friendly guest filesystem API", async (t)
 });
 
 test("host directory bind mounts use native virtio-fs access modes", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -740,7 +779,7 @@ test("host directory bind mounts use native virtio-fs access modes", async (t) =
   await writeFile(join(readWriteSource, "before.txt"), "before\n");
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot({
     mounts: {
       "/tmp/bind-ro": fs.bind({ source: readOnlySource, access: "ro" }),
@@ -765,7 +804,8 @@ test("host directory bind mounts use native virtio-fs access modes", async (t) =
 });
 
 test("read-only host directory masks hide lower host entries", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -780,7 +820,7 @@ test("read-only host directory masks hide lower host entries", async (t) => {
   await writeFile(join(source, "visible.txt"), "visible\n");
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot({
     mounts: {
       "/tmp/workspace": fs.bind({
@@ -813,7 +853,8 @@ test("read-only host directory masks hide lower host entries", async (t) => {
 });
 
 test("writable host directory masks store guest-created entries in host mask storage", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -834,7 +875,7 @@ test("writable host directory masks store guest-created entries in host mask sto
   await writeFile(join(source, "preexisting"), "lower-preexisting\n");
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot({
     mounts: {
       "/tmp/workspace": fs.bind({
@@ -898,7 +939,8 @@ test("writable host directory masks store guest-created entries in host mask sto
 });
 
 test("missing writable mount directories are created before mounting virtual filesystems", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -908,7 +950,7 @@ test("missing writable mount directories are created before mounting virtual fil
     },
   });
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot({
     mounts: {
       "/tmp/missing-mount": fs.virtual(missingFs),
@@ -922,7 +964,8 @@ test("missing writable mount directories are created before mounting virtual fil
 });
 
 test("top-level read-only rootfs mount directories fail with actionable init output", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -933,7 +976,7 @@ test("top-level read-only rootfs mount directories fail with actionable init out
   });
   await assert.rejects(
     defineSandbox({
-      rootfs: rootfs.builtIn("alpine:3.23"),
+      rootfs: testRootfs,
     }).boot({
       mounts: {
         "/missing-mount": fs.virtual(missingFs),
@@ -944,7 +987,8 @@ test("top-level read-only rootfs mount directories fail with actionable init out
 });
 
 test("missing COW rootfs mount directories do not persist synthetic rootfs paths", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -956,7 +1000,7 @@ test("missing COW rootfs mount directories do not persist synthetic rootfs paths
   });
   const sandboxDefinition = defineSandbox({
     rootfs: rootfs.cow({
-      base: rootfs.builtIn("alpine:3.23"),
+      base: testRootfs,
       writable: blockStore,
       maxDirtyBytes: 128 * 1024,
     }),
@@ -978,7 +1022,8 @@ test("missing COW rootfs mount directories do not persist synthetic rootfs paths
 });
 
 test("ordered nested virtual mounts create child directories under parent mounts", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -993,7 +1038,7 @@ test("ordered nested virtual mounts create child directories under parent mounts
     },
   });
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot({
     mounts: {
       "/workspace": fs.virtual(workspace),
@@ -1011,7 +1056,8 @@ test("ordered nested virtual mounts create child directories under parent mounts
 });
 
 test("invalid rootfs mount targets fail with actionable init output", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -1022,7 +1068,7 @@ test("invalid rootfs mount targets fail with actionable init output", async (t) 
   });
   await assert.rejects(
     defineSandbox({
-      rootfs: rootfs.builtIn("alpine:3.23"),
+      rootfs: testRootfs,
     }).boot({
       mounts: {
         "/etc/passwd": fs.virtual(mountedFs),
@@ -1033,7 +1079,8 @@ test("invalid rootfs mount targets fail with actionable init output", async (t) 
 });
 
 test("virtual memory mounts can be used as the boot cwd", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -1043,7 +1090,7 @@ test("virtual memory mounts can be used as the boot cwd", async (t) => {
     },
   });
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot({
     cwd: "/workspace",
     mounts: {
@@ -1062,7 +1109,8 @@ test("virtual memory mounts can be used as the boot cwd", async (t) => {
 });
 
 test("virtual memory mounts support guest directory reads from root cwd", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -1072,7 +1120,7 @@ test("virtual memory mounts support guest directory reads from root cwd", async 
     },
   });
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot({
     cwd: "/",
     mounts: {
@@ -1091,12 +1139,13 @@ test("virtual memory mounts support guest directory reads from root cwd", async 
 });
 
 test("virtual memory mount paths may contain init delimiters", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot({
     cwd: "/",
     mounts: {
@@ -1124,12 +1173,13 @@ test("virtual memory mount paths may contain init delimiters", async (t) => {
 });
 
 test("boot cwd becomes the default process working directory", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot({
     cwd: "/tmp",
   });
@@ -1140,13 +1190,14 @@ test("boot cwd becomes the default process working directory", async (t) => {
   assert.equal(result.stdout.trim(), "/tmp");
 });
 
-test("built-in rootfs exposes enough guest disk space for agent workloads", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+test("agent rootfs image exposes enough guest disk space for agent workloads", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   }).boot();
 
   const result = await sandbox.exec("/bin/sh", [
@@ -1158,13 +1209,14 @@ test("built-in rootfs exposes enough guest disk space for agent workloads", asyn
   assert.ok(Number(result.stdout.trim()) >= 6 * 1024 * 1024, result.stdout);
 });
 
-test("HTTP interception does not make built-in rootfs writable", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+test("HTTP interception does not make read-only rootfs writable", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       conn.accept();
     }),
@@ -1190,13 +1242,14 @@ test("HTTP interception does not make built-in rootfs writable", async (t) => {
 });
 
 test("ephemeral rootfs allows rootfs mutations only for the running instance", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   const sandboxDefinition = defineSandbox({
     rootfs: rootfs.ephemeral({
-      base: rootfs.builtIn("alpine:3.23"),
+      base: testRootfs,
       maxDirtyBytes: 128 * 1024,
     }),
   });
@@ -1225,14 +1278,15 @@ test("ephemeral rootfs allows rootfs mutations only for the running instance", a
 });
 
 test("COW rootfs round-trips rootfs mutations across instances", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   const blockStore = memoryBlockStore();
   const sandboxDefinition = defineSandbox({
     rootfs: rootfs.cow({
-      base: rootfs.builtIn("alpine:3.23"),
+      base: testRootfs,
       writable: blockStore,
     }),
   });
@@ -1254,11 +1308,12 @@ test("COW rootfs round-trips rootfs mutations across instances", async (t) => {
   assert.equal(read.exitCode, 0, read.stderr);
   assert.equal(read.stdout, "persisted");
   assert.deepEqual(blockStore.observedBaseIdentities().length, 1);
-  assert.match(blockStore.observedBaseIdentities()[0] ?? "", /built-in:alpine:3\.23:qcow2:/);
+  assert.match(blockStore.observedBaseIdentities()[0] ?? "", /^rootfs-image:alpine:3\.23-agent:qcow2:/);
 });
 
 test("persistent rootfs creates and reuses a QCOW2 overlay file", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -1269,7 +1324,7 @@ test("persistent rootfs creates and reuses a QCOW2 overlay file", async (t) => {
   const overlayPath = join(dir, "rootfs.qcow2");
   const sandboxDefinition = defineSandbox({
     rootfs: rootfs.persistent({
-      base: rootfs.builtIn("alpine:3.23"),
+      base: testRootfs,
       path: overlayPath,
     }),
   });
@@ -1299,7 +1354,8 @@ test("persistent rootfs creates and reuses a QCOW2 overlay file", async (t) => {
 });
 
 test("persistent rootfs rejects reuse when base metadata does not match", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -1310,7 +1366,7 @@ test("persistent rootfs rejects reuse when base metadata does not match", async 
   const overlayPath = join(dir, "rootfs.qcow2");
   const sandboxDefinition = defineSandbox({
     rootfs: rootfs.persistent({
-      base: rootfs.builtIn("alpine:3.23"),
+      base: testRootfs,
       path: overlayPath,
     }),
   });
@@ -1326,8 +1382,34 @@ test("persistent rootfs rejects reuse when base metadata does not match", async 
   );
 });
 
+test("persistent rootfs validates the base image digest before reuse", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const dir = await mkdtemp(join(tmpdir(), "sandbox-persistent-rootfs-digest-"));
+  t.after(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  await assert.rejects(
+    defineSandbox({
+      rootfs: rootfs.persistent({
+        base: {
+          ...testRootfs,
+          digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        },
+        path: join(dir, "rootfs.qcow2"),
+      }),
+    }).boot(),
+    /rootfs image digest mismatch/,
+  );
+});
+
 test("persistent rootfs can live under a masked read-write host directory mount", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -1342,7 +1424,7 @@ test("persistent rootfs can live under a masked read-write host directory mount"
   const overlayPath = join(workspace, ".sandbox", "rootfs.qcow2");
   const sandboxDefinition = defineSandbox({
     rootfs: rootfs.persistent({
-      base: rootfs.builtIn("alpine:3.23"),
+      base: testRootfs,
       path: overlayPath,
     }),
   });
@@ -1388,7 +1470,8 @@ test("persistent rootfs can live under a masked read-write host directory mount"
 });
 
 test("persistent rootfs locks only the selected overlay file", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -1400,13 +1483,13 @@ test("persistent rootfs locks only the selected overlay file", async (t) => {
   const secondOverlay = join(dir, "second.qcow2");
   const firstDefinition = defineSandbox({
     rootfs: rootfs.persistent({
-      base: rootfs.builtIn("alpine:3.23"),
+      base: testRootfs,
       path: firstOverlay,
     }),
   });
   const secondDefinition = defineSandbox({
     rootfs: rootfs.persistent({
-      base: rootfs.builtIn("alpine:3.23"),
+      base: testRootfs,
       path: secondOverlay,
     }),
   });
@@ -1445,7 +1528,8 @@ test("persistent rootfs locks only the selected overlay file", async (t) => {
 });
 
 test("persistent rootfs locks canonical overlay targets", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -1461,13 +1545,13 @@ test("persistent rootfs locks canonical overlay targets", async (t) => {
   const aliasOverlay = join(aliasDir, "rootfs.qcow2");
   const realDefinition = defineSandbox({
     rootfs: rootfs.persistent({
-      base: rootfs.builtIn("alpine:3.23"),
+      base: testRootfs,
       path: realOverlay,
     }),
   });
   const aliasDefinition = defineSandbox({
     rootfs: rootfs.persistent({
-      base: rootfs.builtIn("alpine:3.23"),
+      base: testRootfs,
       path: aliasOverlay,
     }),
   });
@@ -1484,14 +1568,15 @@ test("persistent rootfs locks canonical overlay targets", async (t) => {
 });
 
 test("COW rootfs can be flattened to a QCOW2 image stream", async (t) => {
-  if (!requireHostArtifact(t)) {
+  const testRootfs = await testRootfsForHostArtifactTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   const overlay = memoryBlockStore();
   const dest = memoryBlockStore();
   const source = rootfs.compose({
-    base: rootfs.builtIn("alpine:3.23"),
+    base: testRootfs,
     overlay,
   });
 
@@ -1518,14 +1603,15 @@ test("COW rootfs can be flattened to a QCOW2 image stream", async (t) => {
 });
 
 test("COW rootfs close sync ignores the instance cwd", async (t) => {
-  if (!requireVmLaunchSupport(t)) {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
   const blockStore = memoryBlockStore();
   const sandboxDefinition = defineSandbox({
     rootfs: rootfs.cow({
-      base: rootfs.builtIn("alpine:3.23"),
+      base: testRootfs,
       writable: blockStore,
     }),
   });

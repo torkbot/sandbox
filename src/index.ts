@@ -1,16 +1,8 @@
 import {
-  builtInRootfsIdentity,
-  builtInRootfsPath,
-} from "./artifacts.ts";
-import {
-  builtInRootfsEnvironmentCommandFacts,
-  builtInRootfsEnvironmentIdentityFacts,
-  type BuiltInRootfsName,
   type SandboxCommandEnvironmentFact,
   type SandboxDistroEnvironmentFact,
   type SandboxDistroVersion,
   type SandboxDistroVersionEnvironmentFact,
-  type SandboxEnvironmentCommand,
   type SandboxEnvironmentFact,
   type SandboxNetworkEgressEnvironmentFact,
   type SandboxPackageManagerEnvironmentFact,
@@ -41,7 +33,6 @@ import type {
 } from "./launch-options.ts";
 
 export type {
-  BuiltInRootfsName,
   SandboxCommandEnvironmentFact,
   SandboxDistroEnvironmentFact,
   SandboxDistroVersion,
@@ -156,14 +147,22 @@ export interface SandboxHttpRequest {
   };
 }
 
-export type BuiltInRootfsConfig = {
-  readonly kind: "built-in-rootfs";
-  readonly name: BuiltInRootfsName;
+export type RootfsImageConfig = {
+  readonly kind: "rootfs-image";
+  readonly name: string;
+  readonly path: string;
+  readonly format: "qcow2";
+  readonly architecture: NodeJS.Architecture;
+  readonly digest: `sha256:${string}`;
+  readonly sizeBytes: bigint;
+  readonly facts: readonly SandboxEnvironmentFact[];
 };
+
+export type RootfsImageInput = Omit<RootfsImageConfig, "kind">;
 
 export type ComposedRootfsConfig = {
   readonly kind: "composed-rootfs";
-  readonly base: BuiltInRootfsConfig;
+  readonly base: RootfsImageConfig;
   readonly overlay: SandboxBlockStore;
 };
 
@@ -175,20 +174,20 @@ export type CowRootfsConfig = {
 
 export type EphemeralRootfsConfig = {
   readonly kind: "ephemeral-rootfs";
-  readonly base: BuiltInRootfsConfig;
+  readonly base: RootfsImageConfig;
   readonly maxDirtyBytes?: number;
 };
 
 export type PersistentRootfsConfig = {
   readonly kind: "persistent-rootfs";
-  readonly base: BuiltInRootfsConfig;
+  readonly base: RootfsImageConfig;
   readonly path: string;
 };
 
-export type Rootfs = BuiltInRootfsConfig | CowRootfsConfig | EphemeralRootfsConfig | PersistentRootfsConfig;
+export type Rootfs = RootfsImageConfig | CowRootfsConfig | EphemeralRootfsConfig | PersistentRootfsConfig;
 
 export type Qcow2RootfsImage = {
-  readonly kind: "rootfs-image";
+  readonly kind: "flattened-rootfs-image";
   readonly format: "qcow2";
   readonly sizeBytes: bigint;
 };
@@ -781,14 +780,20 @@ interface SandboxDiagnostics {
 }
 
 export const rootfs = {
-  builtIn(name: BuiltInRootfsName): BuiltInRootfsConfig {
+  image(input: RootfsImageInput): RootfsImageConfig {
     return {
-      kind: "built-in-rootfs",
-      name,
+      kind: "rootfs-image",
+      name: input.name,
+      path: input.path,
+      format: input.format,
+      architecture: input.architecture,
+      digest: input.digest,
+      sizeBytes: input.sizeBytes,
+      facts: [...input.facts],
     };
   },
   compose(options: {
-    readonly base: BuiltInRootfsConfig;
+    readonly base: RootfsImageConfig;
     readonly overlay: SandboxBlockStore;
   }): ComposedRootfsConfig {
     return composeRootfs(options);
@@ -797,7 +802,7 @@ export const rootfs = {
     readonly source: ComposedRootfsConfig;
     readonly maxDirtyBytes?: number;
   } | {
-    readonly base: BuiltInRootfsConfig;
+    readonly base: RootfsImageConfig;
     readonly writable: SandboxBlockStore;
     readonly maxDirtyBytes?: number;
   }): Rootfs {
@@ -814,7 +819,7 @@ export const rootfs = {
     };
   },
   ephemeral(options: {
-    readonly base: BuiltInRootfsConfig;
+    readonly base: RootfsImageConfig;
     readonly maxDirtyBytes?: number;
   }): Rootfs {
     return {
@@ -824,7 +829,7 @@ export const rootfs = {
     };
   },
   persistent(options: {
-    readonly base: BuiltInRootfsConfig;
+    readonly base: RootfsImageConfig;
     readonly path: string;
   }): Rootfs {
     return {
@@ -835,7 +840,7 @@ export const rootfs = {
   },
   async flatten(options: {
     readonly format: "qcow2";
-    readonly source: BuiltInRootfsConfig | ComposedRootfsConfig;
+    readonly source: RootfsImageConfig | ComposedRootfsConfig;
     readonly dest: SandboxBlockStore;
     readonly clusterSize?: number;
   }): Promise<Qcow2RootfsImage> {
@@ -844,16 +849,16 @@ export const rootfs = {
     }
     validateImageDestination(options.dest);
     validateQcow2Options(options);
-    const source = options.source.kind === "built-in-rootfs"
+    const source = options.source.kind === "rootfs-image"
       ? composeRootfs({
         base: options.source,
         overlay: createEphemeralCowBlockStore(),
       })
       : options.source;
-    if (source.base.kind !== "built-in-rootfs") {
-      throw new Error("invalid rootfs source: base must be created with rootfs.builtIn(...)");
+    if (source.base.kind !== "rootfs-image") {
+      throw new Error("invalid rootfs source: base must be created with rootfs.image(...)");
     }
-    validateBuiltInRootfsName(source.base.name);
+    validateRootfsImage(source.base, "rootfs source image");
     validateBlockStore(source.overlay);
     const destContext = {
       base: `rootfs-image:qcow2:${randomUUID()}`,
@@ -862,17 +867,17 @@ export const rootfs = {
       throw new Error("invalid rootfs image destination: destination block store context must be empty");
     }
     const result = await HostProcessSandboxVm.flattenQcow2({
-      basePath: builtInRootfsPath(source.base.name),
+      basePath: source.base.path,
       overlay: source.overlay,
       overlayContext: {
-        base: builtInRootfsIdentity(source.base.name),
+        base: rootfsImageIdentity(source.base),
       },
       dest: options.dest,
       destContext,
       clusterSize: options.clusterSize ?? 65536,
     });
     const image: Qcow2RootfsImage = {
-      kind: "rootfs-image",
+      kind: "flattened-rootfs-image",
       format: "qcow2",
       sizeBytes: result.sizeBytes,
     };
@@ -883,15 +888,16 @@ export const rootfs = {
     return image;
   },
   async *bytes(
-    image: BuiltInRootfsConfig | Qcow2RootfsImage,
+    image: RootfsImageConfig | Qcow2RootfsImage,
     options: {
       readonly chunkSize?: number;
       readonly signal?: AbortSignal;
     } = {},
   ): AsyncIterable<Uint8Array> {
     const chunkSize = validateByteStreamChunkSize(options.chunkSize);
-    if (image.kind === "built-in-rootfs") {
-      const file = await open(builtInRootfsPath(image.name), "r");
+    if (image.kind === "rootfs-image") {
+      validateRootfsImage(image, "rootfs image");
+      const file = await open(image.path, "r");
       try {
         const buffer = new Uint8Array(chunkSize);
         let offset = 0;
@@ -926,7 +932,7 @@ export const rootfs = {
 };
 
 function composeRootfs(options: {
-  readonly base: BuiltInRootfsConfig;
+  readonly base: RootfsImageConfig;
   readonly overlay: SandboxBlockStore;
 }): ComposedRootfsConfig {
   return {
@@ -1000,21 +1006,18 @@ function environmentFactsForDefinition(
 ): readonly SandboxEnvironmentFact[] {
   const base = rootfsBase(options.rootfs);
   const facts: SandboxEnvironmentFact[] = [
-    ...builtInRootfsEnvironmentIdentityFacts(base.name),
+    ...base.facts,
   ];
 
   facts.push(configRootfsWriteFact(options.rootfs));
   facts.push(configNetworkEgressFact(options.network));
-  if (options.rootfs.kind === "built-in-rootfs") {
-    facts.push(...builtInRootfsEnvironmentCommandFacts(base.name));
-  }
 
   return facts;
 }
 
-function rootfsBase(rootfs: Rootfs): BuiltInRootfsConfig {
+function rootfsBase(rootfs: Rootfs): RootfsImageConfig {
   switch (rootfs.kind) {
-    case "built-in-rootfs":
+    case "rootfs-image":
       return rootfs;
     case "cow-rootfs":
       return rootfs.source.base;
@@ -1027,7 +1030,7 @@ function rootfsBase(rootfs: Rootfs): BuiltInRootfsConfig {
 
 function configRootfsWriteFact(rootfs: Rootfs): SandboxRootfsEnvironmentFact {
   switch (rootfs.kind) {
-    case "built-in-rootfs":
+    case "rootfs-image":
       return {
         source: "config",
         topic: "rootfs",
@@ -1078,45 +1081,54 @@ function configNetworkEgressFact(
   };
 }
 
-const GUEST_ENVIRONMENT_COMMANDS: readonly SandboxEnvironmentCommand[] =
-  builtInRootfsEnvironmentCommandFacts("alpine:3.23").map((fact) => fact.value);
-const GUEST_ENVIRONMENT_COMMAND_ARGS =
-  GUEST_ENVIRONMENT_COMMANDS.map(shellSingleQuote).join(" ");
+function guestEnvironmentFactScript(
+  configFacts: readonly SandboxEnvironmentFact[],
+): string {
+  const commands = Array.from(new Set(
+    configFacts
+      .filter((fact): fact is SandboxCommandEnvironmentFact => {
+        return fact.source === "config" && fact.topic === "command" && fact.relation === "exists";
+      })
+      .map((fact) => fact.value),
+  ));
+  const commandArgs = commands.map(shellSingleQuote).join(" ");
+  const commandProbe = commandArgs.length === 0
+    ? ":"
+    : `for sandbox_command in ${commandArgs}; do if command -v "$sandbox_command" >/dev/null 2>&1; then printf 'command=%s\\n' "$sandbox_command"; fi; done`;
 
-const GUEST_ENVIRONMENT_FACT_SCRIPT = [
-  "set -eu",
-  "os_release_value() {",
-  "  awk -F= -v key=\"$1\" '",
-  "    $1 == key {",
-  "      value = substr($0, index($0, \"=\") + 1)",
-  "      if (value ~ /^\"/ && value ~ /\"$/) {",
-  "        value = substr(value, 2, length(value) - 2)",
-  "      }",
-  "      print value",
-  "      found = 1",
-  "      exit",
-  "    }",
-  "    END { if (found != 1) exit 1 }",
-  "  ' /etc/os-release",
-  "}",
-  "distro_id=$(os_release_value ID)",
-  "distro_version=$(os_release_value VERSION_ID)",
-  "printf 'distro=%s\\n' \"$distro_id\"",
-  "printf 'distro-version=%s\\n' \"$distro_version\"",
-  "command -v apk >/dev/null 2>&1",
-  "printf 'package-manager=apk\\n'",
-  "test -x /bin/sh",
-  "printf 'shell=/bin/sh\\n'",
-  `for sandbox_command in ${GUEST_ENVIRONMENT_COMMAND_ARGS}; do if command -v "$sandbox_command" >/dev/null 2>&1; then printf 'command=%s\\n' "$sandbox_command"; fi; done`,
-  "root_options=$(awk '$2 == \"/\" { print $4; exit }' /proc/mounts)",
-  [
-    "case \",$root_options,\" in",
-    "*,rw,*) printf 'rootfs=read-write\\n' ;;",
-    "*,ro,*) printf 'rootfs=read-only\\n' ;;",
-    "*) echo \"unable to determine rootfs mount mode: $root_options\" >&2; exit 1 ;;",
-    "esac",
-  ].join(" "),
-].join("\n");
+  return [
+    "set -eu",
+    "os_release_value() {",
+    "  awk -F= -v key=\"$1\" '",
+    "    $1 == key {",
+    "      value = substr($0, index($0, \"=\") + 1)",
+    "      if (value ~ /^\"/ && value ~ /\"$/) {",
+    "        value = substr(value, 2, length(value) - 2)",
+    "      }",
+    "      print value",
+    "      found = 1",
+    "      exit",
+    "    }",
+    "    END { if (found != 1) exit 1 }",
+    "  ' /etc/os-release",
+    "}",
+    "distro_id=$(os_release_value ID)",
+    "distro_version=$(os_release_value VERSION_ID)",
+    "printf 'distro=%s\\n' \"$distro_id\"",
+    "printf 'distro-version=%s\\n' \"$distro_version\"",
+    "if command -v apk >/dev/null 2>&1; then printf 'package-manager=apk\\n'; elif command -v apt-get >/dev/null 2>&1; then printf 'package-manager=apt\\n'; fi",
+    "if test -x /bin/sh; then printf 'shell=/bin/sh\\n'; fi",
+    commandProbe,
+    "root_options=$(awk '$2 == \"/\" { print $4; exit }' /proc/mounts)",
+    [
+      "case \",$root_options,\" in",
+      "*,rw,*) printf 'rootfs=read-write\\n' ;;",
+      "*,ro,*) printf 'rootfs=read-only\\n' ;;",
+      "*) echo \"unable to determine rootfs mount mode: $root_options\" >&2; exit 1 ;;",
+      "esac",
+    ].join(" "),
+  ].join("\n");
+}
 
 function shellSingleQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
@@ -1166,10 +1178,9 @@ function parseGuestEnvironmentFacts(text: string): readonly SandboxEnvironmentFa
 }
 
 function guestDistroFact(value: string): SandboxDistroEnvironmentFact {
-  if (value !== "alpine") {
+  if (!/^[a-z0-9._-]+$/.test(value)) {
     throw new Error(`unsupported guest distro environment fact: ${value}`);
   }
-
   return {
     source: "guest",
     topic: "distro",
@@ -1179,10 +1190,6 @@ function guestDistroFact(value: string): SandboxDistroEnvironmentFact {
 }
 
 function guestDistroVersionFact(value: string): SandboxDistroVersionEnvironmentFact {
-  if (!isSandboxDistroVersion(value)) {
-    throw new Error(`unsupported guest distro version environment fact: ${value}`);
-  }
-
   return {
     source: "guest",
     topic: "distro-version",
@@ -1191,15 +1198,7 @@ function guestDistroVersionFact(value: string): SandboxDistroVersionEnvironmentF
   };
 }
 
-function isSandboxDistroVersion(value: string): value is SandboxDistroVersion {
-  return value === "3.23" || /^3\.23\.[0-9]+$/.test(value);
-}
-
 function guestPackageManagerFact(value: string): SandboxPackageManagerEnvironmentFact {
-  if (value !== "apk") {
-    throw new Error(`unsupported guest package manager environment fact: ${value}`);
-  }
-
   return {
     source: "guest",
     topic: "package-manager",
@@ -1209,10 +1208,6 @@ function guestPackageManagerFact(value: string): SandboxPackageManagerEnvironmen
 }
 
 function guestShellFact(value: string): SandboxShellEnvironmentFact {
-  if (value !== "/bin/sh") {
-    throw new Error(`unsupported guest shell environment fact: ${value}`);
-  }
-
   return {
     source: "guest",
     topic: "shell",
@@ -1235,22 +1230,12 @@ function guestRootfsMountFact(value: string): SandboxRootfsEnvironmentFact {
 }
 
 function guestCommandFact(value: string): SandboxCommandEnvironmentFact {
-  if (!isSandboxEnvironmentCommand(value)) {
-    throw new Error(`unsupported guest command environment fact: ${value}`);
-  }
-
   return {
     source: "guest",
     topic: "command",
     relation: "exists",
     value,
   };
-}
-
-function isSandboxEnvironmentCommand(
-  value: string,
-): value is SandboxEnvironmentCommand {
-  return GUEST_ENVIRONMENT_COMMANDS.includes(value as SandboxEnvironmentCommand);
 }
 
 export function defineSandbox(options: SandboxDefinitionOptions): SandboxDefinition {
@@ -1358,7 +1343,7 @@ class HostBackedSandboxVm implements SandboxVm {
   async environmentFacts(): Promise<readonly SandboxEnvironmentFact[]> {
     const result = await this.#rootExec.exec("/bin/sh", [
       "-lc",
-      GUEST_ENVIRONMENT_FACT_SCRIPT,
+      guestEnvironmentFactScript(this.#configEnvironmentFacts),
     ]);
 
     if (result.exitCode !== 0) {
@@ -1973,9 +1958,9 @@ function ipv6StartsWith(ip: string, prefix: string): boolean {
 
 async function lowerRootfs(rootfs: Rootfs): Promise<InternalSandboxOptions["rootfs"]> {
   switch (rootfs.kind) {
-    case "built-in-rootfs": {
+    case "rootfs-image": {
       return {
-        path: builtInRootfsPath(rootfs.name),
+        path: rootfs.path,
         readonly: true,
         format: "qcow2",
       };
@@ -1994,12 +1979,12 @@ async function lowerRootfs(rootfs: Rootfs): Promise<InternalSandboxOptions["root
 }
 
 function lowerCowRootfs(
-  base: BuiltInRootfsConfig,
+  base: RootfsImageConfig,
   writable: SandboxBlockStore,
   maxDirtyBytes: number,
 ): InternalSandboxOptions["rootfs"] {
   return {
-    path: builtInRootfsPath(base.name),
+    path: base.path,
     readonly: false,
     format: "qcow2",
     storage: {
@@ -2008,19 +1993,19 @@ function lowerCowRootfs(
       maxDirtyBytes,
       blockStore: writable,
       context: {
-        base: builtInRootfsIdentity(base.name),
+        base: rootfsImageIdentity(base),
       },
     },
   };
 }
 
 function lowerEphemeralRootfs(
-  base: BuiltInRootfsConfig,
+  base: RootfsImageConfig,
   maxDirtyBytes: number | undefined,
 ): InternalSandboxOptions["rootfs"] {
   const blockSize = 65536;
   return {
-    path: builtInRootfsPath(base.name),
+    path: base.path,
     readonly: false,
     format: "qcow2",
     storage: {
@@ -2032,40 +2017,21 @@ function lowerEphemeralRootfs(
 }
 
 async function lowerPersistentRootfs(
-  base: BuiltInRootfsConfig,
+  base: RootfsImageConfig,
   path: string,
 ): Promise<InternalSandboxOptions["rootfs"]> {
-  const basePath = builtInRootfsPath(base.name);
+  await verifyRootfsImageDigest(base);
   return {
-    path: basePath,
+    path: base.path,
     readonly: false,
     format: "qcow2",
     storage: {
       kind: "persistent-qcow2-overlay",
       path,
-      baseIdentity: builtInRootfsIdentity(base.name),
-      baseDigest: await builtInRootfsDigest(base.name, basePath),
+      baseIdentity: rootfsImageIdentity(base),
+      baseDigest: rootfsImageDigestHex(base),
     },
   };
-}
-
-function builtInRootfsDigest(name: BuiltInRootfsName, path: string): Promise<string> {
-  validateBuiltInRootfsName(name);
-  return sha256File(path);
-}
-
-function sha256File(path: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const hash = createHash("sha256");
-    const stream = createReadStream(path);
-    stream.on("data", (chunk) => {
-      hash.update(chunk);
-    });
-    stream.on("error", reject);
-    stream.on("end", () => {
-      resolve(hash.digest("hex"));
-    });
-  });
 }
 
 function createEphemeralCowBlockStore(): SandboxBlockStore {
@@ -2096,38 +2062,133 @@ function createEphemeralCowBlockStore(): SandboxBlockStore {
 
 function validateRootfs(rootfs: Rootfs): void {
   switch (rootfs.kind) {
-    case "built-in-rootfs":
-      validateBuiltInRootfsName(rootfs.name);
+    case "rootfs-image":
+      validateRootfsImage(rootfs, "rootfs image");
       return;
     case "cow-rootfs":
       if (rootfs.source?.kind !== "composed-rootfs") {
         throw new Error("invalid sandbox definition: rootfs.cow source must be created with rootfs.compose(...)");
       }
-      if (rootfs.source.base.kind !== "built-in-rootfs") {
-        throw new Error("invalid sandbox definition: rootfs.cow base must be created with rootfs.builtIn(...)");
+      if (rootfs.source.base.kind !== "rootfs-image") {
+        throw new Error("invalid sandbox definition: rootfs.cow base must be created with rootfs.image(...)");
       }
-      validateBuiltInRootfsName(rootfs.source.base.name);
+      validateRootfsImage(rootfs.source.base, "rootfs.cow base");
       validateBlockStore(rootfs.source.overlay);
       validateCowMaxDirtyBytes(rootfs);
       return;
     case "ephemeral-rootfs":
-      if (rootfs.base?.kind !== "built-in-rootfs") {
-        throw new Error("invalid sandbox definition: rootfs.ephemeral base must be created with rootfs.builtIn(...)");
+      if (rootfs.base?.kind !== "rootfs-image") {
+        throw new Error("invalid sandbox definition: rootfs.ephemeral base must be created with rootfs.image(...)");
       }
-      validateBuiltInRootfsName(rootfs.base.name);
+      validateRootfsImage(rootfs.base, "rootfs.ephemeral base");
       validateEphemeralRootfs(rootfs);
       return;
     case "persistent-rootfs":
-      if (rootfs.base?.kind !== "built-in-rootfs") {
-        throw new Error("invalid sandbox definition: rootfs.persistent base must be created with rootfs.builtIn(...)");
+      if (rootfs.base?.kind !== "rootfs-image") {
+        throw new Error("invalid sandbox definition: rootfs.persistent base must be created with rootfs.image(...)");
       }
-      validateBuiltInRootfsName(rootfs.base.name);
+      validateRootfsImage(rootfs.base, "rootfs.persistent base");
       validatePersistentRootfs(rootfs);
       return;
     default:
       throw new Error(
-        "invalid sandbox definition: rootfs must be created with rootfs.builtIn(...), rootfs.ephemeral(...), rootfs.cow(...), or rootfs.persistent(...)",
+        "invalid sandbox definition: rootfs must be created with rootfs.image(...), rootfs.ephemeral(...), rootfs.cow(...), or rootfs.persistent(...)",
       );
+  }
+}
+
+function validateRootfsImage(image: RootfsImageConfig, label: string): void {
+  if (image === null || typeof image !== "object" || image.kind !== "rootfs-image") {
+    throw new Error(`invalid sandbox definition: ${label} must be created with rootfs.image(...)`);
+  }
+  if (typeof image.name !== "string" || image.name.length === 0) {
+    throw new Error(`invalid sandbox definition: ${label} name must not be empty`);
+  }
+  if (image.name.includes("\0")) {
+    throw new Error(`invalid sandbox definition: ${label} name must not contain NUL bytes`);
+  }
+  if (isConvenienceImageAlias(image.name)) {
+    throw new Error(`invalid sandbox definition: ${label} name must be a concrete image version, not a convenience alias`);
+  }
+  if (typeof image.path !== "string" || image.path.length === 0) {
+    throw new Error(`invalid sandbox definition: ${label} path must not be empty`);
+  }
+  if (!isAbsolute(image.path)) {
+    throw new Error(`invalid sandbox definition: ${label} path must be absolute`);
+  }
+  if (image.path.includes("\0")) {
+    throw new Error(`invalid sandbox definition: ${label} path must not contain NUL bytes`);
+  }
+  if (image.format !== "qcow2") {
+    throw new Error(`invalid sandbox definition: ${label} format must be qcow2`);
+  }
+  if (image.architecture !== process.arch) {
+    throw new Error(`invalid sandbox definition: ${label} architecture must match the host architecture ${process.arch}`);
+  }
+  validateRootfsImageDigest(image.digest, label);
+  if (typeof image.sizeBytes !== "bigint" || image.sizeBytes <= 0n) {
+    throw new Error(`invalid sandbox definition: ${label} sizeBytes must be a positive bigint`);
+  }
+  if (!Array.isArray(image.facts)) {
+    throw new Error(`invalid sandbox definition: ${label} facts must be an array`);
+  }
+  const hasImageFact = image.facts.some((fact) => {
+    return fact.source === "config"
+      && fact.topic === "rootfs-image"
+      && fact.relation === "is"
+      && fact.value === image.name;
+  });
+  if (!hasImageFact) {
+    throw new Error(`invalid sandbox definition: ${label} facts must include the rootfs-image identity fact`);
+  }
+  for (const [index, fact] of image.facts.entries()) {
+    validateRootfsImageFact(fact, `${label} facts[${index}]`);
+  }
+}
+
+function validateRootfsImageDigest(
+  digest: string,
+  label: string,
+): asserts digest is `sha256:${string}` {
+  if (typeof digest !== "string" || !/^sha256:[0-9a-f]{64}$/.test(digest)) {
+    throw new Error(`invalid sandbox definition: ${label} digest must be sha256:<64 lowercase hex characters>`);
+  }
+}
+
+function validateRootfsImageFact(fact: SandboxEnvironmentFact, label: string): void {
+  if (fact === null || typeof fact !== "object") {
+    throw new Error(`invalid sandbox definition: ${label} must be an environment fact object`);
+  }
+  if (fact.source !== "config") {
+    throw new Error(`invalid sandbox definition: ${label} source must be config`);
+  }
+  switch (fact.topic) {
+    case "rootfs-image":
+      if (fact.relation !== "is" || typeof fact.value !== "string" || fact.value.length === 0) {
+        throw new Error(`invalid sandbox definition: ${label} must be a rootfs-image identity fact`);
+      }
+      return;
+    case "distro":
+    case "distro-version":
+    case "package-manager":
+    case "shell":
+      if (fact.relation !== "is") {
+        throw new Error(`invalid sandbox definition: ${label} relation must be is`);
+      }
+      if (typeof fact.value !== "string" || fact.value.length === 0) {
+        throw new Error(`invalid sandbox definition: ${label} value must not be empty`);
+      }
+      return;
+    case "command":
+      if (fact.relation !== "exists") {
+        throw new Error(`invalid sandbox definition: ${label} relation must be exists`);
+      }
+      if (typeof fact.value !== "string" || fact.value.length === 0) {
+        throw new Error(`invalid sandbox definition: ${label} value must not be empty`);
+      }
+      return;
+    default:
+      throw new Error(`invalid sandbox definition: ${label} topic is not valid image metadata`);
   }
 }
 
@@ -2141,6 +2202,44 @@ function validatePersistentRootfs(rootfs: PersistentRootfsConfig): void {
   if (rootfs.path.includes("\0")) {
     throw new Error("invalid sandbox definition: persistent rootfs path must not contain NUL bytes");
   }
+}
+
+function rootfsImageIdentity(image: RootfsImageConfig): string {
+  return [
+    "rootfs-image",
+    image.name,
+    image.format,
+    image.architecture,
+    image.digest,
+  ].join(":");
+}
+
+function rootfsImageDigestHex(image: RootfsImageConfig): string {
+  validateRootfsImageDigest(image.digest, "rootfs image");
+  return image.digest.slice("sha256:".length);
+}
+
+async function verifyRootfsImageDigest(image: RootfsImageConfig): Promise<void> {
+  const actualDigest = await sha256File(image.path);
+  if (actualDigest !== image.digest) {
+    throw new Error(`rootfs image digest mismatch for ${image.path}: expected ${image.digest}, got ${actualDigest}`);
+  }
+}
+
+async function sha256File(path: string): Promise<`sha256:${string}`> {
+  const hash = createHash("sha256");
+  await new Promise<void>((resolvePromise, reject) => {
+    const stream = createReadStream(path);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("error", reject);
+    stream.on("end", resolvePromise);
+  });
+  return `sha256:${hash.digest("hex")}`;
+}
+
+function isConvenienceImageAlias(name: string): boolean {
+  const tag = name.includes(":") ? name.slice(name.lastIndexOf(":") + 1) : name;
+  return tag === "latest" || tag === "stable" || tag === "lts" || tag === "current";
 }
 
 function validateBlockStore(blockStore: SandboxBlockStore): void {
@@ -2308,12 +2407,6 @@ function validatePtySize(size: SandboxPtySize, field: string): void {
   }
   if (!Number.isSafeInteger(size.cols) || size.cols <= 0 || size.cols > MAX_PTY_SIZE) {
     throw new Error(`${field}.cols must be an integer between 1 and ${MAX_PTY_SIZE}`);
-  }
-}
-
-function validateBuiltInRootfsName(name: string): void {
-  if (name !== "alpine:3.23") {
-    throw new Error(`unsupported built-in rootfs: ${name}`);
   }
 }
 

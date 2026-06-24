@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import dgram from "node:dgram";
 import net from "node:net";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import tls from "node:tls";
 import {
   defineSandbox,
@@ -14,14 +14,25 @@ import {
   network,
   rootfs,
   type NetworkConnectionRequest,
+  type RootfsImageConfig,
 } from "../../../src/index.ts";
 import { requireVmLaunchSupport } from "../support/capabilities.ts";
 import { execGuestShell, withTimeout } from "../support/guest-control.ts";
+import { testRootfsImageOrSkip } from "../support/rootfs.ts";
 
 const execFileAsync = promisify(execFile);
 
+async function testRootfsForVmTest(t: TestContext): Promise<RootfsImageConfig | undefined> {
+  if (!requireVmLaunchSupport(t)) {
+    return undefined;
+  }
+
+  return await testRootfsImageOrSkip(t);
+}
+
 test("network.policy allows plain HTTP over TCP", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
   const observedHeaders: string[] = [];
   const origin = await startTcpServer((socket) => {
     socket.once("data", (chunk) => {
@@ -33,7 +44,7 @@ test("network.policy allows plain HTTP over TCP", async (t) => {
   t.after(() => void origin.close());
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       if (conn.transport === "tcp") {
         conn.acceptHttp((request) => {
@@ -54,7 +65,8 @@ test("network.policy allows plain HTTP over TCP", async (t) => {
 });
 
 test("network.policy HTTP proxy handles real client framing variants", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
 
   const largeBody = "x".repeat(40_000);
   const observedRequests: Array<{ readonly method: string; readonly path: string }> = [];
@@ -113,7 +125,7 @@ test("network.policy HTTP proxy handles real client framing variants", async (t)
 
   const observedPolicy: Array<{ readonly protocol: string; readonly method: string; readonly path: string }> = [];
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       if (conn.transport === "tcp") {
         conn.acceptHttp((request) => {
@@ -171,7 +183,8 @@ test("network.policy HTTP proxy handles real client framing variants", async (t)
 });
 
 test("network.policy allows HTTP middleware on non-standard TCP ports", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
   const observedHeaders: string[] = [];
   const origin = await startTcpServer((socket) => {
     socket.once("data", (chunk) => {
@@ -183,7 +196,7 @@ test("network.policy allows HTTP middleware on non-standard TCP ports", async (t
   t.after(() => void origin.close());
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       if (conn.transport === "tcp") {
         conn.acceptHttp((request) => {
@@ -203,7 +216,8 @@ test("network.policy allows HTTP middleware on non-standard TCP ports", async (t
 });
 
 test("network.policy ignores spoofed Host headers for HTTP identity", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
   const observedDestinations: Array<{ readonly urlHost: string; readonly hostname?: string }> = [];
   const origin = await startTcpServer((socket) => {
     socket.once("data", () => {
@@ -213,7 +227,7 @@ test("network.policy ignores spoofed Host headers for HTTP identity", async (t) 
   t.after(() => void origin.close());
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       if (conn.transport === "tcp") {
         conn.acceptHttp((request) => {
@@ -239,7 +253,8 @@ test("network.policy ignores spoofed Host headers for HTTP identity", async (t) 
 });
 
 test("network.policy accepts IP HTTP without advertising a hostname", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
   const observedDestinations: Array<{ readonly urlHost: string; readonly hostname?: string }> = [];
   const origin = await startTcpServer((socket) => {
     socket.once("data", () => {
@@ -249,7 +264,7 @@ test("network.policy accepts IP HTTP without advertising a hostname", async (t) 
   t.after(() => void origin.close());
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       if (conn.transport === "tcp") {
         conn.acceptHttp((request) => {
@@ -276,13 +291,14 @@ test("network.policy accepts IP HTTP without advertising a hostname", async (t) 
 });
 
 test("network.policy rejects untrusted HTTPS upstream certificates", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
   const host = "localhost";
   const origin = await startTlsHttpServer(8443);
   t.after(() => void origin.close());
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy(async (conn) => {
       if (conn.transport === "udp" && conn.dst.port === 53) {
         conn.accept();
@@ -306,14 +322,15 @@ test("network.policy rejects untrusted HTTPS upstream certificates", async (t) =
 });
 
 test("network.policy denies private HTTP by destination range before origin access", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
   const origin = await startTcpServer((socket) => {
     socket.end("HTTP/1.1 200 OK\r\ncontent-length: 11\r\n\r\nunexpected");
   });
   t.after(() => void origin.close());
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       if (conn.dst.isLoopback() || conn.dst.isPrivate() || conn.dst.isLinkLocal()) return;
       conn.accept();
@@ -329,13 +346,14 @@ test("network.policy denies private HTTP by destination range before origin acce
 });
 
 test("network.policy allows raw TCP echo traffic without HTTP parsing", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
   const echo = await startTcpServer((socket) => {
     socket.on("data", (chunk) => socket.write(chunk));
   });
   t.after(() => void echo.close());
 
-  await using sandbox = await bootAllowingNetwork();
+  await using sandbox = await bootAllowingNetwork(testRootfs);
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "tcp-echo-allow",
     script: pythonTcpExchange(echo.port, "tcp-echo"),
@@ -347,13 +365,14 @@ test("network.policy allows raw TCP echo traffic without HTTP parsing", async (t
 });
 
 test("network.policy denies raw TCP before upstream receives bytes", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
   const echo = await startTcpServer((socket) => {
     socket.on("data", (chunk) => socket.write(chunk));
   });
   t.after(() => void echo.close());
 
-  await using sandbox = await bootDenyingNetwork();
+  await using sandbox = await bootDenyingNetwork(testRootfs);
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "tcp-echo-deny",
     script: pythonTcpRefused(echo.port),
@@ -365,14 +384,15 @@ test("network.policy denies raw TCP before upstream receives bytes", async (t) =
 });
 
 test("network.policy fails closed when the transport hook throws", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
   const echo = await startTcpServer((socket) => {
     socket.on("data", (chunk) => socket.write(chunk));
   });
   t.after(() => void echo.close());
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy(() => {
       throw new Error("policy failed");
     }),
@@ -388,11 +408,12 @@ test("network.policy fails closed when the transport hook throws", async (t) => 
 });
 
 test("network.policy allows SSH handshake traffic as raw bidirectional TCP", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
   const ssh = await startSshBannerServer();
   t.after(() => void ssh.close());
 
-  await using sandbox = await bootAllowingNetwork();
+  await using sandbox = await bootAllowingNetwork(testRootfs);
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "ssh-allow",
     script: [
@@ -412,11 +433,12 @@ test("network.policy allows SSH handshake traffic as raw bidirectional TCP", asy
 });
 
 test("network.policy denies SSH before the server banner is observed", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
   const ssh = await startSshBannerServer();
   t.after(() => void ssh.close());
 
-  await using sandbox = await bootDenyingNetwork();
+  await using sandbox = await bootDenyingNetwork(testRootfs);
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "ssh-deny",
     script: [
@@ -436,11 +458,12 @@ test("network.policy denies SSH before the server banner is observed", async (t)
 });
 
 test("network.policy allows non-HTTP TLS passthrough without MITM", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
   const tlsEcho = await startTlsEchoServer();
   t.after(() => void tlsEcho.close());
 
-  await using sandbox = await bootAllowingNetwork();
+  await using sandbox = await bootAllowingNetwork(testRootfs);
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "tls-passthrough",
     script: pythonTlsExchange(tlsEcho.port, "tls-ping"),
@@ -452,12 +475,13 @@ test("network.policy allows non-HTTP TLS passthrough without MITM", async (t) =>
 });
 
 test("network.policy acceptHttp without middleware still enforces HTTP", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
   const tlsEcho = await startTlsEchoServer();
   t.after(() => void tlsEcho.close());
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       if (conn.transport === "tcp") {
         conn.acceptHttp();
@@ -474,7 +498,8 @@ test("network.policy acceptHttp without middleware still enforces HTTP", async (
 });
 
 test("network.policy matchHttp accept without middleware preserves raw HTTPS", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
 
   const host = "tls-match.test";
   const dnsServer = await startUdpDnsServer(hostOriginAddress());
@@ -483,7 +508,7 @@ test("network.policy matchHttp accept without middleware preserves raw HTTPS", a
   t.after(() => void tlsEcho.close());
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       if (conn.matchDns()?.accept({
         resolvers: [{ ip: "127.0.0.1", port: dnsServer.port }],
@@ -503,7 +528,8 @@ test("network.policy matchHttp accept without middleware preserves raw HTTPS", a
 });
 
 test("network.policy allows a deterministic Redis-style TCP protocol exchange", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
   const redis = await startTcpServer((socket) => {
     socket.once("data", (chunk) => {
       if (chunk.toString("utf8") === "PING\r\n") {
@@ -515,7 +541,7 @@ test("network.policy allows a deterministic Redis-style TCP protocol exchange", 
   });
   t.after(() => void redis.close());
 
-  await using sandbox = await bootAllowingNetwork();
+  await using sandbox = await bootAllowingNetwork(testRootfs);
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "redis-style",
     script: pythonTcpExchange(redis.port, "PING\r\n"),
@@ -527,7 +553,8 @@ test("network.policy allows a deterministic Redis-style TCP protocol exchange", 
 });
 
 test("network.policy raw-relays token-space TCP commands without HTTP framing", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
   const commandServer = await startTcpServer((socket) => {
     socket.once("data", (chunk) => {
       if (chunk.toString("utf8") === "GET key\r\n") {
@@ -539,7 +566,7 @@ test("network.policy raw-relays token-space TCP commands without HTTP framing", 
   });
   t.after(() => void commandServer.close());
 
-  await using sandbox = await bootAllowingNetwork();
+  await using sandbox = await bootAllowingNetwork(testRootfs);
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "token-space-raw-tcp",
     script: pythonTcpExchange(commandServer.port, "GET key\r\n"),
@@ -551,13 +578,14 @@ test("network.policy raw-relays token-space TCP commands without HTTP framing", 
 });
 
 test("network.policy opens allowed raw relays for server-first TCP protocols", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
   const banner = await startTcpServer((socket) => {
     socket.end("220 sandbox.test service ready\r\n");
   });
   t.after(() => void banner.close());
 
-  await using sandbox = await bootAllowingNetwork();
+  await using sandbox = await bootAllowingNetwork(testRootfs);
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "server-first-raw-tcp",
     script: pythonTcpReadBanner(banner.port),
@@ -569,11 +597,12 @@ test("network.policy opens allowed raw relays for server-first TCP protocols", a
 });
 
 test("network.policy allows generic UDP echo traffic", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
   const udp = await startUdpEchoServer();
   t.after(() => void udp.close());
 
-  await using sandbox = await bootAllowingNetwork();
+  await using sandbox = await bootAllowingNetwork(testRootfs);
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "udp-echo-allow",
     script: pythonUdpExchange(udp.port, "udp-echo"),
@@ -585,9 +614,10 @@ test("network.policy allows generic UDP echo traffic", async (t) => {
 });
 
 test("network.policy allows default DNS over UDP as accepted UDP", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
 
-  await using sandbox = await bootAllowingDns();
+  await using sandbox = await bootAllowingDns(testRootfs);
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "dns-udp-default",
     script: pythonDnsQuery({ transport: "udp", name: "localhost" }),
@@ -598,10 +628,11 @@ test("network.policy allows default DNS over UDP as accepted UDP", async (t) => 
 });
 
 test("network.policy matches default DNS over UDP with DNS capability", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       if (conn.matchDns()?.accept()) return;
     }),
@@ -616,7 +647,8 @@ test("network.policy matches default DNS over UDP with DNS capability", async (t
 });
 
 test("network.policy can answer DNS with custom accept resolvers", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
 
   const dnsServer = await startUdpDnsServer("203.0.113.44");
   t.after(() => {
@@ -624,7 +656,7 @@ test("network.policy can answer DNS with custom accept resolvers", async (t) => 
   });
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       if (conn.matchDns()?.accept({
         resolvers: [{ ip: "127.0.0.1", port: dnsServer.port }],
@@ -642,7 +674,8 @@ test("network.policy can answer DNS with custom accept resolvers", async (t) => 
 });
 
 test("network.policy uses DNS cache hostname as HTTP policy authority", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
 
   const hostname = "policy-cache.test";
   const dnsServer = await startUdpDnsServer(hostOriginAddress());
@@ -660,7 +693,7 @@ test("network.policy uses DNS cache hostname as HTTP policy authority", async (t
   t.after(() => void origin.close());
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       if (conn.matchDns()?.accept({
         resolvers: [{ ip: "127.0.0.1", port: dnsServer.port }],
@@ -683,7 +716,8 @@ test("network.policy uses DNS cache hostname as HTTP policy authority", async (t
 });
 
 test("network.policy uses DNS cache hostname for multi-answer Cloudflare-like A records", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
 
   const hostname = "registry.npmjs.org";
   const originAddress = hostOriginAddress();
@@ -707,7 +741,7 @@ test("network.policy uses DNS cache hostname for multi-answer Cloudflare-like A 
   t.after(() => void origin.close());
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       if (conn.matchDns()?.accept({
         resolvers: [{ ip: "127.0.0.1", port: dnsServer.port }],
@@ -763,7 +797,8 @@ test("network.policy uses DNS cache hostname for multi-answer Cloudflare-like A 
 });
 
 test("network.policy keeps DNS cache hostname for delayed Cloudflare-like package fetches", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
 
   const hostname = "registry.npmjs.org";
   const originAddress = hostOriginAddress();
@@ -786,7 +821,7 @@ test("network.policy keeps DNS cache hostname for delayed Cloudflare-like packag
   t.after(() => void origin.close());
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       if (conn.matchDns()?.accept({
         resolvers: [{ ip: "127.0.0.1", port: dnsServer.port }],
@@ -828,7 +863,8 @@ test("network.policy keeps DNS cache hostname for delayed Cloudflare-like packag
 });
 
 test("network.policy uses DNS cache hostname for CNAME additional-section A records", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
 
   const hostname = "registry.npmjs.org";
   const originAddress = hostOriginAddress();
@@ -850,7 +886,7 @@ test("network.policy uses DNS cache hostname for CNAME additional-section A reco
   t.after(() => void origin.close());
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       if (conn.matchDns()?.accept({
         resolvers: [{ ip: "127.0.0.1", port: dnsServer.port }],
@@ -899,7 +935,8 @@ test("network.policy uses DNS cache hostname for CNAME additional-section A reco
 });
 
 test("network.policy resolver survives synthesized mount directories", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
 
   const dnsServer = await startUdpDnsServer("203.0.113.45");
   t.after(() => {
@@ -907,7 +944,7 @@ test("network.policy resolver survives synthesized mount directories", async (t)
   });
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       if (conn.matchDns()?.accept({
         resolvers: [{ ip: "127.0.0.1", port: dnsServer.port }],
@@ -929,7 +966,8 @@ test("network.policy resolver survives synthesized mount directories", async (t)
 });
 
 test("network.policy resolver setup is isolated from /run/sandbox mounts", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
 
   const dnsServer = await startUdpDnsServer("203.0.113.46");
   t.after(() => {
@@ -937,7 +975,7 @@ test("network.policy resolver setup is isolated from /run/sandbox mounts", async
   });
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       if (conn.matchDns()?.accept({
         resolvers: [{ ip: "127.0.0.1", port: dnsServer.port }],
@@ -959,10 +997,11 @@ test("network.policy resolver setup is isolated from /run/sandbox mounts", async
 });
 
 test("network.policy HTTP CA setup survives /run/sandbox mounts", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       conn.accept();
     }),
@@ -983,10 +1022,11 @@ test("network.policy HTTP CA setup survives /run/sandbox mounts", async (t) => {
 });
 
 test("network.policy HTTP CA setup survives /run mounts", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       conn.accept();
     }),
@@ -1008,10 +1048,11 @@ test("network.policy HTTP CA setup survives /run mounts", async (t) => {
 });
 
 test("network.policy preserves nested mounts below /run/sandbox after HTTP CA setup", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       conn.accept();
     }),
@@ -1039,11 +1080,12 @@ test("network.policy preserves nested mounts below /run/sandbox after HTTP CA se
   assert.equal(result.stdout, "parent\nchild\n");
 });
 
-test("network.policy HTTP CA setup keeps read-only built-in trust store unchanged", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+test("network.policy HTTP CA setup keeps read-only rootfs trust store unchanged", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       conn.accept();
     }),
@@ -1064,10 +1106,11 @@ test("network.policy HTTP CA setup keeps read-only built-in trust store unchange
 });
 
 test("network.policy HTTP CA setup populates writable ephemeral trust store", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.ephemeral({ base: rootfs.builtIn("alpine:3.23") }),
+    rootfs: rootfs.ephemeral({ base: testRootfs }),
     network: network.policy((conn) => {
       conn.accept();
     }),
@@ -1081,10 +1124,11 @@ test("network.policy HTTP CA setup populates writable ephemeral trust store", as
 });
 
 test("network.policy user mount can replace internal HTTP CA mount after setup", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       conn.accept();
     }),
@@ -1103,10 +1147,11 @@ test("network.policy user mount can replace internal HTTP CA mount after setup",
 });
 
 test("network.policy user mount can replace internal HTTP CA mount with normalized path", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       conn.accept();
     }),
@@ -1125,7 +1170,8 @@ test("network.policy user mount can replace internal HTTP CA mount with normaliz
 });
 
 test("network.policy preserves TCP DNS for custom accept resolvers", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
 
   const dnsServer = await startTcpDnsServer("203.0.113.45");
   t.after(() => {
@@ -1133,7 +1179,7 @@ test("network.policy preserves TCP DNS for custom accept resolvers", async (t) =
   });
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       if (conn.matchDns()?.accept({
         resolvers: [{ ip: "127.0.0.1", port: dnsServer.port }],
@@ -1151,9 +1197,10 @@ test("network.policy preserves TCP DNS for custom accept resolvers", async (t) =
 });
 
 test("network.policy allows default DNS over TCP as accepted TCP", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
 
-  await using sandbox = await bootAllowingDns();
+  await using sandbox = await bootAllowingDns(testRootfs);
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "dns-tcp-default",
     script: pythonDnsQuery({ transport: "tcp", name: "localhost" }),
@@ -1164,9 +1211,10 @@ test("network.policy allows default DNS over TCP as accepted TCP", async (t) => 
 });
 
 test("network.policy keeps DNS over TCP sessions reusable", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
 
-  await using sandbox = await bootAllowingDns();
+  await using sandbox = await bootAllowingDns(testRootfs);
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "dns-tcp-reuse",
     script: pythonTcpDnsTwoQueries("localhost", "localhost"),
@@ -1177,11 +1225,12 @@ test("network.policy keeps DNS over TCP sessions reusable", async (t) => {
 });
 
 test("network.policy denies generic UDP before upstream receives datagrams", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
   const udp = await startUdpEchoServer();
   t.after(() => void udp.close());
 
-  await using sandbox = await bootDenyingNetwork();
+  await using sandbox = await bootDenyingNetwork(testRootfs);
   const result = await withTimeout(execGuestShell(sandbox, {
     id: "udp-echo-deny",
     script: pythonUdpExchange(udp.port, "udp-denied"),
@@ -1192,7 +1241,8 @@ test("network.policy denies generic UDP before upstream receives datagrams", asy
 });
 
 test("network.policy exposes source and destination endpoint helpers for transport callbacks", async (t) => {
-  if (!requireVmLaunchSupport(t)) return;
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
   const observations: Array<{
     readonly transport: string;
     readonly srcIp: string;
@@ -1204,7 +1254,7 @@ test("network.policy exposes source and destination endpoint helpers for transpo
   }> = [];
 
   await using sandbox = await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       observations.push(observation(conn));
       conn.accept();
@@ -1225,25 +1275,25 @@ test("network.policy exposes source and destination endpoint helpers for transpo
   }), JSON.stringify(observations, null, 2));
 });
 
-async function bootAllowingNetwork() {
+async function bootAllowingNetwork(testRootfs: RootfsImageConfig) {
   return await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       conn.accept();
     }),
   }).boot();
 }
 
-async function bootDenyingNetwork() {
+async function bootDenyingNetwork(testRootfs: RootfsImageConfig) {
   return await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy(() => {}),
   }).boot();
 }
 
-async function bootAllowingDns() {
+async function bootAllowingDns(testRootfs: RootfsImageConfig) {
   return await defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
     network: network.policy((conn) => {
       conn.matchDns()?.accept();
     }),

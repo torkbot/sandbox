@@ -1,0 +1,15 @@
+{
+  "name": "@torkbot/sandbox-image-alpine-3.23-slim",
+  "private": true,
+  "type": "module",
+  "description": "Source package for the Alpine 3.23 slim sandbox rootfs image.",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/torkbot/sandbox",
+    "directory": "images/alpine-3.23-slim"
+  },
+  "peerDependencies": {
+    "@torkbot/sandbox": "^0.13.0"
+  }
+}

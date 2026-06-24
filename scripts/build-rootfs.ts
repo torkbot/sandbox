@@ -1,25 +1,67 @@
-import { chmod, copyFile, mkdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { getgid, getuid } from "node:process";
 import {
-  builtInRootfsApkPackages,
-  builtInRootfsEnvironmentFactsManifest,
-  builtInRootfsGithubCliVersion,
+  configCommandFact,
+  configRootfsImageFact,
   rootfsEnvironmentFactsManifestFile,
-  type BuiltInRootfsName,
+  type RootfsEnvironmentFactsManifest,
 } from "../src/environment-facts.ts";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 const image = process.env.SANDBOX_ROOTFS_IMAGE ?? "alpine:3.23";
-const rootfsName: BuiltInRootfsName = "alpine:3.23";
+const rootfsName = "alpine:3.23-agent";
 const outDir = resolve(repoRoot, process.env.SANDBOX_ROOTFS_OUT_DIR ?? "dist/rootfs/alpine-3.23");
-const initPath = resolve(
-  repoRoot,
-  process.env.SANDBOX_INIT_BINARY_PATH ?? `dist/init/${guestTarget()}/sandbox-init`,
-);
-const agentPackages = builtInRootfsApkPackages(rootfsName);
-const githubCliVersion = builtInRootfsGithubCliVersion(rootfsName);
+const agentPackages = [
+  "bash",
+  "ca-certificates",
+  "coreutils",
+  "curl",
+  "exiftool",
+  "ffmpeg",
+  "file",
+  "findutils",
+  "git",
+  "imagemagick",
+  "jq",
+  "less",
+  "nodejs-current",
+  "npm",
+  "openssh-client",
+  "poppler-utils",
+  "py3-pip",
+  "python3",
+  "ripgrep",
+  "tar",
+  "unzip",
+  "xz",
+  "zip",
+] as const;
+const githubCliVersion = "2.83.0";
+const rootfsEnvironmentFactsManifest: RootfsEnvironmentFactsManifest = {
+  schemaVersion: 1,
+  rootfs: rootfsName,
+  facts: [
+    configRootfsImageFact(rootfsName),
+    { source: "config", topic: "distro", relation: "is", value: "alpine" },
+    { source: "config", topic: "distro-version", relation: "is", value: "3.23" },
+    { source: "config", topic: "package-manager", relation: "is", value: "apk" },
+    { source: "config", topic: "shell", relation: "is", value: "/bin/sh" },
+    ...[
+      "bash",
+      "curl",
+      "git",
+      "gh",
+      "jq",
+      "node",
+      "npm",
+      "pip3",
+      "python3",
+      "rg",
+    ].map(configCommandFact),
+  ],
+};
 
 await rm(outDir, { recursive: true, force: true });
 await mkdir(outDir, { recursive: true });
@@ -42,8 +84,6 @@ await run("docker", [
   ].join(" && "),
 ]);
 
-await assertExists(initPath);
-await copyFile(initPath, resolve(outDir, "sandbox-init"));
 await rm(resolve(outDir, ".dockerenv"), { force: true });
 await mkdir(resolve(outDir, "usr/lib/sandbox"), { recursive: true });
 await writeFile(
@@ -66,6 +106,7 @@ await writeFile(
 );
 await mkdir(resolve(outDir, "dev"), { recursive: true });
 await mkdir(resolve(outDir, "proc"), { recursive: true });
+await mkdir(resolve(outDir, "run"), { recursive: true });
 await mkdir(resolve(outDir, "sandbox"), { recursive: true });
 await mkdir(resolve(outDir, "sys"), { recursive: true });
 await mkdir(resolve(outDir, "tmp"), { recursive: true, mode: 0o1777 });
@@ -73,21 +114,10 @@ await chmod(resolve(outDir, "tmp"), 0o1777);
 await mkdir(resolve(outDir, "workspace"), { recursive: true });
 await writeFile(
   resolve(outDir, rootfsEnvironmentFactsManifestFile),
-  `${JSON.stringify(builtInRootfsEnvironmentFactsManifest(rootfsName), null, 2)}\n`,
+  `${JSON.stringify(rootfsEnvironmentFactsManifest, null, 2)}\n`,
 );
 
 console.log(`rootfs directory written to ${outDir}`);
-
-function guestTarget(): string {
-  switch (process.arch) {
-    case "arm64":
-      return "aarch64-unknown-linux-musl";
-    case "x64":
-      return "x86_64-unknown-linux-musl";
-    default:
-      throw new Error(`unsupported host architecture for rootfs build: ${process.arch}`);
-  }
-}
 
 function shellArg(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
@@ -112,14 +142,6 @@ function cleanupRootfsScript(): string {
     "rm -rf /root/.cache /tmp/* /var/tmp/*",
     "rm -rf /usr/share/doc /usr/share/man /usr/share/info",
   ].join(" && ");
-}
-
-async function assertExists(path: string): Promise<void> {
-  try {
-    await stat(path);
-  } catch {
-    throw new Error(`required path does not exist: ${path}`);
-  }
 }
 
 async function run(command: string, args: readonly string[]): Promise<void> {

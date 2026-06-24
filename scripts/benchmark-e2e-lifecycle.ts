@@ -1,12 +1,13 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
-import { access, mkdir, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { platform } from "node:os";
 import { resolve } from "node:path";
 
 import { hostBinaryPath } from "../src/host-process.ts";
 import { defineSandbox, rootfs } from "../src/index.ts";
+import type { RootfsEnvironmentFactsManifest } from "../src/environment-facts.ts";
 
 type IterationTiming = {
   readonly iteration: number;
@@ -46,6 +47,7 @@ const runId = new Date()
 const config = parseArgs(process.argv.slice(2));
 
 const artifacts = await assertVmLaunchSupport();
+const testRootfs = await loadBenchmarkRootfs(artifacts.rootfs);
 await mkdir(resolve(repoRoot, config.output), { recursive: true });
 
 const timings: IterationTiming[] = [];
@@ -75,7 +77,7 @@ const report = {
   arch: process.arch,
   command: config.command,
   commandArgs: config.commandArgs,
-  rootfs: "alpine:3.23",
+  rootfs: testRootfs.name,
   git: gitMetadata(),
   node: {
     execPath: process.execPath,
@@ -108,7 +110,7 @@ async function runLifecycleIteration(
   const totalStart = nowMs();
   const bootStart = totalStart;
   const sandboxDefinition = defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   });
 
   const sandbox = await sandboxDefinition.boot();
@@ -144,6 +146,23 @@ async function runLifecycleIteration(
       await sandbox.close();
     }
   }
+}
+
+async function loadBenchmarkRootfs(metadata: ArtifactMetadata) {
+  const factsPath = resolve(repoRoot, "dist/rootfs/alpine-3.23-agent.environment-facts.json");
+  const manifest = JSON.parse(await readFile(factsPath, "utf8")) as RootfsEnvironmentFactsManifest;
+  if (manifest.schemaVersion !== 1) {
+    throw new Error(`unsupported rootfs facts manifest schema version: ${manifest.schemaVersion}`);
+  }
+  return rootfs.image({
+    name: manifest.rootfs,
+    path: metadata.path,
+    format: "qcow2",
+    architecture: process.arch,
+    digest: `sha256:${metadata.sha256}`,
+    sizeBytes: BigInt(metadata.bytes),
+    facts: manifest.facts,
+  });
 }
 
 async function assertVmLaunchSupport(): Promise<{

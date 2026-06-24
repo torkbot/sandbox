@@ -26,6 +26,7 @@ env:
 jobs:
   verify:
     name: Verify release gates
+    if: github.event_name != 'release' || !startsWith(github.event.release.tag_name, 'image/')
     runs-on: ubuntu-24.04
     outputs:
       target-sha: ${{ steps.release-target.outputs.target-sha }}
@@ -107,11 +108,9 @@ jobs:
             --platform "${{ matrix.platform }}" \
             --manifest "${artifact_root}/build-manifest.json" \
             --base-dir "${artifact_root}"
-          mkdir -p target/release dist/rootfs
+          mkdir -p target/release
           cp "${artifact_root}/sandbox-host" target/release/sandbox-host
           chmod 755 target/release/sandbox-host
-          cp "${artifact_root}/rootfs/alpine-3.23.qcow2" dist/rootfs/alpine-3.23.qcow2
-          cp "${artifact_root}/rootfs/alpine-3.23.environment-facts.json" dist/rootfs/alpine-3.23.environment-facts.json
 
       - name: Prepare platform package
         run: node ./scripts/prepare-npm-packages.ts --version "$SANDBOX_RELEASE_VERSION" --platform --current

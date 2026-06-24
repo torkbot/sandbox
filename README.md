@@ -1,30 +1,7 @@
 # Sandbox
 
-Sandbox is a TypeScript-first Node.js library for running AI-agent work inside
-isolated Linux VMs. It gives agent builders a small API for booting strongly
-isolated VMs, mounting host-controlled filesystems, preserving machine state
-across boots, and enforcing explicit network egress policy.
-
-Use Sandbox when your agent needs to run tools, install packages, clone repos,
-execute untrusted code, or call external APIs without handing the work broad
-filesystem or network access on the host machine.
-
-Sandbox is designed for:
-
-- agent runtimes that need disposable or durable Linux workspaces,
-- coding agents that need real shells, compilers, package managers, and repo
-  checkouts,
-- browser or data agents that need tightly-scoped outbound network access,
-- hosted agent platforms that need per-task isolation with policy and audit
-  points in TypeScript,
-- systems that need to broker credentials from the host without putting long
-  lived secrets inside the VM.
-
-## Example
-
-This example creates a durable agent lane, mounts a host-controlled workspace,
-allows DNS through Cloudflare, allows only GitHub API HTTP traffic, and injects
-a short-lived GitHub token from the host before the request leaves the sandbox.
+Run real agent work in isolated Linux VMs while your TypeScript host keeps
+control of files, durable machine state, network egress, and credentials.
 
 ```ts
 import {
@@ -32,8 +9,8 @@ import {
   fs,
   network,
   rootfs,
-  type SandboxBlockStore,
 } from "@torkbot/sandbox";
+import { image as alpine323Agent } from "@torkbot/sandbox-image-alpine-3.23-agent";
 
 const workspace = fs.memory({
   files: {
@@ -41,7 +18,7 @@ const workspace = fs.memory({
   },
 });
 
-const writableRootfs: SandboxBlockStore = new BlobBackedBlockStore({
+const machineState = new AgentMachineStore({
   bucket: "agent-machines",
   keyPrefix: "lanes/github-worker",
 });
@@ -52,23 +29,18 @@ const githubTokens = new GitHubInstallationTokenService({
 
 const sandbox = defineSandbox({
   rootfs: rootfs.cow({
-    base: rootfs.builtIn("alpine:3.23"),
-    writable: writableRootfs,
+    base: alpine323Agent,
+    writable: machineState,
   }),
   resources: {
     cpus: 4,
     memoryMiB: 4096,
   },
   network: network.policy(async (conn) => {
-    // Let commands resolve names, but answer DNS via an explicit resolver.
     if (conn.matchDns()?.accept({ resolvers: ["1.1.1.1"] })) return;
 
-    // Only GitHub API HTTP(S) traffic gets HTTP middleware.
     const github = conn.matchHttp("api.github.com");
-    if (!github) return;
-
-    // Keep the credential decision in host-controlled TypeScript.
-    if (!(await githubTokens.canServe(github))) return;
+    if (!github || !(await githubTokens.canServe(github))) return;
 
     github.accept(async (request) => {
       request.headers.set(
@@ -79,16 +51,72 @@ const sandbox = defineSandbox({
   }),
 });
 
-await using lane = await sandbox.boot({
+await using vm = await sandbox.boot({
   mounts: {
     "/workspace": fs.virtual(workspace),
   },
   cwd: "/workspace",
 });
 
-const result = await lane.exec("sh", [
+const result = await vm.exec("sh", [
   "-lc",
   "cat task.txt && curl -fsSL https://api.github.com/user",
+]);
+```
+
+The VM gets ordinary Linux tools. The host keeps the workspace, saved machine
+state, network policy, and GitHub token outside the guest.
+
+## Install
+
+Install the core library and the image package you want to run:
+
+```sh
+npm install @torkbot/sandbox @torkbot/sandbox-image-alpine-3.23-agent
+```
+
+Base images are separate npm packages that define the Linux environment your
+agent starts from. The core package owns the VM runtime, TypeScript API, and
+policy hooks. Image packages own their contents and release cadence. Pin image
+package versions the same way you pin any other npm dependency.
+
+## Scenario Examples
+
+The examples below build up from a single isolated command to durable agent
+machines, host-controlled data, guest inspection, network policy, and credential
+brokering.
+Each example links to the API section that implements it.
+
+### 1. Run One Command In A Clean VM
+
+Use a pinned Linux image and a memory-backed workspace when the task should
+leave no machine state behind.
+
+Uses: [`defineSandbox`](#definesandboxoptions),
+[`sandbox.boot`](#sandboxbootoptions), [`fs.memory`](#fsmemoryoptions),
+[`fs.virtual`](#fsvirtualfilesystem), [`vm.exec`](#vmexeccommand-args-options).
+
+```ts
+const workspace = fs.memory({
+  files: {
+    "/prompt.txt": "Print the Node.js version\n",
+  },
+});
+
+const sandbox = defineSandbox({
+  rootfs: alpine323Agent,
+});
+
+await using vm = await sandbox.boot({
+  mounts: {
+    "/workspace": fs.virtual(workspace),
+  },
+  cwd: "/workspace",
+});
+
+const result = await vm.exec("sh", [
+  "-lc",
+  "cat prompt.txt && node --version",
 ]);
 
 if (result.exitCode !== 0) {
@@ -96,107 +124,134 @@ if (result.exitCode !== 0) {
 }
 ```
 
-The agent process gets a normal Linux VM. The host keeps control over
-the workspace contents, machine persistence, network decisions, and credential
-injection.
+The workload sees a normal Linux VM. The workspace is host-owned memory, mounted
+into the guest only for this boot.
 
-## Quick Paths
+### 2. Give Each Agent A Durable Machine
 
-### Run one isolated command
+Give an agent a saved machine when package installs, language toolchains,
+cloned repos, and caches should survive across boots.
 
-Use a built-in read-only VM image and a memory-backed workspace:
+Uses: [`rootfs.cow`](#rootfscowoptions),
+[`rootfs.persistent`](#rootfspersistentoptions).
 
 ```ts
-const workspace = fs.memory({
-  files: { "/hello.txt": "hello from the host\n" },
+const machineState = new AgentMachineStore({
+  bucket: "agent-machines",
+  keyPrefix: "lanes/github-worker",
 });
 
 const sandbox = defineSandbox({
-  rootfs: rootfs.builtIn("alpine:3.23"),
-});
-
-await using lane = await sandbox.boot({
-  mounts: { "/workspace": fs.virtual(workspace) },
-  cwd: "/workspace",
-});
-
-const result = await lane.exec("cat", ["hello.txt"]);
-```
-
-### Give an agent a durable machine
-
-Use `rootfs.cow(...)` when package installs, language toolchains, caches, and
-other machine changes should survive across boots. Sandbox handles turning those
-changes into storage operations; your application owns where the changed bytes
-are stored.
-
-```ts
-const source = rootfs.compose({
-  base: rootfs.builtIn("alpine:3.23"),
-  overlay: blockStore,
-});
-
-const sandbox = defineSandbox({
-  rootfs: rootfs.cow({ source }),
-});
-```
-
-Attach one writable storage backend to at most one running sandbox instance at a
-time. Create one backend per lane, or enforce exclusivity in your storage
-layer.
-
-Use `rootfs.persistent(...)` when durable VM state should live in one local file
-on disk instead of in a JavaScript storage backend:
-
-```ts
-const sandbox = defineSandbox({
-  rootfs: rootfs.persistent({
-    base: rootfs.builtIn("alpine:3.23"),
-    path: "/absolute/project/.sandbox/rootfs.qcow2",
+  rootfs: rootfs.cow({
+    base: alpine323Agent,
+    writable: machineState,
   }),
 });
 ```
 
-Sandbox creates the state file on first boot and reuses it on later boots. The
-built-in VM image stays read-only and can be shared by many VMs; only the
-selected state file is single-writer while a VM is running. Sandbox records
-which built-in image the file belongs to and rejects mismatched reuse. The
-`.qcow2` extension identifies the VM disk-image format; for callers, the file is
-just the durable state for that lane.
+`rootfs.cow(...)` lets you plug in your own storage backend for saved machine
+changes. Sandbox handles the VM details; your application decides where the
+agent's machine state lives.
 
-### Mount host-controlled data
+This is powerful because Sandbox saves only the deltas the agent creates. Your
+store can put those deltas anywhere with a block-storage-like API: object
+storage, a database, a local cache, a tenant-scoped service, or a content
+addressed backend. Agents get durable machines without the host copying or
+owning a full VM image per agent.
 
-Mounts are per boot. They are paths inside the VM backed by TypeScript
-filesystem implementations, not host path passthrough.
+For one local durable machine, save changes in a local file:
 
 ```ts
-await using lane = await sandbox.boot({
+const sandbox = defineSandbox({
+  rootfs: rootfs.persistent({
+    base: alpine323Agent,
+    path: "/absolute/project/.sandbox/machine-state",
+  }),
+});
+```
+
+Use `rootfs.ephemeral(...)` when the VM can change its machine for one boot but
+all changes should be discarded:
+
+```ts
+const sandbox = defineSandbox({
+  rootfs: rootfs.ephemeral({
+    base: alpine323Agent,
+    maxDirtyBytes: 64 * 1024 * 1024,
+  }),
+});
+```
+
+### 3. Mount Host-Controlled Workspaces
+
+Use virtual filesystems when your application owns the workspace data and wants
+to serve it through JavaScript callbacks.
+
+Uses: [`fs.virtual`](#fsvirtualfilesystem), [`fs.bind`](#fsbindoptions),
+[`sandbox.boot`](#sandboxbootoptions).
+
+```ts
+const taskFiles = fs.memory({
+  files: {
+    "/README.md": "# Task\n",
+    "/src/input.json": JSON.stringify({ repo: "torkbot/sandbox" }),
+  },
+});
+
+await using vm = await sandbox.boot({
   hostname: "agent-42",
   mounts: {
-    "/workspace": fs.virtual(workspaceFs),
-    "/mnt/shared": fs.virtual(sharedFs),
+    "/workspace": fs.virtual(taskFiles),
   },
   cwd: "/workspace",
 });
 ```
 
-Sandbox configures the kernel hostname during boot. Omit `hostname` to use the
-built-in default `sandbox`.
-
-Sandbox init creates missing mount target directories immediately before
-attaching each virtual filesystem, matching container runtime behavior when the
-target parent is on init-owned tmpfs or comes from an earlier virtual mount. On
-durable machine paths that cannot be created without changing saved machine
-state, boot fails with the startup error surfaced in the host exception.
-
-### Read and write the running guest
-
-Use `vm.fs` when the host needs to inspect or mutate the full composed guest
-filesystem after boot, including the rootfs and every mounted filesystem:
+Use `fs.bind(...)` when the VM should see an existing host directory. The host
+path and access mode are explicit:
 
 ```ts
-await using vm = await sandbox.boot();
+await using vm = await sandbox.boot({
+  mounts: {
+    "/workspace": fs.bind({
+      source: "/Users/alice/project",
+      access: "ro",
+      mask: {
+        paths: ["/.git", "/node_modules"],
+      },
+    }),
+  },
+  cwd: "/workspace",
+});
+```
 
+Writable bind mounts require writable mask storage for masked paths:
+
+```ts
+const maskStorage = fs.bind({
+  source: "/tmp/sandbox-mask-storage/project",
+  access: "rw",
+});
+
+const workspace = fs.bind({
+  source: "/Users/alice/project",
+  access: "rw",
+  mask: {
+    paths: ["/node_modules"],
+    storage: maskStorage,
+  },
+});
+```
+
+### 4. Inspect And Mutate The Running Guest
+
+Use `vm.fs` when the host needs to inspect outputs, create inputs, or publish
+files after boot. This API sees the running machine filesystem, including
+mounted workspaces.
+
+Uses: [`vm.fs`](#vmfs).
+
+```ts
 await vm.fs.writeFile("/tmp/task/input.txt", "hello world", {
   createParents: true,
 });
@@ -211,191 +266,142 @@ const published = new TextDecoder().decode(chunk);
 await vm.fs.rename("/tmp/task/input.txt", "/tmp/task/published.txt");
 ```
 
-`readDir(...)` returns entry names, exact entry-name bytes, and metadata
-together, so callers do not need one `stat(...)` call per entry. `writeFile(...)`
-creates a missing file and replaces an existing file; `createParents` only
-controls whether missing parent directories are created first.
+`readDir(...)` returns entry names, raw entry-name bytes, and metadata together,
+so callers do not need one `stat(...)` call per entry.
 
-### Control network egress
+### 5. Run Long-Lived And Interactive Tools
 
-Networking is default-deny. Policy callbacks grant only the flows they accept:
+Use `exec(...)` for buffered commands, `spawn(...)` for streaming processes, and
+`pty(...)` for shells, REPLs, pagers, and terminal UIs.
+
+Uses: [`vm.exec`](#vmexeccommand-args-options),
+[`vm.spawn`](#vmspawncommand-args-options), [`vm.pty`](#vmptycommand-args-options).
+
+```ts
+const result = await vm.exec("npm", ["test"], {
+  cwd: "/workspace",
+  env: { CI: "1" },
+  timeoutMs: 120_000,
+  signal: abortController.signal,
+});
+```
+
+```ts
+import { Writable } from "node:stream";
+
+const child = vm.spawn("npm", ["test"], {
+  cwd: "/workspace",
+});
+
+child.stdout.pipeTo(Writable.toWeb(process.stdout));
+child.stderr.pipeTo(Writable.toWeb(process.stderr));
+
+const { exitCode } = await child.exit;
+```
+
+```ts
+import { Readable, Writable } from "node:stream";
+
+const shell = vm.pty("/bin/sh", ["-i"], {
+  cwd: "/workspace",
+  env: { TERM: "xterm-256color" },
+  size: { rows: 40, cols: 120 },
+});
+
+Readable.toWeb(process.stdin).pipeTo(shell.input);
+shell.output.pipeTo(Writable.toWeb(process.stdout));
+```
+
+### 6. Enforce Default-Deny Network Egress
+
+Networking is blocked unless the policy callback creates a grant.
+
+Uses: [`network.policy`](#networkpolicyonconnectionrequest),
+[`conn.matchDns`](#connmatchdns), [`conn.matchHttp`](#connmatchhttpmatcher),
+[`conn.accept`](#connaccept).
 
 ```ts
 const sandbox = defineSandbox({
-  rootfs: rootfs.builtIn("alpine:3.23"),
+  rootfs: alpine323Agent,
   network: network.policy((conn) => {
     if (conn.matchDns()?.accept({ resolvers: ["1.1.1.1"] })) return;
 
-    conn.matchHttp("api.example.com")?.accept((request) => {
-      request.headers.set("authorization", `Bearer ${apiToken}`);
+    conn.matchHttp("api.example.com")?.accept();
+  }),
+});
+```
+
+Use raw transport grants for protocol-independent reachability:
+
+```ts
+const sandbox = defineSandbox({
+  rootfs: alpine323Agent,
+  network: network.policy((conn) => {
+    if (conn.dst.isLoopback()) {
+      conn.accept();
+      return;
+    }
+
+    if (conn.matchTcp("203.0.113.10:5432")?.accept()) return;
+  }),
+});
+```
+
+HTTP matching is based on trusted destination metadata, not on the guest-sent
+HTTP `Host` header.
+
+### 7. Broker Credentials From The Host
+
+Keep credentials in the host process. Let the VM run ordinary tools, but attach
+authorization only to the upstream request after Sandbox has matched the flow.
+
+Uses: [`HttpConnectionMatch.accept`](#httpconnectionmatchacceptmiddleware),
+[`SandboxHttpRequest`](#sandboxhttprequest).
+
+```ts
+const githubTokens = new GitHubInstallationTokenService({
+  installationId: 123456,
+});
+
+const sandbox = defineSandbox({
+  rootfs: rootfs.cow({
+    base: alpine323Agent,
+    writable: writableRootfs,
+  }),
+  network: network.policy(async (conn) => {
+    if (conn.matchDns()?.accept({ resolvers: ["1.1.1.1"] })) return;
+
+    const github = conn.matchHttp("api.github.com");
+    if (!github) return;
+
+    if (!(await githubTokens.canServe(github))) return;
+
+    github.accept(async (request) => {
+      request.headers.set(
+        "authorization",
+        `Bearer ${await githubTokens.tokenForRequest(request)}`,
+      );
     });
   }),
 });
 ```
 
-Use `conn.accept()` for raw transport, and protocol match helpers when you want
-Sandbox to handle protocol-specific semantics. `conn.matchHttp(...)` does not
-trust the HTTP `Host` header; it uses trusted destination metadata and then
-routes accepted traffic through HTTP-family enforcement.
+The guest never receives the token through environment variables, mounted files,
+or rewritten guest-visible request bytes.
 
-### Broker credentials from the host
+### 8. Snapshot A Configured Machine
 
-Credential injection belongs in HTTP middleware, not in the VM filesystem or
-environment:
+Use `rootfs.compose(...)`, `rootfs.flatten(...)`, and `rootfs.bytes(...)` when
+saved machine state should become a portable image you can upload, archive, or
+reuse later.
 
-```ts
-const github = conn.matchHttp("api.github.com");
-if (!github) return;
-
-if (!(await policyManager.allow(github))) return;
-
-github.accept(async (request) => {
-  request.headers.set(
-    "authorization",
-    `Bearer ${await policyManager.tokenFor(request)}`,
-  );
-});
-```
-
-This lets the VM run ordinary tools such as `curl`, `git`, package managers,
-or language CLIs while the host decides which outbound requests receive
-credentials.
-
-## API Reference
-
-### `defineSandbox(options)`
-
-Creates reusable machine configuration.
-
-```ts
-const sandbox = defineSandbox({
-  rootfs: rootfs.builtIn("alpine:3.23"),
-  resources: {
-    cpus: 4,
-    memoryMiB: 4096,
-  },
-  network: network.policy((conn) => {
-    conn.matchDns()?.accept({ resolvers: ["1.1.1.1"] });
-  }),
-});
-```
-
-`defineSandbox(...)` does not start a VM. It describes rootfs, resource, and
-network policy defaults that can be reused across many boots.
-
-Use `environmentFacts()` on a definition to recover facts known from
-configuration without starting a VM:
-
-```ts
-const facts = sandbox.environmentFacts();
-```
-
-Use `environmentFacts()` on a booted instance when the caller needs observations
-from the running VM as well:
-
-```ts
-await using vm = await sandbox.boot();
-
-const facts = await vm.environmentFacts();
-```
-
-Facts are affirmative typed triples with required provenance. The exported
-`SandboxEnvironmentFact` union narrows `topic`, `relation`, and `value`; every
-member has this outer shape:
-
-```ts
-type SandboxEnvironmentFact = {
-  source: "config" | "guest";
-  topic: string;
-  relation: string;
-  value: string;
-};
-```
-
-The current built-in Alpine rootfs reports facts such as
-`rootfs-image is alpine:3.23`, `distro is alpine`, `distro-version is 3.23`,
-`package-manager is apk`, `shell is /bin/sh`, rootfs write semantics, and
-policy-controlled network egress when `network.policy(...)` is configured.
-Read-only built-in definitions also report concrete `command exists ...`
-entries for `bash`, `curl`, `git`, `gh`, `jq`, `node`, `npm`, `python3`,
-`pip3`, and `rg`; writable rootfs definitions leave command availability to
-the booted instance's runtime-observed facts. Built-in image facts are sourced
-from the rootfs build definition. The booted instance additionally reports
-runtime-observed distro, distro version, package-manager, shell, command
-availability, and root mount mode facts.
-
-### `rootfs`
-
-In this API, `rootfs` means the Linux machine state the VM starts from:
-system packages, language runtimes, caches, and files outside your explicit
-workspace mounts. Most application code should choose whether that machine is
-read-only, temporary, saved through application storage, or saved in one local
-file.
-
-```ts
-rootfs.builtIn("alpine:3.23");
-```
-
-Selects a built-in VM image that the guest can read but not modify. Built-in
-images are prepared at build or install time; Sandbox does not pull container
-images or build root filesystems during `boot()`.
-
-```ts
-rootfs.ephemeral({
-  base: rootfs.builtIn("alpine:3.23"),
-  maxDirtyBytes: 64 * 1024 * 1024,
-});
-```
-
-Gives the VM writable machine state for one boot. Sandbox keeps changes in
-memory and discards them when the sandbox instance exits. Use this when a
-command needs to install packages, write caches, or mutate the Linux machine,
-but those changes must not persist across boots.
-
-```ts
-rootfs.cow({
-  base: rootfs.builtIn("alpine:3.23"),
-  writable: blockStore,
-  maxDirtyBytes: 64 * 1024 * 1024,
-});
-```
-
-Gives the VM a writable machine whose changes are saved through your
-`SandboxBlockStore`. Use this when durable machine state belongs in your own
-storage service, such as object storage, a database-backed block store, or a
-per-agent lane store.
-
-```ts
-rootfs.persistent({
-  base: rootfs.builtIn("alpine:3.23"),
-  path: "/absolute/project/.sandbox/rootfs.qcow2",
-});
-```
-
-Gives the VM a writable machine whose changes are saved in one local host file.
-The `path` is required and must be absolute. If the file does not exist, Sandbox
-creates it on first boot; the parent directory must already exist. If the file
-already exists, Sandbox reuses it. The file is a QCOW2 overlay: a sparse VM disk
-image that stores changes on top of the read-only built-in image. The built-in
-image itself is opened read-only and is not locked, so many VMs can share the
-same base image. Sandbox records which built-in image the state file belongs to
-and rejects reuse with a different base.
-
-The state file is host-owned VM state. Keep it outside guest-writable
-host-directory mounts, or hide its containing directory with a host-directory
-`mask.paths` entry such as `"/.sandbox"`. Sandbox does not attempt to prove this
-for arbitrary host paths, symlinks, or mount layouts. The state file is locked
-for the VM lifetime on filesystems that honor advisory file locks;
-concurrent boots must use distinct state files unless the caller supplies
-stronger storage coordination.
-
-For offline image export, describe the same saved machine state without booting
-a VM:
+Uses: [`rootfs.compose`](#rootfscomposeoptions),
+[`rootfs.flatten`](#rootfsflattenoptions), [`rootfs.bytes`](#rootfsbytesimage-options).
 
 ```ts
 const source = rootfs.compose({
-  base: rootfs.builtIn("alpine:3.23"),
-  overlay: blockStore,
+  base: alpine323Agent,
+  overlay: machineState,
 });
 
 const image = await rootfs.flatten({
@@ -410,29 +416,215 @@ for await (const chunk of rootfs.bytes(image)) {
 }
 ```
 
-Here, `overlay` means the saved changes layered on top of the read-only built-in
-image.
+Most applications can keep using `rootfs.cow(...)` or `rootfs.persistent(...)`.
+This export path is for systems that need to turn a configured machine into a
+portable image.
 
-`rootfs.ephemeral(...)`, `rootfs.cow(...)`, and `rootfs.persistent(...)` all
-present a writable Linux machine without modifying the built-in image.
-`rootfs.cow(...)` normalizes through the same composed source used by
-`rootfs.flatten(...)`, so boot and image export share one contract: a read-only
-base plus saved changes. Unchanged data is served from the built-in image.
-Changed data is read lazily and flushed through your `SandboxBlockStore`.
-`maxDirtyBytes` limits how much changed data Sandbox buffers before forcing a
-write to the storage backend during a run. For
-`rootfs.ephemeral(...)`, the same value is the native in-memory change budget;
-VM writes beyond that budget fail instead of growing host memory without
-bound. When omitted, Sandbox uses a 64 MiB default.
-`rootfs.persistent(...)` stores the saved changes directly in the local state
-file instead of a `SandboxBlockStore`; the file is sparse and grows as the VM
-writes.
+## Public API
 
-`rootfs.flatten(...)` writes a standalone bootable disk image into `dest`, using
-`dest` as random-access image-byte storage. `rootfs.bytes(...)` streams raw image
-container bytes for a built-in image or a flattened image; it does not stream the
-filesystem contents inside the image. The current export format is QCOW2, a
-sparse disk-image container understood by common tooling.
+This section documents the public API in the same order as the scenario
+examples above.
+
+### `defineSandbox(options)`
+
+Used in: [Run one command](#1-run-one-command-in-a-clean-vm),
+[durable machines](#2-give-each-agent-a-durable-machine),
+[network policy](#6-enforce-default-deny-network-egress).
+
+```ts
+const sandbox = defineSandbox({
+  rootfs: alpine323Agent,
+  resources: {
+    cpus: 4,
+    memoryMiB: 4096,
+  },
+  network: network.policy((conn) => {
+    conn.matchDns()?.accept({ resolvers: ["1.1.1.1"] });
+  }),
+});
+```
+
+`defineSandbox(...)` validates reusable VM configuration. It does not start a
+VM. `rootfs` is required. `resources` and `network` are optional.
+
+Use `environmentFacts()` on a definition to recover facts known from
+configuration without launching a VM:
+
+```ts
+const facts = sandbox.environmentFacts();
+```
+
+### `sandbox.boot(options)`
+
+Used in: [Run one command](#1-run-one-command-in-a-clean-vm),
+[mount host-controlled workspaces](#3-mount-host-controlled-workspaces).
+
+```ts
+await using vm = await sandbox.boot({
+  hostname: "agent-42",
+  mounts: {
+    "/workspace": fs.virtual(workspaceFs),
+  },
+  cwd: "/workspace",
+});
+```
+
+Boot options are per instance. The same sandbox definition can be booted with
+different mounts, hostnames, and working directories.
+
+`mounts` is a record keyed by absolute guest paths. `cwd`, when supplied, is the
+default working directory for later process calls. `hostname` configures the
+guest hostname for that boot. Omit it to use `sandbox`.
+
+### `rootfs.image(input)`
+
+Used in: [Install](#install), [machine state options](#2-give-each-agent-a-durable-machine).
+
+```ts
+rootfs.image({
+  name: "alpine:3.23-agent",
+  path: "/absolute/path/to/alpine-3.23-agent.qcow2",
+  format: "qcow2",
+  architecture: process.arch,
+  digest: "sha256:<64 lowercase hex characters>",
+  sizeBytes: 167772160n,
+  facts: [
+    {
+      source: "config",
+      topic: "rootfs-image",
+      relation: "is",
+      value: "alpine:3.23-agent",
+    },
+  ],
+});
+```
+
+Describes the read-only Linux environment a VM starts from. All fields are
+required. Sandbox does not accept moving aliases such as `latest`, `stable`,
+`current`, or `lts`, and it does not pull or build images during `boot()`.
+
+Most applications should import an image package rather than construct this
+descriptor by hand:
+
+```ts
+import { image as alpine323Agent } from "@torkbot/sandbox-image-alpine-3.23-agent";
+```
+
+### `rootfs.ephemeral(options)`
+
+Used in: [Durable machines](#2-give-each-agent-a-durable-machine).
+
+```ts
+rootfs.ephemeral({
+  base: alpine323Agent,
+  maxDirtyBytes: 64 * 1024 * 1024,
+});
+```
+
+Gives the VM writable machine state for one boot. Changes are held in memory
+and discarded when the VM exits. `base` is required. `maxDirtyBytes` is optional
+and defaults to 64 MiB.
+
+### `rootfs.cow(options)`
+
+Used in: [Durable machines](#2-give-each-agent-a-durable-machine),
+[snapshot a configured machine](#8-snapshot-a-configured-machine).
+
+```ts
+rootfs.cow({
+  base: alpine323Agent,
+  writable: blockStore,
+  maxDirtyBytes: 64 * 1024 * 1024,
+});
+```
+
+Creates a VM whose machine changes are saved through caller-owned storage. The
+starting image remains read-only. You can also pass a pre-composed source:
+
+```ts
+const source = rootfs.compose({
+  base: alpine323Agent,
+  overlay: blockStore,
+});
+
+rootfs.cow({ source });
+```
+
+Attach one writable state store to at most one running VM at a time, or enforce
+single-writer coordination in your storage layer.
+
+### `rootfs.persistent(options)`
+
+Used in: [Durable machines](#2-give-each-agent-a-durable-machine).
+
+```ts
+rootfs.persistent({
+  base: alpine323Agent,
+  path: "/absolute/project/.sandbox/machine-state",
+});
+```
+
+Creates or reuses one local file for durable machine state. `path` is required
+and must be absolute. The starting image stays read-only and can be shared by
+many VMs; the selected state file is locked for the VM lifetime on filesystems
+that honor advisory locks.
+
+Keep the state file outside guest-writable host-directory mounts, or hide the
+containing directory with a host-directory mask such as `"/.sandbox"`.
+
+### `rootfs.compose(options)`
+
+Used in: [Snapshot a configured machine](#8-snapshot-a-configured-machine).
+
+```ts
+const source = rootfs.compose({
+  base: alpine323Agent,
+  overlay: blockStore,
+});
+```
+
+Pairs a starting image with saved machine changes. `rootfs.cow(...)` and
+`rootfs.flatten(...)` both understand this composed source.
+
+### `rootfs.flatten(options)`
+
+Used in: [Snapshot a configured machine](#8-snapshot-a-configured-machine).
+
+```ts
+const image = await rootfs.flatten({
+  format: "qcow2",
+  source,
+  dest: imageStore,
+  clusterSize: 65536,
+});
+```
+
+Writes a standalone machine image into `dest`. `source` is either a rootfs image
+or a composed rootfs source. `dest` is a writable `SandboxBlockStore`. The
+current output format is `qcow2`.
+
+### `rootfs.bytes(image, options)`
+
+Used in: [Snapshot a configured machine](#8-snapshot-a-configured-machine).
+
+```ts
+for await (const chunk of rootfs.bytes(image, { chunkSize: 1024 * 1024 })) {
+  await upload(chunk);
+}
+```
+
+Streams image bytes for a rootfs image descriptor or a flattened image. It does
+not stream the filesystem contents inside the image.
+
+### `SandboxBlockStore`
+
+Used in: [Durable machines](#2-give-each-agent-a-durable-machine),
+[snapshot a configured machine](#8-snapshot-a-configured-machine).
+
+`SandboxBlockStore` is the advanced extension point behind caller-owned machine
+state. Sandbox stores only the changes made by the VM. Implement this interface
+when you want those deltas in object storage, a database, a cache, or another
+service instead of a local file.
 
 ```ts
 interface SandboxBlockStore {
@@ -450,105 +642,114 @@ interface SandboxBlockStore {
 }
 ```
 
-The `context.base` value identifies the exact built-in base image for the boot,
-so storage layers can namespace blocks, reject mismatched snapshots, or migrate
-state.
+The `context.base` value identifies the starting image or generated image being
+read or written. Storage layers can use it to namespace deltas, reject
+mismatched snapshots, or migrate state.
 
-`write()` receives block bytes owned by the block store. The sandbox runtime
-will not mutate those `Uint8Array` values after passing them to `write()`, so a
-store may retain them for delayed persistence. A store that returns bytes from
-`read()` should treat the returned arrays as immutable after the promise
-resolves.
+`write()` receives block bytes owned by the block store. Sandbox will not
+mutate those `Uint8Array` values after passing them to `write()`, so stores may
+retain them for delayed persistence.
 
-### `sandbox.boot(options)`
+### `fs.memory(options)`
 
-Boots a sandbox instance.
-
-```ts
-await using lane = await sandbox.boot({
-  mounts: {
-    "/workspace": fs.virtual(workspaceFs),
-  },
-  cwd: "/workspace",
-});
-```
-
-Boot options are per instance. The same sandbox definition can be booted with
-different mounts and working directories.
-
-### Filesystems
+Used in: [Run one command](#1-run-one-command-in-a-clean-vm),
+[mount host-controlled workspaces](#3-mount-host-controlled-workspaces).
 
 ```ts
-const workspaceFs = fs.memory({
+const workspace = fs.memory({
   files: {
     "/README.md": "# Task\n",
   },
 });
 ```
 
-`fs.memory(...)` creates an in-memory POSIX filesystem.
+Creates an in-memory POSIX filesystem.
+
+### `fs.virtual(fileSystem)`
+
+Used in: [Run one command](#1-run-one-command-in-a-clean-vm),
+[mount host-controlled workspaces](#3-mount-host-controlled-workspaces).
 
 ```ts
-const mount = fs.virtual(workspaceFs);
+const mount = fs.virtual(workspace);
 ```
 
-`fs.virtual(...)` adapts a compatible JavaScript filesystem for guest mounts.
-Sandbox virtual mounts are host-implemented filesystems, not direct host
-directory mounts.
+Adapts a compatible JavaScript filesystem for guest mounting. Virtual mounts
+are host-implemented filesystems, not host path passthrough.
+
+### `fs.bind(options)`
+
+Used in: [Mount host-controlled workspaces](#3-mount-host-controlled-workspaces).
 
 ```ts
-const source = fs.bind({
-  source: "/Users/alice/project",
-  access: "ro",
-});
-```
-
-`fs.bind(...)` mounts an absolute host directory through native virtio-fs. The
-`access` field is required and must be `"ro"` or `"rw"`.
-
-```ts
-const source = fs.bind({
+fs.bind({
   source: "/Users/alice/project",
   access: "ro",
   mask: {
-    paths: ["/node_modules", "/.git"],
+    paths: ["/.git", "/node_modules"],
   },
 });
 ```
 
-`mask` hides selected host paths from the guest. Mask paths are absolute inside
-the bound host directory. In a read-only bind mount, masked paths are simply
-absent from the guest.
+Mounts an absolute host directory through native virtio-fs. `source` and
+`access` are required. `access` must be `"ro"` or `"rw"`.
+
+`mask.paths` are absolute paths inside the bound directory. In read-only bind
+mounts, masked paths are absent. In writable bind mounts, masked paths require
+`mask.storage`, and guest-created entries under those paths are stored in the
+mask storage directory instead of the original host directory.
+
+### `vm.exec(command, args, options)`
+
+Used in: [Run one command](#1-run-one-command-in-a-clean-vm),
+[long-lived and interactive tools](#5-run-long-lived-and-interactive-tools).
 
 ```ts
-const maskStorage = fs.bind({
-  source: "/tmp/sandbox-mask-storage/project",
-  access: "rw",
-});
-
-const source = fs.bind({
-  source: "/Users/alice/project",
-  access: "rw",
-  mask: {
-    paths: ["/node_modules"],
-    storage: maskStorage,
-  },
+const result = await vm.exec("npm", ["test"], {
+  cwd: "/workspace",
+  env: { CI: "1" },
+  timeoutMs: 120_000,
+  signal: abortController.signal,
 });
 ```
 
-Writable bind mounts require `mask.storage`, and that storage must also be a
-writable `fs.bind(...)` source. If the guest creates a masked path, Sandbox
-stores that guest-owned entry under the storage directory using the same
-mask-relative path, while the original host entry remains hidden and unchanged.
+Runs a buffered process and returns `{ exitCode, stdout, stderr }`. When
+`timeoutMs` expires, Sandbox terminates the guest process group and returns exit
+code `124`. When `signal` aborts, Sandbox terminates that process group,
+rejects the promise with an `AbortError`, and keeps the VM usable.
 
-### Guest filesystem
+### `vm.spawn(command, args, options)`
 
-Every booted sandbox exposes `vm.fs`, a small host API over the running guest's
-composed filesystem. Paths are absolute guest paths. Except for `/`, paths must
-not end in a trailing slash; this keeps symlink entries from being accidentally
-resolved as their directory targets by Linux path traversal.
-Safe inspection operations may target `/`, but mutation paths for `writeFile`,
-`mkdir`, `remove`, and `rename` must not be the guest root.
+Used in: [Long-lived and interactive tools](#5-run-long-lived-and-interactive-tools).
+
+```ts
+const child = vm.spawn("npm", ["test"], {
+  cwd: "/workspace",
+});
+```
+
+Returns a streaming process handle with `stdin`, `stdout`, `stderr`, `ready`,
+`exit`, and `kill(...)`.
+
+### `vm.pty(command, args, options)`
+
+Used in: [Long-lived and interactive tools](#5-run-long-lived-and-interactive-tools).
+
+```ts
+const shell = vm.pty("/bin/sh", ["-i"], {
+  cwd: "/workspace",
+  env: { TERM: "xterm-256color" },
+  size: { rows: 40, cols: 120 },
+});
+```
+
+Runs a process attached to a real guest terminal. Use this for shells, REPLs,
+pagers, and terminal UIs. The handle exposes `input`, `output`, `ready`, `exit`,
+`resize(...)`, and `kill(...)`.
+
+### `vm.fs`
+
+Used in: [Inspect and mutate the running guest](#4-inspect-and-mutate-the-running-guest).
 
 ```ts
 const stat = await vm.fs.stat("/workspace/package.json");
@@ -566,75 +767,16 @@ await vm.fs.remove("/workspace/maybe-gone", { force: true });
 await vm.fs.rename("/workspace/out/result.tmp", "/workspace/out/result.json");
 ```
 
-`stat(...)` reports the directory entry itself, including symlinks, rather than
-following symlink targets. `readFile(...)` reads the whole file unless a byte
-`range` with required `offset` and `length` is supplied. `writeFile(...)`
-creates or truncates the target file; the caller does not need to know whether
-the file already exists.
+Paths are absolute guest paths. `stat(...)` reports the directory entry itself,
+including symlinks. `readFile(...)` reads the whole file unless a range with
+required `offset` and `length` is supplied. `writeFile(...)` creates or
+truncates the target file. `rename(...)` is a single guest rename operation and
+does not create missing parent directories.
 
-`readDir(...)` includes each entry's `name`, exact `nameBytes`, and `stat` in one
-round trip. `name` is the normal UTF-8 filename for ordinary entries;
-`nameBytes` preserves the raw guest directory-entry bytes.
+### `network.policy(onConnectionRequest)`
 
-For `remove(...)`, `recursive` permits deleting non-empty directories. `force`
-only suppresses a missing target; permission, read-only filesystem, type, and
-non-empty-directory errors are still returned.
-
-`rename(...)` is a single guest rename operation. It does not create missing
-parent directories, because doing so would turn a rename into multiple
-filesystem mutations and weaken the atomicity callers expect. The target parent
-must already exist; cross-filesystem renames may fail with the guest filesystem's
-native error.
-
-### Processes
-
-```ts
-const result = await lane.exec("npm", ["test"], {
-  cwd: "/workspace",
-  env: { CI: "1" },
-  timeoutMs: 120_000,
-  signal: abortController.signal,
-});
-```
-
-`exec(...)` is the buffered process API. It returns after the command exits with
-`exitCode`, `stdout`, and `stderr`. When `timeoutMs` expires, Sandbox terminates
-the guest process group and returns exit code `124`. When `signal` aborts,
-Sandbox terminates that guest process group, rejects the `exec(...)` promise with
-an `AbortError`, and keeps the sandbox usable for subsequent commands.
-
-Use `spawn(...)` for non-interactive long-lived processes with streaming
-stdin, stdout, and stderr. It returns a process handle immediately; `ready`
-tracks guest-side startup.
-
-```ts
-import { Writable } from "node:stream";
-
-const child = lane.spawn("npm", ["test"], { cwd: "/workspace" });
-
-child.stdout.pipeTo(Writable.toWeb(process.stdout));
-child.stderr.pipeTo(Writable.toWeb(process.stderr));
-
-const { exitCode } = await child.exit;
-```
-
-Use `pty(...)` when the guest process should see a real terminal, such as an
-interactive shell, REPL, pager, or terminal UI:
-
-```ts
-import { Readable, Writable } from "node:stream";
-
-const shell = lane.pty("/bin/sh", ["-i"], {
-  cwd: "/workspace",
-  env: { TERM: "xterm-256color" },
-  size: { rows: 40, cols: 120 },
-});
-
-Readable.toWeb(process.stdin).pipeTo(shell.input);
-shell.output.pipeTo(Writable.toWeb(process.stdout));
-```
-
-### Network Policy
+Used in: [Default-deny network egress](#6-enforce-default-deny-network-egress),
+[credential brokering](#7-broker-credentials-from-the-host).
 
 ```ts
 const policy = network.policy(async (conn) => {
@@ -643,9 +785,9 @@ const policy = network.policy(async (conn) => {
   const api = conn.matchHttp("api.example.com");
   if (!api) return;
 
-  if (!(await policyManager.allow(api))) return;
-
-  api.accept((request) => policyManager.handleHttp(request));
+  api.accept((request) => {
+    request.headers.set("x-agent-policy", "allowed");
+  });
 });
 ```
 
@@ -659,11 +801,7 @@ conn.src.ip;
 conn.src.port;
 conn.dst.ip;
 conn.dst.port;
-```
 
-Endpoint helpers classify address ranges without relying on DNS, TLS, or HTTP:
-
-```ts
 conn.dst.isLoopback();
 conn.dst.isPrivate();
 conn.dst.isLinkLocal();
@@ -674,23 +812,16 @@ conn.dst.isReserved();
 conn.dst.isPublicInternet();
 ```
 
-Transport and protocol helpers:
+### `conn.accept()`
 
-```ts
-conn.accept();                  // accept raw TCP or UDP transport
-conn.matchDns();                // DNS over UDP or TCP
-conn.matchTcp("203.0.113.10:5432");
-conn.matchUdp("203.0.113.10:8125");
-conn.matchHttp("api.example.com");
-```
+Used in: [Default-deny network egress](#6-enforce-default-deny-network-egress).
 
-`conn.matchDns()` normalizes DNS over UDP and TCP. The guest is configured to
-use Sandbox's internal resolver; policy code decides whether to accept that DNS
-flow and can choose explicit upstream resolvers in `accept(...)`. Accepted DNS
-answers are cached as trusted, guest-scoped hostname metadata for later
-connection policy decisions. Sandbox may retain this attribution metadata for a
-bounded window after a short DNS TTL so delayed connections can still be tied
-back to the accepted DNS answer that produced their destination IP.
+Accepts the observed raw TCP or UDP flow without protocol-specific handling.
+
+### `conn.matchDns()`
+
+Used in: [Default-deny network egress](#6-enforce-default-deny-network-egress),
+[credential brokering](#7-broker-credentials-from-the-host).
 
 ```ts
 const dns = conn.matchDns();
@@ -699,97 +830,209 @@ if (dns) {
 }
 ```
 
-`conn.matchHttp(...)` acquires an HTTP capability from trusted destination
-metadata, including hostnames observed from accepted DNS answers. It does not
-inspect or trust the HTTP `Host` header. IP-addressed HTTP requests can still be
-accepted through lower-level policy, but they do not advertise a trusted
-hostname. Calling `accept()` without middleware authorizes the matched flow
-without rewriting bytes; pass middleware only when Sandbox should inspect and
-mutate HTTP request headers.
+Normalizes DNS over UDP and TCP. Accepted DNS answers become trusted,
+guest-scoped hostname metadata for later connection policy decisions.
+
+### `conn.matchTcp(matcher)` And `conn.matchUdp(matcher)`
+
+Used in: [Default-deny network egress](#6-enforce-default-deny-network-egress).
+
+```ts
+conn.matchTcp("203.0.113.10:5432")?.accept();
+conn.matchUdp({ ip: "203.0.113.10", port: 8125 })?.accept();
+```
+
+Matches raw transport destinations by endpoint string, endpoint object, or
+predicate callback.
+
+### `conn.matchHttp(matcher)`
+
+Used in: [Default-deny network egress](#6-enforce-default-deny-network-egress),
+[credential brokering](#7-broker-credentials-from-the-host).
 
 ```ts
 const http = conn.matchHttp((candidate) =>
   candidate.hostname.endsWith(".example.com")
 );
-
-if (http) {
-  http.accept((request) => {
-    request.headers.set("x-agent-policy", "allowed");
-  });
-}
 ```
 
-`http.accept(...)` enters Sandbox's HTTP-family enforcement path. If the matched
-flow is not actually HTTP or HTTPS, it fails closed.
+Returns an HTTP capability when trusted destination metadata matches. This does
+not trust the HTTP `Host` header. IP-addressed HTTP requests can be allowed by
+lower-level policy, but they do not advertise a trusted hostname.
 
-## Architecture Reference
+### `HttpConnectionMatch.accept(middleware)`
 
-Sandbox hides the kernel, init, transport, and host helper behind a TypeScript
-API:
+Used in: [Credential brokering](#7-broker-credentials-from-the-host).
 
-- The runtime boots a libkrun-backed microVM from a prebuilt Linux image.
-- The built-in image contains the guest filesystem and common agent tooling.
-- A signed `sandbox-host` helper owns the Node/Rust/libkrun boundary.
-- Guest control traffic uses an fd-backed transport between the host and the
-  custom Sandbox init process.
-- Host-implemented virtual filesystems are mounted into the guest.
-- Durable machine changes are saved below the guest filesystem layer, so callers
-  can persist package installs and caches without exposing host state as a
-  guest-writable POSIX filesystem.
-- Network egress is default-deny and policy-controlled.
-- HTTP request middleware is caller-provided JavaScript, while Sandbox owns
-  interception, forwarding, and certificate plumbing.
+```ts
+http.accept((request) => {
+  request.headers.set("authorization", `Bearer ${token}`);
+});
+```
 
-When HTTP interception is enabled, the host generates CA material and passes
-only the public CA certificate to Sandbox init. Init installs that CA using the
-selected rootfs' native trust-store mechanism only when the rootfs is writable.
-Read-only built-in rootfs launches keep the CA available under `/run` and do not
-mutate the trust store, so HTTP interception does not change rootfs write
-behavior. If a writable rootfs does not provide a supported trust-store
-installer, init fails closed.
+Enters Sandbox's HTTP-family enforcement path. If the matched flow is not
+actually HTTP or HTTPS, it fails closed. Omit `middleware` to authorize the
+matched HTTP-family flow without mutating request headers.
 
-The intended boundary is:
+### `SandboxHttpRequest`
 
-- Sandbox owns launch, isolation, mounts, network interception, and enforcement.
-- User-space owns artifact selection, filesystem durability, network policy
-  state, confirmation flows, audit logs, and credential brokering.
+Used in: [Credential brokering](#7-broker-credentials-from-the-host).
 
-See [docs/architecture.md](docs/architecture.md) for the design background,
-[docs/kernel-build.md](docs/kernel-build.md) for kernel artifact builds, and
-[docs/testing-strategy.md](docs/testing-strategy.md) for the integration and
-e2e testing plan.
+Middleware receives request metadata reconstructed by Sandbox:
 
-## Platform Notes
+```ts
+request.protocol;        // "http/1.1" or "h2"
+request.url;             // URL
+request.method;          // exact guest method
+request.headers;         // mutable upstream request headers
+request.destination;     // source IP/port, original IP/port, hostname
+request.tls?.sni;
+request.tls?.alpn;
+```
 
-The npm package is published as `@torkbot/sandbox`. It does not use
-post-install scripts. The root package contains the TypeScript API and declares
-platform artifacts as optional dependencies:
+Header mutations apply only to the upstream host-side request. Sandbox does not
+write injected credentials back into guest-visible request bytes.
+
+### Environment Facts
+
+Used in: [Install](#install), [`defineSandbox`](#definesandboxoptions).
+
+```ts
+const configFacts = sandbox.environmentFacts();
+
+await using vm = await sandbox.boot();
+const observedFacts = await vm.environmentFacts();
+```
+
+Facts are affirmative typed triples with required provenance:
+
+```ts
+type SandboxEnvironmentFact = {
+  source: "config" | "guest";
+  topic: string;
+  relation: string;
+  value: string;
+};
+```
+
+Image descriptors provide config-sourced facts such as
+`rootfs-image is alpine:3.23-agent`, `distro is alpine`,
+`distro-version is 3.23`, `package-manager is apk`, `shell is /bin/sh`, and
+`command exists ...` entries for commands the image package advertises.
+Sandbox adds rootfs write-mode and network-egress facts from the sandbox
+definition. Booted instances add guest-observed facts.
+
+## Images And Packaging
+
+Core Sandbox releases and image releases are independent.
+
+The `@torkbot/sandbox` package contains:
+
+- TypeScript API,
+- `sandbox-host` platform artifact as an optional dependency,
+- custom kernel and initrd owned by the core library.
+
+Image packages contain:
+
+- one pinned Linux machine image per supported CPU architecture,
+- image facts,
+- an exported `image` descriptor created with `rootfs.image(...)`.
+
+Image package versions use the npm prerelease section for image content:
+
+```text
+0.1.0-image.20260623T142355Z.sha9c4f2a1b3c4d
+```
+
+The `0.1.0` prefix is the JavaScript export compatibility profile. The
+timestamp sorts releases in maintainer-facing lists. The short `sha...` suffix
+correlates with the full release digest recorded in GitHub release metadata.
+
+Applications import and pin image packages explicitly.
+
+## Implementation And Security Model
+
+Sandbox's security boundary is a Linux microVM plus a small set of
+host-mediated services. The host application decides what to attach and what to
+grant.
+
+### Runtime Architecture
+
+- `@torkbot/sandbox` starts a signed `sandbox-host` helper process.
+- `sandbox-host` owns the Rust/libkrun integration and opens the VM.
+- The core package embeds the kernel and initrd.
+- The initrd starts `sandbox-init` as stage 0.
+- Stage 0 mounts the selected machine image and execs the same binary as stage 1.
+- Stage 1 configures the guest, mounts requested filesystems, sets up control,
+  reports readiness, and supervises workloads.
+
+The Node process stays the ergonomic TypeScript API. VM launch and native
+resources live in the helper process, which is important for macOS Hypervisor
+entitlements and for bounding VM lifetime.
+
+### Filesystem Boundary
+
+Machine images are read-only by default. Writable machine state is explicit:
+
+- `rootfs.ephemeral(...)` stores changes in memory for one boot,
+- `rootfs.cow(...)` stores agent-made deltas in caller-owned storage,
+- `rootfs.persistent(...)` stores agent-made deltas in one local state file.
+
+Host workspaces are separate mounts. `fs.virtual(...)` is host-implemented.
+`fs.bind(...)` is host-directory passthrough with explicit `"ro"` or `"rw"`
+access. Keep durable machine state outside guest-writable host mounts.
+
+### Network Boundary
+
+Network egress is default-deny. A policy callback must grant each observed
+flow. HTTP middleware does not grant reachability by itself; reachability comes
+from the accepted connection capability.
+
+For HTTP and HTTPS, Sandbox binds request handling to trusted connection
+metadata such as original destination, accepted DNS answers, TLS SNI, and the
+matched authority. The HTTP `Host` header is not trusted for policy decisions.
+
+### Credential Boundary
+
+Credentials should stay in host-controlled TypeScript. HTTP middleware can add
+headers to the upstream request after Sandbox has matched and accepted the
+flow. Injected credentials are not written into the guest filesystem,
+environment, or guest-visible request bytes.
+
+### CA And HTTPS Interception
+
+When HTTP interception needs a guest-trusted CA, the host generates CA material
+and gives init only the public CA certificate. Init installs it through the
+selected image's native trust-store mechanism only when the machine is writable.
+If no supported installer exists, init fails closed.
+
+### Platform Packaging
+
+The root package has no post-install scripts. It resolves the current platform
+helper through optional dependencies:
 
 - `@torkbot/sandbox-darwin-arm64`
 - `@torkbot/sandbox-linux-x64-gnu`
 
-Each platform package contains the `sandbox-host` helper and built-in rootfs
-artifacts for that target. Runtime artifact resolution only loads the installed
-optional dependency for the current platform. Local development uses the same
-layout by materializing the current platform package under `node_modules`.
+### macOS Signing Setup
 
-### macOS signing setup
-
-For now, the macOS `sandbox-host` artifact is not Developer ID signed or
-notarized. macOS users must sign the installed helper locally before launching a
-VM:
+For now, the macOS `sandbox-host` artifact may need local signing before launch:
 
 ```sh
 npx @torkbot/sandbox setup-macos
 ```
 
 This performs an ad-hoc local `codesign` with the
-`com.apple.security.hypervisor` entitlement required by Hypervisor.framework. It
-does not contact Apple and does not require an Apple Developer account. If a
-macOS user tries to launch a VM before running setup, Sandbox throws a runtime
-error that points back to this command.
+`com.apple.security.hypervisor` entitlement required by Hypervisor.framework.
+It does not contact Apple and does not require an Apple Developer account.
 
 ## Development
+
+```sh
+npm run typecheck
+npm run test:unit
+npm run test:artifact
+```
 
 Local release packaging sanity check:
 
@@ -798,7 +1041,7 @@ npm run release:pack
 ```
 
 After rebuilding local native artifacts, refresh the local optional package
-layout with:
+layout:
 
 ```sh
 npm run artifacts:link-current
@@ -809,8 +1052,14 @@ Repository layout:
 - `src/`: TypeScript API consumed by Node.js callers.
 - `crates/sandbox`: Rust host implementation for libkrun, block storage,
   network, HTTP, and VFS services.
-- `crates/sandbox-host`: signed VM-host helper used for macOS HVF launch.
-- `crates/sandbox-init`: custom guest init used to configure the guest before
-  supervising untrusted code.
+- `crates/sandbox-host`: VM-host helper used for native launch.
+- `crates/sandbox-init`: custom guest init.
+- `images/`: source definitions for separately released rootfs image packages.
 - `tests/e2e`: TypeScript e2e scenarios run directly by Node.js 24+ type
   stripping.
+
+Design background:
+
+- [docs/architecture.md](docs/architecture.md)
+- [docs/kernel-build.md](docs/kernel-build.md)
+- [docs/testing-strategy.md](docs/testing-strategy.md)

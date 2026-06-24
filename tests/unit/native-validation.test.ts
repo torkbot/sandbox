@@ -12,21 +12,59 @@ import {
   type SandboxWritableFileSystem,
 } from "../../src/index.ts";
 
-test("defineSandbox rejects non-built-in rootfs objects", () => {
+const testRootfs = rootfs.image({
+  name: "alpine:3.23-agent",
+  path: "/tmp/sandbox-rootfs-base.qcow2",
+  format: "qcow2",
+  architecture: process.arch,
+  digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  sizeBytes: 1024n,
+  facts: [
+    {
+      source: "config",
+      topic: "rootfs-image",
+      relation: "is",
+      value: "alpine:3.23-agent",
+    },
+  ],
+});
+
+test("defineSandbox rejects non-image rootfs objects", () => {
   assert.throws(
     () => defineSandbox({
       rootfs: { kind: "prebuilt-rootfs", path: "rootfs.qcow2", format: "qcow2" } as never,
     }),
-    /invalid sandbox definition: rootfs must be created with rootfs\.builtIn\(\.\.\.\), rootfs\.ephemeral\(\.\.\.\), rootfs\.cow\(\.\.\.\), or rootfs\.persistent\(\.\.\.\)/,
+    /invalid sandbox definition: rootfs must be created with rootfs\.image\(\.\.\.\), rootfs\.ephemeral\(\.\.\.\), rootfs\.cow\(\.\.\.\), or rootfs\.persistent\(\.\.\.\)/,
   );
 });
 
-test("defineSandbox rejects unsupported built-in rootfs names", () => {
+test("defineSandbox rejects image descriptors with convenience aliases", () => {
   assert.throws(
     () => defineSandbox({
-      rootfs: { kind: "built-in-rootfs", name: "debian:13" } as never,
+      rootfs: {
+        ...testRootfs,
+        name: "ubuntu:lts",
+        facts: [{
+          source: "config",
+          topic: "rootfs-image",
+          relation: "is",
+          value: "ubuntu:lts",
+        }],
+      },
     }),
-    /unsupported built-in rootfs: debian:13/,
+    /rootfs image name must be a concrete image version, not a convenience alias/,
+  );
+});
+
+test("defineSandbox rejects image descriptors without required identity facts", () => {
+  assert.throws(
+    () => defineSandbox({
+      rootfs: {
+        ...testRootfs,
+        facts: [],
+      },
+    }),
+    /rootfs image facts must include the rootfs-image identity fact/,
   );
 });
 
@@ -49,13 +87,13 @@ test("defineSandbox rejects invalid COW rootfs", () => {
         },
       } as never,
     }),
-    /invalid sandbox definition: rootfs.cow base must be created with rootfs\.builtIn\(\.\.\.\)/,
+    /invalid sandbox definition: rootfs.cow base must be created with rootfs\.image\(\.\.\.\)/,
   );
 
   assert.throws(
     () => defineSandbox({
       rootfs: rootfs.cow({
-        base: rootfs.builtIn("alpine:3.23"),
+        base: testRootfs,
         writable: {
           ...memoryBlockStore(),
           blockSize: 0,
@@ -68,7 +106,7 @@ test("defineSandbox rejects invalid COW rootfs", () => {
   assert.throws(
     () => defineSandbox({
       rootfs: rootfs.cow({
-        base: rootfs.builtIn("alpine:3.23"),
+        base: testRootfs,
         writable: memoryBlockStore(),
         maxDirtyBytes: 1024,
       }),
@@ -82,16 +120,16 @@ test("defineSandbox rejects invalid ephemeral rootfs", () => {
     () => defineSandbox({
       rootfs: rootfs.ephemeral({
         // @ts-expect-error invalid rootfs object exercises runtime validation.
-        base: { kind: "built-in-rootfs", name: "ubuntu:latest" },
+        base: { kind: "other-rootfs" },
       }),
     }),
-    /unsupported built-in rootfs: ubuntu:latest/,
+    /invalid sandbox definition: rootfs.ephemeral base must be created with rootfs\.image\(\.\.\.\)/,
   );
 
   assert.throws(
     () => defineSandbox({
       rootfs: rootfs.ephemeral({
-        base: rootfs.builtIn("alpine:3.23"),
+        base: testRootfs,
         maxDirtyBytes: 1024,
       }),
     }),
@@ -104,17 +142,17 @@ test("defineSandbox rejects invalid persistent rootfs", () => {
     () => defineSandbox({
       rootfs: rootfs.persistent({
         // @ts-expect-error invalid rootfs object exercises runtime validation.
-        base: { kind: "built-in-rootfs", name: "ubuntu:latest" },
+        base: { kind: "other-rootfs" },
         path: "/tmp/sandbox-rootfs.qcow2",
       }),
     }),
-    /unsupported built-in rootfs: ubuntu:latest/,
+    /invalid sandbox definition: rootfs.persistent base must be created with rootfs\.image\(\.\.\.\)/,
   );
 
   assert.throws(
     () => defineSandbox({
       rootfs: rootfs.persistent({
-        base: rootfs.builtIn("alpine:3.23"),
+        base: testRootfs,
         path: "rootfs.qcow2",
       }),
     }),
@@ -124,7 +162,7 @@ test("defineSandbox rejects invalid persistent rootfs", () => {
   assert.throws(
     () => defineSandbox({
       rootfs: rootfs.persistent({
-        base: rootfs.builtIn("alpine:3.23"),
+        base: testRootfs,
         path: "/tmp/rootfs\0.qcow2",
       }),
     }),
@@ -135,7 +173,7 @@ test("defineSandbox rejects invalid persistent rootfs", () => {
 test("defineSandbox rejects invalid resource limits", () => {
   assert.throws(
     () => defineSandbox({
-      rootfs: rootfs.builtIn("alpine:3.23"),
+      rootfs: testRootfs,
       resources: { cpus: 0 },
     }),
     /invalid sandbox definition: resources\.cpus must be a positive integer/,
@@ -143,7 +181,7 @@ test("defineSandbox rejects invalid resource limits", () => {
 
   assert.throws(
     () => defineSandbox({
-      rootfs: rootfs.builtIn("alpine:3.23"),
+      rootfs: testRootfs,
       resources: { cpus: 256 },
     }),
     /invalid sandbox definition: resources\.cpus must be less than or equal to 255/,
@@ -151,7 +189,7 @@ test("defineSandbox rejects invalid resource limits", () => {
 
   assert.throws(
     () => defineSandbox({
-      rootfs: rootfs.builtIn("alpine:3.23"),
+      rootfs: testRootfs,
       resources: { memoryMiB: 0 },
     }),
     /invalid sandbox definition: resources\.memoryMiB must be a positive integer/,
@@ -160,7 +198,7 @@ test("defineSandbox rejects invalid resource limits", () => {
 
 test("boot rejects relative mount paths before runtime launch", async () => {
   const sandbox = defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   });
 
   await assert.rejects(
@@ -175,7 +213,7 @@ test("boot rejects relative mount paths before runtime launch", async () => {
 
 test("boot rejects root and dot-component mount paths before runtime launch", async () => {
   const sandbox = defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   });
 
   await assert.rejects(
@@ -199,7 +237,7 @@ test("boot rejects root and dot-component mount paths before runtime launch", as
 
 test("boot rejects mount paths with NUL bytes before runtime launch", async () => {
   const sandbox = defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   });
 
   await assert.rejects(
@@ -214,7 +252,7 @@ test("boot rejects mount paths with NUL bytes before runtime launch", async () =
 
 test("boot rejects writable mounts without POSIX filesystem support", async () => {
   const sandbox = defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   });
 
   await assert.rejects(
@@ -229,7 +267,7 @@ test("boot rejects writable mounts without POSIX filesystem support", async () =
 
 test("boot rejects host directory mounts without absolute sources", async () => {
   const sandbox = defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   });
 
   await assert.rejects(
@@ -244,7 +282,7 @@ test("boot rejects host directory mounts without absolute sources", async () => 
 
 test("boot rejects host directory mounts without explicit access", async () => {
   const sandbox = defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   });
 
   await assert.rejects(
@@ -259,7 +297,7 @@ test("boot rejects host directory mounts without explicit access", async () => {
 
 test("boot rejects invalid host directory mask paths", async () => {
   const sandbox = defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   });
 
   await assert.rejects(
@@ -355,7 +393,7 @@ test("boot rejects invalid host directory mask paths", async () => {
 
 test("boot requires writable mask storage for writable host directory masks", async () => {
   const sandbox = defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   });
 
   await assert.rejects(
@@ -395,7 +433,7 @@ test("boot requires writable mask storage for writable host directory masks", as
 
 test("boot rejects writable mask storage that resolves inside the bind source", async () => {
   const sandbox = defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   });
 
   await assert.rejects(
@@ -492,7 +530,7 @@ test("boot rejects writable mask storage entries hard-linked to the bind source"
     await link(join(source, "lower.txt"), join(storage, "node_modules", "linked.txt"));
 
     const sandbox = defineSandbox({
-      rootfs: rootfs.builtIn("alpine:3.23"),
+      rootfs: testRootfs,
     });
 
     await assert.rejects(
@@ -521,7 +559,7 @@ test("boot rejects writable mask storage entries hard-linked to the bind source"
 
 test("boot rejects mask storage on read-only host directory masks", async () => {
   const sandbox = defineSandbox({
-    rootfs: rootfs.builtIn("alpine:3.23"),
+    rootfs: testRootfs,
   });
 
   await assert.rejects(

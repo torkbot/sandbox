@@ -99,7 +99,9 @@ jobs:
         id: init-cache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
-          path: dist/init
+          path: |
+            dist/init
+            dist/initrd
           key: ${{ steps.fixture-cache-keys.outputs.init-key }}
           enableCrossOsArchive: true
 
@@ -117,7 +119,9 @@ jobs:
 
       - name: Build sandbox init fixture
         if: steps.init-cache.outputs.cache-hit != 'true'
-        run: npm run build:init
+        run: |
+          npm run build:init
+          npm run build:initrd
 
       - name: Build rootfs fixture
         if: steps.rootfs-cache.outputs.cache-hit != 'true'
@@ -158,7 +162,9 @@ jobs:
         id: init-cache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
-          path: dist/init
+          path: |
+            dist/init
+            dist/initrd
           key: ${{ steps.fixture-cache-keys.outputs.init-key }}
           enableCrossOsArchive: true
 
@@ -176,7 +182,9 @@ jobs:
 
       - name: Build sandbox init fixture
         if: steps.init-cache.outputs.cache-hit != 'true'
-        run: npm run build:init
+        run: |
+          npm run build:init
+          npm run build:initrd
 
       - name: Build rootfs fixture
         if: steps.rootfs-cache.outputs.cache-hit != 'true'
@@ -242,7 +250,9 @@ jobs:
       - name: Restore init fixture cache
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
-          path: dist/init
+          path: |
+            dist/init
+            dist/initrd
           key: ${{ steps.fixture-cache-keys.outputs.init-key }}
           enableCrossOsArchive: true
           fail-on-cache-miss: true
@@ -369,16 +379,10 @@ jobs:
       - name: Restore init fixture cache
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
-          path: dist/init
+          path: |
+            dist/init
+            dist/initrd
           key: ${{ steps.fixture-cache-keys.outputs.init-key }}
-          enableCrossOsArchive: true
-          fail-on-cache-miss: true
-
-      - name: Restore rootfs fixture cache
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
-        with:
-          path: dist/rootfs
-          key: ${{ steps.fixture-cache-keys.outputs.rootfs-key }}
           enableCrossOsArchive: true
           fail-on-cache-miss: true
 
@@ -392,10 +396,8 @@ jobs:
         run: |
           set -euo pipefail
           artifact_root="dist/release-platform/${{ matrix.platform }}"
-          mkdir -p "${artifact_root}/rootfs"
+          mkdir -p "${artifact_root}"
           cp target/release/sandbox-host "${artifact_root}/sandbox-host"
-          cp dist/rootfs/alpine-3.23.qcow2 "${artifact_root}/rootfs/alpine-3.23.qcow2"
-          cp dist/rootfs/alpine-3.23.environment-facts.json "${artifact_root}/rootfs/alpine-3.23.environment-facts.json"
           node ./scripts/release-artifact-manifest.ts write \
             --head-sha "${{ github.sha }}" \
             --platform "${{ matrix.platform }}" \
@@ -403,10 +405,7 @@ jobs:
             --base-dir "${artifact_root}" \
             --kernel-key "${{ steps.fixture-cache-keys.outputs.kernel-key }}" \
             --init-key "${{ steps.fixture-cache-keys.outputs.init-key }}" \
-            --rootfs-key "${{ steps.fixture-cache-keys.outputs.rootfs-key }}" \
-            --file sandbox-host \
-            --file rootfs/alpine-3.23.qcow2 \
-            --file rootfs/alpine-3.23.environment-facts.json
+            --file sandbox-host
 
       - name: Upload release platform artifact
         if: matrix.platform != 'darwin-arm64'
@@ -421,14 +420,11 @@ jobs:
         run: |
           set -euo pipefail
           artifact_root="dist/unsigned-release-platform/${{ matrix.platform }}"
-          mkdir -p "${artifact_root}/rootfs"
+          mkdir -p "${artifact_root}"
           cp target/release/sandbox-host "${artifact_root}/sandbox-host"
-          cp dist/rootfs/alpine-3.23.qcow2 "${artifact_root}/rootfs/alpine-3.23.qcow2"
-          cp dist/rootfs/alpine-3.23.environment-facts.json "${artifact_root}/rootfs/alpine-3.23.environment-facts.json"
           {
             printf 'kernel_key=%s\n' '${{ steps.fixture-cache-keys.outputs.kernel-key }}'
             printf 'init_key=%s\n' '${{ steps.fixture-cache-keys.outputs.init-key }}'
-            printf 'rootfs_key=%s\n' '${{ steps.fixture-cache-keys.outputs.rootfs-key }}'
           } > "${artifact_root}/fixture-keys.env"
 
       - name: Upload unsigned macOS release inputs
@@ -559,10 +555,8 @@ jobs:
           notarization_submission_id="$(node -e 'const result = JSON.parse(require("node:fs").readFileSync("dist/signing/darwin-arm64/notarytool-submit.json", "utf8")); console.log(result.id);')"
           notarization_status="$(node -e 'const result = JSON.parse(require("node:fs").readFileSync("dist/signing/darwin-arm64/notarytool-submit.json", "utf8")); console.log(result.status);')"
           artifact_root="dist/release-platform/darwin-arm64"
-          mkdir -p "${artifact_root}/rootfs"
+          mkdir -p "${artifact_root}"
           cp dist/signing/darwin-arm64/sandbox-host "${artifact_root}/sandbox-host"
-          cp dist/signing/darwin-arm64/rootfs/alpine-3.23.qcow2 "${artifact_root}/rootfs/alpine-3.23.qcow2"
-          cp dist/signing/darwin-arm64/rootfs/alpine-3.23.environment-facts.json "${artifact_root}/rootfs/alpine-3.23.environment-facts.json"
           node ./scripts/release-artifact-manifest.ts write \
             --head-sha "${{ github.sha }}" \
             --platform darwin-arm64 \
@@ -570,14 +564,11 @@ jobs:
             --base-dir "${artifact_root}" \
             --kernel-key "$kernel_key" \
             --init-key "$init_key" \
-            --rootfs-key "$rootfs_key" \
             --macos-codesign-authority "$codesign_authority" \
             --macos-codesign-team-identifier "$codesign_team_identifier" \
             --macos-notarization-submission-id "$notarization_submission_id" \
             --macos-notarization-status "$notarization_status" \
-            --file sandbox-host \
-            --file rootfs/alpine-3.23.qcow2 \
-            --file rootfs/alpine-3.23.environment-facts.json
+            --file sandbox-host
 
       - name: Upload release platform artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

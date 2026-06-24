@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 1,
+  "imageName": "ubuntu:26.04-slim",
+  "source": "docker.io/library/ubuntu:26.04@sha256:53958ec7b67c2c9355df922dd08dbf0360611f8c3cdb656875e81873db9ffdba",
+  "exportCompatibility": "0.1.0"
+}

@@ -1,0 +1,219 @@
+name: Image Release Reconcile
+
+on:
+  schedule:
+    - cron: "23 8 * * 1"
+  workflow_dispatch:
+    inputs:
+      image:
+        description: Image id to reconcile, or all
+        type: string
+        required: true
+        default: all
+
+permissions:
+  contents: write
+
+concurrency:
+  group: image-release-reconcile
+  cancel-in-progress: false
+
+jobs:
+  select:
+    name: Select image release matrix
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      images: ${{ steps.matrix.outputs.images }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Verify image release source
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "image releases must be reconciled from refs/heads/main" >&2
+            exit 1
+          fi
+          git fetch origin main
+          main_sha="$(git rev-parse origin/main)"
+          if [ "$GITHUB_SHA" != "$main_sha" ]; then
+            echo "image release source must be current origin/main" >&2
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate image definitions
+        run: node ./scripts/image-manifest.ts validate
+
+      - name: Select images
+        id: matrix
+        run: node ./scripts/image-release-matrix.ts --image "${{ github.event_name == 'workflow_dispatch' && inputs.image || 'all' }}"
+
+  build-rootfs:
+    name: Build image rootfs (${{ matrix.image }}, ${{ matrix.architecture }})
+    needs: select
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.select.outputs.matrix) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build image rootfs directory
+        run: |
+          node ./scripts/build-image-rootfs.ts \
+            --image "${{ matrix.image }}" \
+            --architecture "${{ matrix.architecture }}" \
+            --out-dir "dist/image-release/${{ matrix.image }}/${{ matrix.architecture }}/rootfs"
+
+      - name: Build image QCOW2
+        run: node ./scripts/build-rootfs-qcow2.ts
+        env:
+          SANDBOX_ROOTFS_SOURCE_DIR: dist/image-release/${{ matrix.image }}/${{ matrix.architecture }}/rootfs
+          SANDBOX_ROOTFS_QCOW2_OUT: dist/image-release/${{ matrix.image }}/${{ matrix.architecture }}/rootfs.qcow2
+          SANDBOX_ROOTFS_ENVIRONMENT_FACTS_OUT: dist/image-release/${{ matrix.image }}/${{ matrix.architecture }}/environment-facts.json
+
+      - name: Write rootfs digest
+        run: |
+          digest="$(node --input-type=module -e 'import { sha256File } from "./scripts/image-release-version.ts"; console.log(await sha256File(process.argv[1]));' "dist/image-release/${{ matrix.image }}/${{ matrix.architecture }}/rootfs.qcow2")"
+          printf '%s\n' "$digest" > "dist/image-release/${{ matrix.image }}/${{ matrix.architecture }}/rootfs.digest"
+
+      - name: Upload image rootfs artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: image-rootfs-${{ matrix.image }}-${{ matrix.architecture }}
+          path: |
+            dist/image-release/${{ matrix.image }}/${{ matrix.architecture }}/rootfs.qcow2
+            dist/image-release/${{ matrix.image }}/${{ matrix.architecture }}/environment-facts.json
+            dist/image-release/${{ matrix.image }}/${{ matrix.architecture }}/rootfs.digest
+          if-no-files-found: error
+
+  draft-release:
+    name: Draft image release (${{ matrix.image }})
+    needs:
+      - select
+      - build-rootfs
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.select.outputs.images) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download x64 rootfs artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: image-rootfs-${{ matrix.image }}-x64
+          path: dist/image-release/${{ matrix.image }}/x64
+
+      - name: Download arm64 rootfs artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: image-rootfs-${{ matrix.image }}-arm64
+          path: dist/image-release/${{ matrix.image }}/arm64
+
+      - name: Resolve image release state
+        id: release-state
+        run: |
+          set -euo pipefail
+          x64_digest="$(cat "dist/image-release/${{ matrix.image }}/x64/rootfs.digest")"
+          arm64_digest="$(cat "dist/image-release/${{ matrix.image }}/arm64/rootfs.digest")"
+          x64_facts_digest="$(node --input-type=module -e 'import { sha256File } from "./scripts/image-release-version.ts"; console.log(await sha256File(process.argv[1]));' "dist/image-release/${{ matrix.image }}/x64/environment-facts.json")"
+          arm64_facts_digest="$(node --input-type=module -e 'import { sha256File } from "./scripts/image-release-version.ts"; console.log(await sha256File(process.argv[1]));' "dist/image-release/${{ matrix.image }}/arm64/environment-facts.json")"
+          release_digest="$(node ./scripts/image-release-digest.ts \
+            --image "${{ matrix.image }}" \
+            --artifact "x64=${x64_digest},${x64_facts_digest}" \
+            --artifact "arm64=${arm64_digest},${arm64_facts_digest}")"
+          existing_tag="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq ".[] | select(.tag_name | startswith(\"image/${{ matrix.image }}/v\")) | select((.body // \"\") | contains(\"Release digest: ${release_digest}\")) | .tag_name" | sed -n '1p')"
+          echo "x64-digest=${x64_digest}" >> "$GITHUB_OUTPUT"
+          echo "arm64-digest=${arm64_digest}" >> "$GITHUB_OUTPUT"
+          echo "release-digest=${release_digest}" >> "$GITHUB_OUTPUT"
+          if [ -n "$existing_tag" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "existing-tag=${existing_tag}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          compat="$(node --input-type=module -e 'import { readImageDefinition } from "./scripts/image-manifest.ts"; console.log((await readImageDefinition(process.argv[1])).manifest.exportCompatibility);' "${{ matrix.image }}")"
+          generated_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          version="$(node ./scripts/image-release-version.ts --compat "$compat" --generated-at "$generated_at" --digest "$release_digest")"
+          echo "exists=false" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=image/${{ matrix.image }}/v${version}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Prepare image packages
+        if: steps.release-state.outputs.exists == 'false'
+        run: |
+          set -euo pipefail
+          node ./scripts/prepare-image-npm-packages.ts \
+            --image "${{ matrix.image }}" \
+            --version "${{ steps.release-state.outputs.version }}" \
+            --architecture x64 \
+            --rootfs "dist/image-release/${{ matrix.image }}/x64/rootfs.qcow2" \
+            --facts "dist/image-release/${{ matrix.image }}/x64/environment-facts.json" \
+            --release-digest "${{ steps.release-state.outputs.release-digest }}" \
+            --out-dir dist/npm
+          node ./scripts/prepare-image-npm-packages.ts \
+            --image "${{ matrix.image }}" \
+            --version "${{ steps.release-state.outputs.version }}" \
+            --architecture arm64 \
+            --rootfs "dist/image-release/${{ matrix.image }}/arm64/rootfs.qcow2" \
+            --facts "dist/image-release/${{ matrix.image }}/arm64/environment-facts.json" \
+            --release-digest "${{ steps.release-state.outputs.release-digest }}" \
+            --out-dir dist/npm
+
+      - name: Pack image packages
+        if: steps.release-state.outputs.exists == 'false'
+        run: npm pack "./dist/npm/sandbox-image-${{ matrix.image }}" "./dist/npm/sandbox-image-${{ matrix.image }}-x64" "./dist/npm/sandbox-image-${{ matrix.image }}-arm64" --pack-destination dist/npm
+
+      - name: Write image release notes
+        if: steps.release-state.outputs.exists == 'false'
+        run: |
+          {
+            printf 'Image: %s\n' "${{ matrix.image }}"
+            printf 'Version: %s\n' "${{ steps.release-state.outputs.version }}"
+            printf 'Release digest: %s\n' "${{ steps.release-state.outputs.release-digest }}"
+            printf 'x64 rootfs digest: %s\n' "${{ steps.release-state.outputs.x64-digest }}"
+            printf 'arm64 rootfs digest: %s\n' "${{ steps.release-state.outputs.arm64-digest }}"
+          } > dist/npm/image-release-notes.txt
+
+      - name: Create draft image release
+        if: steps.release-state.outputs.exists == 'false'
+        run: gh release create "${{ steps.release-state.outputs.tag }}" dist/npm/*.tgz --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft --prerelease --title "${{ matrix.image }} ${{ steps.release-state.outputs.version }}" --notes-file dist/npm/image-release-notes.txt
+        env:
+          GH_TOKEN: ${{ github.token }}

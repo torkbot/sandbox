@@ -13,8 +13,13 @@ const kernelBundle = resolve(
   repoRoot,
   process.env.SANDBOX_KERNEL_BUNDLE_C ?? `dist/kernel/libkrunfw/${kernelArch()}/kernel.c`,
 );
+const initrdImage = resolve(
+  repoRoot,
+  process.env.SANDBOX_INITRD_IMAGE ?? `dist/initrd/${guestTarget()}/sandbox-initrd.cpio`,
+);
 
 await assertExists(kernelBundle);
+await assertExists(initrdImage);
 assertKernelArtifactMetadataMatches(
   await readKernelArtifactMetadata(metadataPathForKernelBundle(kernelBundle)),
   await expectedKernelArtifactMetadata({ repoRoot, arch: kernelArch() }),
@@ -22,6 +27,7 @@ assertKernelArtifactMetadataMatches(
 
 await run("cargo", ["build", "-p", "sandbox-host", "--release"], {
   SANDBOX_KERNEL_BUNDLE_C: kernelBundle,
+  SANDBOX_INITRD_IMAGE: initrdImage,
 });
 
 if (process.env.SANDBOX_SKIP_HOST_SIGNING !== "1") {
@@ -36,6 +42,17 @@ function kernelArch(): string {
       return "x86_64";
     default:
       throw new Error(`unsupported host architecture for host build: ${process.arch}`);
+  }
+}
+
+function guestTarget(): string {
+  switch (process.arch) {
+    case "arm64":
+      return "aarch64-unknown-linux-musl";
+    case "x64":
+      return "x86_64-unknown-linux-musl";
+    default:
+      throw new Error(`unsupported host architecture for initrd build: ${process.arch}`);
   }
 }
 

@@ -2,13 +2,17 @@ import { copyFile, mkdir, stat } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import {
-  rootfsEnvironmentFactsArtifactName,
   rootfsEnvironmentFactsManifestFile,
 } from "../src/environment-facts.ts";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 const sourceDir = resolve(repoRoot, process.env.SANDBOX_ROOTFS_SOURCE_DIR ?? "dist/rootfs/alpine-3.23");
 const outPath = resolve(repoRoot, process.env.SANDBOX_ROOTFS_QCOW2_OUT ?? "dist/rootfs/alpine-3.23.qcow2");
+const rootfsEnvironmentFactsArtifactName = "alpine-3.23-agent.environment-facts.json";
+const rootfsEnvironmentFactsOut = resolve(
+  repoRoot,
+  process.env.SANDBOX_ROOTFS_ENVIRONMENT_FACTS_OUT ?? `dist/rootfs/${rootfsEnvironmentFactsArtifactName}`,
+);
 const clusterSize = decimalEnv("SANDBOX_QCOW2_CLUSTER_SIZE", "32768");
 const virtualSizeKiB = sizeEnvKiB("SANDBOX_ROOTFS_VIRTUAL_SIZE", "8gb");
 const filesystemUuid = "00000000-0000-0000-0000-000000000000";
@@ -24,7 +28,7 @@ await run("docker", [
   `${sourceDir}:/rootfs:ro`,
   "--volume",
   `${outDir}:/out`,
-  process.env.SANDBOX_QCOW2_BUILDER_IMAGE ?? "debian:bookworm",
+  process.env.SANDBOX_QCOW2_BUILDER_IMAGE ?? "debian:12",
   "sh",
   "-lc",
   [
@@ -62,11 +66,12 @@ await run("docker", [
 ]);
 
 console.log(`rootfs QCOW2 image written to ${outPath}`);
+await mkdir(dirname(rootfsEnvironmentFactsOut), { recursive: true });
 await copyFile(
   resolve(sourceDir, rootfsEnvironmentFactsManifestFile),
-  resolve(outDir, rootfsEnvironmentFactsArtifactName),
+  rootfsEnvironmentFactsOut,
 );
-console.log(`rootfs environment facts written to ${resolve(outDir, rootfsEnvironmentFactsArtifactName)}`);
+console.log(`rootfs environment facts written to ${rootfsEnvironmentFactsOut}`);
 
 async function assertDirectory(path: string): Promise<void> {
   try {

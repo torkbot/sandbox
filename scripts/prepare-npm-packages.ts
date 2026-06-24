@@ -33,8 +33,6 @@ type PlatformPackage = {
   readonly libc?: string[];
   readonly files: {
     readonly host: string;
-    readonly rootfs: string;
-    readonly rootfsFacts: string;
   };
 };
 
@@ -51,8 +49,6 @@ const platformPackages = [
     libc: undefined,
     files: {
       host: "sandbox-host",
-      rootfs: "rootfs/alpine-3.23.qcow2",
-      rootfsFacts: "rootfs/alpine-3.23.environment-facts.json",
     },
   },
   {
@@ -63,8 +59,6 @@ const platformPackages = [
     libc: ["glibc"],
     files: {
       host: "sandbox-host",
-      rootfs: "rootfs/alpine-3.23.qcow2",
-      rootfsFacts: "rootfs/alpine-3.23.environment-facts.json",
     },
   },
 ] as const satisfies readonly PlatformPackage[];
@@ -129,7 +123,7 @@ for (const platformPackage of preparePlatforms ? selectedPlatformPackages : []) 
     os: platformPackage.os,
     cpu: platformPackage.cpu,
     ...(platformPackage.libc === undefined ? {} : { libc: platformPackage.libc }),
-    files: [platformPackage.files.host, "rootfs", "README.md"],
+    files: [platformPackage.files.host, "README.md"],
   });
   await writeFile(
     resolve(packageRoot, "README.md"),
@@ -138,15 +132,6 @@ for (const platformPackage of preparePlatforms ? selectedPlatformPackages : []) 
   await copyFile(
     resolve(repoRoot, "target/release/sandbox-host"),
     resolve(packageRoot, platformPackage.files.host),
-  );
-  await mkdir(resolve(packageRoot, "rootfs"), { recursive: true });
-  await copyFile(
-    resolve(repoRoot, "dist/rootfs/alpine-3.23.qcow2"),
-    resolve(packageRoot, platformPackage.files.rootfs),
-  );
-  await copyFile(
-    resolve(repoRoot, "dist/rootfs/alpine-3.23.environment-facts.json"),
-    resolve(packageRoot, platformPackage.files.rootfsFacts),
   );
 
   if (installSelectedPlatforms) {
