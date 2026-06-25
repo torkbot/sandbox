@@ -353,8 +353,11 @@ fn configure_hostname<'a>(
         .map_err(|error| InitError(format!("write /run/sandbox/hostname: {error}")))?;
     configure_hosts(&hostname)?;
     if !std::path::Path::new("/etc/hostname").exists() {
-        std::fs::write("/etc/hostname", format!("{hostname}\n"))
-            .map_err(|error| InitError(format!("write /etc/hostname: {error}")))?;
+        write_file_creating_parent(
+            "/etc/hostname",
+            format!("{hostname}\n"),
+            "write /etc/hostname",
+        )?;
         return Ok(());
     }
     bind_mount_file("/run/sandbox/hostname", "/etc/hostname")?;
@@ -368,8 +371,7 @@ fn configure_hosts(hostname: &str) -> Result<(), InitError> {
     std::fs::write("/run/sandbox/hosts", hosts.as_bytes())
         .map_err(|error| InitError(format!("write /run/sandbox/hosts: {error}")))?;
     if !std::path::Path::new("/etc/hosts").exists() {
-        std::fs::write("/etc/hosts", hosts)
-            .map_err(|error| InitError(format!("write /etc/hosts: {error}")))?;
+        write_file_creating_parent("/etc/hosts", hosts, "write /etc/hosts")?;
         return Ok(());
     }
     bind_mount_file("/run/sandbox/hosts", "/etc/hosts")
@@ -625,8 +627,7 @@ fn install_resolver_config() -> Result<(), InitError> {
     std::fs::write("/run/sandbox/resolv.conf", RESOLV_CONF)
         .map_err(|error| InitError(format!("write sandbox resolver config: {error}")))?;
     if !Path::new("/etc/resolv.conf").exists() {
-        std::fs::write("/etc/resolv.conf", RESOLV_CONF)
-            .map_err(|error| InitError(format!("write /etc/resolv.conf: {error}")))?;
+        write_file_creating_parent("/etc/resolv.conf", RESOLV_CONF, "write /etc/resolv.conf")?;
         return Ok(());
     }
 
@@ -2529,6 +2530,28 @@ fn send_control_frame(control: &Arc<ControlWriter>, frame: ControlFrame) -> Resu
     control.send_packet(&packet)
 }
 
+fn write_file_creating_parent(
+    path: &str,
+    contents: impl AsRef<[u8]>,
+    operation: &str,
+) -> Result<(), InitError> {
+    let path = std::path::Path::new(path);
+    ensure_parent_directory(path)?;
+    std::fs::write(path, contents.as_ref())
+        .map_err(|error| InitError(format!("{operation}: {error}")))
+}
+
+fn ensure_parent_directory(path: &std::path::Path) -> Result<(), InitError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(parent)
+        .map_err(|error| InitError(format!("create {}: {error}", parent.display())))
+}
+
 #[derive(Debug)]
 struct InitError(String);
 
@@ -2571,5 +2594,30 @@ mod tests {
             decode_mount_field(&encoded).unwrap(),
             "/mnt/with=equals;semicolon",
         );
+    }
+
+    #[test]
+    fn root_file_write_creates_missing_parent_directory() {
+        let root = unique_test_dir("root-file-parent");
+        let file = root.join("etc/hosts");
+        write_file_creating_parent(
+            file.to_str().unwrap(),
+            "127.0.0.1 localhost\n",
+            "write test hosts",
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "127.0.0.1 localhost\n"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn unique_test_dir(name: &str) -> std::path::PathBuf {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("sandbox-init-{name}-{}-{now}", std::process::id()))
     }
 }

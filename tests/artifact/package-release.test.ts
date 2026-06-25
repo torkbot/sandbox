@@ -202,6 +202,8 @@ test("init build restores Cargo target ownership before host build", async () =>
   const buildInit = await readFile(new URL("../../scripts/build-init.ts", import.meta.url), "utf8");
 
   assert.match(buildInit, /cargo build -p sandbox-init --release --target/);
+  assert.match(buildInit, /"--platform"/);
+  assert.match(buildInit, /dockerPlatformArch/);
   assert.match(buildInit, /chown -R \$\{shellArg\(owner\)\} \/work\/target/);
   assert.doesNotMatch(buildInit, /\/work\/target\/\$\{shellArg\(target\)\}/);
 });
@@ -216,6 +218,8 @@ test("host build validates kernel artifact metadata before Cargo embeds it", asy
   assert.match(buildKernel, /await rm\(resolve\(libkrunfwRoot, metadata\.kernelBundle\)/);
   assert.match(buildKernel, /await rm\(resolve\(libkrunfwRoot, metadata\.kernelVersion\)/);
   assert.match(buildKernel, /SANDBOX_KERNEL_JOBS/);
+  assert.match(buildKernel, /"--platform"/);
+  assert.match(buildKernel, /dockerPlatformArch/);
   assert.match(buildKernel, /make -j/);
   assert.match(buildHost, /readKernelArtifactMetadata/);
   assert.match(buildHost, /assertKernelArtifactMetadataMatches/);

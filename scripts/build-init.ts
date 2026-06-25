@@ -6,12 +6,15 @@ import { getgid, getuid } from "node:process";
 const repoRoot = resolve(import.meta.dirname, "..");
 const target = process.env.SANDBOX_INIT_TARGET ?? guestTarget();
 const image = process.env.SANDBOX_INIT_BUILDER_IMAGE ?? "rust:1-bookworm";
+const dockerPlatform = `linux/${dockerPlatformArch(target)}`;
 const outDir = resolve(repoRoot, process.env.SANDBOX_INIT_OUT_DIR ?? `dist/init/${target}`);
 const owner = `${getuid?.() ?? 0}:${getgid?.() ?? 0}`;
 
 await run("docker", [
   "run",
   "--rm",
+  "--platform",
+  dockerPlatform,
   "--volume",
   `${repoRoot}:/work`,
   "--workdir",
@@ -48,6 +51,16 @@ function guestTarget(): string {
     default:
       throw new Error(`unsupported host architecture for init build: ${process.arch}`);
   }
+}
+
+function dockerPlatformArch(target: string): string {
+  if (target.startsWith("aarch64-")) {
+    return "arm64";
+  }
+  if (target.startsWith("x86_64-")) {
+    return "amd64";
+  }
+  throw new Error(`unsupported init build target for Docker platform: ${target}`);
 }
 
 async function assertExists(path: string): Promise<void> {

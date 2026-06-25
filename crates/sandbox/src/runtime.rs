@@ -1,4 +1,4 @@
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -361,12 +361,7 @@ impl KrunContext {
     }
 
     fn apply_console_output(&self) -> Result<(), KrunError> {
-        let Some(path) = std::env::var_os("SANDBOX_CONSOLE_OUTPUT") else {
-            return check_krun(
-                "krun_disable_implicit_console",
-                krun::krun_disable_implicit_console(self.id),
-            );
-        };
+        let path = console_output_path(std::env::var_os("SANDBOX_CONSOLE_OUTPUT"));
         let path = CString::new(path.to_string_lossy().as_bytes())
             .map_err(|_| KrunError::new("SANDBOX_CONSOLE_OUTPUT", -libc::EINVAL))?;
         check_krun("krun_set_console_output", unsafe {
@@ -493,15 +488,12 @@ impl KrunContext {
                 rootfs_trace.stage("add_storage_disk", add_disk_start);
 
                 let root_start = Instant::now();
-                check_krun(
-                    "krun_set_direct_block_root",
-                    krun::krun_set_direct_block_root(
-                        self.id,
-                        "/dev/vda".to_string(),
-                        "ext4".to_string(),
-                        if spec.rootfs.readonly { "ro" } else { "rw" }.to_string(),
-                        project_init_path().to_string(),
-                    ),
+                set_direct_block_root(
+                    self.id,
+                    "/dev/vda".to_string(),
+                    "ext4".to_string(),
+                    if spec.rootfs.readonly { "ro" } else { "rw" }.to_string(),
+                    project_init_path().to_string(),
                 )?;
                 rootfs_trace.stage("set_direct_block_root", root_start);
                 rootfs_trace.finish();
@@ -553,6 +545,10 @@ impl KrunContext {
             krun::krun_set_exec(self.id, exec_path.as_ptr(), argv.as_ptr(), envp.as_ptr())
         })
     }
+}
+
+fn console_output_path(configured: Option<OsString>) -> OsString {
+    configured.unwrap_or_else(|| OsString::from("/dev/null"))
 }
 
 pub enum VirtioFsDevice {
@@ -879,6 +875,34 @@ fn project_init_stage() -> &'static str {
     "1"
 }
 
+#[cfg(sandbox_static_initrd)]
+fn set_direct_block_root(
+    ctx_id: u32,
+    device: String,
+    fstype: String,
+    options: String,
+    init_path: String,
+) -> Result<(), KrunError> {
+    check_krun(
+        "krun_set_direct_block_root_initrd",
+        krun::krun_set_direct_block_root_initrd(ctx_id, device, fstype, options, init_path),
+    )
+}
+
+#[cfg(not(sandbox_static_initrd))]
+fn set_direct_block_root(
+    ctx_id: u32,
+    device: String,
+    fstype: String,
+    options: String,
+    init_path: String,
+) -> Result<(), KrunError> {
+    check_krun(
+        "krun_set_direct_block_root",
+        krun::krun_set_direct_block_root(ctx_id, device, fstype, options, init_path),
+    )
+}
+
 #[cfg(sandbox_static_kernel)]
 unsafe extern "C" {
     fn krunfw_get_kernel(
@@ -1161,6 +1185,19 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn default_console_output_keeps_implicit_console_device() {
+        assert_eq!(console_output_path(None), OsString::from("/dev/null"));
+    }
+
+    #[test]
+    fn configured_console_output_uses_requested_path() {
+        assert_eq!(
+            console_output_path(Some(OsString::from("/tmp/sandbox-console.log"))),
+            OsString::from("/tmp/sandbox-console.log")
+        );
     }
 
     #[test]

@@ -13,6 +13,7 @@ const arch = process.env.SANDBOX_KERNEL_ARCH ?? guestArch();
 const image = process.env.SANDBOX_KERNEL_BUILDER_IMAGE ?? "debian:12";
 const outDir = resolve(repoRoot, process.env.SANDBOX_KERNEL_OUT_DIR ?? `dist/kernel/libkrunfw/${arch}`);
 const jobs = process.env.SANDBOX_KERNEL_JOBS ?? "4";
+const dockerPlatform = `linux/${dockerPlatformArch(arch)}`;
 
 if (!/^[1-9]\d*$/.test(jobs)) {
   throw new Error(`SANDBOX_KERNEL_JOBS must be a positive integer: ${jobs}`);
@@ -29,6 +30,8 @@ await rm(resolve(libkrunfwRoot, metadata.kernelVersion), { recursive: true, forc
 await run("docker", [
   "run",
   "--rm",
+  "--platform",
+  dockerPlatform,
   "--volume",
   `${repoRoot}:/work`,
   "--workdir",
@@ -74,6 +77,18 @@ function guestArch(): string {
       return "x86_64";
     default:
       throw new Error(`unsupported host architecture for kernel build: ${process.arch}`);
+  }
+}
+
+function dockerPlatformArch(value: string): string {
+  switch (value) {
+    case "arm64":
+    case "aarch64":
+      return "arm64";
+    case "x86_64":
+      return "amd64";
+    default:
+      throw new Error(`unsupported Docker platform architecture for kernel build: ${value}`);
   }
 }
 
