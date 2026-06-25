@@ -22,6 +22,7 @@ export interface SandboxControl extends Transport<SandboxControlEvent, SandboxCo
     readonly id?: string;
     readonly argv: readonly string[];
     readonly env?: Record<string, string>;
+    readonly cwd: string;
     readonly timeoutMs?: number;
     readonly signal?: AbortSignal;
   }): Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>>;
@@ -29,11 +30,13 @@ export interface SandboxControl extends Transport<SandboxControlEvent, SandboxCo
     readonly id?: string;
     readonly argv: readonly string[];
     readonly env?: Record<string, string>;
+    readonly cwd: string;
   }): ControlBackedSandboxProcess;
   pty(input: {
     readonly id?: string;
     readonly argv: readonly string[];
     readonly env?: Record<string, string>;
+    readonly cwd: string;
     readonly size: { readonly rows: number; readonly cols: number };
   }): ControlBackedSandboxPty;
 }
@@ -127,6 +130,7 @@ export class HostControlTransport implements SandboxControl {
     readonly id?: string;
     readonly argv: readonly string[];
     readonly env?: Record<string, string>;
+    readonly cwd: string;
     readonly timeoutMs?: number;
     readonly signal?: AbortSignal;
   }): Promise<Extract<SandboxControlEvent, { type: "guest.exec.complete" }>> {
@@ -176,6 +180,7 @@ export class HostControlTransport implements SandboxControl {
         id,
         argv: input.argv,
         env: input.env,
+        cwd: input.cwd,
         timeoutMs: input.timeoutMs,
       });
     } catch (error) {
@@ -195,6 +200,7 @@ export class HostControlTransport implements SandboxControl {
     readonly id?: string;
     readonly argv: readonly string[];
     readonly env?: Record<string, string>;
+    readonly cwd: string;
   }): ControlBackedSandboxProcess {
     this.#assertOpen();
     const id = input.id ?? crypto.randomUUID();
@@ -215,6 +221,7 @@ export class HostControlTransport implements SandboxControl {
         id,
         argv: input.argv,
         env: input.env,
+        cwd: input.cwd,
         stdin: "pipe",
         stdout: "pipe",
         stderr: "pipe",
@@ -229,6 +236,7 @@ export class HostControlTransport implements SandboxControl {
     readonly id?: string;
     readonly argv: readonly string[];
     readonly env?: Record<string, string>;
+    readonly cwd: string;
     readonly size: { readonly rows: number; readonly cols: number };
   }): ControlBackedSandboxPty {
     this.#assertOpen();
@@ -250,6 +258,7 @@ export class HostControlTransport implements SandboxControl {
       id,
       argv: input.argv,
       env: input.env,
+      cwd: input.cwd,
       stdin: "pty",
       stdout: "pty",
       stderr: "pty",

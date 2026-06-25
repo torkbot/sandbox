@@ -1550,6 +1550,7 @@ mod tests {
             id: "write-after-poll".to_string(),
             argv: vec!["true".to_string()],
             env: Vec::new(),
+            cwd: "/".to_string(),
             timeout_ms: None,
         }
         .encode_packet()

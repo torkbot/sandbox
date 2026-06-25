@@ -193,6 +193,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
       child,
       {
         hostname: "flatten-qcow2",
+        cwd: "/",
         rootfs: { path: input.basePath, readonly: true, format: "qcow2" },
       },
       new Map(),

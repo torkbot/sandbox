@@ -12,6 +12,7 @@ test("control command codec emits length-prefixed BSON", () => {
     id: "test",
     argv: ["/bin/true"],
     env: { FOO: "bar" },
+    cwd: "/workspace",
   });
 
   const frameLength = new DataView(packet.buffer, packet.byteOffset, 4).getUint32(0, true);
@@ -21,6 +22,7 @@ test("control command codec emits length-prefixed BSON", () => {
     id: "test",
     argv: ["/bin/true"],
     env: [{ key: "FOO", value: "bar" }],
+    cwd: "/workspace",
   });
 });
 
@@ -30,6 +32,7 @@ test("control command codec encodes guest spawn commands", () => {
     id: "spawn",
     argv: ["/bin/cat"],
     env: { FOO: "bar" },
+    cwd: "/workspace",
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
@@ -40,6 +43,7 @@ test("control command codec encodes guest spawn commands", () => {
     id: "spawn",
     argv: ["/bin/cat"],
     env: [{ key: "FOO", value: "bar" }],
+    cwd: "/workspace",
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",

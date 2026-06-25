@@ -20,6 +20,7 @@ pub enum ControlFrame {
         id: String,
         argv: Vec<String>,
         env: Vec<(String, String)>,
+        cwd: String,
         timeout_ms: Option<u64>,
     },
     GuestExecAbort {
@@ -29,6 +30,7 @@ pub enum ControlFrame {
         id: String,
         argv: Vec<String>,
         env: Vec<(String, String)>,
+        cwd: String,
         stdin: GuestSpawnStdio,
         stdout: GuestSpawnStdio,
         stderr: GuestSpawnStdio,
@@ -191,6 +193,7 @@ impl ControlFrame {
                 id,
                 argv,
                 env,
+                cwd,
                 timeout_ms,
             } => {
                 let mut document = bson::doc! {
@@ -202,6 +205,7 @@ impl ControlFrame {
                         "value": value,
                     }).collect::<Vec<_>>(),
                 };
+                document.insert("cwd", cwd);
                 if let Some(timeout_ms) = timeout_ms {
                     let timeout_ms = i64::try_from(*timeout_ms)
                         .map_err(|_| ControlFrameError::new("guest.exec timeoutMs exceeds i64"))?;
@@ -217,6 +221,7 @@ impl ControlFrame {
                 id,
                 argv,
                 env,
+                cwd,
                 stdin,
                 stdout,
                 stderr,
@@ -234,6 +239,7 @@ impl ControlFrame {
                     "stdout": stdout.as_str(),
                     "stderr": stderr.as_str(),
                 };
+                document.insert("cwd", cwd);
                 if let Some(pty) = pty {
                     document.insert(
                         "pty",
@@ -483,6 +489,10 @@ impl ControlFrame {
                     })
                     .transpose()?
                     .unwrap_or_default(),
+                cwd: document
+                    .get_str("cwd")
+                    .map_err(|_| ControlFrameError::new("guest.exec missing cwd"))?
+                    .to_string(),
                 timeout_ms: read_optional_u64(&document, "timeoutMs", "guest.exec timeoutMs")?,
             }),
             "guest.exec.abort" => Ok(Self::GuestExecAbort {
@@ -498,6 +508,10 @@ impl ControlFrame {
                     .to_string(),
                 argv: read_string_array(&document, "argv", "guest.spawn argv")?,
                 env: read_env_array(&document, "env", "guest.spawn env")?,
+                cwd: document
+                    .get_str("cwd")
+                    .map_err(|_| ControlFrameError::new("guest.spawn missing cwd"))?
+                    .to_string(),
                 stdin: read_spawn_stdio(&document, "stdin", "guest.spawn stdin")?,
                 stdout: read_spawn_stdio(&document, "stdout", "guest.spawn stdout")?,
                 stderr: read_spawn_stdio(&document, "stderr", "guest.spawn stderr")?,
@@ -1092,6 +1106,7 @@ mod tests {
                 id: "test".to_string(),
                 argv: vec!["/bin/true".to_string()],
                 env: vec![("FOO".to_string(), "bar".to_string())],
+                cwd: "/workspace".to_string(),
                 timeout_ms: Some(5000),
             },
             ControlFrame::GuestExecAbort {
@@ -1125,6 +1140,7 @@ mod tests {
                 id: "spawn".to_string(),
                 argv: vec!["/bin/cat".to_string()],
                 env: vec![("FOO".to_string(), "bar".to_string())],
+                cwd: "/workspace".to_string(),
                 stdin: GuestSpawnStdio::Pipe,
                 stdout: GuestSpawnStdio::Pipe,
                 stderr: GuestSpawnStdio::Pipe,
@@ -1134,6 +1150,7 @@ mod tests {
                 id: "pty".to_string(),
                 argv: vec!["/bin/sh".to_string()],
                 env: vec![],
+                cwd: "/".to_string(),
                 stdin: GuestSpawnStdio::Pty,
                 stdout: GuestSpawnStdio::Pty,
                 stderr: GuestSpawnStdio::Pty,
@@ -1295,6 +1312,7 @@ mod tests {
             id: "test".to_string(),
             argv: vec!["/bin/true".to_string()],
             env: Vec::new(),
+            cwd: "/".to_string(),
             timeout_ms: None,
         };
         let mut packet = frame.encode_packet().unwrap();
