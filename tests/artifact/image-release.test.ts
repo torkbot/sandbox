@@ -379,6 +379,59 @@ test("local image package bootstrap publishes release assets and documents trust
   assert.match(localPublishScript, /allowedAction: "npm publish"/);
 });
 
+test("local VM tools consume release-layout image artifacts", async () => {
+  const packageJson = JSON.parse(
+    await readFile(new URL("../../package.json", import.meta.url), "utf8"),
+  ) as {
+    readonly scripts: Record<string, string>;
+  };
+  const buildLocalImageScript = await readFile(
+    new URL("../../scripts/build-local-image-artifact.ts", import.meta.url),
+    "utf8",
+  );
+  const localImageArtifactSupport = await readFile(
+    new URL("../../scripts/support/local-image-artifact.ts", import.meta.url),
+    "utf8",
+  );
+  const localHostArtifactSupport = await readFile(
+    new URL("../../scripts/support/local-host-artifact.ts", import.meta.url),
+    "utf8",
+  );
+  const benchmarkScript = await readFile(
+    new URL("../../scripts/benchmark-e2e-lifecycle.ts", import.meta.url),
+    "utf8",
+  );
+  const diskTestScript = await readFile(
+    new URL("../../scripts/test-disk.ts", import.meta.url),
+    "utf8",
+  );
+  const apkReproScript = await readFile(
+    new URL("../../scripts/repro-heavy-apk-network.mjs", import.meta.url),
+    "utf8",
+  );
+
+  assert.equal(packageJson.scripts["images:build-local"], "node ./scripts/build-local-image-artifact.ts");
+  assert.match(buildLocalImageScript, /build-image-rootfs\.ts/);
+  assert.match(buildLocalImageScript, /build-rootfs-qcow2\.ts/);
+  assert.match(buildLocalImageScript, /SANDBOX_ROOTFS_SOURCE_DIR/);
+  assert.match(localImageArtifactSupport, /dist\/image-release/);
+  assert.match(localImageArtifactSupport, /rootfs\.qcow2/);
+  assert.match(localImageArtifactSupport, /environment-facts\.json/);
+  assert.match(localImageArtifactSupport, /rootfs\.digest/);
+  assert.match(localImageArtifactSupport, /npm run images:build-local/);
+  assert.match(localHostArtifactSupport, /hostBinaryPath/);
+  assert.match(localHostArtifactSupport, /codesign/);
+  assert.match(localHostArtifactSupport, /entitlements\/macos-hvf\.plist/);
+
+  for (const script of [benchmarkScript, diskTestScript, apkReproScript]) {
+    assert.match(script, /loadLocalImageArtifact/);
+    assert.match(script, /ensureLocalSandboxHost/);
+    assert.doesNotMatch(script, /@torkbot\/sandbox-image-alpine-3\.23-agent/);
+    assert.doesNotMatch(script, /SANDBOX_TEST_IMAGE_PACKAGE/);
+    assert.doesNotMatch(script, /dist\/rootfs\/alpine-3\.23\.qcow2/);
+  }
+});
+
 test("image rootfs builder preserves agent CLI facts and strips Docker markers", async () => {
   const buildImageRootfsScript = await readFile(
     new URL("../../scripts/build-image-rootfs.ts", import.meta.url),

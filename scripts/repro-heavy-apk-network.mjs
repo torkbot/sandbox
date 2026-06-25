@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineSandbox, network, rootfs } from "../src/index.ts";
+import { ensureLocalSandboxHost } from "./support/local-host-artifact.ts";
+import { loadLocalImageArtifact } from "./support/local-image-artifact.ts";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const stamp = new Date().toISOString().replaceAll(/[:.]/g, "-");
@@ -16,6 +16,10 @@ const cowBlockSize = optionalIntegerFlag("--cow-block-size");
 const execTimeouts = !process.argv.includes("--host-timeouts");
 const dnsResolver = flagValue("--dns-resolver") ?? "1.1.1.1";
 const testRootfs = await loadReproRootfs();
+await ensureLocalSandboxHost({
+  repoRoot,
+  consumer: "heavy APK repro",
+});
 
 await mkdir(outDir, { recursive: true });
 
@@ -247,44 +251,9 @@ try {
 }
 
 async function loadReproRootfs() {
-  const path = resolve(process.env.SANDBOX_TEST_ROOTFS_IMAGE ?? resolve(repoRoot, "dist/rootfs/alpine-3.23.qcow2"));
-  const factsPath = resolve(process.env.SANDBOX_TEST_ROOTFS_FACTS ?? resolve(repoRoot, "dist/rootfs/alpine-3.23-agent.environment-facts.json"));
-  const [imageStat, manifest] = await Promise.all([
-    stat(path),
-    readRootfsFactsManifest(factsPath),
-  ]);
-  if (!imageStat.isFile()) {
-    throw new Error(`rootfs image path is not a file: ${path}`);
-  }
-  return rootfs.image({
-    name: manifest.rootfs,
-    path,
-    format: "qcow2",
-    architecture: process.arch,
-    digest: `sha256:${await sha256File(path)}`,
-    sizeBytes: BigInt(imageStat.size),
-    facts: manifest.facts,
+  const artifact = await loadLocalImageArtifact({
+    repoRoot,
+    consumer: "heavy APK repro",
   });
-}
-
-async function readRootfsFactsManifest(path) {
-  const manifest = JSON.parse(await readFile(path, "utf8"));
-  if (manifest.schemaVersion !== 1) {
-    throw new Error(`unsupported rootfs facts manifest schema version: ${manifest.schemaVersion}`);
-  }
-  return manifest;
-}
-
-function sha256File(path) {
-  return new Promise((resolveDigest, reject) => {
-    const hash = createHash("sha256");
-    const stream = createReadStream(path);
-    stream.on("data", (chunk) => {
-      hash.update(chunk);
-    });
-    stream.on("error", reject);
-    stream.on("end", () => {
-      resolveDigest(hash.digest("hex"));
-    });
-  });
+  return artifact.image;
 }

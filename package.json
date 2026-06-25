@@ -17,6 +17,7 @@
     "build:rootfs": "node ./scripts/build-rootfs.ts",
     "build:rootfs:qcow2": "node ./scripts/build-rootfs-qcow2.ts",
     "build:ts": "rm -f dist/*.js dist/*.js.map dist/*.d.ts dist/*.d.ts.map && tsgo --project tsconfig.build.json --pretty",
+    "images:build-local": "node ./scripts/build-local-image-artifact.ts",
     "images:validate": "node ./scripts/image-manifest.ts validate",
     "images:publish-local": "node ./scripts/publish-image-packages-local.ts",
     "artifacts:link-current": "node ./scripts/prepare-npm-packages.ts --version ${SANDBOX_RELEASE_VERSION:-0.0.0-dev} --platform --current --install",

@@ -2,6 +2,7 @@ use std::env;
 use std::io::{self, ErrorKind, Read};
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -151,25 +152,36 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
     let guest_writer_slot: Arc<(Mutex<Option<ControlSocket>>, Condvar)> =
         Arc::new((Mutex::new(None), Condvar::new()));
     let start_status_slot: Arc<Mutex<Option<StartStatusObserver>>> = Arc::new(Mutex::new(None));
+    let launch_ready = Arc::new(AtomicBool::new(false));
+    let host_stdin_closed = Arc::new(AtomicBool::new(false));
 
     let stdin_bridge = bridge.clone();
     let stdin_tx = bridge_tx.clone();
     let stdin_guest_writer = guest_writer_slot.clone();
     let stdin_start_status = start_status_slot.clone();
+    let stdin_launch_ready = launch_ready.clone();
+    let stdin_host_stdin_closed = host_stdin_closed.clone();
     thread::spawn(move || {
         let mut stdin = io::stdin().lock();
         loop {
             let (packet, document) = match read_packet(&mut stdin) {
                 Ok(value) => value,
                 Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
-                    let start_status = stdin_start_status.lock().unwrap().clone();
-                    let result = match start_status.and_then(|status| status.get()) {
-                        Some(Ok(())) => Ok(()),
-                        Some(Err(error)) => {
-                            Err(format!("VM exited after host stdin closed: {error}"))
-                        }
-                        None => Err("host stdin closed before VM launch completed".to_string()),
-                    };
+                    stdin_host_stdin_closed.store(true, Ordering::SeqCst);
+                    let start_status =
+                        stdin_start_status
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .and_then(|status| {
+                                status
+                                    .get()
+                                    .map(|result| result.map_err(|error| error.to_string()))
+                            });
+                    let result = host_stdin_closed_result(
+                        start_status,
+                        stdin_launch_ready.load(Ordering::SeqCst),
+                    );
                     let _ = stdin_tx.send(result);
                     return;
                 }
@@ -227,13 +239,21 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
     let start_status = vm.start_status_observer();
     *start_status_slot.lock().unwrap() = Some(start_status.clone());
     let status_tx = bridge_tx.clone();
+    let status_launch_ready = launch_ready.clone();
+    let status_host_stdin_closed = host_stdin_closed.clone();
     thread::spawn(move || {
-        if let Err(error) = start_status.wait() {
-            let _ = status_tx.send(Err(error.to_string()));
+        let result = start_status.wait().map_err(|error| error.to_string());
+        if status_host_stdin_closed.load(Ordering::SeqCst) {
+            return;
         }
+        let _ = status_tx.send(vm_exited_before_host_stdin_result(
+            result,
+            status_launch_ready.load(Ordering::SeqCst),
+        ));
     });
 
     let guest_tx = bridge_tx.clone();
+    let guest_launch_ready = launch_ready.clone();
     thread::spawn(move || {
         loop {
             let packet = match guest_reader.read_packet() {
@@ -243,6 +263,9 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
                     return;
                 }
             };
+            if is_init_ready_packet(&packet) {
+                guest_launch_ready.store(true, Ordering::SeqCst);
+            }
             if let Err(error) = bridge.write_raw_packet(&packet) {
                 let _ = guest_tx.send(Err(format!("write host control packet: {error}")));
                 return;
@@ -260,6 +283,40 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(error) => Err(format!("control bridge stopped: {error}").into()),
     }
+}
+
+fn host_stdin_closed_result(
+    start_status: Option<Result<(), String>>,
+    launch_ready: bool,
+) -> Result<(), String> {
+    match start_status {
+        Some(Ok(())) if launch_ready => Ok(()),
+        Some(Ok(())) => Err("host stdin closed after VM exited before init.ready".to_string()),
+        Some(Err(error)) => Err(format!("VM exited after host stdin closed: {error}")),
+        None if launch_ready => Ok(()),
+        None => Err("host stdin closed before VM launch completed".to_string()),
+    }
+}
+
+fn vm_exited_before_host_stdin_result(
+    start_status: Result<(), String>,
+    launch_ready: bool,
+) -> Result<(), String> {
+    match start_status {
+        Ok(()) if launch_ready => Err("VM exited before host stdin closed".to_string()),
+        Ok(()) => Err("VM exited before init.ready".to_string()),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_init_ready_packet(packet: &[u8]) -> bool {
+    if packet.len() < 4 {
+        return false;
+    }
+    let Ok(document) = Document::from_reader(&packet[4..]) else {
+        return false;
+    };
+    matches!(document.get_str("type"), Ok("init.ready"))
 }
 
 fn network_policy_runtime(
@@ -1062,4 +1119,55 @@ fn optional_i32(document: &Document, key: &str) -> Option<i32> {
 
 fn optional_bool(document: &Document, key: &str) -> Option<bool> {
     document.get_bool(key).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_stdin_close_after_ready_is_normal_shutdown() {
+        assert_eq!(host_stdin_closed_result(Some(Ok(())), true), Ok(()));
+    }
+
+    #[test]
+    fn host_stdin_close_after_ready_before_vm_exit_is_normal_shutdown() {
+        assert_eq!(host_stdin_closed_result(None, true), Ok(()));
+    }
+
+    #[test]
+    fn host_stdin_close_before_ready_reports_launch_failure() {
+        assert_eq!(
+            host_stdin_closed_result(Some(Ok(())), false),
+            Err("host stdin closed after VM exited before init.ready".to_string()),
+        );
+    }
+
+    #[test]
+    fn vm_exit_before_ready_reports_launch_failure() {
+        assert_eq!(
+            vm_exited_before_host_stdin_result(Ok(()), false),
+            Err("VM exited before init.ready".to_string()),
+        );
+    }
+
+    #[test]
+    fn vm_exit_after_ready_without_host_close_reports_unexpected_exit() {
+        assert_eq!(
+            vm_exited_before_host_stdin_result(Ok(()), true),
+            Err("VM exited before host stdin closed".to_string()),
+        );
+    }
+
+    #[test]
+    fn init_ready_packet_is_detected() {
+        let packet = encode_document_packet(&doc! {
+            "type": "init.ready",
+            "rootReadonly": true,
+            "initName": "sandbox-init",
+        })
+        .unwrap();
+
+        assert!(is_init_ready_packet(&packet));
+    }
 }
