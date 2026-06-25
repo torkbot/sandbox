@@ -46,7 +46,7 @@ test("HostControlTransport fails sends until native channel is connected", async
   const control = new HostControlTransport();
 
   await assert.rejects(
-    control.exec({ id: "test", argv: ["/bin/true"] }),
+    control.exec({ id: "test", argv: ["/bin/true"], cwd: "/" }),
     /sandbox control send is not connected yet/,
   );
 });
@@ -59,6 +59,7 @@ test("HostControlTransport sends commands as packets", async () => {
     type: "guest.exec",
     id: "test",
     argv: ["/bin/true"],
+    cwd: "/",
   });
 
   const write = channel.writes[0];
@@ -68,6 +69,7 @@ test("HostControlTransport sends commands as packets", async () => {
     id: "test",
     argv: ["/bin/true"],
     env: [],
+    cwd: "/",
   });
   await control.close();
 });
@@ -99,7 +101,7 @@ test("HostControlTransport pumps native packets into incoming events", async () 
 test("HostControlTransport exec waits for matching completion", async () => {
   const channel = new MemoryControlChannel();
   const control = new HostControlTransport({ channel });
-  const exec = control.exec({ id: "test", argv: ["/bin/true"] });
+  const exec = control.exec({ id: "test", argv: ["/bin/true"], cwd: "/" });
 
   channel.packets.push(
     encodePacket({
@@ -124,13 +126,14 @@ test("HostControlTransport exec waits for matching completion", async () => {
 test("HostControlTransport sends exec timeout to guest", async () => {
   const channel = new MemoryControlChannel();
   const control = new HostControlTransport({ channel });
-  const exec = control.exec({ id: "test", argv: ["/bin/sleep", "10"], timeoutMs: 250 });
+  const exec = control.exec({ id: "test", argv: ["/bin/sleep", "10"], cwd: "/", timeoutMs: 250 });
 
   assert.deepEqual(BSON.deserialize(channel.writes[0]!.subarray(4)), {
     type: "guest.exec",
     id: "test",
     argv: ["/bin/sleep", "10"],
     env: [],
+    cwd: "/",
     timeoutMs: 250,
   });
 
@@ -155,6 +158,7 @@ test("HostControlTransport sends exec abort and rejects aborted call", async () 
   const exec = control.exec({
     id: "test",
     argv: ["/bin/sleep", "10"],
+    cwd: "/",
     signal: abort.signal,
   });
 
@@ -169,6 +173,7 @@ test("HostControlTransport sends exec abort and rejects aborted call", async () 
         id: "test",
         argv: ["/bin/sleep", "10"],
         env: [],
+        cwd: "/",
       },
       {
         type: "guest.exec.abort",
@@ -187,7 +192,7 @@ test("HostControlTransport sends exec abort and rejects aborted call", async () 
     }),
   );
 
-  const followup = control.exec({ id: "followup", argv: ["/bin/true"] });
+  const followup = control.exec({ id: "followup", argv: ["/bin/true"], cwd: "/" });
   channel.packets.push(
     encodePacket({
       type: "guest.exec.complete",
@@ -208,13 +213,14 @@ test("HostControlTransport keeps aborted exec id reserved until completion arriv
   const exec = control.exec({
     id: "reused",
     argv: ["/bin/sleep", "10"],
+    cwd: "/",
     signal: abort.signal,
   });
 
   abort.abort();
   await assert.rejects(exec, { name: "AbortError" });
   await assert.rejects(
-    control.exec({ id: "reused", argv: ["/bin/true"] }),
+    control.exec({ id: "reused", argv: ["/bin/true"], cwd: "/" }),
     /sandbox exec id is already in flight: reused/,
   );
 
@@ -232,7 +238,7 @@ test("HostControlTransport keeps aborted exec id reserved until completion arriv
     "guest.exec.complete",
   );
 
-  const followup = control.exec({ id: "reused", argv: ["/bin/true"] });
+  const followup = control.exec({ id: "reused", argv: ["/bin/true"], cwd: "/" });
   channel.packets.push(
     encodePacket({
       type: "guest.exec.complete",
@@ -250,13 +256,14 @@ test("HostControlTransport keeps aborted exec id reserved until completion arriv
 test("HostControlTransport omits exec timeout when not requested", async () => {
   const channel = new MemoryControlChannel();
   const control = new HostControlTransport({ channel });
-  const exec = control.exec({ id: "test", argv: ["/bin/true"] });
+  const exec = control.exec({ id: "test", argv: ["/bin/true"], cwd: "/" });
 
   assert.deepEqual(BSON.deserialize(channel.writes[0]!.subarray(4)), {
     type: "guest.exec",
     id: "test",
     argv: ["/bin/true"],
     env: [],
+    cwd: "/",
   });
 
   channel.packets.push(
@@ -286,6 +293,7 @@ test("HostControlTransport spawn streams stdio and resolves exit", async () => {
         id: "spawn",
         argv: ["/bin/cat"],
         env: [],
+        cwd: "/",
         stdin: "pipe",
         stdout: "pipe",
         stderr: "pipe",
@@ -409,7 +417,7 @@ test("HostControlTransport keeps spawn streams open after process exit", async (
 test("HostControlTransport rejects pre-start spawn failures without exposing a process", async () => {
   const channel = new MemoryControlChannel();
   const control = new HostControlTransport({ channel });
-  const spawned = control.spawn({ id: "spawn", argv: ["/bin/cat"] });
+  const spawned = control.spawn({ id: "spawn", argv: ["/bin/cat"], cwd: "/" });
 
   await control.close();
 
@@ -420,7 +428,7 @@ test("HostControlTransport rejects pre-start spawn failures without exposing a p
 test("HostControlTransport rejects spawn ready when process exits before start", async () => {
   const channel = new MemoryControlChannel();
   const control = new HostControlTransport({ channel });
-  const spawned = control.spawn({ id: "spawn", argv: ["/missing"] });
+  const spawned = control.spawn({ id: "spawn", argv: ["/missing"], cwd: "/" });
 
   channel.packets.push(
     encodePacket({
@@ -493,12 +501,12 @@ test("HostControlTransport demultiplexes concurrent spawn output", async () => {
 test("HostControlTransport rejects duplicate in-flight spawn ids", async () => {
   const channel = new MemoryControlChannel();
   const control = new HostControlTransport({ channel });
-  const first = control.spawn({ id: "duplicate", argv: ["/bin/cat"] });
+  const first = control.spawn({ id: "duplicate", argv: ["/bin/cat"], cwd: "/" });
 
   channel.packets.push(encodePacket({ type: "guest.spawn.started", id: "duplicate" }));
   await first.ready;
   assert.throws(
-    () => control.spawn({ id: "duplicate", argv: ["/bin/cat"] }),
+    () => control.spawn({ id: "duplicate", argv: ["/bin/cat"], cwd: "/" }),
     /sandbox spawn id is already in flight: duplicate/,
   );
 
@@ -524,6 +532,7 @@ test("HostControlTransport pty streams terminal data and sends resize", async ()
   const pty = control.pty({
     id: "pty",
     argv: ["/bin/sh"],
+    cwd: "/",
     size: { rows: 24, cols: 80 },
   });
 
@@ -532,6 +541,7 @@ test("HostControlTransport pty streams terminal data and sends resize", async ()
     id: "pty",
     argv: ["/bin/sh"],
     env: [],
+    cwd: "/",
     stdin: "pty",
     stdout: "pty",
     stderr: "pty",
@@ -595,6 +605,7 @@ test("HostControlTransport rejects invalid pty resize before sending", async () 
   const pty = control.pty({
     id: "pty",
     argv: ["/bin/sh"],
+    cwd: "/",
     size: { rows: 24, cols: 80 },
   });
 
@@ -677,8 +688,8 @@ test("HostControlTransport errors process stdin after streams close", async () =
 test("HostControlTransport demultiplexes concurrent exec completions", async () => {
   const channel = new MemoryControlChannel();
   const control = new HostControlTransport({ channel });
-  const first = control.exec({ id: "first", argv: ["/bin/true"] });
-  const second = control.exec({ id: "second", argv: ["/bin/true"] });
+  const first = control.exec({ id: "first", argv: ["/bin/true"], cwd: "/" });
+  const second = control.exec({ id: "second", argv: ["/bin/true"], cwd: "/" });
 
   channel.packets.push(
     encodePacket({
@@ -706,7 +717,7 @@ test("HostControlTransport exec is not starved by incoming consumers", async () 
   const channel = new MemoryControlChannel();
   const control = new HostControlTransport({ channel });
   const iterator = control.incoming[Symbol.asyncIterator]();
-  const exec = control.exec({ id: "test", argv: ["/bin/true"] });
+  const exec = control.exec({ id: "test", argv: ["/bin/true"], cwd: "/" });
 
   channel.packets.push(
     encodePacket({
@@ -741,10 +752,10 @@ test("HostControlTransport exec is not starved by incoming consumers", async () 
 test("HostControlTransport rejects duplicate in-flight exec ids", async () => {
   const channel = new MemoryControlChannel();
   const control = new HostControlTransport({ channel });
-  const first = control.exec({ id: "duplicate", argv: ["/bin/true"] });
+  const first = control.exec({ id: "duplicate", argv: ["/bin/true"], cwd: "/" });
 
   await assert.rejects(
-    control.exec({ id: "duplicate", argv: ["/bin/true"] }),
+    control.exec({ id: "duplicate", argv: ["/bin/true"], cwd: "/" }),
     /sandbox exec id is already in flight: duplicate/,
   );
 
@@ -827,14 +838,14 @@ test("HostControlTransport closes and rejects pending execs on malformed frames"
   const channel = new MemoryControlChannel();
   const control = new HostControlTransport({ channel });
   const iterator = control.incoming[Symbol.asyncIterator]();
-  const exec = control.exec({ id: "pending", argv: ["/bin/true"] });
+  const exec = control.exec({ id: "pending", argv: ["/bin/true"], cwd: "/" });
 
   channel.packets.push(encodePacket({ type: "unknown.control.frame" }));
 
   await assert.rejects(exec, /unknown control frame type: unknown.control.frame/);
   await assert.rejects(iterator.next(), /unknown control frame type: unknown.control.frame/);
   await assert.rejects(
-    control.exec({ id: "after-failure", argv: ["/bin/true"] }),
+    control.exec({ id: "after-failure", argv: ["/bin/true"], cwd: "/" }),
     /sandbox control is closed/,
   );
 });
@@ -883,7 +894,7 @@ function startSpawn(
   channel: MemoryControlChannel,
   id: string,
 ) {
-  const spawned = control.spawn({ id, argv: ["/bin/cat"] });
+  const spawned = control.spawn({ id, argv: ["/bin/cat"], cwd: "/" });
   channel.packets.push(encodePacket({ type: "guest.spawn.started", id }));
   return spawned;
 }

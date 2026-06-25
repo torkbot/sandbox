@@ -1585,9 +1585,9 @@ class ControlBackedSandboxGuestFileSystem implements SandboxGuestFileSystem {
 
 class ControlBackedSandboxExec {
   readonly #control: SandboxControl;
-  readonly #cwd: string | undefined;
+  readonly #cwd: string;
 
-  constructor(control: SandboxControl, cwd: string | undefined) {
+  constructor(control: SandboxControl, cwd: string) {
     this.#control = control;
     this.#cwd = cwd;
   }
@@ -1599,19 +1599,11 @@ class ControlBackedSandboxExec {
   ): Promise<SandboxExecResult> {
     args ??= [];
     const cwd = options.cwd ?? this.#cwd;
-    const env = cwd === undefined
-      ? options.env
-      : {
-          ...options.env,
-          SANDBOX_EXEC_CWD: cwd,
-          PWD: cwd,
-        };
-    const argv = cwd === undefined
-      ? [command, ...args]
-      : ["/bin/sh", "-lc", "cd \"$SANDBOX_EXEC_CWD\" && exec \"$@\"", "sandbox-exec", command, ...args];
+    const env = { ...options.env, PWD: cwd };
     const result = await this.#control.exec({
-      argv,
+      argv: [command, ...args],
       env,
+      cwd,
       timeoutMs: options.timeoutMs,
       signal: options.signal,
     });
@@ -1626,9 +1618,9 @@ class ControlBackedSandboxExec {
 
 class ControlBackedSandboxSpawn {
   readonly #control: SandboxControl;
-  readonly #cwd: string | undefined;
+  readonly #cwd: string;
 
-  constructor(control: SandboxControl, cwd: string | undefined) {
+  constructor(control: SandboxControl, cwd: string) {
     this.#control = control;
     this.#cwd = cwd;
   }
@@ -1640,19 +1632,11 @@ class ControlBackedSandboxSpawn {
   ): ControlBackedSandboxProcess {
     args ??= [];
     const cwd = options.cwd ?? this.#cwd;
-    const env = cwd === undefined
-      ? options.env
-      : {
-          ...options.env,
-          SANDBOX_EXEC_CWD: cwd,
-          PWD: cwd,
-        };
-    const argv = cwd === undefined
-      ? [command, ...args]
-      : ["/bin/sh", "-lc", "cd \"$SANDBOX_EXEC_CWD\" && exec \"$@\"", "sandbox-spawn", command, ...args];
+    const env = { ...options.env, PWD: cwd };
     return this.#control.spawn({
-      argv,
+      argv: [command, ...args],
       env,
+      cwd,
     });
   }
 
@@ -1663,19 +1647,11 @@ class ControlBackedSandboxSpawn {
   ): ControlBackedSandboxPty {
     args ??= [];
     const cwd = options.cwd ?? this.#cwd;
-    const env = cwd === undefined
-      ? options.env
-      : {
-          ...options.env,
-          SANDBOX_EXEC_CWD: cwd,
-          PWD: cwd,
-        };
-    const argv = cwd === undefined
-      ? [command, ...args]
-      : ["/bin/sh", "-lc", "cd \"$SANDBOX_EXEC_CWD\" && exec \"$@\"", "sandbox-pty", command, ...args];
+    const env = { ...options.env, PWD: cwd };
     return this.#control.pty({
-      argv,
+      argv: [command, ...args],
       env,
+      cwd,
       size: options.size,
     });
   }
@@ -1738,7 +1714,7 @@ async function toInternalSandboxOptions(
   return {
     resources: config.resources,
     rootfs,
-    cwd: boot.cwd,
+    cwd: boot.cwd ?? "/",
     hostname: boot.hostname ?? "sandbox",
     mounts: Object.entries(boot.mounts ?? {}).map(([path, source]) => {
       return lowerInternalMount(path, source);

@@ -118,6 +118,7 @@ export type SandboxControlCommand =
       readonly id: string;
       readonly argv: readonly string[];
       readonly env?: Record<string, string>;
+      readonly cwd: string;
       readonly timeoutMs?: number;
     }
   | {
@@ -129,6 +130,7 @@ export type SandboxControlCommand =
       readonly id: string;
       readonly argv: readonly string[];
       readonly env?: Record<string, string>;
+      readonly cwd: string;
       readonly stdin: "pipe" | "pty";
       readonly stdout: "pipe" | "pty";
       readonly stderr: "pipe" | "pty";
@@ -168,6 +170,7 @@ export function encodeControlCommand(command: SandboxControlCommand): Uint8Array
         id: command.id,
         argv: [...command.argv],
         env: Object.entries(command.env ?? {}).map(([key, value]) => ({ key, value })),
+        cwd: command.cwd,
         ...(command.timeoutMs === undefined ? {} : { timeoutMs: command.timeoutMs }),
       });
     case "guest.exec.abort":
@@ -181,6 +184,7 @@ export function encodeControlCommand(command: SandboxControlCommand): Uint8Array
         id: command.id,
         argv: [...command.argv],
         env: Object.entries(command.env ?? {}).map(([key, value]) => ({ key, value })),
+        cwd: command.cwd,
         stdin: command.stdin,
         stdout: command.stdout,
         stderr: command.stderr,

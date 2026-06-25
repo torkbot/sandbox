@@ -14,7 +14,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 const GUEST_FS_RESPONSE_PAYLOAD_LIMIT: u64 = 60 * 1024 * 1024;
 const GUEST_FS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
@@ -1209,13 +1209,14 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
                 id,
                 argv,
                 env,
+                cwd,
                 timeout_ms,
             } => {
                 let writer = writer.clone();
                 let execs = execs.clone();
                 let cancel = execs.insert(id.clone());
                 std::thread::spawn(move || {
-                    let response = run_guest_exec(id.clone(), argv, env, timeout_ms, cancel);
+                    let response = run_guest_exec(id.clone(), argv, env, cwd, timeout_ms, cancel);
                     execs.remove(&id);
                     match response {
                         Ok(frame) => {
@@ -1242,6 +1243,7 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
                 id,
                 argv,
                 env,
+                cwd,
                 stdin,
                 stdout,
                 stderr,
@@ -1255,6 +1257,7 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
                         id.clone(),
                         argv,
                         env,
+                        cwd,
                         stdin,
                         stdout,
                         stderr,
@@ -1605,6 +1608,7 @@ fn run_guest_spawn(
     id: String,
     argv: Vec<String>,
     env: Vec<(String, String)>,
+    cwd: String,
     stdin: GuestSpawnStdio,
     stdout: GuestSpawnStdio,
     stderr: GuestSpawnStdio,
@@ -1634,6 +1638,7 @@ fn run_guest_spawn(
     let mut command = std::process::Command::new(&argv[0]);
     command.args(&argv[1..]);
     command.envs(env);
+    command.current_dir(cwd);
 
     let mut pty_master = None;
     if let Some(size) = pty_mode {
@@ -2132,6 +2137,7 @@ fn run_guest_exec(
     id: String,
     argv: Vec<String>,
     env: Vec<(String, String)>,
+    cwd: String,
     timeout_ms: Option<u64>,
     cancellation: Arc<ExecCancellation>,
 ) -> Result<ControlFrame, InitError> {
@@ -2146,7 +2152,7 @@ fn run_guest_exec(
 
     prepare_exec_environment(&env)?;
 
-    let output = match run_guest_exec_command(&argv, env, timeout_ms, cancellation) {
+    let output = match run_guest_exec_command(&argv, env, cwd, timeout_ms, cancellation) {
         Ok(output) => output,
         Err(ExecCommandError::Spawn(error)) => {
             return Ok(ControlFrame::GuestExecComplete {
@@ -2205,6 +2211,7 @@ enum ExecCommandError {
 fn run_guest_exec_command(
     argv: &[String],
     env: Vec<(String, String)>,
+    cwd: String,
     timeout_ms: Option<u64>,
     cancellation: Arc<ExecCancellation>,
 ) -> Result<GuestExecOutput, ExecCommandError> {
@@ -2216,6 +2223,7 @@ fn run_guest_exec_command(
     configure_command_process_group(&mut command);
 
     command.envs(env);
+    command.current_dir(cwd);
     let (mut child, child_id) =
         spawn_active_child(&mut command).map_err(ExecCommandError::Spawn)?;
     cancellation.set_child(child_id);
@@ -2226,55 +2234,133 @@ fn run_guest_exec_command(
     let stderr_reader = read_child_output(stderr);
 
     let deadline = timeout_ms.and_then(exec_deadline);
-    loop {
-        if cancellation.is_aborted() {
-            terminate_child_process_group(child_id);
-            let _ = child.kill();
-            let _ = child.wait();
+    let timeout = ExecTimeout::start(child_id, timeout_ms);
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
             unregister_active_child(child_id);
             cancellation.clear_child();
-            let grace_deadline =
-                std::time::Instant::now().checked_add(std::time::Duration::from_millis(100));
-            let (stdout, stderr) =
-                join_output_readers_until(stdout_reader, stderr_reader, grace_deadline)
-                    .unwrap_or_default();
-            return Err(ExecCommandError::Aborted { stdout, stderr });
+            let _ = timeout.finish();
+            return Err(ExecCommandError::Wait(error));
         }
-        if let Some(status) = child.try_wait().map_err(ExecCommandError::Wait)? {
-            unregister_active_child(child_id);
-            return match join_output_readers_until(stdout_reader, stderr_reader, deadline) {
-                Some((stdout, stderr)) => {
-                    cancellation.clear_child();
-                    Ok(GuestExecOutput {
-                        status,
-                        stdout,
-                        stderr,
-                    })
-                }
-                None => {
+    };
+
+    unregister_active_child(child_id);
+    let timed_out = timeout.finish();
+    if timed_out {
+        cancellation.clear_child();
+        let grace_deadline =
+            std::time::Instant::now().checked_add(std::time::Duration::from_millis(100));
+        let (stdout, stderr) =
+            join_output_readers_until(stdout_reader, stderr_reader, grace_deadline)
+                .unwrap_or_default();
+        return Err(ExecCommandError::TimedOut { stdout, stderr });
+    }
+    if cancellation.is_aborted() {
+        cancellation.clear_child();
+        let grace_deadline =
+            std::time::Instant::now().checked_add(std::time::Duration::from_millis(100));
+        let (stdout, stderr) =
+            join_output_readers_until(stdout_reader, stderr_reader, grace_deadline)
+                .unwrap_or_default();
+        return Err(ExecCommandError::Aborted { stdout, stderr });
+    }
+
+    match join_output_readers_until(stdout_reader, stderr_reader, deadline) {
+        Some((stdout, stderr)) => {
+            cancellation.clear_child();
+            Ok(GuestExecOutput {
+                status,
+                stdout,
+                stderr,
+            })
+        }
+        None => {
+            terminate_child_process_group(child_id);
+            cancellation.clear_child();
+            Err(ExecCommandError::TimedOut {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+}
+
+enum ExecTimeout {
+    Disabled,
+    Enabled {
+        state: Arc<ExecTimeoutState>,
+        worker: std::thread::JoinHandle<()>,
+    },
+}
+
+impl ExecTimeout {
+    fn start(child_id: u32, timeout_ms: Option<u64>) -> Self {
+        let Some(timeout_ms) = timeout_ms else {
+            return Self::Disabled;
+        };
+        let state = Arc::new(ExecTimeoutState {
+            completed: Mutex::new(false),
+            completed_changed: Condvar::new(),
+            timed_out: AtomicBool::new(false),
+        });
+        let worker = {
+            let state = state.clone();
+            std::thread::spawn(move || {
+                state.wait_until_deadline_or_completion(timeout_ms);
+                if state.timed_out() {
                     terminate_child_process_group(child_id);
-                    cancellation.clear_child();
-                    Err(ExecCommandError::TimedOut {
-                        stdout: Vec::new(),
-                        stderr: Vec::new(),
-                    })
                 }
-            };
+            })
+        };
+        Self::Enabled { state, worker }
+    }
+
+    fn finish(self) -> bool {
+        match self {
+            Self::Disabled => false,
+            Self::Enabled { state, worker } => {
+                state.complete();
+                let _ = worker.join();
+                state.timed_out()
+            }
         }
-        if deadline_expired(deadline) {
-            terminate_child_process_group(child_id);
-            let _ = child.kill();
-            let _ = child.wait();
-            unregister_active_child(child_id);
-            cancellation.clear_child();
-            let grace_deadline =
-                std::time::Instant::now().checked_add(std::time::Duration::from_millis(100));
-            let (stdout, stderr) =
-                join_output_readers_until(stdout_reader, stderr_reader, grace_deadline)
-                    .unwrap_or_default();
-            return Err(ExecCommandError::TimedOut { stdout, stderr });
+    }
+}
+
+struct ExecTimeoutState {
+    completed: Mutex<bool>,
+    completed_changed: Condvar,
+    timed_out: AtomicBool,
+}
+
+impl ExecTimeoutState {
+    fn wait_until_deadline_or_completion(&self, timeout_ms: u64) {
+        let completed = self.completed.lock().unwrap();
+        let (completed, result) = self
+            .completed_changed
+            .wait_timeout_while(
+                completed,
+                std::time::Duration::from_millis(timeout_ms),
+                |completed| !*completed,
+            )
+            .unwrap();
+        if !*completed && result.timed_out() {
+            self.timed_out.store(true, Ordering::SeqCst);
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    fn complete(&self) {
+        if let Ok(mut completed) = self.completed.lock() {
+            if !*completed {
+                *completed = true;
+                self.completed_changed.notify_all();
+            }
+        }
+    }
+
+    fn timed_out(&self) -> bool {
+        self.timed_out.load(Ordering::SeqCst)
     }
 }
 
@@ -2282,14 +2368,7 @@ fn run_guest_exec_command(
 fn configure_command_process_group(command: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
 
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    command.process_group(0);
 }
 
 #[cfg(not(unix))]
@@ -2324,10 +2403,6 @@ fn read_child_output(
 
 fn exec_deadline(timeout_ms: u64) -> Option<std::time::Instant> {
     std::time::Instant::now().checked_add(std::time::Duration::from_millis(timeout_ms))
-}
-
-fn deadline_expired(deadline: Option<std::time::Instant>) -> bool {
-    deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
 }
 
 fn join_output_readers_until(
