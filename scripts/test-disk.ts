@@ -1,9 +1,6 @@
 #!/usr/bin/env node
 
-import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
-import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { stderr, stdout } from "node:process";
 import {
   defineSandbox,
@@ -13,7 +10,8 @@ import {
   type NetworkConnectionRequest,
   type SandboxBlockStore,
 } from "../src/index.ts";
-import type { RootfsEnvironmentFactsManifest } from "../src/environment-facts.ts";
+import { ensureLocalSandboxHost } from "./support/local-host-artifact.ts";
+import { loadLocalImageArtifact } from "./support/local-image-artifact.ts";
 
 type DiskTestOptions = {
   readonly size: string;
@@ -23,10 +21,15 @@ type DiskTestOptions = {
 };
 
 const options = parseArgs(process.argv.slice(2));
+const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const blockStore = memoryBlockStore();
 const networkStats = createNetworkStats();
 const workspace = fs.memory({});
 const testRootfs = await loadDiskTestRootfs();
+await ensureLocalSandboxHost({
+  repoRoot,
+  consumer: "disk test",
+});
 
 const sandbox = defineSandbox({
   rootfs: rootfs.cow({
@@ -78,47 +81,11 @@ try {
 process.exitCode = exitCode;
 
 async function loadDiskTestRootfs() {
-  const repoRoot = resolve(import.meta.dirname, "..");
-  const path = resolve(process.env.SANDBOX_TEST_ROOTFS_IMAGE ?? resolve(repoRoot, "dist/rootfs/alpine-3.23.qcow2"));
-  const factsPath = resolve(process.env.SANDBOX_TEST_ROOTFS_FACTS ?? resolve(repoRoot, "dist/rootfs/alpine-3.23-agent.environment-facts.json"));
-  const [imageStat, manifest] = await Promise.all([
-    stat(path),
-    readRootfsFactsManifest(factsPath),
-  ]);
-  if (!imageStat.isFile()) {
-    throw new Error(`rootfs image path is not a file: ${path}`);
-  }
-  return rootfs.image({
-    name: manifest.rootfs,
-    path,
-    format: "qcow2",
-    architecture: process.arch,
-    digest: `sha256:${await sha256File(path)}`,
-    sizeBytes: BigInt(imageStat.size),
-    facts: manifest.facts,
+  const artifact = await loadLocalImageArtifact({
+    repoRoot,
+    consumer: "disk test",
   });
-}
-
-async function readRootfsFactsManifest(path: string): Promise<RootfsEnvironmentFactsManifest> {
-  const manifest = JSON.parse(await readFile(path, "utf8")) as RootfsEnvironmentFactsManifest;
-  if (manifest.schemaVersion !== 1) {
-    throw new Error(`unsupported rootfs facts manifest schema version: ${manifest.schemaVersion}`);
-  }
-  return manifest;
-}
-
-function sha256File(path: string): Promise<string> {
-  return new Promise((resolveDigest, reject) => {
-    const hash = createHash("sha256");
-    const stream = createReadStream(path);
-    stream.on("data", (chunk) => {
-      hash.update(chunk);
-    });
-    stream.on("error", reject);
-    stream.on("end", () => {
-      resolveDigest(hash.digest("hex"));
-    });
-  });
+  return artifact.image;
 }
 
 async function runFio(name: string, directory: string, options: DiskTestOptions): Promise<void> {

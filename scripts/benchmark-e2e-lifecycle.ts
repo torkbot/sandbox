@@ -1,13 +1,13 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { platform } from "node:os";
 import { resolve } from "node:path";
 
-import { hostBinaryPath } from "../src/host-process.ts";
-import { defineSandbox, rootfs } from "../src/index.ts";
-import type { RootfsEnvironmentFactsManifest } from "../src/environment-facts.ts";
+import { defineSandbox } from "../src/index.ts";
+import { ensureLocalSandboxHost } from "./support/local-host-artifact.ts";
+import { defaultLocalImageId, loadLocalImageArtifact, type LocalImageArtifact } from "./support/local-image-artifact.ts";
 
 type IterationTiming = {
   readonly iteration: number;
@@ -36,6 +36,7 @@ type BenchmarkConfig = {
   readonly warmups: number;
   readonly command: string;
   readonly commandArgs: readonly string[];
+  readonly image: string;
   readonly output: string;
 };
 
@@ -47,7 +48,8 @@ const runId = new Date()
 const config = parseArgs(process.argv.slice(2));
 
 const artifacts = await assertVmLaunchSupport();
-const testRootfs = await loadBenchmarkRootfs(artifacts.rootfs);
+const benchmarkImage = await loadBenchmarkRootfs(config.image);
+const testRootfs = benchmarkImage.image;
 await mkdir(resolve(repoRoot, config.output), { recursive: true });
 
 const timings: IterationTiming[] = [];
@@ -83,7 +85,11 @@ const report = {
     execPath: process.execPath,
     version: process.version,
   },
-  artifacts,
+  artifacts: {
+    ...artifacts,
+    rootfs: benchmarkImage.rootfs,
+    rootfsFactsPath: benchmarkImage.factsPath,
+  },
   iterations: config.iterations,
   warmups: config.warmups,
   stats: {
@@ -148,39 +154,29 @@ async function runLifecycleIteration(
   }
 }
 
-async function loadBenchmarkRootfs(metadata: ArtifactMetadata) {
-  const factsPath = resolve(repoRoot, "dist/rootfs/alpine-3.23-agent.environment-facts.json");
-  const manifest = JSON.parse(await readFile(factsPath, "utf8")) as RootfsEnvironmentFactsManifest;
-  if (manifest.schemaVersion !== 1) {
-    throw new Error(`unsupported rootfs facts manifest schema version: ${manifest.schemaVersion}`);
-  }
-  return rootfs.image({
-    name: manifest.rootfs,
-    path: metadata.path,
-    format: "qcow2",
-    architecture: process.arch,
-    digest: `sha256:${metadata.sha256}`,
-    sizeBytes: BigInt(metadata.bytes),
-    facts: manifest.facts,
+async function loadBenchmarkRootfs(imageId: string): Promise<LocalImageArtifact> {
+  return await loadLocalImageArtifact({
+    repoRoot,
+    imageId,
+    consumer: "benchmark",
   });
 }
 
 async function assertVmLaunchSupport(): Promise<{
   readonly hostBinary: ArtifactMetadata;
-  readonly rootfs: ArtifactMetadata;
 }> {
-  const hostBinary = hostBinaryPath();
   if (process.platform === "linux" && !existsSync("/dev/kvm")) {
     throw new Error("Linux KVM is not available on this host");
   }
   if (process.platform !== "darwin" && process.platform !== "linux") {
     throw new Error(`unsupported VM launch host platform: ${process.platform}`);
   }
-  const rootfsPath = resolve(repoRoot, "dist/rootfs/alpine-3.23.qcow2");
-  await access(rootfsPath);
+  const hostBinary = await ensureLocalSandboxHost({
+    repoRoot,
+    consumer: "benchmark",
+  });
   return {
     hostBinary: await artifactMetadata(hostBinary),
-    rootfs: await artifactMetadata(rootfsPath),
   };
 }
 
@@ -232,6 +228,7 @@ function parseArgs(args: readonly string[]): BenchmarkConfig {
   let warmups = 1;
   let command = "/bin/true";
   let commandArgs: readonly string[] = [];
+  let image = defaultLocalImageId;
   let output = `test-results/benchmarks/e2e-lifecycle/${runId}`;
 
   for (let index = 0; index < args.length; index += 1) {
@@ -270,10 +267,15 @@ function parseArgs(args: readonly string[]): BenchmarkConfig {
       index += 1;
       continue;
     }
+    if (arg === "--image") {
+      image = readValue(args, index);
+      index += 1;
+      continue;
+    }
     throw new Error(`unknown argument: ${arg}`);
   }
 
-  return { iterations, warmups, command, commandArgs, output };
+  return { iterations, warmups, command, commandArgs, image, output };
 }
 
 function readValue(args: readonly string[], index: number): string {
@@ -374,6 +376,10 @@ Options:
       --warmups <count>     warmup iterations excluded from stats (default: 1)
       --exec <path>          guest executable to run directly (default: /bin/true)
   -c, --command <script>    guest shell command to run through /bin/sh -lc
+      --image <id>           built local image artifact to use (default: ${defaultLocalImageId})
       --output <dir>        output directory for summary.json
+
+Image prerequisite:
+  npm run images:build-local -- --image ${defaultLocalImageId}
 `);
 }
