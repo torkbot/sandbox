@@ -42,4 +42,5 @@ RUN apk add --no-cache \
     'update-ca-certificates' \
     > /usr/lib/sandbox/install-http-ca \
   && chmod 755 /usr/lib/sandbox/install-http-ca \
-  && rm -rf /var/cache/apk/* /etc/apk/cache/* /root/.cache /tmp/* /var/tmp/* /usr/share/doc /usr/share/man /usr/share/info
+  && npm cache clean --force \
+  && rm -rf /var/cache/apk/* /etc/apk/cache/* /root/.cache /root/.npm /tmp/* /var/tmp/* /usr/share/bug /usr/share/doc /usr/share/info /usr/share/lintian /usr/share/locale /usr/share/man

@@ -30,9 +30,7 @@ const repoRoot = resolve(import.meta.dirname, "../..");
 const expectedImageIds = [
   "alpine-3.23-agent",
   "alpine-3.23-slim",
-  "debian-13-agent",
   "debian-13-slim",
-  "ubuntu-26.04-agent",
   "ubuntu-26.04-slim",
 ];
 
@@ -53,9 +51,25 @@ test("checked-in image manifests stay minimal and immutable", async () => {
     const dockerfile = await readFile(new URL(`../../images/${definition.id}/Dockerfile`, import.meta.url), "utf8");
     assert.match(dockerfile, /^ARG SOURCE_IMAGE$/m);
     assert.match(dockerfile, /^FROM \$\{SOURCE_IMAGE\}$/m);
+    if (definition.id.startsWith("debian-") || definition.id.startsWith("ubuntu-")) {
+      assert.match(dockerfile, /--no-install-recommends --no-install-suggests/);
+      assert.match(dockerfile, /path-exclude=\/usr\/share\/doc\/\*/);
+      assert.match(dockerfile, /path-exclude=\/usr\/share\/locale\/\*/);
+      assert.match(dockerfile, /apt-get clean/);
+      assert.match(dockerfile, /\/var\/cache\/apt\/archives\/\*/);
+    }
     if (definition.id.endsWith("-agent")) {
       assert.match(dockerfile, /gh_2\.83\.0_linux_\$\{gh_arch\}\.tar\.gz/);
       assert.match(dockerfile, /\/usr\/local\/bin\/gh/);
+      assert.match(dockerfile, /\/root\/\.npm/);
+      if (definition.id.startsWith("debian-") || definition.id.startsWith("ubuntu-")) {
+        assert.doesNotMatch(dockerfile, /^\s+nodejs \\/m);
+        assert.doesNotMatch(dockerfile, /^\s+npm \\/m);
+        assert.match(dockerfile, /node_version=24\.18\.0/);
+        assert.match(dockerfile, /node-v\$\{node_version\}-linux-\$\{node_arch\}\.tar\.xz/);
+        assert.match(dockerfile, /sha256sum -c -/);
+        assert.match(dockerfile, /\/usr\/local\/include\/node/);
+      }
     }
   }
 });
@@ -374,6 +388,12 @@ test("image rootfs builder preserves agent CLI facts and strips Docker markers",
   assert.match(buildImageRootfsScript, /"gh"/);
   assert.match(buildImageRootfsScript, /configCommandFact/);
   assert.match(buildImageRootfsScript, /resolve\(outDir, "\.dockerenv"\)/);
+  assert.match(buildImageRootfsScript, /pruneRootfs\(outDir\)/);
+  assert.match(buildImageRootfsScript, /"var\/cache\/apt\/archives"/);
+  assert.match(buildImageRootfsScript, /"var\/cache\/apk"/);
+  assert.match(buildImageRootfsScript, /"usr\/share\/locale"/);
+  assert.match(buildImageRootfsScript, /"usr\/local\/include\/node"/);
+  assert.match(buildImageRootfsScript, /"var\/log"/);
   assert.match(buildImageRootfsScript, /resolve\(outDir, "etc\/hostname"\)/);
   assert.match(buildImageRootfsScript, /127\.0\.0\.1 localhost sandbox/);
 });

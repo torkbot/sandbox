@@ -12,4 +12,4 @@ RUN apk add --no-cache ca-certificates \
     'update-ca-certificates' \
     > /usr/lib/sandbox/install-http-ca \
   && chmod 755 /usr/lib/sandbox/install-http-ca \
-  && rm -rf /var/cache/apk/* /etc/apk/cache/*
+  && rm -rf /var/cache/apk/* /etc/apk/cache/* /root/.cache /tmp/* /var/tmp/* /usr/share/bug /usr/share/doc /usr/share/info /usr/share/lintian /usr/share/locale /usr/share/man
