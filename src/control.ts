@@ -325,7 +325,7 @@ export class HostControlTransport implements SandboxControl {
       event.type === "guest.spawn.stdout"
       || event.type === "guest.spawn.stderr"
       || event.type === "guest.spawn.pipe.output"
-      || event.type === "guest.spawn.pipe.closed"
+      || event.type === "guest.spawn.pipe.output.closed"
     ) {
       this.#dispatchSpawnEvent(event);
       return;
@@ -357,7 +357,7 @@ export class HostControlTransport implements SandboxControl {
       event.type !== "guest.spawn.stdout"
       && event.type !== "guest.spawn.stderr"
       && event.type !== "guest.spawn.pipe.output"
-      && event.type !== "guest.spawn.pipe.closed"
+      && event.type !== "guest.spawn.pipe.output.closed"
       && event.type !== "guest.spawn.started"
       && event.type !== "guest.spawn.exit"
       && event.type !== "guest.spawn.streams.closed"
@@ -384,7 +384,7 @@ export class HostControlTransport implements SandboxControl {
     if (event.type === "guest.spawn.streams.closed") {
       pending.streamsClosed = true;
     }
-    if (event.type === "guest.spawn.pipe.output" || event.type === "guest.spawn.pipe.closed") {
+    if (event.type === "guest.spawn.pipe.output" || event.type === "guest.spawn.pipe.output.closed") {
       if (pending.process instanceof ControlBackedSandboxProcess) {
         pending.process.emit(event);
       }
@@ -493,7 +493,7 @@ export class ControlBackedSandboxProcess {
       | "guest.spawn.stdout"
       | "guest.spawn.stderr"
       | "guest.spawn.pipe.output"
-      | "guest.spawn.pipe.closed"
+      | "guest.spawn.pipe.output.closed"
       | "guest.spawn.exit"
       | "guest.spawn.streams.closed";
   }>): void {
@@ -507,8 +507,8 @@ export class ControlBackedSandboxProcess {
       case "guest.spawn.pipe.output":
         this.#pipes.get(event.fd)?.enqueue(event.data);
         return;
-      case "guest.spawn.pipe.closed":
-        this.#pipes.get(event.fd)?.closeFromGuest(new Error(`sandbox process pipe is closed: ${this.#id} fd ${event.fd}`));
+      case "guest.spawn.pipe.output.closed":
+        this.#pipes.get(event.fd)?.closeOutputFromGuest();
         return;
       case "guest.spawn.exit":
         this.#exited = true;
@@ -571,6 +571,10 @@ export class ControlBackedSandboxProcessPipe {
 
   closeFromGuest(error: unknown): void {
     this.#input.closeFromGuest(error);
+    this.#output.close();
+  }
+
+  closeOutputFromGuest(): void {
     this.#output.close();
   }
 

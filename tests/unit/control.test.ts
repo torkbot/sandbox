@@ -428,7 +428,6 @@ test("HostControlTransport streams caller-selected process pipes", async () => {
   const output = readAll(pipe.output);
   const writer = pipe.input.getWriter();
   await writer.write(new TextEncoder().encode("request"));
-  await writer.close();
   assert.deepEqual(
     channel.writes.slice(1).map((packet) => BSON.deserialize(packet.subarray(4))),
     [
@@ -437,11 +436,6 @@ test("HostControlTransport streams caller-selected process pipes", async () => {
         id: "spawn",
         fd: 3,
         data: new Binary(new TextEncoder().encode("request")),
-      },
-      {
-        type: "guest.spawn.pipe.close",
-        id: "spawn",
-        fd: 3,
       },
     ],
   );
@@ -453,7 +447,27 @@ test("HostControlTransport streams caller-selected process pipes", async () => {
       fd: 3,
       data: new Binary(new TextEncoder().encode("reply")),
     }),
-    encodePacket({ type: "guest.spawn.pipe.closed", id: "spawn", fd: 3 }),
+    encodePacket({ type: "guest.spawn.pipe.output.closed", id: "spawn", fd: 3 }),
+  );
+  await output;
+
+  await writer.write(new TextEncoder().encode("after-output-eof"));
+  assert.deepEqual(
+    BSON.deserialize(channel.writes.at(-1)!.subarray(4)),
+    {
+      type: "guest.spawn.pipe.write",
+      id: "spawn",
+      fd: 3,
+      data: new Binary(new TextEncoder().encode("after-output-eof")),
+    },
+  );
+  await writer.close();
+  assert.deepEqual(
+    BSON.deserialize(channel.writes.at(-1)!.subarray(4)),
+    { type: "guest.spawn.pipe.close", id: "spawn", fd: 3 },
+  );
+
+  channel.packets.push(
     encodePacket({ type: "guest.spawn.exit", id: "spawn", exitCode: 0 }),
     encodePacket({ type: "guest.spawn.streams.closed", id: "spawn" }),
   );

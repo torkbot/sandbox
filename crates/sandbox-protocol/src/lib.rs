@@ -79,7 +79,7 @@ pub enum ControlFrame {
         fd: i32,
         data: Vec<u8>,
     },
-    GuestSpawnPipeClosed {
+    GuestSpawnPipeOutputClosed {
         id: String,
         fd: i32,
     },
@@ -339,8 +339,8 @@ impl ControlFrame {
                     bytes: data.clone(),
                 },
             },
-            Self::GuestSpawnPipeClosed { id, fd } => bson::doc! {
-                "type": "guest.spawn.pipe.closed",
+            Self::GuestSpawnPipeOutputClosed { id, fd } => bson::doc! {
+                "type": "guest.spawn.pipe.output.closed",
                 "id": id,
                 "fd": *fd,
             },
@@ -657,12 +657,14 @@ impl ControlFrame {
                     .map_err(|_| ControlFrameError::new("guest.spawn.pipe.output missing data"))?
                     .to_vec(),
             }),
-            "guest.spawn.pipe.closed" => Ok(Self::GuestSpawnPipeClosed {
+            "guest.spawn.pipe.output.closed" => Ok(Self::GuestSpawnPipeOutputClosed {
                 id: document
                     .get_str("id")
-                    .map_err(|_| ControlFrameError::new("guest.spawn.pipe.closed missing id"))?
+                    .map_err(|_| {
+                        ControlFrameError::new("guest.spawn.pipe.output.closed missing id")
+                    })?
                     .to_string(),
-                fd: read_fd(&document, "fd", "guest.spawn.pipe.closed fd")?,
+                fd: read_fd(&document, "fd", "guest.spawn.pipe.output.closed fd")?,
             }),
             "guest.spawn.exit" => Ok(Self::GuestSpawnExit {
                 id: document
@@ -1326,7 +1328,7 @@ mod tests {
                 fd: 3,
                 data: b"reply".to_vec(),
             },
-            ControlFrame::GuestSpawnPipeClosed {
+            ControlFrame::GuestSpawnPipeOutputClosed {
                 id: "spawn".to_string(),
                 fd: 3,
             },

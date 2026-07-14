@@ -208,12 +208,12 @@ test("control event codec decodes init ready and binary exec output", () => {
 
   assert.deepEqual(
     decodeControlEvent(encodePacket({
-      type: "guest.spawn.pipe.closed",
+      type: "guest.spawn.pipe.output.closed",
       id: "spawn",
       fd: 3,
     })),
     {
-      type: "guest.spawn.pipe.closed",
+      type: "guest.spawn.pipe.output.closed",
       id: "spawn",
       fd: 3,
     },

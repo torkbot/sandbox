@@ -1328,7 +1328,7 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
             | ControlFrame::GuestSpawnStdout { .. }
             | ControlFrame::GuestSpawnStderr { .. }
             | ControlFrame::GuestSpawnPipeOutput { .. }
-            | ControlFrame::GuestSpawnPipeClosed { .. }
+            | ControlFrame::GuestSpawnPipeOutputClosed { .. }
             | ControlFrame::GuestSpawnExit { .. }
             | ControlFrame::GuestSpawnStreamsClosed { .. } => {}
         }
@@ -1670,6 +1670,17 @@ fn run_guest_spawn(
 
     let guest_pipes = open_guest_pipes(&pipes)?;
     configure_guest_pipe_command(&mut command, &guest_pipes);
+    let guest_pipe_readers = guest_pipes
+        .iter()
+        .map(|pipe| {
+            pipe.parent.try_clone().map_err(|error| {
+                InitError(format!(
+                    "clone guest pipe fd {} for output: {error}",
+                    pipe.fd
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let (mut child, child_id) = spawn_active_child(&mut command)
         .map_err(|error| InitError(format!("{}: {error}", argv[0])))?;
@@ -1679,12 +1690,8 @@ fn run_guest_spawn(
     let controls_stopped = Arc::new(AtomicBool::new(false));
     let mut pipe_writers = HashMap::new();
     let mut pipe_fds = Vec::with_capacity(guest_pipes.len());
-    for pipe in guest_pipes {
+    for (pipe, reader) in guest_pipes.into_iter().zip(guest_pipe_readers) {
         let fd = pipe.fd;
-        let reader = pipe
-            .parent
-            .try_clone()
-            .map_err(|error| InitError(format!("clone guest pipe fd {fd} for output: {error}")))?;
         pipe_writers.insert(fd, pipe.parent);
         pipe_fds.push(fd);
         pump_spawn_output(
@@ -2170,7 +2177,7 @@ fn run_spawn_output_coordinator(
                 if open_pipes.remove(&fd) {
                     let _ = send_control_frame(
                         &control,
-                        ControlFrame::GuestSpawnPipeClosed { id: id.clone(), fd },
+                        ControlFrame::GuestSpawnPipeOutputClosed { id: id.clone(), fd },
                     );
                 }
             }

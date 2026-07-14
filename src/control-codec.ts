@@ -27,7 +27,7 @@ export type SandboxControlEvent =
       readonly data: Uint8Array;
     }
   | {
-      readonly type: "guest.spawn.pipe.closed";
+      readonly type: "guest.spawn.pipe.output.closed";
       readonly id: string;
       readonly fd: number;
     }
@@ -343,9 +343,9 @@ export function decodeControlEvent(packet: Uint8Array): SandboxControlEvent {
         fd: readInteger(document, "fd"),
         data: readBytes(document, "data"),
       };
-    case "guest.spawn.pipe.closed":
+    case "guest.spawn.pipe.output.closed":
       return {
-        type: "guest.spawn.pipe.closed",
+        type: "guest.spawn.pipe.output.closed",
         id: readString(document, "id"),
         fd: readInteger(document, "fd"),
       };
