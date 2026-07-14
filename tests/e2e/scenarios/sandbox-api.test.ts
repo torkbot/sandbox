@@ -317,6 +317,15 @@ test("spawn returns stream handles immediately and pipes guest stdio", async (t)
     rootfs: testRootfs,
   }).boot();
 
+  assert.throws(
+    () => sandbox.spawn("/bin/true", [], { pipes: [2] }),
+    /pipes\[0\] must be an integer between 3 and 2147483647/,
+  );
+  assert.throws(
+    () => sandbox.spawn("/bin/true", [], { pipes: [3, 3] }),
+    /duplicate pipe fd: 3/,
+  );
+
   const child = sandbox.spawn("/bin/sh", [
     "-lc",
     "cat; printf stderr-ready >&2",
@@ -330,6 +339,35 @@ test("spawn returns stream handles immediately and pipes guest stdio", async (t)
   await child.ready;
   assert.equal(await stdout, "stdin-ready");
   assert.equal(await stderr, "stderr-ready");
+  assert.deepEqual(await child.exit, { exitCode: 0, signal: null });
+});
+
+test("spawn exposes caller-selected full-duplex guest file descriptors", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  await using sandbox = await defineSandbox({
+    rootfs: testRootfs,
+  }).boot();
+
+  const child = sandbox.spawn("/bin/sh", [
+    "-lc",
+    "request=$(cat <&3); printf 'reply:%s' \"$request\" >&3",
+  ], {
+    pipes: [3],
+  });
+  const pipe = child.pipes.get(3);
+  assert.ok(pipe);
+
+  const output = readStreamText(pipe.output);
+  const writer = pipe.input.getWriter();
+  await writer.write(new TextEncoder().encode("request"));
+  await writer.close();
+
+  await child.ready;
+  assert.equal(await output, "reply:request");
   assert.deepEqual(await child.exit, { exitCode: 0, signal: null });
 });
 

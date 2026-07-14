@@ -725,11 +725,16 @@ Used in: [Long-lived and interactive tools](#5-run-long-lived-and-interactive-to
 ```ts
 const child = vm.spawn("npm", ["test"], {
   cwd: "/workspace",
+  pipes: [3],
 });
+
+const backchannel = child.pipes.get(3);
 ```
 
 Returns a streaming process handle with `stdin`, `stdout`, `stderr`, `ready`,
-`exit`, and `kill(...)`.
+`exit`, and `kill(...)`. Each requested descriptor in `pipes` is inherited by
+the guest process and exposed as a full-duplex `{ input, output }` channel in
+`child.pipes`.
 
 ### `vm.pty(command, args, options)`
 

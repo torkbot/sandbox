@@ -36,6 +36,7 @@ test("control command codec encodes guest spawn commands", () => {
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
+    pipes: [3],
   });
 
   assert.deepEqual(BSON.deserialize(packet.subarray(4)), {
@@ -47,6 +48,7 @@ test("control command codec encodes guest spawn commands", () => {
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
+    pipes: [3],
   });
 });
 
@@ -190,6 +192,32 @@ test("control event codec decodes init ready and binary exec output", () => {
   assert.equal(stdout.type, "guest.spawn.stdout");
   assert.equal(stdout.id, "spawn");
   assert.deepEqual([...stdout.data], [0, 1, 2]);
+
+  const pipeOutput = decodeControlEvent(
+    encodePacket({
+      type: "guest.spawn.pipe.output",
+      id: "spawn",
+      fd: 3,
+      data: new Binary(new Uint8Array([3, 4, 5])),
+    }),
+  );
+  assert.equal(pipeOutput.type, "guest.spawn.pipe.output");
+  assert.equal(pipeOutput.id, "spawn");
+  assert.equal(pipeOutput.fd, 3);
+  assert.deepEqual([...pipeOutput.data], [3, 4, 5]);
+
+  assert.deepEqual(
+    decodeControlEvent(encodePacket({
+      type: "guest.spawn.pipe.output.closed",
+      id: "spawn",
+      fd: 3,
+    })),
+    {
+      type: "guest.spawn.pipe.output.closed",
+      id: "spawn",
+      fd: 3,
+    },
+  );
 
   assert.deepEqual(
     decodeControlEvent(

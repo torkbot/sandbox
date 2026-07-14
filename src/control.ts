@@ -31,6 +31,7 @@ export interface SandboxControl extends Transport<SandboxControlEvent, SandboxCo
     readonly argv: readonly string[];
     readonly env?: Record<string, string>;
     readonly cwd: string;
+    readonly pipes: readonly number[];
   }): ControlBackedSandboxProcess;
   pty(input: {
     readonly id?: string;
@@ -201,13 +202,14 @@ export class HostControlTransport implements SandboxControl {
     readonly argv: readonly string[];
     readonly env?: Record<string, string>;
     readonly cwd: string;
+    readonly pipes: readonly number[];
   }): ControlBackedSandboxProcess {
     this.#assertOpen();
     const id = input.id ?? crypto.randomUUID();
     if (this.#pendingSpawn.has(id)) {
       throw new Error(`sandbox spawn id is already in flight: ${id}`);
     }
-    const process = new ControlBackedSandboxProcess(id, this);
+    const process = new ControlBackedSandboxProcess(id, this, input.pipes);
     this.#pendingSpawn.set(id, {
       resolve: () => process.resolveReady(),
       reject: (error) => process.fail(error),
@@ -225,6 +227,7 @@ export class HostControlTransport implements SandboxControl {
         stdin: "pipe",
         stdout: "pipe",
         stderr: "pipe",
+        pipes: input.pipes,
       }).catch((error) => {
         this.#pendingSpawn.delete(id);
         process.fail(error);
@@ -262,6 +265,7 @@ export class HostControlTransport implements SandboxControl {
       stdin: "pty",
       stdout: "pty",
       stderr: "pty",
+      pipes: [],
       pty: input.size,
     }).catch((error) => {
       this.#pendingSpawn.delete(id);
@@ -317,7 +321,12 @@ export class HostControlTransport implements SandboxControl {
   }
 
   #dispatchEvent(event: SandboxControlEvent): void {
-    if (event.type === "guest.spawn.stdout" || event.type === "guest.spawn.stderr") {
+    if (
+      event.type === "guest.spawn.stdout"
+      || event.type === "guest.spawn.stderr"
+      || event.type === "guest.spawn.pipe.output"
+      || event.type === "guest.spawn.pipe.output.closed"
+    ) {
       this.#dispatchSpawnEvent(event);
       return;
     }
@@ -347,6 +356,8 @@ export class HostControlTransport implements SandboxControl {
     if (
       event.type !== "guest.spawn.stdout"
       && event.type !== "guest.spawn.stderr"
+      && event.type !== "guest.spawn.pipe.output"
+      && event.type !== "guest.spawn.pipe.output.closed"
       && event.type !== "guest.spawn.started"
       && event.type !== "guest.spawn.exit"
       && event.type !== "guest.spawn.streams.closed"
@@ -372,6 +383,12 @@ export class HostControlTransport implements SandboxControl {
     }
     if (event.type === "guest.spawn.streams.closed") {
       pending.streamsClosed = true;
+    }
+    if (event.type === "guest.spawn.pipe.output" || event.type === "guest.spawn.pipe.output.closed") {
+      if (pending.process instanceof ControlBackedSandboxProcess) {
+        pending.process.emit(event);
+      }
+      return;
     }
     pending.process.emit(event);
     if (pending.exited && pending.streamsClosed) {
@@ -434,6 +451,7 @@ export class ControlBackedSandboxProcess {
   readonly stdin: WritableStream<Uint8Array>;
   readonly stdout: ReadableStream<Uint8Array>;
   readonly stderr: ReadableStream<Uint8Array>;
+  readonly pipes: ReadonlyMap<number, ControlBackedSandboxProcessPipe>;
   readonly ready: Promise<void>;
   readonly exit: Promise<{ readonly exitCode: number | null; readonly signal: SandboxProcessSignal | null }>;
 
@@ -442,19 +460,24 @@ export class ControlBackedSandboxProcess {
   readonly #stdin: ControlWritable;
   readonly #stdout = new ReadableByteQueue();
   readonly #stderr = new ReadableByteQueue();
+  readonly #pipes = new Map<number, ControlBackedSandboxProcessPipe>();
   #resolveReady!: () => void;
   #rejectReady!: (error: unknown) => void;
   #resolveExit!: (result: { readonly exitCode: number | null; readonly signal: SandboxProcessSignal | null }) => void;
   #rejectExit!: (error: unknown) => void;
   #exited = false;
 
-  constructor(id: string, control: SandboxControl) {
+  constructor(id: string, control: SandboxControl, pipes: readonly number[]) {
     this.#id = id;
     this.#control = control;
     this.#stdin = new ControlWritable(control, id);
     this.stdin = this.#stdin.stream;
     this.stdout = this.#stdout.stream;
     this.stderr = this.#stderr.stream;
+    for (const fd of pipes) {
+      this.#pipes.set(fd, new ControlBackedSandboxProcessPipe(control, id, fd));
+    }
+    this.pipes = this.#pipes;
     this.ready = new Promise((resolve, reject) => {
       this.#resolveReady = resolve;
       this.#rejectReady = reject;
@@ -466,7 +489,13 @@ export class ControlBackedSandboxProcess {
   }
 
   emit(event: Extract<SandboxControlEvent, {
-    type: "guest.spawn.stdout" | "guest.spawn.stderr" | "guest.spawn.exit" | "guest.spawn.streams.closed";
+    type:
+      | "guest.spawn.stdout"
+      | "guest.spawn.stderr"
+      | "guest.spawn.pipe.output"
+      | "guest.spawn.pipe.output.closed"
+      | "guest.spawn.exit"
+      | "guest.spawn.streams.closed";
   }>): void {
     switch (event.type) {
       case "guest.spawn.stdout":
@@ -474,6 +503,12 @@ export class ControlBackedSandboxProcess {
         return;
       case "guest.spawn.stderr":
         this.#stderr.enqueue(event.data);
+        return;
+      case "guest.spawn.pipe.output":
+        this.#pipes.get(event.fd)?.enqueue(event.data);
+        return;
+      case "guest.spawn.pipe.output.closed":
+        this.#pipes.get(event.fd)?.closeOutputFromGuest();
         return;
       case "guest.spawn.exit":
         this.#exited = true;
@@ -483,6 +518,9 @@ export class ControlBackedSandboxProcess {
         this.#stdin.closeFromGuest(new Error(`sandbox process stdin is closed: ${this.#id}`));
         this.#stdout.close();
         this.#stderr.close();
+        for (const pipe of this.#pipes.values()) {
+          pipe.closeFromGuest(new Error(`sandbox process pipe is closed: ${this.#id}`));
+        }
         return;
     }
   }
@@ -506,8 +544,43 @@ export class ControlBackedSandboxProcess {
     this.#stdin.closeFromGuest(error);
     this.#stdout.close(error);
     this.#stderr.close(error);
+    for (const pipe of this.#pipes.values()) {
+      pipe.fail(error);
+    }
     this.#rejectReady(error);
     this.#rejectExit(error);
+  }
+}
+
+export class ControlBackedSandboxProcessPipe {
+  readonly input: WritableStream<Uint8Array>;
+  readonly output: ReadableStream<Uint8Array>;
+
+  readonly #input: ControlPipeWritable;
+  readonly #output = new ReadableByteQueue();
+
+  constructor(control: SandboxControl, id: string, fd: number) {
+    this.#input = new ControlPipeWritable(control, id, fd);
+    this.input = this.#input.stream;
+    this.output = this.#output.stream;
+  }
+
+  enqueue(chunk: Uint8Array): void {
+    this.#output.enqueue(chunk);
+  }
+
+  closeFromGuest(error: unknown): void {
+    this.#input.closeFromGuest(error);
+    this.#output.close();
+  }
+
+  closeOutputFromGuest(): void {
+    this.#output.close();
+  }
+
+  fail(error: unknown): void {
+    this.#input.closeFromGuest(error);
+    this.#output.close(error);
   }
 }
 
@@ -643,6 +716,68 @@ class ControlWritable {
         }
         this.#closed = true;
         await this.#control.send({ type: "guest.spawn.stdin.close", id: this.#id });
+      },
+    });
+  }
+
+  closeFromGuest(error: unknown): void {
+    if (this.#closed) {
+      return;
+    }
+    this.#closed = true;
+    this.#controller?.error(error);
+    this.#controller = null;
+  }
+}
+
+class ControlPipeWritable {
+  readonly stream: WritableStream<Uint8Array>;
+  readonly #control: SandboxControl;
+  readonly #id: string;
+  readonly #fd: number;
+  #controller: WritableStreamDefaultController | null = null;
+  #closed = false;
+
+  constructor(control: SandboxControl, id: string, fd: number) {
+    this.#control = control;
+    this.#id = id;
+    this.#fd = fd;
+    this.stream = new WritableStream<Uint8Array>({
+      start: (controller) => {
+        this.#controller = controller;
+      },
+      write: async (chunk) => {
+        if (this.#closed) {
+          throw new Error(`sandbox process pipe is closed: ${this.#id} fd ${this.#fd}`);
+        }
+        await this.#control.send({
+          type: "guest.spawn.pipe.write",
+          id: this.#id,
+          fd: this.#fd,
+          data: chunk,
+        });
+      },
+      close: async () => {
+        if (this.#closed) {
+          return;
+        }
+        this.#closed = true;
+        await this.#control.send({
+          type: "guest.spawn.pipe.close",
+          id: this.#id,
+          fd: this.#fd,
+        });
+      },
+      abort: async () => {
+        if (this.#closed) {
+          return;
+        }
+        this.#closed = true;
+        await this.#control.send({
+          type: "guest.spawn.pipe.close",
+          id: this.#id,
+          fd: this.#fd,
+        });
       },
     });
   }
