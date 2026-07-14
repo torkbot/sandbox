@@ -297,6 +297,7 @@ test("HostControlTransport spawn streams stdio and resolves exit", async () => {
         stdin: "pipe",
         stdout: "pipe",
         stderr: "pipe",
+        pipes: [],
       },
     ],
   );
@@ -414,10 +415,58 @@ test("HostControlTransport keeps spawn streams open after process exit", async (
   await control.close();
 });
 
+test("HostControlTransport streams caller-selected process pipes", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const spawned = control.spawn({ id: "spawn", argv: ["/bin/cat"], cwd: "/", pipes: [3] });
+  const pipe = spawned.pipes.get(3);
+  assert.ok(pipe);
+
+  channel.packets.push(encodePacket({ type: "guest.spawn.started", id: "spawn" }));
+  await spawned.ready;
+
+  const output = readAll(pipe.output);
+  const writer = pipe.input.getWriter();
+  await writer.write(new TextEncoder().encode("request"));
+  await writer.close();
+  assert.deepEqual(
+    channel.writes.slice(1).map((packet) => BSON.deserialize(packet.subarray(4))),
+    [
+      {
+        type: "guest.spawn.pipe.write",
+        id: "spawn",
+        fd: 3,
+        data: new Binary(new TextEncoder().encode("request")),
+      },
+      {
+        type: "guest.spawn.pipe.close",
+        id: "spawn",
+        fd: 3,
+      },
+    ],
+  );
+
+  channel.packets.push(
+    encodePacket({
+      type: "guest.spawn.pipe.output",
+      id: "spawn",
+      fd: 3,
+      data: new Binary(new TextEncoder().encode("reply")),
+    }),
+    encodePacket({ type: "guest.spawn.pipe.closed", id: "spawn", fd: 3 }),
+    encodePacket({ type: "guest.spawn.exit", id: "spawn", exitCode: 0 }),
+    encodePacket({ type: "guest.spawn.streams.closed", id: "spawn" }),
+  );
+
+  assert.equal(await output, "reply");
+  assert.deepEqual(await spawned.exit, { exitCode: 0, signal: null });
+  await control.close();
+});
+
 test("HostControlTransport rejects pre-start spawn failures without exposing a process", async () => {
   const channel = new MemoryControlChannel();
   const control = new HostControlTransport({ channel });
-  const spawned = control.spawn({ id: "spawn", argv: ["/bin/cat"], cwd: "/" });
+  const spawned = control.spawn({ id: "spawn", argv: ["/bin/cat"], cwd: "/", pipes: [] });
 
   await control.close();
 
@@ -428,7 +477,7 @@ test("HostControlTransport rejects pre-start spawn failures without exposing a p
 test("HostControlTransport rejects spawn ready when process exits before start", async () => {
   const channel = new MemoryControlChannel();
   const control = new HostControlTransport({ channel });
-  const spawned = control.spawn({ id: "spawn", argv: ["/missing"], cwd: "/" });
+  const spawned = control.spawn({ id: "spawn", argv: ["/missing"], cwd: "/", pipes: [] });
 
   channel.packets.push(
     encodePacket({
@@ -501,12 +550,12 @@ test("HostControlTransport demultiplexes concurrent spawn output", async () => {
 test("HostControlTransport rejects duplicate in-flight spawn ids", async () => {
   const channel = new MemoryControlChannel();
   const control = new HostControlTransport({ channel });
-  const first = control.spawn({ id: "duplicate", argv: ["/bin/cat"], cwd: "/" });
+  const first = control.spawn({ id: "duplicate", argv: ["/bin/cat"], cwd: "/", pipes: [] });
 
   channel.packets.push(encodePacket({ type: "guest.spawn.started", id: "duplicate" }));
   await first.ready;
   assert.throws(
-    () => control.spawn({ id: "duplicate", argv: ["/bin/cat"], cwd: "/" }),
+    () => control.spawn({ id: "duplicate", argv: ["/bin/cat"], cwd: "/", pipes: [] }),
     /sandbox spawn id is already in flight: duplicate/,
   );
 
@@ -545,6 +594,7 @@ test("HostControlTransport pty streams terminal data and sends resize", async ()
     stdin: "pty",
     stdout: "pty",
     stderr: "pty",
+    pipes: [],
     pty: { rows: 24, cols: 80 },
   });
 
@@ -894,7 +944,7 @@ function startSpawn(
   channel: MemoryControlChannel,
   id: string,
 ) {
-  const spawned = control.spawn({ id, argv: ["/bin/cat"], cwd: "/" });
+  const spawned = control.spawn({ id, argv: ["/bin/cat"], cwd: "/", pipes: [] });
   channel.packets.push(encodePacket({ type: "guest.spawn.started", id }));
   return spawned;
 }

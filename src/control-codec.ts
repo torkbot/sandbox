@@ -21,6 +21,17 @@ export type SandboxControlEvent =
       readonly data: Uint8Array;
     }
   | {
+      readonly type: "guest.spawn.pipe.output";
+      readonly id: string;
+      readonly fd: number;
+      readonly data: Uint8Array;
+    }
+  | {
+      readonly type: "guest.spawn.pipe.closed";
+      readonly id: string;
+      readonly fd: number;
+    }
+  | {
       readonly type: "guest.spawn.started";
       readonly id: string;
     }
@@ -134,6 +145,7 @@ export type SandboxControlCommand =
       readonly stdin: "pipe" | "pty";
       readonly stdout: "pipe" | "pty";
       readonly stderr: "pipe" | "pty";
+      readonly pipes: readonly number[];
       readonly pty?: {
         readonly rows: number;
         readonly cols: number;
@@ -147,6 +159,17 @@ export type SandboxControlCommand =
   | {
       readonly type: "guest.spawn.stdin.close";
       readonly id: string;
+    }
+  | {
+      readonly type: "guest.spawn.pipe.write";
+      readonly id: string;
+      readonly fd: number;
+      readonly data: Uint8Array;
+    }
+  | {
+      readonly type: "guest.spawn.pipe.close";
+      readonly id: string;
+      readonly fd: number;
     }
   | {
       readonly type: "guest.spawn.signal";
@@ -188,6 +211,7 @@ export function encodeControlCommand(command: SandboxControlCommand): Uint8Array
         stdin: command.stdin,
         stdout: command.stdout,
         stderr: command.stderr,
+        pipes: command.pipes,
         ...(command.pty === undefined ? {} : { pty: { rows: command.pty.rows, cols: command.pty.cols } }),
       });
     case "guest.spawn.stdin":
@@ -200,6 +224,19 @@ export function encodeControlCommand(command: SandboxControlCommand): Uint8Array
       return encodePacket({
         type: "guest.spawn.stdin.close",
         id: command.id,
+      });
+    case "guest.spawn.pipe.write":
+      return encodePacket({
+        type: "guest.spawn.pipe.write",
+        id: command.id,
+        fd: command.fd,
+        data: new Binary(command.data),
+      });
+    case "guest.spawn.pipe.close":
+      return encodePacket({
+        type: "guest.spawn.pipe.close",
+        id: command.id,
+        fd: command.fd,
       });
     case "guest.spawn.signal":
       return encodePacket({
@@ -299,6 +336,19 @@ export function decodeControlEvent(packet: Uint8Array): SandboxControlEvent {
         id: readString(document, "id"),
         data: readBytes(document, "data"),
       };
+    case "guest.spawn.pipe.output":
+      return {
+        type: "guest.spawn.pipe.output",
+        id: readString(document, "id"),
+        fd: readInteger(document, "fd"),
+        data: readBytes(document, "data"),
+      };
+    case "guest.spawn.pipe.closed":
+      return {
+        type: "guest.spawn.pipe.closed",
+        id: readString(document, "id"),
+        fd: readInteger(document, "fd"),
+      };
     case "guest.spawn.started":
       return {
         type: "guest.spawn.started",
@@ -388,6 +438,14 @@ function readNumber(document: Record<string, unknown>, key: string): number {
   const value = document[key];
   if (typeof value !== "number") {
     throw new Error(`control frame field must be a number: ${key}`);
+  }
+  return value;
+}
+
+function readInteger(document: Record<string, unknown>, key: string): number {
+  const value = readNumber(document, key);
+  if (!Number.isSafeInteger(value)) {
+    throw new Error(`control frame field must be a safe integer: ${key}`);
   }
   return value;
 }

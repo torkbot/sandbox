@@ -5,9 +5,7 @@ use sandbox_protocol::{
     ControlFrame, GuestFsDirectoryEntry, GuestFsEntryType, GuestFsError, GuestFsReadRange,
     GuestFsResponseResult, GuestFsStat, GuestPtySize, GuestSpawnStdio,
 };
-use std::collections::HashMap;
-#[cfg(target_os = "linux")]
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "linux")]
@@ -1247,6 +1245,7 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
                 stdin,
                 stdout,
                 stderr,
+                pipes,
                 pty,
             } => {
                 let writer = writer.clone();
@@ -1261,6 +1260,7 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
                         stdin,
                         stdout,
                         stderr,
+                        pipes,
                         pty,
                         controls,
                         writer.clone(),
@@ -1297,6 +1297,12 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
             ControlFrame::GuestSpawnStdinClose { id } => {
                 spawns.send(&id, SpawnControl::StdinClose);
             }
+            ControlFrame::GuestSpawnPipeWrite { id, fd, data } => {
+                spawns.send(&id, SpawnControl::PipeInput { fd, data });
+            }
+            ControlFrame::GuestSpawnPipeClose { id, fd } => {
+                spawns.send(&id, SpawnControl::PipeClose { fd });
+            }
             ControlFrame::GuestSpawnSignal { id, signal } => {
                 spawns.send(&id, SpawnControl::Signal(signal));
             }
@@ -1321,6 +1327,8 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
             | ControlFrame::GuestSpawnStarted { .. }
             | ControlFrame::GuestSpawnStdout { .. }
             | ControlFrame::GuestSpawnStderr { .. }
+            | ControlFrame::GuestSpawnPipeOutput { .. }
+            | ControlFrame::GuestSpawnPipeClosed { .. }
             | ControlFrame::GuestSpawnExit { .. }
             | ControlFrame::GuestSpawnStreamsClosed { .. } => {}
         }
@@ -1612,6 +1620,7 @@ fn run_guest_spawn(
     stdin: GuestSpawnStdio,
     stdout: GuestSpawnStdio,
     stderr: GuestSpawnStdio,
+    pipes: Vec<i32>,
     pty: Option<GuestPtySize>,
     controls: mpsc::Receiver<SpawnControl>,
     control: Arc<ControlWriter>,
@@ -1659,12 +1668,32 @@ fn run_guest_spawn(
         command.stderr(std::process::Stdio::piped());
     }
 
+    let guest_pipes = open_guest_pipes(&pipes)?;
+    configure_guest_pipe_command(&mut command, &guest_pipes);
+
     let (mut child, child_id) = spawn_active_child(&mut command)
         .map_err(|error| InitError(format!("{}: {error}", argv[0])))?;
     drop(command);
 
     let (events, event_receiver) = mpsc::channel();
     let controls_stopped = Arc::new(AtomicBool::new(false));
+    let mut pipe_writers = HashMap::new();
+    let mut pipe_fds = Vec::with_capacity(guest_pipes.len());
+    for pipe in guest_pipes {
+        let fd = pipe.fd;
+        let reader = pipe
+            .parent
+            .try_clone()
+            .map_err(|error| InitError(format!("clone guest pipe fd {fd} for output: {error}")))?;
+        pipe_writers.insert(fd, pipe.parent);
+        pipe_fds.push(fd);
+        pump_spawn_output(
+            reader,
+            events.clone(),
+            move |data| SpawnOutputEvent::Pipe { fd, data },
+            SpawnOutputEvent::PipeClosed { fd },
+        );
+    }
     if let Some(master) = pty_master {
         let writer = master
             .try_clone()
@@ -1673,6 +1702,7 @@ fn run_guest_spawn(
             child_id,
             controls,
             Some(writer),
+            pipe_writers,
             true,
             controls_stopped.clone(),
         );
@@ -1700,6 +1730,7 @@ fn run_guest_spawn(
             child_id,
             controls,
             Some(stdin),
+            pipe_writers,
             false,
             controls_stopped.clone(),
         );
@@ -1729,16 +1760,18 @@ fn run_guest_spawn(
         let _ = events.send(SpawnOutputEvent::Exit { exit_code, signal });
     });
 
-    run_spawn_output_coordinator(id, control, event_receiver);
+    run_spawn_output_coordinator(id, control, event_receiver, pipe_fds);
     Ok(())
 }
 
-fn pump_spawn_output(
+fn pump_spawn_output<F>(
     mut reader: impl std::io::Read + Send + 'static,
     events: mpsc::Sender<SpawnOutputEvent>,
-    data_event: fn(Vec<u8>) -> SpawnOutputEvent,
+    data_event: F,
     closed_event: SpawnOutputEvent,
-) {
+) where
+    F: Fn(Vec<u8>) -> SpawnOutputEvent + Send + 'static,
+{
     std::thread::spawn(move || {
         let mut buffer = [0; 8192];
         loop {
@@ -1767,6 +1800,7 @@ fn pump_spawn_controls<W>(
     child_id: u32,
     controls: mpsc::Receiver<SpawnControl>,
     mut stdin: Option<W>,
+    mut pipes: HashMap<i32, std::os::unix::net::UnixStream>,
     resize_input: bool,
     stopped: Arc<AtomicBool>,
 ) where
@@ -1796,6 +1830,17 @@ fn pump_spawn_controls<W>(
                     }
                     stdin = None;
                 }
+                SpawnControl::PipeInput { fd, data } => {
+                    if let Some(writer) = pipes.get_mut(&fd) {
+                        let _ = writer.write_all(&data);
+                        let _ = writer.flush();
+                    }
+                }
+                SpawnControl::PipeClose { fd } => {
+                    if let Some(writer) = pipes.remove(&fd) {
+                        let _ = writer.shutdown(std::net::Shutdown::Write);
+                    }
+                }
                 SpawnControl::Signal(signal) => {
                     if let Some(signal) = signal_number(&signal) {
                         signal_child_process_group(child_id, signal);
@@ -1818,6 +1863,7 @@ fn pump_spawn_controls<W>(
     _child_id: u32,
     controls: mpsc::Receiver<SpawnControl>,
     mut stdin: Option<W>,
+    mut pipes: HashMap<i32, std::os::unix::net::UnixStream>,
     _resize_input: bool,
     stopped: Arc<AtomicBool>,
 ) where
@@ -1839,6 +1885,15 @@ fn pump_spawn_controls<W>(
                 }
                 SpawnControl::StdinClose => {
                     stdin = None;
+                }
+                SpawnControl::PipeInput { fd, data } => {
+                    if let Some(writer) = pipes.get_mut(&fd) {
+                        let _ = writer.write_all(&data);
+                        let _ = writer.flush();
+                    }
+                }
+                SpawnControl::PipeClose { fd } => {
+                    pipes.remove(&fd);
                 }
                 SpawnControl::Signal(_) | SpawnControl::Resize(_) => {}
             }
@@ -1885,6 +1940,101 @@ fn resize_spawn_input<W: std::os::fd::AsRawFd>(
 #[cfg(not(unix))]
 fn resize_spawn_input<W>(_input: &W, _size: GuestPtySize) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(unix)]
+struct PreparedGuestPipe {
+    fd: i32,
+    parent: std::os::unix::net::UnixStream,
+    child: std::os::unix::net::UnixStream,
+}
+
+#[cfg(unix)]
+fn open_guest_pipes(pipes: &[i32]) -> Result<Vec<PreparedGuestPipe>, InitError> {
+    use std::os::fd::AsRawFd;
+
+    let requested_fds = pipes.iter().copied().collect::<HashSet<_>>();
+    pipes
+        .iter()
+        .map(|pipe| {
+            let (parent, child) = std::os::unix::net::UnixStream::pair()
+                .map_err(|error| InitError(format!("open guest pipe fd {pipe}: {error}")))?;
+            let child = if requested_fds.contains(&child.as_raw_fd()) {
+                duplicate_stream_outside_fds(&child, &requested_fds)
+                    .map_err(|error| InitError(format!("prepare guest pipe fd {pipe}: {error}")))?
+            } else {
+                child
+            };
+            Ok(PreparedGuestPipe {
+                fd: *pipe,
+                parent,
+                child,
+            })
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn duplicate_stream_outside_fds(
+    stream: &std::os::unix::net::UnixStream,
+    excluded: &HashSet<i32>,
+) -> std::io::Result<std::os::unix::net::UnixStream> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let mut minimum = 3;
+    loop {
+        let fd = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_DUPFD_CLOEXEC, minimum) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if !excluded.contains(&fd) {
+            return Ok(unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) });
+        }
+        unsafe {
+            libc::close(fd);
+        }
+        minimum = fd
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("guest pipe descriptor space exhausted"))?;
+    }
+}
+
+#[cfg(not(unix))]
+fn open_guest_pipes(_pipes: &[i32]) -> Result<Vec<PreparedGuestPipe>, InitError> {
+    Err(InitError(
+        "guest process pipes are only supported on Unix".to_string(),
+    ))
+}
+
+#[cfg(unix)]
+fn configure_guest_pipe_command(command: &mut std::process::Command, pipes: &[PreparedGuestPipe]) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let mappings = pipes
+        .iter()
+        .map(|pipe| (pipe.child.as_raw_fd(), pipe.fd))
+        .collect::<Vec<_>>();
+    unsafe {
+        command.pre_exec(move || {
+            for (source, target) in &mappings {
+                if libc::dup2(*source, *target) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            for (source, _) in &mappings {
+                libc::close(*source);
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_guest_pipe_command(
+    _command: &mut std::process::Command,
+    _pipes: &[PreparedGuestPipe],
+) {
 }
 
 #[cfg(unix)]
@@ -1971,10 +2121,14 @@ fn run_spawn_output_coordinator(
     id: String,
     control: Arc<ControlWriter>,
     events: mpsc::Receiver<SpawnOutputEvent>,
+    pipe_fds: Vec<i32>,
 ) {
     let mut stdout_open = true;
     let mut stderr_open = true;
     let mut exited = false;
+    let mut open_pipes = pipe_fds
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
     loop {
         let event = match events.recv() {
             Ok(event) => event,
@@ -2000,8 +2154,26 @@ fn run_spawn_output_coordinator(
                     },
                 );
             }
+            SpawnOutputEvent::Pipe { fd, data } => {
+                let _ = send_control_frame(
+                    &control,
+                    ControlFrame::GuestSpawnPipeOutput {
+                        id: id.clone(),
+                        fd,
+                        data,
+                    },
+                );
+            }
             SpawnOutputEvent::StdoutClosed => stdout_open = false,
             SpawnOutputEvent::StderrClosed => stderr_open = false,
+            SpawnOutputEvent::PipeClosed { fd } => {
+                if open_pipes.remove(&fd) {
+                    let _ = send_control_frame(
+                        &control,
+                        ControlFrame::GuestSpawnPipeClosed { id: id.clone(), fd },
+                    );
+                }
+            }
             SpawnOutputEvent::Exit { exit_code, signal } => {
                 exited = true;
                 let _ = send_control_frame(
@@ -2015,7 +2187,7 @@ fn run_spawn_output_coordinator(
             }
         }
 
-        if exited && !stdout_open && !stderr_open {
+        if exited && !stdout_open && !stderr_open && open_pipes.is_empty() {
             break;
         }
     }
@@ -2026,8 +2198,15 @@ fn run_spawn_output_coordinator(
 enum SpawnOutputEvent {
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
+    Pipe {
+        fd: i32,
+        data: Vec<u8>,
+    },
     StdoutClosed,
     StderrClosed,
+    PipeClosed {
+        fd: i32,
+    },
     Exit {
         exit_code: Option<i32>,
         signal: Option<String>,
@@ -2037,6 +2216,8 @@ enum SpawnOutputEvent {
 enum SpawnControl {
     Stdin(Vec<u8>),
     StdinClose,
+    PipeInput { fd: i32, data: Vec<u8> },
+    PipeClose { fd: i32 },
     Signal(String),
     Resize(GuestPtySize),
 }

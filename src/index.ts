@@ -603,6 +603,11 @@ export interface SandboxExecOptions {
 export interface SandboxSpawnOptions {
   readonly cwd?: string;
   readonly env?: Record<string, string>;
+  /**
+   * Unique file descriptors, numbered 3 or above, to expose as full-duplex
+   * channels in both the guest process and `SandboxProcess.pipes`.
+   */
+  readonly pipes?: readonly number[];
   readonly signal?: AbortSignal;
 }
 
@@ -628,9 +633,16 @@ export interface SandboxProcess {
   readonly stdin: WritableStream<Uint8Array>;
   readonly stdout: ReadableStream<Uint8Array>;
   readonly stderr: ReadableStream<Uint8Array>;
+  /** Full-duplex channels keyed by the descriptors requested at spawn. */
+  readonly pipes: ReadonlyMap<number, SandboxProcessPipe>;
   readonly ready: Promise<void>;
   readonly exit: Promise<SandboxProcessExit>;
   kill(signal?: SandboxSignal): void;
+}
+
+export interface SandboxProcessPipe {
+  readonly input: WritableStream<Uint8Array>;
+  readonly output: ReadableStream<Uint8Array>;
 }
 
 export interface SandboxPty {
@@ -1637,6 +1649,7 @@ class ControlBackedSandboxSpawn {
       argv: [command, ...args],
       env,
       cwd,
+      pipes: options.pipes ?? [],
     });
   }
 
@@ -2357,7 +2370,24 @@ function validateSandboxExecOptions(options: SandboxExecOptions): void {
   }
 }
 
-function validateSandboxSpawnOptions(_options: SandboxSpawnOptions): void {}
+function validateSandboxSpawnOptions(options: SandboxSpawnOptions): void {
+  if (options.pipes === undefined) {
+    return;
+  }
+  if (!Array.isArray(options.pipes)) {
+    throw new Error("invalid sandbox spawn options: pipes must be an array");
+  }
+  const fds = new Set<number>();
+  for (const [index, pipe] of options.pipes.entries()) {
+    if (!Number.isSafeInteger(pipe) || pipe < 3 || pipe > 2_147_483_647) {
+      throw new Error(`invalid sandbox spawn options: pipes[${index}] must be an integer between 3 and 2147483647`);
+    }
+    if (fds.has(pipe)) {
+      throw new Error(`invalid sandbox spawn options: duplicate pipe fd: ${pipe}`);
+    }
+    fds.add(pipe);
+  }
+}
 
 function validateSandboxPtyOptions(options: SandboxPtyOptions | undefined): asserts options is SandboxPtyOptions {
   if (options === undefined || options === null) {
