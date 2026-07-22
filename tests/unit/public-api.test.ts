@@ -61,6 +61,7 @@ const testRootfs = {
 } satisfies RootfsImageConfig;
 
 test("external rootfs images are typed plain-data descriptors", () => {
+  assert.equal("image" in rootfs, false);
   assert.deepEqual(testRootfs, {
     kind: "rootfs-image",
     name: "alpine:3.23-agent",
@@ -108,12 +109,6 @@ test("external rootfs images are typed plain-data descriptors", () => {
       },
     ],
   });
-});
-
-test("rootfs.image remains a compatibility shim for previously published image packages", () => {
-  const { kind: _kind, ...legacyImageInput } = testRootfs;
-
-  assert.deepEqual(rootfs.image(legacyImageInput), testRootfs);
 });
 
 test("fs.virtual wraps user-space filesystems for mounts", () => {

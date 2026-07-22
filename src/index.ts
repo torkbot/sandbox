@@ -796,23 +796,6 @@ interface SandboxDiagnostics {
 }
 
 export const rootfs = {
-  /**
-   * @deprecated Compatibility shim for image packages published before
-   * dependency-free image descriptors. New code should pass a
-   * `RootfsImageConfig` plain-data object directly.
-   */
-  image(input: Omit<RootfsImageConfig, "kind">): RootfsImageConfig {
-    return {
-      kind: "rootfs-image",
-      name: input.name,
-      path: input.path,
-      format: input.format,
-      architecture: input.architecture,
-      digest: input.digest,
-      sizeBytes: input.sizeBytes,
-      facts: [...input.facts],
-    };
-  },
   compose(options: {
     readonly base: RootfsImageConfig;
     readonly overlay: SandboxBlockStore;
