@@ -10,9 +10,11 @@ import {
   type SandboxBlockStore,
   type SandboxFileSystem,
   type SandboxWritableFileSystem,
+  type RootfsImageConfig,
 } from "../../src/index.ts";
 
-const testRootfs = rootfs.image({
+const testRootfs = {
+  kind: "rootfs-image",
   name: "alpine:3.23-agent",
   path: "/tmp/sandbox-rootfs-base.qcow2",
   format: "qcow2",
@@ -27,14 +29,14 @@ const testRootfs = rootfs.image({
       value: "alpine:3.23-agent",
     },
   ],
-});
+} satisfies RootfsImageConfig;
 
 test("defineSandbox rejects non-image rootfs objects", () => {
   assert.throws(
     () => defineSandbox({
       rootfs: { kind: "prebuilt-rootfs", path: "rootfs.qcow2", format: "qcow2" } as never,
     }),
-    /invalid sandbox definition: rootfs must be created with rootfs\.image\(\.\.\.\), rootfs\.ephemeral\(\.\.\.\), rootfs\.cow\(\.\.\.\), or rootfs\.persistent\(\.\.\.\)/,
+    /invalid sandbox definition: rootfs must be a rootfs image descriptor or a value returned by rootfs\.ephemeral\(\.\.\.\), rootfs\.cow\(\.\.\.\), or rootfs\.persistent\(\.\.\.\)/,
   );
 });
 
@@ -87,7 +89,7 @@ test("defineSandbox rejects invalid COW rootfs", () => {
         },
       } as never,
     }),
-    /invalid sandbox definition: rootfs.cow base must be created with rootfs\.image\(\.\.\.\)/,
+    /invalid sandbox definition: rootfs.cow base must be a rootfs image descriptor/,
   );
 
   assert.throws(
@@ -123,7 +125,7 @@ test("defineSandbox rejects invalid ephemeral rootfs", () => {
         base: { kind: "other-rootfs" },
       }),
     }),
-    /invalid sandbox definition: rootfs.ephemeral base must be created with rootfs\.image\(\.\.\.\)/,
+    /invalid sandbox definition: rootfs.ephemeral base must be a rootfs image descriptor/,
   );
 
   assert.throws(
@@ -146,7 +148,7 @@ test("defineSandbox rejects invalid persistent rootfs", () => {
         path: "/tmp/sandbox-rootfs.qcow2",
       }),
     }),
-    /invalid sandbox definition: rootfs.persistent base must be created with rootfs\.image\(\.\.\.\)/,
+    /invalid sandbox definition: rootfs.persistent base must be a rootfs image descriptor/,
   );
 
   assert.throws(

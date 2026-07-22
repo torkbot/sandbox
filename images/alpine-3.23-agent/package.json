@@ -8,8 +8,5 @@
     "type": "git",
     "url": "https://github.com/torkbot/sandbox",
     "directory": "images/alpine-3.23-agent"
-  },
-  "peerDependencies": {
-    "@torkbot/sandbox": "^0.13.0"
   }
 }

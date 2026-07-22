@@ -2,10 +2,15 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
+import {
+  defineSandbox,
+  type RootfsImageConfig,
+} from "../../src/index.ts";
 import {
   imageManifestKeys,
   imagePackageName,
@@ -46,7 +51,8 @@ test("checked-in image manifests stay minimal and immutable", async () => {
     assert.match(definition.manifest.exportCompatibility, /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/);
     assert.equal(definition.packageJson.name, imagePackageName(definition.id));
     assert.equal(definition.packageJson.private, true);
-    assert.equal(definition.packageJson.peerDependencies["@torkbot/sandbox"], "^0.13.0");
+    assert.equal("dependencies" in definition.packageJson, false);
+    assert.equal("peerDependencies" in definition.packageJson, false);
 
     const dockerfile = await readFile(new URL(`../../images/${definition.id}/Dockerfile`, import.meta.url), "utf8");
     assert.match(dockerfile, /^ARG SOURCE_IMAGE$/m);
@@ -206,7 +212,9 @@ test("image publish matrix selects ready unpublished image releases", async () =
   assert.equal(await imageReleaseNeedsPublish({ release, fetch: allPublished as typeof fetch }), false);
 });
 
-test("image package preparation emits a root package and architecture artifact package", async () => {
+test("image package preparation emits a standalone root package and architecture artifact package", async () => {
+  assert.ok(process.arch === "arm64" || process.arch === "x64");
+  const architecture = process.arch;
   const tempRoot = await mkdtemp(join(tmpdir(), "sandbox-image-package-"));
   const rootfsPath = join(tempRoot, "rootfs.qcow2");
   const factsPath = join(tempRoot, "environment-facts.json");
@@ -227,11 +235,23 @@ test("image package preparation emits a root package and architecture artifact p
   const releaseDigest = await imageReleaseDigest({
     imageId: "alpine-3.23-slim",
     artifacts: [
-      { architecture: "arm64", rootfsDigest, factsDigest },
+      {
+        architecture: "arm64",
+        rootfsDigest: architecture === "arm64"
+          ? rootfsDigest
+          : "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        factsDigest: architecture === "arm64"
+          ? factsDigest
+          : "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      },
       {
         architecture: "x64",
-        rootfsDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        factsDigest: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        rootfsDigest: architecture === "x64"
+          ? rootfsDigest
+          : "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        factsDigest: architecture === "x64"
+          ? factsDigest
+          : "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
       },
     ],
   });
@@ -248,7 +268,7 @@ test("image package preparation emits a root package and architecture artifact p
     "--version",
     version,
     "--architecture",
-    "arm64",
+    architecture,
     "--rootfs",
     rootfsPath,
     "--facts",
@@ -265,11 +285,12 @@ test("image package preparation emits a root package and architecture artifact p
     name?: string;
     version?: string;
     private?: boolean;
+    dependencies?: Record<string, string>;
     peerDependencies?: Record<string, string>;
     optionalDependencies?: Record<string, string>;
   };
   const archPackage = JSON.parse(
-    await readFile(join(outDir, "sandbox-image-alpine-3.23-slim-arm64", "package.json"), "utf8"),
+    await readFile(join(outDir, `sandbox-image-alpine-3.23-slim-${architecture}`, "package.json"), "utf8"),
   ) as {
     name?: string;
     version?: string;
@@ -282,24 +303,64 @@ test("image package preparation emits a root package and architecture artifact p
   assert.equal(rootPackage.name, "@torkbot/sandbox-image-alpine-3.23-slim");
   assert.equal(rootPackage.version, version);
   assert.equal(rootPackage.private, false);
-  assert.deepEqual(rootPackage.peerDependencies, {
-    "@torkbot/sandbox": "^0.13.0",
-  });
+  assert.equal(rootPackage.dependencies, undefined);
+  assert.equal(rootPackage.peerDependencies, undefined);
   assert.deepEqual(rootPackage.optionalDependencies, {
     "@torkbot/sandbox-image-alpine-3.23-slim-arm64": version,
     "@torkbot/sandbox-image-alpine-3.23-slim-x64": version,
   });
 
-  assert.equal(archPackage.name, "@torkbot/sandbox-image-alpine-3.23-slim-arm64");
+  assert.equal(archPackage.name, `@torkbot/sandbox-image-alpine-3.23-slim-${architecture}`);
   assert.equal(archPackage.version, version);
   assert.equal(archPackage.private, false);
   assert.equal(archPackage.main, "index.cjs");
   assert.equal(archPackage.os, undefined);
-  assert.deepEqual(archPackage.cpu, ["arm64"]);
-  assert.equal((await stat(join(outDir, "sandbox-image-alpine-3.23-slim-arm64", "rootfs.qcow2"))).isFile(), true);
+  assert.deepEqual(archPackage.cpu, [architecture]);
+  assert.equal((await stat(join(outDir, `sandbox-image-alpine-3.23-slim-${architecture}`, "rootfs.qcow2"))).isFile(), true);
 
-  const archIndex = await readFile(join(outDir, "sandbox-image-alpine-3.23-slim-arm64", "index.cjs"), "utf8");
+  const rootPackageDir = join(outDir, "sandbox-image-alpine-3.23-slim");
+  const archPackageDir = join(outDir, `sandbox-image-alpine-3.23-slim-${architecture}`);
+  const rootIndex = await readFile(join(rootPackageDir, "index.js"), "utf8");
+  const rootTypes = await readFile(join(rootPackageDir, "index.d.ts"), "utf8");
+  const archIndex = await readFile(join(archPackageDir, "index.cjs"), "utf8");
+
+  assert.doesNotMatch(rootIndex, /(?:from\s+|require\()["']@torkbot\/sandbox["']/);
+  assert.doesNotMatch(rootTypes, /from "@torkbot\/sandbox"/);
+  assert.match(rootTypes, /readonly kind: "rootfs-image"/);
+  assert.match(archIndex, /kind: "rootfs-image"/);
   assert.match(archIndex, new RegExp(rootfsDigest));
+
+  const installScope = join(tempRoot, "consumer", "node_modules", "@torkbot");
+  const installedRootPackage = join(installScope, "sandbox-image-alpine-3.23-slim");
+  await mkdir(installScope, { recursive: true });
+  await cp(rootPackageDir, installedRootPackage, { recursive: true });
+  await cp(
+    archPackageDir,
+    join(installScope, `sandbox-image-alpine-3.23-slim-${architecture}`),
+    { recursive: true },
+  );
+
+  const imageModule = await import(pathToFileURL(join(installedRootPackage, "index.js")).href) as {
+    readonly image: RootfsImageConfig;
+    readonly default: RootfsImageConfig;
+  };
+  const installedRootfsPath = await realpath(
+    join(installScope, `sandbox-image-alpine-3.23-slim-${architecture}`, "rootfs.qcow2"),
+  );
+  assert.equal(imageModule.default, imageModule.image);
+  assert.deepEqual(imageModule.image, {
+    kind: "rootfs-image",
+    name: "alpine:3.23-slim",
+    path: installedRootfsPath,
+    format: "qcow2",
+    architecture,
+    digest: rootfsDigest,
+    sizeBytes: BigInt(Buffer.byteLength("rootfs bytes\n")),
+    facts: [
+      { source: "config", topic: "rootfs-image", relation: "is", value: "alpine:3.23-slim" },
+    ],
+  });
+  assert.doesNotThrow(() => defineSandbox({ rootfs: imageModule.image }));
 });
 
 test("image release workflows are GitHub-state driven", async () => {

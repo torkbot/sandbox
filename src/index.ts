@@ -147,6 +147,12 @@ export interface SandboxHttpRequest {
   };
 }
 
+/**
+ * Plain-data descriptor for an immutable QCOW2 root filesystem image.
+ *
+ * Image packages export this shape directly and remain runtime-independent
+ * from the core Sandbox package.
+ */
 export type RootfsImageConfig = {
   readonly kind: "rootfs-image";
   readonly name: string;
@@ -157,8 +163,6 @@ export type RootfsImageConfig = {
   readonly sizeBytes: bigint;
   readonly facts: readonly SandboxEnvironmentFact[];
 };
-
-export type RootfsImageInput = Omit<RootfsImageConfig, "kind">;
 
 export type ComposedRootfsConfig = {
   readonly kind: "composed-rootfs";
@@ -792,18 +796,6 @@ interface SandboxDiagnostics {
 }
 
 export const rootfs = {
-  image(input: RootfsImageInput): RootfsImageConfig {
-    return {
-      kind: "rootfs-image",
-      name: input.name,
-      path: input.path,
-      format: input.format,
-      architecture: input.architecture,
-      digest: input.digest,
-      sizeBytes: input.sizeBytes,
-      facts: [...input.facts],
-    };
-  },
   compose(options: {
     readonly base: RootfsImageConfig;
     readonly overlay: SandboxBlockStore;
@@ -868,7 +860,7 @@ export const rootfs = {
       })
       : options.source;
     if (source.base.kind !== "rootfs-image") {
-      throw new Error("invalid rootfs source: base must be created with rootfs.image(...)");
+      throw new Error("invalid rootfs source: base must be a rootfs image descriptor");
     }
     validateRootfsImage(source.base, "rootfs source image");
     validateBlockStore(source.overlay);
@@ -2059,7 +2051,7 @@ function validateRootfs(rootfs: Rootfs): void {
         throw new Error("invalid sandbox definition: rootfs.cow source must be created with rootfs.compose(...)");
       }
       if (rootfs.source.base.kind !== "rootfs-image") {
-        throw new Error("invalid sandbox definition: rootfs.cow base must be created with rootfs.image(...)");
+        throw new Error("invalid sandbox definition: rootfs.cow base must be a rootfs image descriptor");
       }
       validateRootfsImage(rootfs.source.base, "rootfs.cow base");
       validateBlockStore(rootfs.source.overlay);
@@ -2067,28 +2059,28 @@ function validateRootfs(rootfs: Rootfs): void {
       return;
     case "ephemeral-rootfs":
       if (rootfs.base?.kind !== "rootfs-image") {
-        throw new Error("invalid sandbox definition: rootfs.ephemeral base must be created with rootfs.image(...)");
+        throw new Error("invalid sandbox definition: rootfs.ephemeral base must be a rootfs image descriptor");
       }
       validateRootfsImage(rootfs.base, "rootfs.ephemeral base");
       validateEphemeralRootfs(rootfs);
       return;
     case "persistent-rootfs":
       if (rootfs.base?.kind !== "rootfs-image") {
-        throw new Error("invalid sandbox definition: rootfs.persistent base must be created with rootfs.image(...)");
+        throw new Error("invalid sandbox definition: rootfs.persistent base must be a rootfs image descriptor");
       }
       validateRootfsImage(rootfs.base, "rootfs.persistent base");
       validatePersistentRootfs(rootfs);
       return;
     default:
       throw new Error(
-        "invalid sandbox definition: rootfs must be created with rootfs.image(...), rootfs.ephemeral(...), rootfs.cow(...), or rootfs.persistent(...)",
+        "invalid sandbox definition: rootfs must be a rootfs image descriptor or a value returned by rootfs.ephemeral(...), rootfs.cow(...), or rootfs.persistent(...)",
       );
   }
 }
 
 function validateRootfsImage(image: RootfsImageConfig, label: string): void {
   if (image === null || typeof image !== "object" || image.kind !== "rootfs-image") {
-    throw new Error(`invalid sandbox definition: ${label} must be created with rootfs.image(...)`);
+    throw new Error(`invalid sandbox definition: ${label} must be a rootfs image descriptor`);
   }
   if (typeof image.name !== "string" || image.name.length === 0) {
     throw new Error(`invalid sandbox definition: ${label} name must not be empty`);

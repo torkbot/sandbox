@@ -3,7 +3,7 @@ import { createReadStream } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { TestContext } from "node:test";
-import { rootfs, type RootfsImageConfig } from "../../../src/index.ts";
+import type { RootfsImageConfig } from "../../../src/index.ts";
 import type { RootfsEnvironmentFactsManifest } from "../../../src/environment-facts.ts";
 
 const repoRoot = resolve(import.meta.dirname, "../../..");
@@ -41,7 +41,8 @@ async function loadTestRootfsImage(): Promise<RootfsImageConfig> {
     throw new Error(`test rootfs image path is not a file: ${path}`);
   }
 
-  return rootfs.image({
+  return {
+    kind: "rootfs-image",
     name: manifest.rootfs,
     path,
     format: "qcow2",
@@ -49,7 +50,7 @@ async function loadTestRootfsImage(): Promise<RootfsImageConfig> {
     digest: `sha256:${await sha256File(path)}`,
     sizeBytes: BigInt(imageStat.size),
     facts: manifest.facts,
-  });
+  };
 }
 
 async function readRootfsFactsManifest(path: string): Promise<RootfsEnvironmentFactsManifest> {
