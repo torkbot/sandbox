@@ -9,9 +9,11 @@ import {
   type SandboxBlockStore,
   type SandboxEnvironmentFact,
   type SandboxWritableFileSystem,
+  type RootfsImageConfig,
 } from "../../src/index.ts";
 
-const testRootfs = rootfs.image({
+const testRootfs = {
+  kind: "rootfs-image",
   name: "alpine:3.23-agent",
   path: "/tmp/sandbox-rootfs-base.qcow2",
   format: "qcow2",
@@ -56,9 +58,10 @@ const testRootfs = rootfs.image({
       value: "git",
     },
   ],
-});
+} satisfies RootfsImageConfig;
 
-test("rootfs.image creates a typed external rootfs image descriptor", () => {
+test("external rootfs images are typed plain-data descriptors", () => {
+  assert.equal("image" in rootfs, false);
   assert.deepEqual(testRootfs, {
     kind: "rootfs-image",
     name: "alpine:3.23-agent",

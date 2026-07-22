@@ -94,7 +94,7 @@ Runs with a real VM and explicit rootfs COW primitives.
 Evidence:
 
 - immutable root mode remains the default.
-- `rootfs.cow({ base: rootfs.image(...), writable })` makes `/` writable through host-side block COW.
+- `rootfs.cow({ base: image, writable })` makes `/` writable through host-side block COW.
 - the immutable base image remains unchanged after guest writes through the COW rootfs.
 - each block store owns the mutations for its VM instances.
 - `mount(path, fs)` creates a guest-visible mount boundary.

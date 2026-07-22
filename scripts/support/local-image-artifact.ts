@@ -1,6 +1,6 @@
 import { readFile, stat } from "node:fs/promises";
 import { resolve } from "node:path";
-import { rootfs, type RootfsImageConfig } from "../../src/index.ts";
+import type { RootfsImageConfig } from "../../src/index.ts";
 import type { RootfsEnvironmentFactsManifest } from "../../src/environment-facts.ts";
 
 export const defaultLocalImageId = "alpine-3.23-agent";
@@ -68,7 +68,8 @@ export async function loadLocalImageArtifact(input: {
       throw new Error(`rootfs image path is not a file: ${paths.rootfsPath}`);
     }
     return {
-      image: rootfs.image({
+      image: {
+        kind: "rootfs-image",
         name: manifest.rootfs,
         path: paths.rootfsPath,
         format: "qcow2",
@@ -76,7 +77,7 @@ export async function loadLocalImageArtifact(input: {
         digest,
         sizeBytes: BigInt(imageStat.size),
         facts: manifest.facts,
-      }),
+      },
       rootfs: {
         path: paths.rootfsPath,
         sha256: digest.slice("sha256:".length),

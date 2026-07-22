@@ -20,9 +20,6 @@ export type ImagePackageJson = {
     readonly url: string;
     readonly directory: string;
   };
-  readonly peerDependencies: {
-    readonly "@torkbot/sandbox": string;
-  };
 };
 
 export type ImageDefinition = {
@@ -139,11 +136,6 @@ export function assertImagePackageJson(id: string, value: unknown): ImagePackage
   }
   if (repository.directory !== `images/${id}`) {
     throw new Error(`${id}/package.json repository.directory must be images/${id}`);
-  }
-
-  const peerDependencies = record.peerDependencies as Record<string, unknown> | undefined;
-  if (typeof peerDependencies?.["@torkbot/sandbox"] !== "string" || peerDependencies["@torkbot/sandbox"].length === 0) {
-    throw new Error(`${id}/package.json must require @torkbot/sandbox as a peer dependency`);
   }
 
   return record as ImagePackageJson;

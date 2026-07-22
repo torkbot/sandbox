@@ -10,6 +10,7 @@ import {
   assertImageReleaseVersion,
   sha256File,
 } from "./image-release-version.ts";
+import type { RootfsImageConfig } from "../src/index.ts";
 
 type RootfsEnvironmentFactsManifest = {
   readonly schemaVersion: 1;
@@ -20,6 +21,37 @@ type RootfsEnvironmentFactsManifest = {
 const repoRoot = resolve(import.meta.dirname, "..");
 const supportedNodeArchitectures = ["arm64", "x64"] as const;
 type SupportedNodeArchitecture = typeof supportedNodeArchitectures[number];
+
+type ImagePackageEnvironmentFact =
+  | {
+      readonly source: "config";
+      readonly topic: "rootfs-image" | "distro" | "distro-version" | "package-manager" | "shell";
+      readonly relation: "is";
+      readonly value: string;
+    }
+  | {
+      readonly source: "config";
+      readonly topic: "command";
+      readonly relation: "exists";
+      readonly value: string;
+    };
+
+type ImagePackageRootfsConfig = {
+  readonly kind: "rootfs-image";
+  readonly name: string;
+  readonly path: string;
+  readonly format: "qcow2";
+  readonly architecture: SupportedNodeArchitecture;
+  readonly digest: `sha256:${string}`;
+  readonly sizeBytes: bigint;
+  readonly facts: readonly ImagePackageEnvironmentFact[];
+};
+
+type AssertAssignable<Expected, Actual extends Expected> = Actual;
+// The published declaration mirrors this dependency-free shape. Keep the
+// assertion local so image packages never acquire a runtime or peer dependency
+// on the core package merely to share its type.
+type ImagePackageRootfsCompatibility = AssertAssignable<RootfsImageConfig, ImagePackageRootfsConfig>;
 
 const args = process.argv.slice(2);
 const imageId = requiredArg(args, "--image");
@@ -97,7 +129,6 @@ async function writeRootPackage(input: {
     publishConfig: {
       access: "public",
     },
-    peerDependencies: input.packageJson.peerDependencies,
     optionalDependencies,
     exports: {
       ".": {
@@ -121,12 +152,7 @@ async function writeRootPackage(input: {
   );
   await writeFile(
     resolve(input.rootPackageDir, "index.d.ts"),
-    [
-      'import type { RootfsImageConfig } from "@torkbot/sandbox";',
-      "export declare const image: RootfsImageConfig;",
-      "export default image;",
-      "",
-    ].join("\n"),
+    rootPackageTypes(),
   );
   await writeFile(
     resolve(input.rootPackageDir, "README.md"),
@@ -200,7 +226,6 @@ function rootPackageIndex(packageName: string): string {
   );
   return [
     'import { createRequire } from "node:module";',
-    'import { rootfs as sandboxRootfs } from "@torkbot/sandbox";',
     "",
     "const require = createRequire(import.meta.url);",
     `const packageByArchitecture = ${JSON.stringify(architectureMap, null, 2)};`,
@@ -209,16 +234,41 @@ function rootPackageIndex(packageName: string): string {
     "  throw new Error(`unsupported sandbox image architecture: ${process.arch}`);",
     "}",
     "",
-    "const { artifact } = require(packageName);",
-    "export const image = sandboxRootfs.image({",
-    "  name: artifact.imageName,",
-    "  path: artifact.path,",
-    "  format: artifact.format,",
-    "  architecture: artifact.architecture,",
-    "  digest: artifact.digest,",
-    "  sizeBytes: artifact.sizeBytes,",
-    "  facts: artifact.facts,",
-    "});",
+    "const { image } = require(packageName);",
+    "export { image };",
+    "export default image;",
+    "",
+  ].join("\n");
+}
+
+function rootPackageTypes(): string {
+  return [
+    "type ImagePackageEnvironmentFact =",
+    "  | {",
+    '      readonly source: "config";',
+    '      readonly topic: "rootfs-image" | "distro" | "distro-version" | "package-manager" | "shell";',
+    '      readonly relation: "is";',
+    "      readonly value: string;",
+    "    }",
+    "  | {",
+    '      readonly source: "config";',
+    '      readonly topic: "command";',
+    '      readonly relation: "exists";',
+    "      readonly value: string;",
+    "    };",
+    "",
+    "declare const image: {",
+    '  readonly kind: "rootfs-image";',
+    "  readonly name: string;",
+    "  readonly path: string;",
+    '  readonly format: "qcow2";',
+    '  readonly architecture: "arm64" | "x64";',
+    "  readonly digest: `sha256:${string}`;",
+    "  readonly sizeBytes: bigint;",
+    "  readonly facts: readonly ImagePackageEnvironmentFact[];",
+    "};",
+    "",
+    "export { image };",
     "export default image;",
     "",
   ].join("\n");
@@ -240,8 +290,9 @@ function archPackageIndex(input: {
     'const factsPath = join(__dirname, "environment-facts.json");',
     "const factsManifest = JSON.parse(readFileSync(factsPath, \"utf8\"));",
     "",
-    "exports.artifact = Object.freeze({",
-    `  imageName: ${JSON.stringify(input.imageName)},`,
+    "exports.image = Object.freeze({",
+    '  kind: "rootfs-image",',
+    `  name: ${JSON.stringify(input.imageName)},`,
     "  path: rootfsPath,",
     '  format: "qcow2",',
     `  architecture: ${JSON.stringify(input.architecture)},`,

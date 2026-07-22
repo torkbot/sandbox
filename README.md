@@ -476,12 +476,15 @@ different mounts, hostnames, and working directories.
 default working directory for later process calls. `hostname` configures the
 guest hostname for that boot. Omit it to use `sandbox`.
 
-### `rootfs.image(input)`
+### `RootfsImageConfig`
 
 Used in: [Install](#install), [machine state options](#2-give-each-agent-a-durable-machine).
 
 ```ts
-rootfs.image({
+import type { RootfsImageConfig } from "@torkbot/sandbox";
+
+const image = {
+  kind: "rootfs-image",
   name: "alpine:3.23-agent",
   path: "/absolute/path/to/alpine-3.23-agent.qcow2",
   format: "qcow2",
@@ -496,7 +499,7 @@ rootfs.image({
       value: "alpine:3.23-agent",
     },
   ],
-});
+} satisfies RootfsImageConfig;
 ```
 
 Describes the read-only Linux environment a VM starts from. All fields are
@@ -941,7 +944,12 @@ Image packages contain:
 
 - one pinned Linux machine image per supported CPU architecture,
 - image facts,
-- an exported `image` descriptor created with `rootfs.image(...)`.
+- an exported plain-data `image` descriptor compatible with `RootfsImageConfig`.
+
+Image packages do not load or declare a peer dependency on `@torkbot/sandbox`.
+Their concrete descriptor types are checked against the core contract during
+development, while applications choose the independently versioned core and
+image packages they want to combine.
 
 Image package versions use the npm prerelease section for image content:
 

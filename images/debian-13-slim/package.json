@@ -8,8 +8,5 @@
     "type": "git",
     "url": "https://github.com/torkbot/sandbox",
     "directory": "images/debian-13-slim"
-  },
-  "peerDependencies": {
-    "@torkbot/sandbox": "^0.13.0"
   }
 }

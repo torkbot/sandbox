@@ -85,7 +85,7 @@ Build the guest root filesystem before VM instantiation. The runtime API should 
 
 The build-time tooling can use a simple Docker image create/export/extract flow to shape the rootfs. That flow belongs in packaging or fixture-generation tools, not in the hot runtime path.
 
-The target shape is a single compressed QCOW2 artifact containing an ext4 guest filesystem, produced from that extracted rootfs with a build-time virtual size large enough for agent workloads. `rootfs.image(...)` describes that immutable artifact with a concrete name, absolute path, format, architecture, digest, size, and facts. Runtime writable root behavior must be explicit: `rootfs.cow(...)` mounts the same artifact read-write through host-side COW block storage; `rootfs.persistent(...)` mounts it through a local writable QCOW2 overlay file.
+The target shape is a single compressed QCOW2 artifact containing an ext4 guest filesystem, produced from that extracted rootfs with a build-time virtual size large enough for agent workloads. A plain-data `RootfsImageConfig` descriptor identifies that immutable artifact with a concrete name, absolute path, format, architecture, digest, size, and facts. Runtime writable root behavior must be explicit: `rootfs.cow(...)` mounts the same artifact read-write through host-side COW block storage; `rootfs.persistent(...)` mounts it through a local writable QCOW2 overlay file.
 
 The host-backed block COW primitive is:
 
@@ -256,7 +256,7 @@ Host networking must cover:
 
 Sandbox needs small filesystem primitives:
 
-- `rootfs.image(...)`: a supplied immutable QCOW2 root artifact mounted read-only in the guest.
+- `RootfsImageConfig`: a supplied immutable QCOW2 root artifact mounted read-only in the guest.
 - `rootfs.cow(...)`: the same immutable QCOW2 root artifact mounted read-write through a host-side COW block store.
 - `rootfs.persistent(...)`: the same immutable QCOW2 root artifact mounted read-write through a local QCOW2 overlay file.
 - `mount(path, fs)`: a guest-visible mount boundary.
@@ -313,7 +313,7 @@ The first helper protocol is deliberately small. Node starts `sandbox-host --std
 2. Build `sandbox-init` as a static guest binary and boot it directly with an explicit kernel/initramfs.
 3. Add a vsock control channel and adapt it to the TypeScript `Transport` interface.
 4. Add build-time Docker image export/extract rootfs tooling, then consume a prebuilt immutable read-only root volume at VM instantiation.
-5. Add `rootfs.cow({ base: rootfs.image(...), writable })` so `/` can be writable while the base rootfs artifact remains immutable.
+5. Add `rootfs.cow({ base: image, writable })` so `/` can be writable while the base rootfs artifact remains immutable.
 6. Add CA injection and Rust-owned HTTP request-header interception using Rama.
 7. Add a vhost-user filesystem backend for virtual and writable host-implemented guest mounts.
 8. Move any required libkrun changes into `torkbot/libkrun` and keep them upstream-shaped.
