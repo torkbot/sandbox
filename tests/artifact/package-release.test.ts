@@ -26,13 +26,14 @@ test("release package manifest is the checked-in publish source", async () => {
   assert.equal(releasePackageJson.optionalDependencies, undefined);
 });
 
-test("root package declares public release metadata and platform optional dependencies", async () => {
+test("root package declares only its runtime and platform dependencies", async () => {
   const packageJson = JSON.parse(
     await readFile(new URL("../../dist/npm/sandbox/package.json", import.meta.url), "utf8"),
   ) as {
     private?: boolean;
     publishConfig?: { access?: string };
     bin?: Record<string, string>;
+    dependencies?: Record<string, string>;
     optionalDependencies?: Record<string, string>;
     napi?: unknown;
     version?: string;
@@ -42,6 +43,9 @@ test("root package declares public release metadata and platform optional depend
   assert.equal(packageJson.publishConfig?.access, "public");
   assert.deepEqual(packageJson.bin, {
     sandbox: "./dist/cli.js",
+  });
+  assert.deepEqual(packageJson.dependencies, {
+    bson: "^7.2.0",
   });
   assert.deepEqual(Object.keys(packageJson.optionalDependencies ?? {}).sort(), [
     "@torkbot/sandbox-darwin-arm64",
