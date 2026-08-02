@@ -956,7 +956,7 @@ dependencies = [
  "ipnet",
  "jni",
  "once_cell",
- "rand 0.10.1",
+ "rand 0.10.2",
  "thiserror",
  "tinyvec",
  "tracing",
@@ -1330,7 +1330,7 @@ checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 
 [[package]]
 name = "krun-arch"
-version = "0.1.0-1.18.0"
+version = "0.1.0-2.0.0-dev"
 dependencies = [
  "krun-arch-gen",
  "krun-smbios",
@@ -1341,26 +1341,26 @@ dependencies = [
  "libc",
  "linux-loader",
  "vm-memory",
- "vmm-sys-util",
+ "vmm-sys-util 0.15.0",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "krun-arch-gen"
-version = "0.1.0-1.18.0"
+version = "0.1.0-2.0.0-dev"
 
 [[package]]
 name = "krun-cpuid"
-version = "0.1.0-1.18.0"
+version = "0.1.0-2.0.0-dev"
 dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
- "vmm-sys-util",
+ "vmm-sys-util 0.15.0",
 ]
 
 [[package]]
 name = "krun-devices"
-version = "0.1.0-1.18.0"
+version = "0.1.0-2.0.0-dev"
 dependencies = [
  "bitflags 1.3.2",
  "caps",
@@ -1378,7 +1378,7 @@ dependencies = [
  "log",
  "lru",
  "nix",
- "rand 0.9.4",
+ "rand 0.10.2",
  "virtio-bindings",
  "vm-fdt",
  "vm-memory",
@@ -1387,7 +1387,7 @@ dependencies = [
 
 [[package]]
 name = "krun-hvf"
-version = "0.1.0-1.18.0"
+version = "0.1.0-2.0.0-dev"
 dependencies = [
  "crossbeam-channel",
  "krun-arch",
@@ -1397,7 +1397,7 @@ dependencies = [
 
 [[package]]
 name = "krun-kernel"
-version = "0.1.0-1.18.0"
+version = "0.1.0-2.0.0-dev"
 dependencies = [
  "krun-utils",
  "vm-memory",
@@ -1405,7 +1405,7 @@ dependencies = [
 
 [[package]]
 name = "krun-polly"
-version = "0.1.0-1.18.0"
+version = "0.1.0-2.0.0-dev"
 dependencies = [
  "krun-utils",
  "libc",
@@ -1413,14 +1413,14 @@ dependencies = [
 
 [[package]]
 name = "krun-smbios"
-version = "0.1.0-1.18.0"
+version = "0.1.0-2.0.0-dev"
 dependencies = [
  "vm-memory",
 ]
 
 [[package]]
 name = "krun-utils"
-version = "0.1.0-1.18.0"
+version = "0.1.0-2.0.0-dev"
 dependencies = [
  "bitflags 1.3.2",
  "crossbeam-channel",
@@ -1428,13 +1428,13 @@ dependencies = [
  "libc",
  "log",
  "nix",
- "vmm-sys-util",
+ "vmm-sys-util 0.15.0",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "krun-vmm"
-version = "0.1.0-1.18.0"
+version = "0.1.0-2.0.0-dev"
 dependencies = [
  "bzip2",
  "crossbeam-channel",
@@ -1455,14 +1455,14 @@ dependencies = [
  "log",
  "nix",
  "vm-memory",
- "vmm-sys-util",
+ "vmm-sys-util 0.14.0",
  "windows-sys 0.61.2",
  "zstd",
 ]
 
 [[package]]
 name = "krun-whp"
-version = "0.1.0-1.18.0"
+version = "0.1.0-2.0.0-dev"
 dependencies = [
  "log",
  "windows-sys 0.61.2",
@@ -1470,23 +1470,23 @@ dependencies = [
 
 [[package]]
 name = "kvm-bindings"
-version = "0.12.1"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a537873e15e8daabb416667e606d9b0abc2a8fb9a45bd5853b888ae0ead82f9"
+checksum = "11cf0ca75d59e9d298647c59cf6c5286fa048120caa77972a7a504a0824d234f"
 dependencies = [
- "vmm-sys-util",
+ "vmm-sys-util 0.14.0",
 ]
 
 [[package]]
 name = "kvm-ioctls"
-version = "0.22.1"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c8f7370330b4f57981e300fa39b02088f2f2a5c2d0f1f994e8090589619c56d"
+checksum = "333f77a20344a448f3f70664918135fddeb804e938f28a99d685bd92926e0b19"
 dependencies = [
  "bitflags 2.11.1",
  "kvm-bindings",
  "libc",
- "vmm-sys-util",
+ "vmm-sys-util 0.14.0",
 ]
 
 [[package]]
@@ -1509,7 +1509,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libkrun"
-version = "1.18.0"
+version = "2.0.0-dev"
 dependencies = [
  "crossbeam-channel",
  "env_logger",
@@ -1525,7 +1525,6 @@ dependencies = [
  "libloading",
  "log",
  "once_cell",
- "rand 0.9.4",
  "vm-memory",
  "windows-sys 0.61.2",
 ]
@@ -2058,7 +2057,7 @@ dependencies = [
  "rama-core",
  "rama-net",
  "rama-utils",
- "rand 0.10.1",
+ "rand 0.10.2",
  "tokio",
  "windows-sys 0.61.2",
 ]
@@ -2092,7 +2091,7 @@ dependencies = [
  "rama-http-types",
  "rama-net",
  "rama-utils",
- "rand 0.10.1",
+ "rand 0.10.2",
  "serde",
  "serde_html_form",
  "serde_json",
@@ -2159,7 +2158,7 @@ dependencies = [
  "rama-macros",
  "rama-net",
  "rama-utils",
- "rand 0.10.1",
+ "rand 0.10.2",
  "serde",
  "sha1",
 ]
@@ -2185,7 +2184,7 @@ dependencies = [
  "rama-core",
  "rama-macros",
  "rama-utils",
- "rand 0.10.1",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "sync_wrapper",
@@ -2246,7 +2245,7 @@ dependencies = [
  "rama-http-types",
  "rama-net",
  "rama-utils",
- "rand 0.10.1",
+ "rand 0.10.2",
  "tokio",
 ]
 
@@ -2313,9 +2312,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2e8e8bcc7961af1fdac401278c6a831614941f6164ee3bf4ce61b7edb162207"
+checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
 dependencies = [
  "chacha20",
  "getrandom 0.4.2",
@@ -3265,6 +3264,16 @@ name = "vmm-sys-util"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d21f366bf22bfba3e868349978766a965cbe628c323d58e026be80b8357ab789"
+dependencies = [
+ "bitflags 1.3.2",
+ "libc",
+]
+
+[[package]]
+name = "vmm-sys-util"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "506c62fdf617a5176827c2f9afbcf1be155b03a9b4bf9617a60dbc07e3a1642f"
 dependencies = [
  "bitflags 1.3.2",
  "libc",
