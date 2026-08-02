@@ -276,16 +276,18 @@ Durable filesystem implementations should be layered on top of the generic user-
 
 ## libkrun Fork
 
-`torkbot/libkrun` is checked out at `deps/libkrun` for local inspection. It is currently a fresh fork with only `main` from `origin`. Convert it to a git submodule when this repo needs to track a specific libkrun commit as part of the build.
+`torkbot/libkrun` is pinned at `deps/libkrun` as a git submodule. Its integration
+branch is based on the current upstream 2.0 development line and carries only
+the capabilities exercised by Sandbox: process-resident kernel and initrd
+bundles, direct block-root storage, fd-backed vsock ports and console output,
+in-process virtual and masked virtio-fs backends, and direct Rust init
+configuration.
 
-Expected fork patches:
-
-- expose any missing vhost-user device type needed for virtio-fs,
-- add file-descriptor variants for libkrun surfaces that currently force UNIX socket paths when the caller already owns a connected or listening socket,
-- make custom kernel/initramfs/static-kernel workflows smooth for this package,
-- make direct Rust init injection the normal path, without a C stage-0 init binary,
-- support linking libkrun into Sandbox statically instead of loading libkrun as a dynamic C library,
-- keep changes small and upstreamable.
+Sandbox links the libkrun Rust crate directly. It does not maintain a Rust
+binding to libkrun's C API, and the fork does not revive upstream's removed
+implicit-device or legacy root/data-disk compatibility APIs. See
+[libkrun-fork-notes.md](libkrun-fork-notes.md) for the exact upstream baseline
+and integration policy.
 
 Prefer fd-oriented APIs for host services owned by Sandbox. Socket paths are useful when integrating with a separately managed process, but they force unnecessary filesystem coordination when the Node/Rust host runtime already created the socket and controls its lifetime.
 

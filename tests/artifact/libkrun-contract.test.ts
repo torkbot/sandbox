@@ -16,8 +16,18 @@ test("Sandbox-owned sockets can be supplied without filesystem socket paths", as
 
   assert.match(runtime, /UnixStream::pair\(\)/);
   assert.match(runtime, /add_control_socket_fd/);
+  assert.match(runtime, /krun_add_vsock\(/);
   assert.match(runtime, /krun_add_vsock_port_fd/);
+  assert.doesNotMatch(runtime, /krun_disable_implicit_vsock/);
   assert.doesNotMatch(runtime, /krun_add_vsock_port\([^_]/);
+});
+
+test("Sandbox uses libkrun 2.0 explicit console and logging configuration", async () => {
+  const runtime = await readFile(new URL("../../crates/sandbox/src/runtime.rs", import.meta.url), "utf8");
+
+  assert.match(runtime, /krun_add_console_output_fd/);
+  assert.match(runtime, /krun_init_log/);
+  assert.doesNotMatch(runtime, /krun_set_console_output|krun_set_log_level/);
 });
 
 test("virtual filesystem operations use libkrun virtual filesystem traits", async () => {

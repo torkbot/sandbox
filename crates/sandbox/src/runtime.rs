@@ -28,6 +28,7 @@ use crate::vfs::VirtioVirtualFsBackend;
 #[derive(Debug)]
 pub struct KrunContext {
     id: u32,
+    _console_output: fs::File,
     _networks: Vec<HostNetwork>,
     _rootfs_overlay_lock: Option<RootfsOverlayLock>,
 }
@@ -201,6 +202,7 @@ impl KrunContext {
         services: HostServices,
     ) -> Result<Self, KrunError> {
         init_krun_logging();
+        let console_output = open_console_output()?;
         let raw_id = krun::krun_create_ctx();
         if raw_id < 0 {
             return Err(KrunError {
@@ -211,6 +213,7 @@ impl KrunContext {
 
         let mut context = Self {
             id: raw_id as u32,
+            _console_output: console_output,
             _networks: Vec::new(),
             _rootfs_overlay_lock: None,
         };
@@ -338,10 +341,6 @@ impl KrunContext {
     }
 
     pub fn add_control_socket_fd(&self, fd: RawFd) -> Result<(), KrunError> {
-        check_krun(
-            "krun_disable_implicit_vsock",
-            krun::krun_disable_implicit_vsock(self.id),
-        )?;
         check_krun("krun_add_vsock", krun::krun_add_vsock(self.id, 0))?;
         check_krun(
             "krun_add_vsock_port_fd",
@@ -361,12 +360,10 @@ impl KrunContext {
     }
 
     fn apply_console_output(&self) -> Result<(), KrunError> {
-        let path = console_output_path(std::env::var_os("SANDBOX_CONSOLE_OUTPUT"));
-        let path = CString::new(path.to_string_lossy().as_bytes())
-            .map_err(|_| KrunError::new("SANDBOX_CONSOLE_OUTPUT", -libc::EINVAL))?;
-        check_krun("krun_set_console_output", unsafe {
-            krun::krun_set_console_output(self.id, path.as_ptr())
-        })
+        check_krun(
+            "krun_add_console_output_fd",
+            krun::krun_add_console_output_fd(self.id, self._console_output.as_raw_fd()),
+        )
     }
 
     fn apply_kernel(&self, spec: &MicroVmSpec) -> Result<(), KrunError> {
@@ -549,6 +546,16 @@ impl KrunContext {
 
 fn console_output_path(configured: Option<OsString>) -> OsString {
     configured.unwrap_or_else(|| OsString::from("/dev/null"))
+}
+
+fn open_console_output() -> Result<fs::File, KrunError> {
+    let path = console_output_path(std::env::var_os("SANDBOX_CONSOLE_OUTPUT"));
+    fs::File::create(path).map_err(|error| {
+        KrunError::new(
+            "SANDBOX_CONSOLE_OUTPUT",
+            -error.raw_os_error().unwrap_or(libc::EIO),
+        )
+    })
 }
 
 pub enum VirtioFsDevice {
@@ -771,7 +778,7 @@ fn init_krun_logging() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         if std::env::var_os("SANDBOX_KRUN_LOG").is_some() {
-            let _ = krun::krun_set_log_level(4);
+            let _ = unsafe { krun::krun_init_log(-1, 4, 0, 0) };
         }
     });
 }
@@ -1188,7 +1195,7 @@ mod tests {
     }
 
     #[test]
-    fn default_console_output_keeps_implicit_console_device() {
+    fn default_console_output_is_discarded() {
         assert_eq!(console_output_path(None), OsString::from("/dev/null"));
     }
 
@@ -1350,6 +1357,7 @@ mod tests {
         .unwrap();
         let mut context = KrunContext {
             id: 0,
+            _console_output: fs::File::create("/dev/null").unwrap(),
             _networks: Vec::new(),
             _rootfs_overlay_lock: None,
         };
