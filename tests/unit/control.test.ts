@@ -921,6 +921,7 @@ test("HostControlTransport drives a guest connection", async () => {
     hostname: "example.com",
     port: 443,
     secure: true,
+    timeoutMs: 10_000,
     serverName: "example.com",
   });
   const open = BSON.deserialize(channel.writes[0]!.subarray(4));
@@ -928,6 +929,7 @@ test("HostControlTransport drives a guest connection", async () => {
   assert.equal(open.hostname, "example.com");
   assert.equal(open.port, 443);
   assert.equal(open.secure, true);
+  assert.equal(open.timeoutMs, 10_000);
   assert.equal(open.serverName, "example.com");
 
   channel.packets.push(encodePacket({

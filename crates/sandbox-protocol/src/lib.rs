@@ -141,6 +141,7 @@ pub enum ControlFrame {
         hostname: String,
         port: u16,
         secure: bool,
+        timeout_ms: u64,
         server_name: Option<String>,
     },
     GuestConnectionWrite {
@@ -506,6 +507,7 @@ impl ControlFrame {
                 hostname,
                 port,
                 secure,
+                timeout_ms,
                 server_name,
             } => {
                 let mut document = bson::doc! {
@@ -514,6 +516,9 @@ impl ControlFrame {
                     "hostname": hostname,
                     "port": i32::from(*port),
                     "secure": *secure,
+                    "timeoutMs": i64::try_from(*timeout_ms).map_err(|_| {
+                        ControlFrameError::new("guest.connection.open timeoutMs exceeds i64")
+                    })?,
                 };
                 if let Some(server_name) = server_name {
                     document.insert("serverName", server_name);
@@ -854,6 +859,11 @@ impl ControlFrame {
                 secure: document
                     .get_bool("secure")
                     .map_err(|_| ControlFrameError::new("guest.connection.open missing secure"))?,
+                timeout_ms: read_required_u64(
+                    &document,
+                    "timeoutMs",
+                    "guest.connection.open timeoutMs",
+                )?,
                 server_name: document.get_str("serverName").ok().map(str::to_string),
             }),
             "guest.connection.write" => Ok(Self::GuestConnectionWrite {
@@ -1352,6 +1362,23 @@ fn read_optional_u64(
         .map_err(|_| ControlFrameError::new(format!("{label} must fit in u64")))
 }
 
+fn read_required_u64(
+    document: &bson::Document,
+    key: &str,
+    label: &str,
+) -> Result<u64, ControlFrameError> {
+    let value = read_bson_integer(
+        document
+            .get(key)
+            .ok_or_else(|| ControlFrameError::new(format!("{label} missing")))?,
+        label,
+    )?;
+    if value <= 0 {
+        return Err(ControlFrameError::new(format!("{label} must be positive")));
+    }
+    u64::try_from(value).map_err(|_| ControlFrameError::new(format!("{label} must fit in u64")))
+}
+
 fn read_bson_integer(value: &bson::Bson, label: &str) -> Result<i64, ControlFrameError> {
     match value {
         bson::Bson::Int32(value) => Ok(i64::from(*value)),
@@ -1605,6 +1632,7 @@ mod tests {
                 hostname: "example.com".to_string(),
                 port: 443,
                 secure: true,
+                timeout_ms: 10_000,
                 server_name: Some("example.com".to_string()),
             },
             ControlFrame::GuestConnectionWrite {

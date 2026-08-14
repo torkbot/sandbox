@@ -41,20 +41,37 @@ test("sandbox.fetch performs fetch through the guest network", async (t) => {
   const hostname = "sandbox-fetch.test";
   const dnsServer = await startUdpDnsServer(hostOriginAddress());
   const httpOrigin = await startFetchHttpServer();
+  const stalledOrigin = await startTcpServer(() => {});
   const deniedOrigin = await startTcpServer(() => {});
   const httpsOrigin = await startFetchHttpsServer();
+  let notifyPolicyStarted!: () => void;
+  const policyStarted = new Promise<void>((resolve) => {
+    notifyPolicyStarted = resolve;
+  });
+  let releasePolicy!: () => void;
+  const policyRelease = new Promise<void>((resolve) => {
+    releasePolicy = resolve;
+  });
   t.after(() => void dnsServer.close());
   t.after(() => void httpOrigin.close());
+  t.after(() => void stalledOrigin.close());
   t.after(() => void deniedOrigin.close());
   t.after(() => void httpsOrigin.close());
+  t.after(releasePolicy);
 
   const sandbox = await defineSandbox({
     rootfs: rootfs.ephemeral({ base: testRootfs }),
-    network: network.policy((conn) => {
+    network: network.policy(async (conn) => {
       if (conn.matchDns()?.accept({
         resolvers: [{ ip: "127.0.0.1", port: dnsServer.port }],
       })) return;
       if (conn.transport !== "tcp") return;
+      if (conn.dst.port === stalledOrigin.port) {
+        notifyPolicyStarted();
+        await policyRelease;
+        conn.accept();
+        return;
+      }
       if (conn.dst.port === httpOrigin.port) {
         conn.acceptHttp((request) => {
           request.headers.set("x-sandbox-policy", "allowed");
@@ -123,6 +140,19 @@ test("sandbox.fetch performs fetch through the guest network", async (t) => {
   )), 10_000, "sandbox fetch abort response");
   abortController.abort();
   await assert.rejects(abortResponse.text(), { name: "AbortError" });
+
+  const connectAbortController = new AbortController();
+  const connecting = sandbox.fetch(new Request(
+    `http://${hostOriginAddress()}:${stalledOrigin.port}/`,
+    { signal: connectAbortController.signal },
+  ));
+  await withTimeout(policyStarted, 2_000, "sandbox fetch connection policy");
+  connectAbortController.abort();
+  await assert.rejects(
+    withTimeout(connecting, 2_000, "sandbox fetch abort during connect"),
+    { name: "AbortError" },
+  );
+  releasePolicy();
 
   const afterAbort = await withTimeout(sandbox.fetch(new Request(
     `http://${hostname}:${httpOrigin.port}/stream`,

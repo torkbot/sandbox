@@ -202,6 +202,7 @@ export type SandboxControlCommand =
       readonly hostname: string;
       readonly port: number;
       readonly secure: boolean;
+      readonly timeoutMs: number;
       readonly serverName?: string;
     }
   | {
@@ -294,6 +295,7 @@ export function encodeControlCommand(command: SandboxControlCommand): Uint8Array
         hostname: command.hostname,
         port: command.port,
         secure: command.secure,
+        timeoutMs: command.timeoutMs,
         ...(command.serverName === undefined ? {} : { serverName: command.serverName }),
       });
     case "guest.connection.write":

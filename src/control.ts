@@ -44,6 +44,7 @@ export interface SandboxControl extends Transport<SandboxControlEvent, SandboxCo
     readonly hostname: string;
     readonly port: number;
     readonly secure: boolean;
+    readonly timeoutMs: number;
     readonly serverName?: string;
   }): ControlBackedGuestConnection;
 }
@@ -285,6 +286,7 @@ export class HostControlTransport implements SandboxControl {
     readonly hostname: string;
     readonly port: number;
     readonly secure: boolean;
+    readonly timeoutMs: number;
     readonly serverName?: string;
   }): ControlBackedGuestConnection {
     this.#assertOpen();
@@ -299,6 +301,7 @@ export class HostControlTransport implements SandboxControl {
       hostname: input.hostname,
       port: input.port,
       secure: input.secure,
+      timeoutMs: input.timeoutMs,
       serverName: input.serverName,
     }).catch((error) => {
       this.#connections.delete(id);
@@ -522,6 +525,9 @@ export class ControlBackedGuestConnection {
   }
 
   async write(data: Uint8Array): Promise<void> {
+    if (!this.#opened) {
+      await this.opened;
+    }
     this.#assertOpen();
     if (this.#pendingWrite !== undefined) {
       throw new Error("sandbox guest connection already has a write in flight");
@@ -543,6 +549,9 @@ export class ControlBackedGuestConnection {
   }
 
   async read(maxBytes: number): Promise<Uint8Array | null> {
+    if (!this.#opened) {
+      await this.opened;
+    }
     this.#assertOpen();
     if (this.#pendingRead !== undefined) {
       throw new Error("sandbox guest connection already has a read in flight");
@@ -621,12 +630,9 @@ export class ControlBackedGuestConnection {
     }
     this.#closed = true;
     const connectionError = error instanceof Error ? error : new Error(String(error));
-    const wasOpened = this.#opened;
     this.#rejectPending(connectionError);
     this.#onClose();
-    if (wasOpened) {
-      this.#errorHandler?.(connectionError);
-    }
+    this.#errorHandler?.(connectionError);
   }
 
   #assertOpen(): void {

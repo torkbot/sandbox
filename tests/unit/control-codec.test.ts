@@ -153,6 +153,7 @@ test("control codec encodes and decodes guest connection frames", () => {
       hostname: "example.com",
       port: 443,
       secure: true,
+      timeoutMs: 10_000,
       serverName: "example.com",
     }).subarray(4)),
     {
@@ -161,6 +162,7 @@ test("control codec encodes and decodes guest connection frames", () => {
       hostname: "example.com",
       port: 443,
       secure: true,
+      timeoutMs: 10_000,
       serverName: "example.com",
     },
   );

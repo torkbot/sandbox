@@ -5,16 +5,17 @@ use sandbox_protocol::{
     ControlFrame, GuestFsDirectoryEntry, GuestFsEntryType, GuestFsError, GuestFsReadRange,
     GuestFsResponseResult, GuestFsStat, GuestPtySize, GuestSpawnStdio,
 };
-use std::collections::{HashMap, HashSet};
+use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::{Shutdown, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-#[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const GUEST_FS_RESPONSE_PAYLOAD_LIMIT: u64 = 60 * 1024 * 1024;
 const GUEST_FS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
@@ -1329,6 +1330,7 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
                 hostname,
                 port,
                 secure,
+                timeout_ms,
                 server_name,
             } => {
                 let writer = writer.clone();
@@ -1340,6 +1342,7 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
                         hostname,
                         port,
                         secure,
+                        timeout_ms,
                         server_name,
                         controls,
                         writer.clone(),
@@ -2283,6 +2286,41 @@ enum ConnectionControl {
     Close,
 }
 
+const CONNECTION_IO_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const RESOLVER_QUEUE_CAPACITY: usize = 64;
+
+struct ResolveRequest {
+    hostname: String,
+    port: u16,
+    cancelled: Arc<AtomicBool>,
+    response: mpsc::Sender<Result<Vec<SocketAddr>, String>>,
+}
+
+fn resolver_sender() -> &'static mpsc::SyncSender<ResolveRequest> {
+    static RESOLVER: OnceLock<mpsc::SyncSender<ResolveRequest>> = OnceLock::new();
+    RESOLVER.get_or_init(|| {
+        let (sender, receiver) = mpsc::sync_channel::<ResolveRequest>(RESOLVER_QUEUE_CAPACITY);
+        std::thread::Builder::new()
+            .name("sandbox-guest-resolver".to_string())
+            .spawn(move || {
+                while let Ok(request) = receiver.recv() {
+                    if request.cancelled.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    let result = (request.hostname.as_str(), request.port)
+                        .to_socket_addrs()
+                        .map(|addresses| addresses.collect::<Vec<_>>())
+                        .map_err(|error| error.to_string());
+                    if !request.cancelled.load(Ordering::Acquire) {
+                        let _ = request.response.send(result);
+                    }
+                }
+            })
+            .expect("spawn sandbox guest resolver");
+        sender
+    })
+}
+
 enum GuestConnectionIo {
     Plain(TcpStream),
     Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
@@ -2342,25 +2380,59 @@ fn run_guest_connection(
     hostname: String,
     port: u16,
     secure: bool,
+    timeout_ms: u64,
     server_name: Option<String>,
     controls: mpsc::Receiver<ConnectionControl>,
     writer: Arc<ControlWriter>,
 ) -> Result<(), InitError> {
-    let stream = TcpStream::connect((hostname.as_str(), port))
-        .map_err(|error| InitError(format!("connect to {hostname}:{port}: {error}")))?;
+    let deadline = Instant::now()
+        .checked_add(Duration::from_millis(timeout_ms))
+        .ok_or_else(|| InitError("guest connection timeout is too large".to_string()))?;
+    let mut pending_controls = VecDeque::new();
+    let Some(addresses) = resolve_guest_addresses(
+        &hostname,
+        port,
+        deadline,
+        timeout_ms,
+        &controls,
+        &mut pending_controls,
+    )?
+    else {
+        return Ok(());
+    };
+    let Some(stream) = connect_guest_tcp(
+        &hostname,
+        port,
+        &addresses,
+        deadline,
+        timeout_ms,
+        &controls,
+        &mut pending_controls,
+    )?
+    else {
+        return Ok(());
+    };
     let mut connection = if secure {
-        GuestConnectionIo::Tls(Box::new(connect_guest_tls(
+        let Some(tls) = connect_guest_tls(
             stream,
             server_name.unwrap_or_else(|| hostname.clone()),
-        )?))
+            deadline,
+            timeout_ms,
+            &controls,
+            &mut pending_controls,
+        )?
+        else {
+            return Ok(());
+        };
+        GuestConnectionIo::Tls(Box::new(tls))
     } else {
         GuestConnectionIo::Plain(stream)
     };
     connection
-        .set_read_timeout(Some(Duration::from_millis(20)))
+        .set_read_timeout(Some(CONNECTION_IO_POLL_INTERVAL))
         .map_err(|error| InitError(format!("configure guest connection read timeout: {error}")))?;
     connection
-        .set_write_timeout(Some(Duration::from_secs(10)))
+        .set_write_timeout(Some(CONNECTION_IO_POLL_INTERVAL))
         .map_err(|error| InitError(format!("configure guest connection write timeout: {error}")))?;
     send_control_frame(
         &writer,
@@ -2369,7 +2441,9 @@ fn run_guest_connection(
 
     let mut pending_read = None;
     loop {
-        let control = if pending_read.is_some() {
+        let control = if let Some(control) = pending_controls.pop_front() {
+            Some(control)
+        } else if pending_read.is_some() {
             match controls.recv_timeout(Duration::from_millis(1)) {
                 Ok(control) => Some(control),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
@@ -2384,10 +2458,15 @@ fn run_guest_connection(
 
         match control {
             Some(ConnectionControl::Write(data)) => {
-                connection
-                    .write_all(&data)
-                    .and_then(|()| connection.flush())
-                    .map_err(|error| InitError(format!("write guest connection: {error}")))?;
+                if !write_guest_connection(
+                    &mut connection,
+                    &data,
+                    &controls,
+                    &mut pending_controls,
+                )? {
+                    connection.shutdown();
+                    return Ok(());
+                }
                 send_control_frame(
                     &writer,
                     ControlFrame::GuestConnectionWriteComplete { id: id.clone() },
@@ -2439,15 +2518,218 @@ fn run_guest_connection(
     }
 }
 
+fn resolve_guest_addresses(
+    hostname: &str,
+    port: u16,
+    deadline: Instant,
+    timeout_ms: u64,
+    controls: &mpsc::Receiver<ConnectionControl>,
+    pending_controls: &mut VecDeque<ConnectionControl>,
+) -> Result<Option<Vec<SocketAddr>>, InitError> {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (response, result) = mpsc::channel();
+    resolver_sender()
+        .try_send(ResolveRequest {
+            hostname: hostname.to_string(),
+            port,
+            cancelled: cancelled.clone(),
+            response,
+        })
+        .map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => InitError("guest resolver queue is full".to_string()),
+            mpsc::TrySendError::Disconnected(_) => {
+                InitError("guest resolver is unavailable".to_string())
+            }
+        })?;
+
+    loop {
+        if drain_connection_controls(controls, pending_controls) {
+            cancelled.store(true, Ordering::Release);
+            return Ok(None);
+        }
+        let remaining = connection_remaining(deadline, timeout_ms)?;
+        match result.recv_timeout(remaining.min(CONNECTION_IO_POLL_INTERVAL)) {
+            Ok(Ok(addresses)) if addresses.is_empty() => {
+                return Err(InitError(format!(
+                    "resolve {hostname}:{port}: no addresses"
+                )));
+            }
+            Ok(Ok(addresses)) => return Ok(Some(addresses)),
+            Ok(Err(error)) => {
+                return Err(InitError(format!("resolve {hostname}:{port}: {error}")));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(InitError("guest resolver stopped unexpectedly".to_string()));
+            }
+        }
+    }
+}
+
+fn connect_guest_tcp(
+    hostname: &str,
+    port: u16,
+    addresses: &[SocketAddr],
+    deadline: Instant,
+    timeout_ms: u64,
+    controls: &mpsc::Receiver<ConnectionControl>,
+    pending_controls: &mut VecDeque<ConnectionControl>,
+) -> Result<Option<TcpStream>, InitError> {
+    let mut last_error = None;
+    for address in addresses {
+        let mut connect_failed = false;
+        let socket = Socket::new(
+            Domain::for_address(*address),
+            Type::STREAM,
+            Some(Protocol::TCP),
+        )
+        .map_err(|error| InitError(format!("create guest connection socket: {error}")))?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|error| InitError(format!("configure guest connection socket: {error}")))?;
+
+        match socket.connect(&(*address).into()) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(libc::EINPROGRESS) => loop {
+                if drain_connection_controls(controls, pending_controls) {
+                    return Ok(None);
+                }
+                let remaining = connection_remaining(deadline, timeout_ms)?;
+                if !poll_socket_writable(&socket, remaining.min(CONNECTION_IO_POLL_INTERVAL))
+                    .map_err(|error| InitError(format!("poll guest connection socket: {error}")))?
+                {
+                    continue;
+                }
+                match socket.take_error().map_err(|error| {
+                    InitError(format!("inspect guest connection socket: {error}"))
+                })? {
+                    Some(error) => {
+                        last_error = Some(error);
+                        connect_failed = true;
+                        break;
+                    }
+                    None => break,
+                }
+            },
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        }
+
+        if connect_failed {
+            continue;
+        }
+        if let Some(error) = socket
+            .take_error()
+            .map_err(|error| InitError(format!("inspect guest connection socket: {error}")))?
+        {
+            last_error = Some(error);
+            continue;
+        }
+        socket
+            .set_nonblocking(false)
+            .map_err(|error| InitError(format!("configure guest connection socket: {error}")))?;
+        socket
+            .set_tcp_nodelay(true)
+            .map_err(|error| InitError(format!("configure guest connection socket: {error}")))?;
+        return Ok(Some(socket.into()));
+    }
+
+    let details = last_error
+        .map(|error| error.to_string())
+        .unwrap_or_else(|| "no usable addresses".to_string());
+    Err(InitError(format!(
+        "connect to {hostname}:{port}: {details}"
+    )))
+}
+
+fn poll_socket_writable(socket: &Socket, timeout: Duration) -> std::io::Result<bool> {
+    let mut descriptor = libc::pollfd {
+        fd: socket.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    let timeout_ms = timeout.as_millis().clamp(1, i32::MAX as u128) as i32;
+    let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(result > 0)
+}
+
+fn connection_remaining(deadline: Instant, timeout_ms: u64) -> Result<Duration, InitError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| InitError(format!("guest connection timed out after {timeout_ms} ms")))
+}
+
+fn drain_connection_controls(
+    controls: &mpsc::Receiver<ConnectionControl>,
+    pending_controls: &mut VecDeque<ConnectionControl>,
+) -> bool {
+    loop {
+        match controls.try_recv() {
+            Ok(ConnectionControl::Close) | Err(mpsc::TryRecvError::Disconnected) => return true,
+            Ok(control) => pending_controls.push_back(control),
+            Err(mpsc::TryRecvError::Empty) => return false,
+        }
+    }
+}
+
+fn write_guest_connection(
+    connection: &mut GuestConnectionIo,
+    data: &[u8],
+    controls: &mpsc::Receiver<ConnectionControl>,
+    pending_controls: &mut VecDeque<ConnectionControl>,
+) -> Result<bool, InitError> {
+    let mut offset = 0;
+    while offset < data.len() {
+        if drain_connection_controls(controls, pending_controls) {
+            return Ok(false);
+        }
+        match connection.write(&data[offset..]) {
+            Ok(0) => {
+                return Err(InitError(
+                    "write guest connection returned zero bytes".to_string(),
+                ));
+            }
+            Ok(written) => offset += written,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut
+                    || error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(InitError(format!("write guest connection: {error}"))),
+        }
+    }
+    loop {
+        if drain_connection_controls(controls, pending_controls) {
+            return Ok(false);
+        }
+        match connection.flush() {
+            Ok(()) => return Ok(true),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut
+                    || error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(InitError(format!("flush guest connection: {error}"))),
+        }
+    }
+}
+
 fn connect_guest_tls(
     stream: TcpStream,
     server_name: String,
-) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>, InitError> {
+    deadline: Instant,
+    timeout_ms: u64,
+    controls: &mpsc::Receiver<ConnectionControl>,
+    pending_controls: &mut VecDeque<ConnectionControl>,
+) -> Result<Option<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>, InitError> {
     stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(CONNECTION_IO_POLL_INTERVAL))
         .map_err(|error| InitError(format!("configure TLS handshake read timeout: {error}")))?;
     stream
-        .set_write_timeout(Some(Duration::from_secs(10)))
+        .set_write_timeout(Some(CONNECTION_IO_POLL_INTERVAL))
         .map_err(|error| InitError(format!("configure TLS handshake write timeout: {error}")))?;
 
     let native_roots = rustls_native_certs::load_native_certs();
@@ -2480,11 +2762,20 @@ fn connect_guest_tls(
         .map_err(|error| InitError(format!("create guest TLS connection: {error}")))?;
     let mut tls = rustls::StreamOwned::new(client, stream);
     while tls.conn.is_handshaking() {
-        tls.conn
-            .complete_io(&mut tls.sock)
-            .map_err(|error| InitError(format!("guest TLS handshake: {error}")))?;
+        if drain_connection_controls(controls, pending_controls) {
+            return Ok(None);
+        }
+        connection_remaining(deadline, timeout_ms)?;
+        match tls.conn.complete_io(&mut tls.sock) {
+            Ok(_) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut
+                    || error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(InitError(format!("guest TLS handshake: {error}"))),
+        }
     }
-    Ok(tls)
+    Ok(Some(tls))
 }
 
 #[derive(Default)]
