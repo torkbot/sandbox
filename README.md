@@ -243,6 +243,29 @@ const workspace = fs.bind({
 });
 ```
 
+Mask storage can travel with a project when the storage root is strictly
+beneath another masked path in that project:
+
+```ts
+const project = "/Users/alice/project";
+
+const workspace = fs.bind({
+  source: project,
+  access: "rw",
+  mask: {
+    paths: ["/.agent-state", "/node_modules"],
+    storage: fs.bind({
+      source: `${project}/.agent-state/mounts/workspace`,
+      access: "rw",
+    }),
+  },
+});
+```
+
+The storage root must resolve beneath the masked source path without escaping
+through an alias. The guest sees masked entries stored below that root, but it
+cannot reach the storage root through the original project tree.
+
 ### 4. Inspect And Mutate The Running Guest
 
 Use `vm.fs` when the host needs to inspect outputs, create inputs, or publish
@@ -700,7 +723,10 @@ Mounts an absolute host directory through native virtio-fs. `source` and
 `mask.paths` are absolute paths inside the bound directory. In read-only bind
 mounts, masked paths are absent. In writable bind mounts, masked paths require
 `mask.storage`, and guest-created entries under those paths are stored in the
-mask storage directory instead of the original host directory.
+mask storage directory instead of the original host directory. The storage
+directory may be inside the bound source only when its canonical path is
+strictly beneath a declared masked path and remains isolated from every other
+source path.
 
 ### `vm.exec(command, args, options)`
 

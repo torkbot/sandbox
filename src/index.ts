@@ -12,7 +12,7 @@ import {
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, lstatSync, readdirSync, realpathSync } from "node:fs";
 import { open } from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { HostControlTransport } from "./control.ts";
 import { GuestFetch } from "./guest-fetch.ts";
 import { HostProcessSandboxVm } from "./host-process.ts";
@@ -2496,12 +2496,23 @@ function validateHostDirectoryMask(source: HostDirectorySourceForValidation): vo
   validateHostDirectoryMaskStorage(mask.storage);
   const sourcePath = realpathOrResolve(source.source);
   const storagePath = realpathOrResolve(mask.storage.source);
-  if (isPathInsideOrEqual(sourcePath, storagePath)) {
-    throw new Error("invalid sandbox boot options: host directory mask storage source must not be inside the bind source");
+  const storageIsInsideSource = isPathInsideOrEqual(sourcePath, storagePath);
+  if (
+    storageIsInsideSource
+    && !isPathStrictlyBeneathMaskedSourcePath(sourcePath, storagePath, mask.paths)
+  ) {
+    throw new Error(
+      "invalid sandbox boot options: host directory mask storage source inside the bind source must be strictly beneath a masked path",
+    );
   }
   for (const path of mask.paths) {
     const upperPath = realpathOrResolve(storagePath, path.slice(1));
-    if (isPathInsideOrEqual(sourcePath, upperPath)) {
+    if (storageIsInsideSource && !isPathStrictlyInside(storagePath, upperPath)) {
+      throw new Error(
+        "invalid sandbox boot options: host directory mask storage entries must not resolve outside the storage source",
+      );
+    }
+    if (!storageIsInsideSource && isPathInsideOrEqual(sourcePath, upperPath)) {
       throw new Error("invalid sandbox boot options: host directory mask storage entries must not resolve inside the bind source");
     }
   }
@@ -2527,6 +2538,56 @@ function isPathInsideOrEqual(parent: string, child: string): boolean {
   return path === "" || (!path.startsWith("..") && !isAbsolute(path));
 }
 
+function isPathStrictlyInside(parent: string, child: string): boolean {
+  return parent !== child && isPathInsideOrEqual(parent, child);
+}
+
+function isPathStrictlyBeneathMaskedSourcePath(
+  sourcePath: string,
+  storagePath: string,
+  maskPaths: readonly string[],
+): boolean {
+  const storageRelativePath = relative(sourcePath, storagePath);
+  if (
+    storageRelativePath === ""
+    || storageRelativePath.startsWith("..")
+    || isAbsolute(storageRelativePath)
+  ) {
+    return false;
+  }
+  const storageComponents = storageRelativePath.split(sep);
+  return maskPaths.some((maskPath) => {
+    const maskComponents = maskPath.split("/").slice(1);
+    if (storageComponents.length <= maskComponents.length) {
+      return false;
+    }
+    if (pathTraversesSymbolicLink(sourcePath, maskComponents)) {
+      return false;
+    }
+    const declaredMaskPath = realpathOrResolve(sourcePath, ...maskComponents);
+    const storagePrefixPath = realpathOrResolve(
+      sourcePath,
+      ...storageComponents.slice(0, maskComponents.length),
+    );
+    return declaredMaskPath === storagePrefixPath;
+  });
+}
+
+function pathTraversesSymbolicLink(root: string, components: readonly string[]): boolean {
+  let path = root;
+  for (const component of components) {
+    path = resolve(path, component);
+    try {
+      if (lstatSync(path).isSymbolicLink()) {
+        return true;
+      }
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
 function isMaskPathNested(left: string, right: string): boolean {
   const leftComponents = left.split("/").slice(1);
   const rightComponents = right.split("/").slice(1);
@@ -2545,7 +2606,10 @@ function rejectMaskStorageHardLinks(sourcePath: string, storagePath: string, mas
   if (upperInodes.size === 0) {
     return;
   }
-  if (treeContainsRegularFileInode(sourcePath, upperInodes)) {
+  const excludedPath = isPathInsideOrEqual(sourcePath, storagePath)
+    ? storagePath
+    : undefined;
+  if (treeContainsRegularFileInode(sourcePath, excludedPath, upperInodes)) {
     throw new Error("invalid sandbox boot options: host directory mask storage entries must not hard-link to the bind source");
   }
 }
@@ -2575,7 +2639,14 @@ function collectLinkedRegularFileInodes(path: string, inodes: Set<string>): void
   }
 }
 
-function treeContainsRegularFileInode(path: string, inodes: ReadonlySet<string>): boolean {
+function treeContainsRegularFileInode(
+  path: string,
+  excludedPath: string | undefined,
+  inodes: ReadonlySet<string>,
+): boolean {
+  if (excludedPath !== undefined && isPathInsideOrEqual(excludedPath, path)) {
+    return false;
+  }
   let stat;
   try {
     stat = lstatSync(path);
@@ -2594,7 +2665,9 @@ function treeContainsRegularFileInode(path: string, inodes: ReadonlySet<string>)
   } catch {
     return false;
   }
-  return entries.some((entry) => treeContainsRegularFileInode(resolve(path, entry.name), inodes));
+  return entries.some((entry) => {
+    return treeContainsRegularFileInode(resolve(path, entry.name), excludedPath, inodes);
+  });
 }
 
 function validateHostDirectoryMaskPath(path: string): void {

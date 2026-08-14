@@ -454,7 +454,7 @@ test("boot rejects writable mask storage that resolves inside the bind source", 
         }),
       },
     }),
-    /invalid sandbox boot options: host directory mask storage source must not be inside the bind source/,
+    /invalid sandbox boot options: host directory mask storage source inside the bind source must be strictly beneath a masked path/,
   );
 
   await assert.rejects(
@@ -473,7 +473,7 @@ test("boot rejects writable mask storage that resolves inside the bind source", 
         }),
       },
     }),
-    /invalid sandbox boot options: host directory mask storage source must not be inside the bind source/,
+    /invalid sandbox boot options: host directory mask storage source inside the bind source must be strictly beneath a masked path/,
   );
 
   await assert.rejects(
@@ -515,7 +515,29 @@ test("boot rejects writable mask storage that resolves inside the bind source", 
           }),
         },
       }),
-      /invalid sandbox boot options: host directory mask storage source must not be inside the bind source/,
+      /invalid sandbox boot options: host directory mask storage source inside the bind source must be strictly beneath a masked path/,
+    );
+
+    await mkdir(join(source, ".kc"));
+    await mkdir(join(source, "visible", "workspace"), { recursive: true });
+    await symlink(join(source, "visible"), join(source, ".kc", "mounts"));
+    await assert.rejects(
+      sandbox.boot({
+        mounts: {
+          "/mnt": fs.bind({
+            source,
+            access: "rw",
+            mask: {
+              paths: ["/.kc", "/node_modules"],
+              storage: fs.bind({
+                source: join(source, ".kc", "mounts", "workspace"),
+                access: "rw",
+              }),
+            },
+          }),
+        },
+      }),
+      /invalid sandbox boot options: host directory mask storage source inside the bind source must be strictly beneath a masked path/,
     );
   } finally {
     await rm(sourceLink, { force: true });
@@ -556,6 +578,42 @@ test("boot rejects writable mask storage entries hard-linked to the bind source"
   } finally {
     await rm(storage, { recursive: true, force: true });
     await rm(source, { recursive: true, force: true });
+  }
+});
+
+test("boot rejects writable ancestor mask storage entries hard-linked to the bind source", async () => {
+  const storage = await mkdtemp(join(tmpdir(), "sandbox-mask-ancestor-storage-"));
+  const source = join(storage, "workspace");
+  try {
+    await mkdir(source);
+    await mkdir(join(storage, "cache"));
+    await writeFile(join(source, "lower.txt"), "lower");
+    await link(join(source, "lower.txt"), join(storage, "cache", "linked.txt"));
+
+    const sandbox = defineSandbox({
+      rootfs: testRootfs,
+    });
+
+    await assert.rejects(
+      sandbox.boot({
+        mounts: {
+          "/mnt": fs.bind({
+            source,
+            access: "rw",
+            mask: {
+              paths: ["/cache"],
+              storage: fs.bind({
+                source: storage,
+                access: "rw",
+              }),
+            },
+          }),
+        },
+      }),
+      /invalid sandbox boot options: host directory mask storage entries must not hard-link to the bind source/,
+    );
+  } finally {
+    await rm(storage, { recursive: true, force: true });
   }
 });
 

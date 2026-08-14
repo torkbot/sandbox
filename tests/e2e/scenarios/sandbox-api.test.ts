@@ -976,6 +976,85 @@ test("writable host directory masks store guest-created entries in host mask sto
   assert.equal(await readFile(join(storage, "preexisting"), "utf8"), "upper-preexisting\n");
 });
 
+test("writable host directory masks persist storage beneath another masked source path", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const source = await mkdtemp(join(tmpdir(), "sandbox-mask-nested-source-"));
+  const storage = join(source, ".kc", "mounts", "workspace");
+  t.after(async () => {
+    await rm(source, { recursive: true, force: true });
+  });
+  await mkdir(storage, { recursive: true });
+  await mkdir(join(source, "node_modules"));
+  await writeFile(join(source, ".kc", "machine-state"), "host-private\n");
+  await writeFile(join(source, "node_modules", "lower.txt"), "host-native\n");
+  await writeFile(join(source, "visible.txt"), "visible\n");
+
+  const sandboxDefinition = defineSandbox({
+    rootfs: testRootfs,
+  });
+  const boot = () => sandboxDefinition.boot({
+    mounts: {
+      "/tmp/workspace": fs.bind({
+        source,
+        access: "rw",
+        mask: {
+          paths: ["/.kc", "/node_modules"],
+          storage: fs.bind({
+            source: storage,
+            access: "rw",
+          }),
+        },
+      }),
+    },
+  });
+
+  {
+    await using sandbox = await boot();
+    const result = await sandbox.exec("/bin/sh", [
+      "-lc",
+      [
+        "set -e",
+        "test ! -e /tmp/workspace/.kc",
+        "test ! -e /tmp/workspace/node_modules",
+        "cat /tmp/workspace/visible.txt",
+        "mkdir /tmp/workspace/node_modules",
+        "printf guest-native > /tmp/workspace/node_modules/native.txt",
+        "ln /tmp/workspace/node_modules/native.txt /tmp/workspace/node_modules/native-link.txt",
+        "test ! -e /tmp/workspace/.kc",
+      ].join("\n"),
+    ]);
+
+    assert.equal(result.exitCode, 0, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+    assert.equal(result.stdout, "visible\n");
+    assert.equal(result.stderr, "");
+  }
+
+  assert.equal(await readFile(join(source, ".kc", "machine-state"), "utf8"), "host-private\n");
+  assert.equal(await readFile(join(source, "node_modules", "lower.txt"), "utf8"), "host-native\n");
+  assert.equal(await readFile(join(storage, "node_modules", "native.txt"), "utf8"), "guest-native");
+
+  {
+    await using sandbox = await boot();
+    const result = await sandbox.exec("/bin/sh", [
+      "-lc",
+      [
+        "set -e",
+        "test ! -e /tmp/workspace/.kc",
+        "cat /tmp/workspace/node_modules/native.txt",
+        "cat /tmp/workspace/node_modules/native-link.txt",
+      ].join("\n"),
+    ]);
+
+    assert.equal(result.exitCode, 0, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+    assert.equal(result.stdout, "guest-nativeguest-native");
+    assert.equal(result.stderr, "");
+  }
+});
+
 test("missing writable mount directories are created before mounting virtual filesystems", async (t) => {
   const testRootfs = await testRootfsForVmTest(t);
   if (testRootfs === undefined) {
