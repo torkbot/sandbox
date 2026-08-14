@@ -14,6 +14,7 @@ import { createReadStream, lstatSync, readdirSync, realpathSync } from "node:fs"
 import { open } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { HostControlTransport } from "./control.ts";
+import { GuestFetch } from "./guest-fetch.ts";
 import { HostProcessSandboxVm } from "./host-process.ts";
 import { createMemoryFileSystem } from "./memory-fs.ts";
 import {
@@ -23,6 +24,7 @@ import {
 import type { HostSpawnMount, HostSpawnSandboxOptions } from "./spawn-options.ts";
 import type { ControlBackedSandboxProcess, ControlBackedSandboxPty, SandboxControl } from "./control.ts";
 import type { SandboxControlEvent } from "./control-codec.ts";
+import type { Request, Response } from "undici";
 import type {
   InternalMount,
   InternalNetworkConfig,
@@ -46,6 +48,7 @@ export type {
   SandboxRootfsImageEnvironmentFact,
   SandboxShellEnvironmentFact,
 } from "./environment-facts.ts";
+export { Request, Response } from "undici";
 
 export type SandboxFileType = "file" | "directory" | "symlink";
 
@@ -759,6 +762,10 @@ export class SandboxFileSystemError extends Error {
 export interface SandboxInstance {
   readonly fs: SandboxGuestFileSystem;
   /**
+   * Performs an HTTP request through the guest runtime and its network policy.
+   */
+  fetch(request: Request): Promise<Response>;
+  /**
    * Returns config-derived facts plus facts observed from the running guest.
    */
   environmentFacts(): Promise<readonly SandboxEnvironmentFact[]>;
@@ -1296,6 +1303,7 @@ class HostBackedSandboxVm implements SandboxVm {
   readonly fs: SandboxGuestFileSystem;
   readonly #exec: ControlBackedSandboxExec;
   readonly #rootExec: ControlBackedSandboxExec;
+  readonly #fetch: GuestFetch;
   readonly #options: InternalSandboxOptions;
   readonly #configEnvironmentFacts: readonly SandboxEnvironmentFact[];
 
@@ -1329,6 +1337,7 @@ class HostBackedSandboxVm implements SandboxVm {
       channel: hostVm,
     });
     this.fs = new ControlBackedSandboxGuestFileSystem(this.control);
+    this.#fetch = new GuestFetch(this.control);
     this.#exec = new ControlBackedSandboxExec(this.control, options.cwd);
     this.#rootExec = new ControlBackedSandboxExec(this.control, "/");
     if (hostVm.terminateHostForTest !== undefined) {
@@ -1368,6 +1377,7 @@ class HostBackedSandboxVm implements SandboxVm {
     }
 
     this.#closed = true;
+    await this.#fetch.close();
     let syncError: unknown;
     if (this.#options.rootfs.storage !== undefined) {
       try {
@@ -1407,6 +1417,10 @@ class HostBackedSandboxVm implements SandboxVm {
     validateSandboxProcessArgs(args, "sandbox exec");
     validateSandboxExecOptions(options);
     return await this.#exec.exec(command, args, options);
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    return await this.#fetch.fetch(request);
   }
 
   spawn(

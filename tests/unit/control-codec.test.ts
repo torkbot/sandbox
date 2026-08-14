@@ -145,6 +145,61 @@ test("control command codec encodes guest filesystem commands", () => {
   );
 });
 
+test("control codec encodes and decodes guest connection frames", () => {
+  assert.deepEqual(
+    BSON.deserialize(encodeControlCommand({
+      type: "guest.connection.open",
+      id: "connection",
+      hostname: "example.com",
+      port: 443,
+      secure: true,
+      timeoutMs: 10_000,
+      serverName: "example.com",
+    }).subarray(4)),
+    {
+      type: "guest.connection.open",
+      id: "connection",
+      hostname: "example.com",
+      port: 443,
+      secure: true,
+      timeoutMs: 10_000,
+      serverName: "example.com",
+    },
+  );
+  assert.deepEqual(
+    BSON.deserialize(encodeControlCommand({
+      type: "guest.connection.write",
+      id: "connection",
+      data: new Uint8Array([1, 2, 3]),
+    }).subarray(4)),
+    {
+      type: "guest.connection.write",
+      id: "connection",
+      data: new Binary(new Uint8Array([1, 2, 3])),
+    },
+  );
+  const data = decodeControlEvent(encodePacket({
+    type: "guest.connection.data",
+    id: "connection",
+    data: new Binary(new Uint8Array([4, 5, 6])),
+  }));
+  assert.equal(data.type, "guest.connection.data");
+  assert.equal(data.id, "connection");
+  assert.deepEqual([...data.data], [4, 5, 6]);
+  assert.deepEqual(
+    decodeControlEvent(encodePacket({
+      type: "guest.connection.error",
+      id: "connection",
+      message: "connect failed",
+    })),
+    {
+      type: "guest.connection.error",
+      id: "connection",
+      message: "connect failed",
+    },
+  );
+});
+
 test("control event codec decodes init ready and binary exec output", () => {
   assert.deepEqual(
     decodeControlEvent(

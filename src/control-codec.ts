@@ -62,6 +62,20 @@ export type SandboxControlEvent =
               readonly code?: string;
             };
           };
+    }
+  | {
+      readonly type: "guest.connection.opened" | "guest.connection.write.complete" | "guest.connection.end";
+      readonly id: string;
+    }
+  | {
+      readonly type: "guest.connection.data";
+      readonly id: string;
+      readonly data: Uint8Array;
+    }
+  | {
+      readonly type: "guest.connection.error";
+      readonly id: string;
+      readonly message: string;
     };
 
 export type SandboxControlFsStat = {
@@ -182,6 +196,29 @@ export type SandboxControlCommand =
       readonly rows: number;
       readonly cols: number;
     }
+  | {
+      readonly type: "guest.connection.open";
+      readonly id: string;
+      readonly hostname: string;
+      readonly port: number;
+      readonly secure: boolean;
+      readonly timeoutMs: number;
+      readonly serverName?: string;
+    }
+  | {
+      readonly type: "guest.connection.write";
+      readonly id: string;
+      readonly data: Uint8Array;
+    }
+  | {
+      readonly type: "guest.connection.read";
+      readonly id: string;
+      readonly maxBytes: number;
+    }
+  | {
+      readonly type: "guest.connection.close";
+      readonly id: string;
+    }
   | SandboxControlFsCommand
 ;
 
@@ -250,6 +287,33 @@ export function encodeControlCommand(command: SandboxControlCommand): Uint8Array
         id: command.id,
         rows: command.rows,
         cols: command.cols,
+      });
+    case "guest.connection.open":
+      return encodePacket({
+        type: "guest.connection.open",
+        id: command.id,
+        hostname: command.hostname,
+        port: command.port,
+        secure: command.secure,
+        timeoutMs: command.timeoutMs,
+        ...(command.serverName === undefined ? {} : { serverName: command.serverName }),
+      });
+    case "guest.connection.write":
+      return encodePacket({
+        type: "guest.connection.write",
+        id: command.id,
+        data: new Binary(command.data),
+      });
+    case "guest.connection.read":
+      return encodePacket({
+        type: "guest.connection.read",
+        id: command.id,
+        maxBytes: command.maxBytes,
+      });
+    case "guest.connection.close":
+      return encodePacket({
+        type: "guest.connection.close",
+        id: command.id,
       });
     case "guest.fs.stat":
       return encodePacket({
@@ -371,6 +435,25 @@ export function decodeControlEvent(packet: Uint8Array): SandboxControlEvent {
         type: "guest.fs.response",
         id: readString(document, "id"),
         result: readFsResponseResult(document),
+      };
+    case "guest.connection.opened":
+    case "guest.connection.write.complete":
+    case "guest.connection.end":
+      return {
+        type: frameType,
+        id: readString(document, "id"),
+      };
+    case "guest.connection.data":
+      return {
+        type: "guest.connection.data",
+        id: readString(document, "id"),
+        data: readBytes(document, "data"),
+      };
+    case "guest.connection.error":
+      return {
+        type: "guest.connection.error",
+        id: readString(document, "id"),
+        message: readString(document, "message"),
       };
     default:
       throw new Error(`unknown control frame type: ${frameType}`);

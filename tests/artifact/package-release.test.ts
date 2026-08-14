@@ -46,6 +46,7 @@ test("root package declares only its runtime and platform dependencies", async (
   });
   assert.deepEqual(packageJson.dependencies, {
     bson: "^7.2.0",
+    undici: "^8.10.0",
   });
   assert.deepEqual(Object.keys(packageJson.optionalDependencies ?? {}).sort(), [
     "@torkbot/sandbox-darwin-arm64",

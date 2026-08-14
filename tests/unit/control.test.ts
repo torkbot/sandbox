@@ -914,6 +914,60 @@ test("HostControlTransport closes and rejects pending execs on malformed frames"
   );
 });
 
+test("HostControlTransport drives a guest connection", async () => {
+  const channel = new MemoryControlChannel();
+  const control = new HostControlTransport({ channel });
+  const connection = control.openConnection({
+    hostname: "example.com",
+    port: 443,
+    secure: true,
+    timeoutMs: 10_000,
+    serverName: "example.com",
+  });
+  const open = BSON.deserialize(channel.writes[0]!.subarray(4));
+  assert.equal(open.type, "guest.connection.open");
+  assert.equal(open.hostname, "example.com");
+  assert.equal(open.port, 443);
+  assert.equal(open.secure, true);
+  assert.equal(open.timeoutMs, 10_000);
+  assert.equal(open.serverName, "example.com");
+
+  channel.packets.push(encodePacket({
+    type: "guest.connection.opened",
+    id: open.id,
+  }));
+  await connection.opened;
+
+  const write = connection.write(new Uint8Array([1, 2, 3]));
+  const writeFrame = BSON.deserialize(channel.writes[1]!.subarray(4));
+  assert.equal(writeFrame.type, "guest.connection.write");
+  assert.deepEqual(writeFrame.data, new Binary(new Uint8Array([1, 2, 3])));
+  channel.packets.push(encodePacket({
+    type: "guest.connection.write.complete",
+    id: open.id,
+  }));
+  await write;
+
+  const read = connection.read(4096);
+  const readFrame = BSON.deserialize(channel.writes[2]!.subarray(4));
+  assert.equal(readFrame.type, "guest.connection.read");
+  assert.equal(readFrame.maxBytes, 4096);
+  channel.packets.push(encodePacket({
+    type: "guest.connection.data",
+    id: open.id,
+    data: new Binary(new Uint8Array([4, 5, 6])),
+  }));
+  assert.deepEqual([...(await read ?? [])], [4, 5, 6]);
+
+  const end = connection.read(4096);
+  channel.packets.push(encodePacket({
+    type: "guest.connection.end",
+    id: open.id,
+  }));
+  assert.equal(await end, null);
+  await control.close();
+});
+
 class MemoryControlChannel implements HostControlChannel {
   readonly writes: Uint8Array[] = [];
   readonly packets = new MemoryPacketStream();

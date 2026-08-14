@@ -739,6 +739,27 @@ Returns a streaming process handle with `stdin`, `stdout`, `stderr`, `ready`,
 the guest process and exposed as a full-duplex `{ input, output }` channel in
 `child.pipes`.
 
+### `vm.fetch(request)`
+
+```ts
+import { Request } from "@torkbot/sandbox";
+
+const response = await vm.fetch(new Request("https://api.example.com/items", {
+  headers: { accept: "application/json" },
+}));
+
+if (!response.ok) {
+  throw new Error(`request failed: ${response.status}`);
+}
+```
+
+Accepts the real Undici `Request` exported by `@torkbot/sandbox` and returns an
+Undici `Response`. DNS resolution, TCP, and TLS run through the guest, so the
+request is subject to the sandbox's network policy just like a guest process.
+Redirects, streamed bodies, and request abort signals follow Undici's fetch
+semantics. The dispatcher and its connection pool are private to the VM and are
+closed with it.
+
 ### `vm.pty(command, args, options)`
 
 Used in: [Long-lived and interactive tools](#5-run-long-lived-and-interactive-tools).
