@@ -521,14 +521,22 @@ fn validate_host_directory_mask_storage_isolated(
 ) -> Result<(), SpecError> {
     let source = realpath_or_resolve(source);
     let storage = realpath_or_resolve(storage);
-    if path_inside_or_equal(&source, &storage) {
+    let storage_is_inside_source = path_inside_or_equal(&source, &storage);
+    if storage_is_inside_source
+        && !storage_path_is_strictly_beneath_masked_source_path(&source, &storage, masks)
+    {
         return Err(SpecError::new(
-            "host-directory mask storage source must not be inside the bind source",
+            "host-directory mask storage source inside the bind source must be strictly beneath a masked path",
         ));
     }
     for mask in masks {
         let upper_path = realpath_or_resolve(&storage.join(mask.trim_start_matches('/')));
-        if path_inside_or_equal(&source, &upper_path) {
+        if storage_is_inside_source && !path_strictly_inside(&storage, &upper_path) {
+            return Err(SpecError::new(
+                "host-directory mask storage entries must not resolve outside the storage source",
+            ));
+        }
+        if !storage_is_inside_source && path_inside_or_equal(&source, &upper_path) {
             return Err(SpecError::new(
                 "host-directory mask storage entries must not resolve inside the bind source",
             ));
@@ -559,6 +567,37 @@ fn path_inside_or_equal(parent: &Path, child: &Path) -> bool {
     child == parent || child.starts_with(parent)
 }
 
+fn path_strictly_inside(parent: &Path, child: &Path) -> bool {
+    child != parent && path_inside_or_equal(parent, child)
+}
+
+fn storage_path_is_strictly_beneath_masked_source_path(
+    source: &Path,
+    storage: &Path,
+    masks: &[String],
+) -> bool {
+    let Ok(relative_storage) = storage.strip_prefix(source) else {
+        return false;
+    };
+    let case_insensitive = host_path_is_case_insensitive(source);
+    let storage_components = relative_storage
+        .iter()
+        .map(|component| normalize_mask_component(&component.to_string_lossy(), case_insensitive))
+        .collect::<Vec<_>>();
+    masks.iter().any(|mask| {
+        let mask_components = mask
+            .split('/')
+            .skip(1)
+            .map(|component| normalize_mask_component(component, case_insensitive))
+            .collect::<Vec<_>>();
+        storage_components.len() > mask_components.len()
+            && storage_components
+                .iter()
+                .zip(mask_components.iter())
+                .all(|(storage, mask)| storage == mask)
+    })
+}
+
 fn reject_mask_storage_hard_links(
     source: &Path,
     storage: &Path,
@@ -574,7 +613,8 @@ fn reject_mask_storage_hard_links(
     if upper_inodes.is_empty() {
         return Ok(());
     }
-    if tree_contains_regular_file_inode(source, &upper_inodes) {
+    let excluded_path = path_inside_or_equal(source, storage).then_some(storage);
+    if tree_contains_regular_file_inode(source, excluded_path, &upper_inodes) {
         return Err(SpecError::new(
             "host-directory mask storage entries must not hard-link to the bind source",
         ));
@@ -603,7 +643,14 @@ fn collect_linked_regular_file_inodes(path: &Path, inodes: &mut HashSet<(u64, u6
     }
 }
 
-fn tree_contains_regular_file_inode(path: &Path, inodes: &HashSet<(u64, u64)>) -> bool {
+fn tree_contains_regular_file_inode(
+    path: &Path,
+    excluded_path: Option<&Path>,
+    inodes: &HashSet<(u64, u64)>,
+) -> bool {
+    if excluded_path.is_some_and(|excluded| path_inside_or_equal(excluded, path)) {
+        return false;
+    }
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return false;
     };
@@ -618,7 +665,7 @@ fn tree_contains_regular_file_inode(path: &Path, inodes: &HashSet<(u64, u64)>) -
     };
     entries
         .flatten()
-        .any(|entry| tree_contains_regular_file_inode(&entry.path(), inodes))
+        .any(|entry| tree_contains_regular_file_inode(&entry.path(), excluded_path, inodes))
 }
 
 #[cfg(target_os = "macos")]
@@ -864,6 +911,29 @@ mod tests {
             network_http: None,
             network_policy: None,
         }
+    }
+
+    fn input_with_writable_host_directory_mask(
+        source: &Path,
+        storage: &Path,
+        masks: &[&str],
+    ) -> MicroVmSpecInput {
+        let mut input = valid_input();
+        input.mounts = vec![MountSpecInput {
+            kind: "host-directory".to_string(),
+            path: "/workspace".to_string(),
+            writable: None,
+            source: Some(source.to_string_lossy().into_owned()),
+            access: Some("rw".to_string()),
+            mask: Some(HostDirectoryMaskInput {
+                paths: masks.iter().map(|mask| (*mask).to_string()).collect(),
+                storage: Some(HostDirectoryMaskStorageInput {
+                    source: Some(storage.to_string_lossy().into_owned()),
+                    access: Some("rw".to_string()),
+                }),
+            }),
+        }];
+        input
     }
 
     #[test]
@@ -1222,26 +1292,102 @@ mod tests {
     fn rejects_host_directory_mask_storage_inside_source() {
         let source = TempTree::new("source");
         let storage = source.path.join(".sandbox-mask");
-        let mut input = valid_input();
-        input.mounts = vec![MountSpecInput {
-            kind: "host-directory".to_string(),
-            path: "/workspace".to_string(),
-            writable: None,
-            source: Some(source.path.to_string_lossy().into_owned()),
-            access: Some("rw".to_string()),
-            mask: Some(HostDirectoryMaskInput {
-                paths: vec!["/node_modules".to_string()],
-                storage: Some(HostDirectoryMaskStorageInput {
-                    source: Some(storage.to_string_lossy().into_owned()),
-                    access: Some("rw".to_string()),
-                }),
-            }),
-        }];
+        let input =
+            input_with_writable_host_directory_mask(&source.path, &storage, &["/node_modules"]);
 
         let err = MicroVmSpec::build(input).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "host-directory mask storage source must not be inside the bind source",
+            "host-directory mask storage source inside the bind source must be strictly beneath a masked path",
+        );
+    }
+
+    #[test]
+    fn accepts_host_directory_mask_storage_beneath_masked_source_path() {
+        let source = TempTree::new("source");
+        let storage = source.path.join(".kc").join("mounts").join("workspace");
+        fs::create_dir_all(storage.join("node_modules")).unwrap();
+        fs::write(storage.join("node_modules").join("native.txt"), "native").unwrap();
+        fs::hard_link(
+            storage.join("node_modules").join("native.txt"),
+            storage.join("node_modules").join("native-link.txt"),
+        )
+        .unwrap();
+        let input = input_with_writable_host_directory_mask(
+            &source.path,
+            &storage,
+            &["/.kc", "/node_modules"],
+        );
+
+        let spec = MicroVmSpec::build(input).unwrap();
+
+        let MountSpec::HostDirectory { mask, .. } = &spec.mounts[0] else {
+            panic!("expected host-directory mount");
+        };
+        assert_eq!(
+            mask.as_ref().unwrap().storage.as_ref().unwrap().source,
+            storage,
+        );
+    }
+
+    #[test]
+    fn rejects_host_directory_mask_storage_equal_to_masked_source_path() {
+        let source = TempTree::new("source");
+        let storage = source.path.join(".kc");
+        fs::create_dir(&storage).unwrap();
+        let input = input_with_writable_host_directory_mask(&source.path, &storage, &["/.kc"]);
+
+        let err = MicroVmSpec::build(input).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "host-directory mask storage source inside the bind source must be strictly beneath a masked path",
+        );
+    }
+
+    #[test]
+    fn rejects_host_directory_mask_storage_that_escapes_masked_source_path() {
+        use std::os::unix::fs::symlink;
+
+        let source = TempTree::new("source");
+        let masked = source.path.join(".kc");
+        let visible = source.path.join("visible");
+        let storage = masked.join("mounts").join("workspace");
+        fs::create_dir(&masked).unwrap();
+        fs::create_dir_all(visible.join("workspace")).unwrap();
+        symlink(&visible, masked.join("mounts")).unwrap();
+        let input = input_with_writable_host_directory_mask(
+            &source.path,
+            &storage,
+            &["/.kc", "/node_modules"],
+        );
+
+        let err = MicroVmSpec::build(input).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "host-directory mask storage source inside the bind source must be strictly beneath a masked path",
+        );
+    }
+
+    #[test]
+    fn rejects_nested_host_directory_mask_storage_entries_that_escape_storage() {
+        use std::os::unix::fs::symlink;
+
+        let source = TempTree::new("source");
+        let storage = source.path.join(".kc").join("mounts").join("workspace");
+        let visible = source.path.join("visible");
+        fs::create_dir_all(&storage).unwrap();
+        fs::create_dir(&visible).unwrap();
+        symlink(&visible, storage.join("node_modules")).unwrap();
+        let input = input_with_writable_host_directory_mask(
+            &source.path,
+            &storage,
+            &["/.kc", "/node_modules"],
+        );
+
+        let err = MicroVmSpec::build(input).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "host-directory mask storage entries must not resolve outside the storage source",
         );
     }
 
@@ -1250,21 +1396,7 @@ mod tests {
         let root = TempTree::new("root");
         let source = root.path.join("workspace");
         fs::create_dir(&source).unwrap();
-        let mut input = valid_input();
-        input.mounts = vec![MountSpecInput {
-            kind: "host-directory".to_string(),
-            path: "/workspace".to_string(),
-            writable: None,
-            source: Some(source.to_string_lossy().into_owned()),
-            access: Some("rw".to_string()),
-            mask: Some(HostDirectoryMaskInput {
-                paths: vec!["/workspace".to_string()],
-                storage: Some(HostDirectoryMaskStorageInput {
-                    source: Some(root.path.to_string_lossy().into_owned()),
-                    access: Some("rw".to_string()),
-                }),
-            }),
-        }];
+        let input = input_with_writable_host_directory_mask(&source, &root.path, &["/workspace"]);
 
         let err = MicroVmSpec::build(input).unwrap_err();
         assert_eq!(
@@ -1284,21 +1416,53 @@ mod tests {
             storage.path.join("node_modules").join("linked.txt"),
         )
         .unwrap();
-        let mut input = valid_input();
-        input.mounts = vec![MountSpecInput {
-            kind: "host-directory".to_string(),
-            path: "/workspace".to_string(),
-            writable: None,
-            source: Some(source.path.to_string_lossy().into_owned()),
-            access: Some("rw".to_string()),
-            mask: Some(HostDirectoryMaskInput {
-                paths: vec!["/node_modules".to_string()],
-                storage: Some(HostDirectoryMaskStorageInput {
-                    source: Some(storage.path.to_string_lossy().into_owned()),
-                    access: Some("rw".to_string()),
-                }),
-            }),
-        }];
+        let input = input_with_writable_host_directory_mask(
+            &source.path,
+            &storage.path,
+            &["/node_modules"],
+        );
+
+        let err = MicroVmSpec::build(input).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "host-directory mask storage entries must not hard-link to the bind source",
+        );
+    }
+
+    #[test]
+    fn rejects_ancestor_mask_storage_hard_links_to_source() {
+        let root = TempTree::new("root");
+        let source = root.path.join("workspace");
+        let upper = root.path.join("cache");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&upper).unwrap();
+        fs::write(source.join("lower.txt"), "lower").unwrap();
+        fs::hard_link(source.join("lower.txt"), upper.join("linked.txt")).unwrap();
+        let input = input_with_writable_host_directory_mask(&source, &root.path, &["/cache"]);
+
+        let err = MicroVmSpec::build(input).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "host-directory mask storage entries must not hard-link to the bind source",
+        );
+    }
+
+    #[test]
+    fn rejects_nested_host_directory_mask_storage_hard_links_outside_storage() {
+        let source = TempTree::new("source");
+        let storage = source.path.join(".kc").join("mounts").join("workspace");
+        fs::write(source.path.join("lower.txt"), "lower").unwrap();
+        fs::create_dir_all(storage.join("node_modules")).unwrap();
+        fs::hard_link(
+            source.path.join("lower.txt"),
+            storage.join("node_modules").join("linked.txt"),
+        )
+        .unwrap();
+        let input = input_with_writable_host_directory_mask(
+            &source.path,
+            &storage,
+            &["/.kc", "/node_modules"],
+        );
 
         let err = MicroVmSpec::build(input).unwrap_err();
         assert_eq!(
