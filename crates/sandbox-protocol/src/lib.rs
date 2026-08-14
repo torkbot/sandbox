@@ -136,6 +136,41 @@ pub enum ControlFrame {
         id: String,
         result: GuestFsResponseResult,
     },
+    GuestConnectionOpen {
+        id: String,
+        hostname: String,
+        port: u16,
+        secure: bool,
+        server_name: Option<String>,
+    },
+    GuestConnectionWrite {
+        id: String,
+        data: Vec<u8>,
+    },
+    GuestConnectionRead {
+        id: String,
+        max_bytes: u32,
+    },
+    GuestConnectionClose {
+        id: String,
+    },
+    GuestConnectionOpened {
+        id: String,
+    },
+    GuestConnectionWriteComplete {
+        id: String,
+    },
+    GuestConnectionData {
+        id: String,
+        data: Vec<u8>,
+    },
+    GuestConnectionEnd {
+        id: String,
+    },
+    GuestConnectionError {
+        id: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -466,6 +501,67 @@ impl ControlFrame {
                 encode_guest_fs_response_result(&mut document, result)?;
                 document
             }
+            Self::GuestConnectionOpen {
+                id,
+                hostname,
+                port,
+                secure,
+                server_name,
+            } => {
+                let mut document = bson::doc! {
+                    "type": "guest.connection.open",
+                    "id": id,
+                    "hostname": hostname,
+                    "port": i32::from(*port),
+                    "secure": *secure,
+                };
+                if let Some(server_name) = server_name {
+                    document.insert("serverName", server_name);
+                }
+                document
+            }
+            Self::GuestConnectionWrite { id, data } => bson::doc! {
+                "type": "guest.connection.write",
+                "id": id,
+                "data": bson::Binary {
+                    subtype: bson::spec::BinarySubtype::Generic,
+                    bytes: data.clone(),
+                },
+            },
+            Self::GuestConnectionRead { id, max_bytes } => bson::doc! {
+                "type": "guest.connection.read",
+                "id": id,
+                "maxBytes": i64::from(*max_bytes),
+            },
+            Self::GuestConnectionClose { id } => bson::doc! {
+                "type": "guest.connection.close",
+                "id": id,
+            },
+            Self::GuestConnectionOpened { id } => bson::doc! {
+                "type": "guest.connection.opened",
+                "id": id,
+            },
+            Self::GuestConnectionWriteComplete { id } => bson::doc! {
+                "type": "guest.connection.write.complete",
+                "id": id,
+            },
+            Self::GuestConnectionData { id, data } => bson::doc! {
+                "type": "guest.connection.data",
+                "id": id,
+                "data": bson::Binary {
+                    subtype: bson::spec::BinarySubtype::Generic,
+                    bytes: data.clone(),
+                },
+            },
+            Self::GuestConnectionEnd { id } => bson::doc! {
+                "type": "guest.connection.end",
+                "id": id,
+            },
+            Self::GuestConnectionError { id, message } => bson::doc! {
+                "type": "guest.connection.error",
+                "id": id,
+                "message": message,
+            },
         };
 
         document
@@ -746,6 +842,61 @@ impl ControlFrame {
             "guest.fs.response" => Ok(Self::GuestFsResponse {
                 id: read_required_string(&document, "id", "guest.fs.response id")?,
                 result: read_guest_fs_response_result(&document)?,
+            }),
+            "guest.connection.open" => Ok(Self::GuestConnectionOpen {
+                id: read_required_string(&document, "id", "guest.connection.open id")?,
+                hostname: read_required_string(
+                    &document,
+                    "hostname",
+                    "guest.connection.open hostname",
+                )?,
+                port: read_u16(&document, "port", "guest.connection.open port")?,
+                secure: document
+                    .get_bool("secure")
+                    .map_err(|_| ControlFrameError::new("guest.connection.open missing secure"))?,
+                server_name: document.get_str("serverName").ok().map(str::to_string),
+            }),
+            "guest.connection.write" => Ok(Self::GuestConnectionWrite {
+                id: read_required_string(&document, "id", "guest.connection.write id")?,
+                data: document
+                    .get_binary_generic("data")
+                    .map_err(|_| ControlFrameError::new("guest.connection.write missing data"))?
+                    .to_vec(),
+            }),
+            "guest.connection.read" => Ok(Self::GuestConnectionRead {
+                id: read_required_string(&document, "id", "guest.connection.read id")?,
+                max_bytes: read_positive_u32(
+                    &document,
+                    "maxBytes",
+                    "guest.connection.read maxBytes",
+                )?,
+            }),
+            "guest.connection.close" => Ok(Self::GuestConnectionClose {
+                id: read_required_string(&document, "id", "guest.connection.close id")?,
+            }),
+            "guest.connection.opened" => Ok(Self::GuestConnectionOpened {
+                id: read_required_string(&document, "id", "guest.connection.opened id")?,
+            }),
+            "guest.connection.write.complete" => Ok(Self::GuestConnectionWriteComplete {
+                id: read_required_string(&document, "id", "guest.connection.write.complete id")?,
+            }),
+            "guest.connection.data" => Ok(Self::GuestConnectionData {
+                id: read_required_string(&document, "id", "guest.connection.data id")?,
+                data: document
+                    .get_binary_generic("data")
+                    .map_err(|_| ControlFrameError::new("guest.connection.data missing data"))?
+                    .to_vec(),
+            }),
+            "guest.connection.end" => Ok(Self::GuestConnectionEnd {
+                id: read_required_string(&document, "id", "guest.connection.end id")?,
+            }),
+            "guest.connection.error" => Ok(Self::GuestConnectionError {
+                id: read_required_string(&document, "id", "guest.connection.error id")?,
+                message: read_required_string(
+                    &document,
+                    "message",
+                    "guest.connection.error message",
+                )?,
             }),
             other => Err(ControlFrameError::new(format!(
                 "unknown control frame type: {other}"
@@ -1132,6 +1283,18 @@ fn read_u16(document: &bson::Document, key: &str, label: &str) -> Result<u16, Co
     u16::try_from(value).map_err(|_| ControlFrameError::new(format!("{label} must fit in u16")))
 }
 
+fn read_positive_u32(
+    document: &bson::Document,
+    key: &str,
+    label: &str,
+) -> Result<u32, ControlFrameError> {
+    let value = read_i64(document, key, label)?;
+    if value <= 0 {
+        return Err(ControlFrameError::new(format!("{label} must be positive")));
+    }
+    u32::try_from(value).map_err(|_| ControlFrameError::new(format!("{label} must fit in u32")))
+}
+
 fn read_i64(document: &bson::Document, key: &str, label: &str) -> Result<i64, ControlFrameError> {
     let Some(value) = document.get(key) else {
         return Err(ControlFrameError::new(format!("{label} missing")));
@@ -1425,6 +1588,52 @@ mod tests {
                     message: "missing".to_string(),
                     code: Some("ENOENT".to_string()),
                 }),
+            },
+        ];
+
+        for frame in frames {
+            let encoded = frame.encode().unwrap();
+            assert_eq!(ControlFrame::decode(&encoded).unwrap(), frame);
+        }
+    }
+
+    #[test]
+    fn round_trips_guest_connection_frames() {
+        let frames = [
+            ControlFrame::GuestConnectionOpen {
+                id: "connection".to_string(),
+                hostname: "example.com".to_string(),
+                port: 443,
+                secure: true,
+                server_name: Some("example.com".to_string()),
+            },
+            ControlFrame::GuestConnectionWrite {
+                id: "connection".to_string(),
+                data: b"request".to_vec(),
+            },
+            ControlFrame::GuestConnectionRead {
+                id: "connection".to_string(),
+                max_bytes: 65_536,
+            },
+            ControlFrame::GuestConnectionClose {
+                id: "connection".to_string(),
+            },
+            ControlFrame::GuestConnectionOpened {
+                id: "connection".to_string(),
+            },
+            ControlFrame::GuestConnectionWriteComplete {
+                id: "connection".to_string(),
+            },
+            ControlFrame::GuestConnectionData {
+                id: "connection".to_string(),
+                data: b"response".to_vec(),
+            },
+            ControlFrame::GuestConnectionEnd {
+                id: "connection".to_string(),
+            },
+            ControlFrame::GuestConnectionError {
+                id: "connection".to_string(),
+                message: "failed".to_string(),
             },
         ];
 

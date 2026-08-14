@@ -7,12 +7,14 @@ use sandbox_protocol::{
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::net::{Shutdown, TcpStream};
 use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 const GUEST_FS_RESPONSE_PAYLOAD_LIMIT: u64 = 60 * 1024 * 1024;
 const GUEST_FS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
@@ -1195,6 +1197,7 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
     ));
     let execs = Arc::new(ActiveExecs::default());
     let spawns = Arc::new(ActiveSpawns::default());
+    let connections = Arc::new(ActiveConnections::default());
     loop {
         let frame = match ControlFrame::decode_packet_from_reader(control) {
             Ok(frame) => frame,
@@ -1321,6 +1324,46 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
                     let _ = send_control_frame(&writer, handle_guest_fs_request(request));
                 });
             }
+            ControlFrame::GuestConnectionOpen {
+                id,
+                hostname,
+                port,
+                secure,
+                server_name,
+            } => {
+                let writer = writer.clone();
+                let connections_for_thread = connections.clone();
+                let controls = connections.insert(id.clone());
+                std::thread::spawn(move || {
+                    if let Err(error) = run_guest_connection(
+                        id.clone(),
+                        hostname,
+                        port,
+                        secure,
+                        server_name,
+                        controls,
+                        writer.clone(),
+                    ) {
+                        let _ = send_control_frame(
+                            &writer,
+                            ControlFrame::GuestConnectionError {
+                                id: id.clone(),
+                                message: error.to_string(),
+                            },
+                        );
+                    }
+                    connections_for_thread.remove(&id);
+                });
+            }
+            ControlFrame::GuestConnectionWrite { id, data } => {
+                connections.send(&id, ConnectionControl::Write(data));
+            }
+            ControlFrame::GuestConnectionRead { id, max_bytes } => {
+                connections.send(&id, ConnectionControl::Read(max_bytes));
+            }
+            ControlFrame::GuestConnectionClose { id } => {
+                connections.send(&id, ConnectionControl::Close);
+            }
             ControlFrame::InitReady { .. }
             | ControlFrame::GuestExecComplete { .. }
             | ControlFrame::GuestFsResponse { .. }
@@ -1330,7 +1373,12 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
             | ControlFrame::GuestSpawnPipeOutput { .. }
             | ControlFrame::GuestSpawnPipeOutputClosed { .. }
             | ControlFrame::GuestSpawnExit { .. }
-            | ControlFrame::GuestSpawnStreamsClosed { .. } => {}
+            | ControlFrame::GuestSpawnStreamsClosed { .. }
+            | ControlFrame::GuestConnectionOpened { .. }
+            | ControlFrame::GuestConnectionWriteComplete { .. }
+            | ControlFrame::GuestConnectionData { .. }
+            | ControlFrame::GuestConnectionEnd { .. }
+            | ControlFrame::GuestConnectionError { .. } => {}
         }
     }
 }
@@ -2227,6 +2275,245 @@ enum SpawnControl {
     PipeClose { fd: i32 },
     Signal(String),
     Resize(GuestPtySize),
+}
+
+enum ConnectionControl {
+    Write(Vec<u8>),
+    Read(u32),
+    Close,
+}
+
+enum GuestConnectionIo {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl GuestConnectionIo {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.set_read_timeout(timeout),
+            Self::Tls(stream) => stream.sock.set_read_timeout(timeout),
+        }
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.set_write_timeout(timeout),
+            Self::Tls(stream) => stream.sock.set_write_timeout(timeout),
+        }
+    }
+
+    fn shutdown(&self) {
+        let result = match self {
+            Self::Plain(stream) => stream.shutdown(Shutdown::Both),
+            Self::Tls(stream) => stream.sock.shutdown(Shutdown::Both),
+        };
+        let _ = result;
+    }
+}
+
+impl Read for GuestConnectionIo {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.read(buffer),
+            Self::Tls(stream) => stream.read(buffer),
+        }
+    }
+}
+
+impl Write for GuestConnectionIo {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.write(buffer),
+            Self::Tls(stream) => stream.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.flush(),
+            Self::Tls(stream) => stream.flush(),
+        }
+    }
+}
+
+fn run_guest_connection(
+    id: String,
+    hostname: String,
+    port: u16,
+    secure: bool,
+    server_name: Option<String>,
+    controls: mpsc::Receiver<ConnectionControl>,
+    writer: Arc<ControlWriter>,
+) -> Result<(), InitError> {
+    let stream = TcpStream::connect((hostname.as_str(), port))
+        .map_err(|error| InitError(format!("connect to {hostname}:{port}: {error}")))?;
+    let mut connection = if secure {
+        GuestConnectionIo::Tls(Box::new(connect_guest_tls(
+            stream,
+            server_name.unwrap_or_else(|| hostname.clone()),
+        )?))
+    } else {
+        GuestConnectionIo::Plain(stream)
+    };
+    connection
+        .set_read_timeout(Some(Duration::from_millis(20)))
+        .map_err(|error| InitError(format!("configure guest connection read timeout: {error}")))?;
+    connection
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .map_err(|error| InitError(format!("configure guest connection write timeout: {error}")))?;
+    send_control_frame(
+        &writer,
+        ControlFrame::GuestConnectionOpened { id: id.clone() },
+    )?;
+
+    let mut pending_read = None;
+    loop {
+        let control = if pending_read.is_some() {
+            match controls.recv_timeout(Duration::from_millis(1)) {
+                Ok(control) => Some(control),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+        } else {
+            match controls.recv() {
+                Ok(control) => Some(control),
+                Err(_) => return Ok(()),
+            }
+        };
+
+        match control {
+            Some(ConnectionControl::Write(data)) => {
+                connection
+                    .write_all(&data)
+                    .and_then(|()| connection.flush())
+                    .map_err(|error| InitError(format!("write guest connection: {error}")))?;
+                send_control_frame(
+                    &writer,
+                    ControlFrame::GuestConnectionWriteComplete { id: id.clone() },
+                )?;
+            }
+            Some(ConnectionControl::Read(max_bytes)) => {
+                if pending_read.is_some() {
+                    return Err(InitError(
+                        "guest connection already has a read in flight".to_string(),
+                    ));
+                }
+                pending_read = Some(max_bytes);
+            }
+            Some(ConnectionControl::Close) => {
+                connection.shutdown();
+                return Ok(());
+            }
+            None => {}
+        }
+
+        let Some(max_bytes) = pending_read else {
+            continue;
+        };
+        let mut data = vec![0; max_bytes as usize];
+        match connection.read(&mut data) {
+            Ok(0) => {
+                send_control_frame(&writer, ControlFrame::GuestConnectionEnd { id: id.clone() })?;
+                return Ok(());
+            }
+            Ok(read) => {
+                data.truncate(read);
+                pending_read = None;
+                send_control_frame(
+                    &writer,
+                    ControlFrame::GuestConnectionData {
+                        id: id.clone(),
+                        data,
+                    },
+                )?;
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut
+                    || error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                return Err(InitError(format!("read guest connection: {error}")));
+            }
+        }
+    }
+}
+
+fn connect_guest_tls(
+    stream: TcpStream,
+    server_name: String,
+) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>, InitError> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|error| InitError(format!("configure TLS handshake read timeout: {error}")))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .map_err(|error| InitError(format!("configure TLS handshake write timeout: {error}")))?;
+
+    let native_roots = rustls_native_certs::load_native_certs();
+    if native_roots.certs.is_empty() {
+        let details = native_roots
+            .errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(InitError(if details.is_empty() {
+            "guest TLS root store is empty".to_string()
+        } else {
+            format!("load guest TLS roots: {details}")
+        }));
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in native_roots.certs {
+        roots
+            .add(certificate)
+            .map_err(|error| InitError(format!("add guest TLS root: {error}")))?;
+    }
+    let mut config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let server_name = rustls::pki_types::ServerName::try_from(server_name)
+        .map_err(|error| InitError(format!("invalid TLS server name: {error}")))?;
+    let client = rustls::ClientConnection::new(Arc::new(config), server_name)
+        .map_err(|error| InitError(format!("create guest TLS connection: {error}")))?;
+    let mut tls = rustls::StreamOwned::new(client, stream);
+    while tls.conn.is_handshaking() {
+        tls.conn
+            .complete_io(&mut tls.sock)
+            .map_err(|error| InitError(format!("guest TLS handshake: {error}")))?;
+    }
+    Ok(tls)
+}
+
+#[derive(Default)]
+struct ActiveConnections {
+    connections: Mutex<HashMap<String, mpsc::Sender<ConnectionControl>>>,
+}
+
+impl ActiveConnections {
+    fn insert(&self, id: String) -> mpsc::Receiver<ConnectionControl> {
+        let (sender, receiver) = mpsc::channel();
+        if let Ok(mut connections) = self.connections.lock() {
+            connections.insert(id, sender);
+        }
+        receiver
+    }
+
+    fn send(&self, id: &str, control: ConnectionControl) {
+        if let Ok(connections) = self.connections.lock() {
+            if let Some(sender) = connections.get(id) {
+                let _ = sender.send(control);
+            }
+        }
+    }
+
+    fn remove(&self, id: &str) {
+        if let Ok(mut connections) = self.connections.lock() {
+            connections.remove(id);
+        }
+    }
 }
 
 #[derive(Default)]

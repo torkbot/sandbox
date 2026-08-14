@@ -8,4 +8,6 @@ repository.workspace = true
 [dependencies]
 base64 = "0.22"
 libc = "0.2"
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "std"] }
+rustls-native-certs = "0.8"
 sandbox-protocol = { path = "../sandbox-protocol" }

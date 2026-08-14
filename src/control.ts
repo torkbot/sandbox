@@ -40,6 +40,12 @@ export interface SandboxControl extends Transport<SandboxControlEvent, SandboxCo
     readonly cwd: string;
     readonly size: { readonly rows: number; readonly cols: number };
   }): ControlBackedSandboxPty;
+  openConnection(input: {
+    readonly hostname: string;
+    readonly port: number;
+    readonly secure: boolean;
+    readonly serverName?: string;
+  }): ControlBackedGuestConnection;
 }
 
 export interface Transport<TIncoming = unknown, TOutgoing = unknown> {
@@ -80,6 +86,7 @@ export class HostControlTransport implements SandboxControl {
     resolve(event: Extract<SandboxControlEvent, { type: "guest.fs.response" }>): void;
     reject(error: unknown): void;
   }>();
+  readonly #connections = new Map<string, ControlBackedGuestConnection>();
   #closed = false;
 
   constructor(options: {
@@ -274,6 +281,32 @@ export class HostControlTransport implements SandboxControl {
     return process;
   }
 
+  openConnection(input: {
+    readonly hostname: string;
+    readonly port: number;
+    readonly secure: boolean;
+    readonly serverName?: string;
+  }): ControlBackedGuestConnection {
+    this.#assertOpen();
+    const id = crypto.randomUUID();
+    const connection = new ControlBackedGuestConnection(id, this, () => {
+      this.#connections.delete(id);
+    });
+    this.#connections.set(id, connection);
+    void this.send({
+      type: "guest.connection.open",
+      id,
+      hostname: input.hostname,
+      port: input.port,
+      secure: input.secure,
+      serverName: input.serverName,
+    }).catch((error) => {
+      this.#connections.delete(id);
+      connection.fail(error);
+    });
+    return connection;
+  }
+
   async close(): Promise<void> {
     if (this.#closed) {
       return;
@@ -283,6 +316,7 @@ export class HostControlTransport implements SandboxControl {
     this.#rejectPendingExec(new Error("sandbox control is closed"));
     this.#rejectPendingSpawn(new Error("sandbox control is closed"));
     this.#rejectPendingFileSystem(new Error("sandbox control is closed"));
+    this.#failConnections(new Error("sandbox control is closed"));
     this.#events.close();
   }
 
@@ -321,6 +355,20 @@ export class HostControlTransport implements SandboxControl {
   }
 
   #dispatchEvent(event: SandboxControlEvent): void {
+    if (
+      event.type === "guest.connection.opened"
+      || event.type === "guest.connection.write.complete"
+      || event.type === "guest.connection.data"
+      || event.type === "guest.connection.end"
+      || event.type === "guest.connection.error"
+    ) {
+      const connection = this.#connections.get(event.id);
+      connection?.emit(event);
+      if (event.type === "guest.connection.end" || event.type === "guest.connection.error") {
+        this.#connections.delete(event.id);
+      }
+      return;
+    }
     if (
       event.type === "guest.spawn.stdout"
       || event.type === "guest.spawn.stderr"
@@ -405,6 +453,7 @@ export class HostControlTransport implements SandboxControl {
     this.#rejectPendingExec(error);
     this.#rejectPendingSpawn(error);
     this.#rejectPendingFileSystem(error);
+    this.#failConnections(error);
     this.#events.close(error);
   }
 
@@ -428,6 +477,175 @@ export class HostControlTransport implements SandboxControl {
       pending.reject(error);
     }
     this.#pendingFileSystem.clear();
+  }
+
+  #failConnections(error: unknown): void {
+    for (const connection of this.#connections.values()) {
+      connection.fail(error);
+    }
+    this.#connections.clear();
+  }
+}
+
+export class ControlBackedGuestConnection {
+  readonly opened: Promise<void>;
+
+  readonly #id: string;
+  readonly #control: SandboxControl;
+  readonly #onClose: () => void;
+  #resolveOpened!: () => void;
+  #rejectOpened!: (error: unknown) => void;
+  #pendingRead: {
+    resolve(data: Uint8Array | null): void;
+    reject(error: unknown): void;
+  } | undefined;
+  #pendingWrite: {
+    resolve(): void;
+    reject(error: unknown): void;
+  } | undefined;
+  #errorHandler: ((error: Error) => void) | undefined;
+  #opened = false;
+  #closed = false;
+
+  constructor(id: string, control: SandboxControl, onClose: () => void) {
+    this.#id = id;
+    this.#control = control;
+    this.#onClose = onClose;
+    this.opened = new Promise((resolve, reject) => {
+      this.#resolveOpened = resolve;
+      this.#rejectOpened = reject;
+    });
+  }
+
+  onError(handler: (error: Error) => void): void {
+    this.#errorHandler = handler;
+  }
+
+  async write(data: Uint8Array): Promise<void> {
+    this.#assertOpen();
+    if (this.#pendingWrite !== undefined) {
+      throw new Error("sandbox guest connection already has a write in flight");
+    }
+    const completion = new Promise<void>((resolve, reject) => {
+      this.#pendingWrite = { resolve, reject };
+    });
+    try {
+      await this.#control.send({
+        type: "guest.connection.write",
+        id: this.#id,
+        data,
+      });
+    } catch (error) {
+      this.#pendingWrite = undefined;
+      throw error;
+    }
+    await completion;
+  }
+
+  async read(maxBytes: number): Promise<Uint8Array | null> {
+    this.#assertOpen();
+    if (this.#pendingRead !== undefined) {
+      throw new Error("sandbox guest connection already has a read in flight");
+    }
+    const completion = new Promise<Uint8Array | null>((resolve, reject) => {
+      this.#pendingRead = { resolve, reject };
+    });
+    try {
+      await this.#control.send({
+        type: "guest.connection.read",
+        id: this.#id,
+        maxBytes,
+      });
+    } catch (error) {
+      this.#pendingRead = undefined;
+      throw error;
+    }
+    return await completion;
+  }
+
+  close(): void {
+    if (this.#closed) {
+      return;
+    }
+    this.#closed = true;
+    const error = new Error("sandbox guest connection is closed");
+    this.#rejectPending(error);
+    this.#onClose();
+    void this.#control.send({ type: "guest.connection.close", id: this.#id }).catch(() => {});
+  }
+
+  emit(event: Extract<SandboxControlEvent, {
+    type:
+      | "guest.connection.opened"
+      | "guest.connection.write.complete"
+      | "guest.connection.data"
+      | "guest.connection.end"
+      | "guest.connection.error";
+  }>): void {
+    switch (event.type) {
+      case "guest.connection.opened":
+        this.#opened = true;
+        this.#resolveOpened();
+        return;
+      case "guest.connection.write.complete": {
+        const pending = this.#pendingWrite;
+        this.#pendingWrite = undefined;
+        pending?.resolve();
+        return;
+      }
+      case "guest.connection.data": {
+        const pending = this.#pendingRead;
+        this.#pendingRead = undefined;
+        pending?.resolve(event.data);
+        return;
+      }
+      case "guest.connection.end": {
+        this.#closed = true;
+        const pending = this.#pendingRead;
+        this.#pendingRead = undefined;
+        pending?.resolve(null);
+        this.#pendingWrite?.reject(new Error("sandbox guest connection ended"));
+        this.#pendingWrite = undefined;
+        this.#onClose();
+        return;
+      }
+      case "guest.connection.error":
+        this.fail(new Error(event.message));
+        return;
+    }
+  }
+
+  fail(error: unknown): void {
+    if (this.#closed) {
+      return;
+    }
+    this.#closed = true;
+    const connectionError = error instanceof Error ? error : new Error(String(error));
+    const wasOpened = this.#opened;
+    this.#rejectPending(connectionError);
+    this.#onClose();
+    if (wasOpened) {
+      this.#errorHandler?.(connectionError);
+    }
+  }
+
+  #assertOpen(): void {
+    if (this.#closed) {
+      throw new Error("sandbox guest connection is closed");
+    }
+    if (!this.#opened) {
+      throw new Error("sandbox guest connection is not open yet");
+    }
+  }
+
+  #rejectPending(error: Error): void {
+    if (!this.#opened) {
+      this.#rejectOpened(error);
+    }
+    this.#pendingRead?.reject(error);
+    this.#pendingRead = undefined;
+    this.#pendingWrite?.reject(error);
+    this.#pendingWrite = undefined;
   }
 }
 

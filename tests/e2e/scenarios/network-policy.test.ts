@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import http from "node:http";
+import https from "node:https";
 import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -12,6 +14,8 @@ import {
   defineSandbox,
   fs,
   network,
+  Request,
+  Response,
   rootfs,
   type NetworkConnectionRequest,
   type RootfsImageConfig,
@@ -29,6 +33,107 @@ async function testRootfsForVmTest(t: TestContext): Promise<RootfsImageConfig | 
 
   return await testRootfsImageOrSkip(t);
 }
+
+test("sandbox.fetch performs fetch through the guest network", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
+
+  const hostname = "sandbox-fetch.test";
+  const dnsServer = await startUdpDnsServer(hostOriginAddress());
+  const httpOrigin = await startFetchHttpServer();
+  const deniedOrigin = await startTcpServer(() => {});
+  const httpsOrigin = await startFetchHttpsServer();
+  t.after(() => void dnsServer.close());
+  t.after(() => void httpOrigin.close());
+  t.after(() => void deniedOrigin.close());
+  t.after(() => void httpsOrigin.close());
+
+  const sandbox = await defineSandbox({
+    rootfs: rootfs.ephemeral({ base: testRootfs }),
+    network: network.policy((conn) => {
+      if (conn.matchDns()?.accept({
+        resolvers: [{ ip: "127.0.0.1", port: dnsServer.port }],
+      })) return;
+      if (conn.transport !== "tcp") return;
+      if (conn.dst.port === httpOrigin.port) {
+        conn.acceptHttp((request) => {
+          request.headers.set("x-sandbox-policy", "allowed");
+        });
+        return;
+      }
+      if (conn.dst.port === httpsOrigin.port) {
+        conn.accept();
+      }
+    }),
+  }).boot();
+  t.after(() => sandbox.close());
+
+  const certificateBundlePath = "/etc/ssl/certs/ca-certificates.crt";
+  const certificateBundle = await sandbox.fs.readFile(certificateBundlePath);
+  await sandbox.fs.writeFile(
+    certificateBundlePath,
+    concatenateBytes(certificateBundle, new TextEncoder().encode("\n"), httpsOrigin.certificate),
+  );
+
+  const encoder = new TextEncoder();
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode("request-"));
+      controller.enqueue(encoder.encode("body"));
+      controller.close();
+    },
+  });
+  const response = await withTimeout(sandbox.fetch(new Request(
+    `http://${hostname}:${httpOrigin.port}/echo`,
+    {
+      method: "POST",
+      headers: { "content-type": "text/plain" },
+      body,
+      duplex: "half",
+    },
+  )), 10_000, "sandbox fetch POST");
+
+  assert.ok(response instanceof Response);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "application/json");
+  assert.deepEqual(await response.json(), {
+    body: "request-body",
+    policy: "allowed",
+  });
+  assert.throws(() => response.headers.set("x-mutated", "yes"), TypeError);
+
+  const redirected = await withTimeout(sandbox.fetch(new Request(
+    `http://${hostname}:${httpOrigin.port}/redirect`,
+  )), 10_000, "sandbox fetch redirect");
+  assert.equal(redirected.redirected, true);
+  assert.equal(redirected.url, `http://${hostname}:${httpOrigin.port}/stream`);
+  assert.equal(await redirected.text(), "streamed-response");
+  assert.deepEqual(httpOrigin.policyHeaders, ["allowed", "allowed", "allowed"]);
+
+  const secure = await withTimeout(sandbox.fetch(new Request(
+    `https://${hostOriginAddress()}:${httpsOrigin.port}/`,
+  )), 10_000, "sandbox fetch HTTPS");
+  assert.ok(secure instanceof Response);
+  assert.equal(await secure.text(), "https-ok");
+
+  const abortController = new AbortController();
+  const abortResponse = await withTimeout(sandbox.fetch(new Request(
+    `http://${hostname}:${httpOrigin.port}/abort`,
+    { signal: abortController.signal },
+  )), 10_000, "sandbox fetch abort response");
+  abortController.abort();
+  await assert.rejects(abortResponse.text(), { name: "AbortError" });
+
+  const afterAbort = await withTimeout(sandbox.fetch(new Request(
+    `http://${hostname}:${httpOrigin.port}/stream`,
+  )), 10_000, "sandbox fetch after abort");
+  assert.equal(await afterAbort.text(), "streamed-response");
+
+  await assert.rejects(withTimeout(sandbox.fetch(new Request(
+    `http://${hostname}:${deniedOrigin.port}/`,
+  )), 10_000, "sandbox fetch denied by policy"), TypeError);
+  assert.equal(deniedOrigin.connections.length, 0);
+});
 
 test("network.policy allows plain HTTP over TCP", async (t) => {
   const testRootfs = await testRootfsForVmTest(t);
@@ -1368,6 +1473,109 @@ async function startTcpServer(onConnection: (socket: net.Socket) => void, port =
   };
 }
 
+async function startFetchHttpServer(): Promise<{
+  readonly port: number;
+  readonly policyHeaders: string[];
+  close(): Promise<void>;
+}> {
+  const policyHeaders: string[] = [];
+  const sockets = new Set<{ destroy(): void }>();
+  const server = http.createServer(async (request, response) => {
+    const policyHeader = request.headers["x-sandbox-policy"];
+    policyHeaders.push(Array.isArray(policyHeader) ? policyHeader.join(", ") : policyHeader ?? "");
+    switch (request.url) {
+      case "/echo": {
+        const chunks: Buffer[] = [];
+        for await (const chunk of request) {
+          chunks.push(Buffer.from(chunk));
+        }
+        const result = Buffer.from(JSON.stringify({
+          body: Buffer.concat(chunks).toString("utf8"),
+          policy: request.headers["x-sandbox-policy"],
+        }));
+        response.writeHead(200, {
+          "content-length": result.byteLength,
+          "content-type": "application/json",
+        });
+        response.end(result);
+        return;
+      }
+      case "/redirect":
+        response.writeHead(302, { location: "/stream" });
+        response.end();
+        return;
+      case "/stream":
+        response.writeHead(200, { "content-type": "text/plain" });
+        response.write("streamed-");
+        setTimeout(() => response.end("response"), 25);
+        return;
+      case "/abort":
+        response.writeHead(200, { "content-type": "text/plain" });
+        response.write("partial");
+        return;
+      default:
+        response.writeHead(404);
+        response.end();
+    }
+  });
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+  });
+  await listen(server);
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("fetch HTTP server did not bind a port");
+  }
+  return {
+    port: address.port,
+    policyHeaders,
+    async close() {
+      for (const socket of sockets) {
+        socket.destroy();
+      }
+      await closeServer(server);
+    },
+  };
+}
+
+async function startFetchHttpsServer(): Promise<{
+  readonly port: number;
+  readonly certificate: Uint8Array;
+  close(): Promise<void>;
+}> {
+  const certificate = await createSelfSignedCertificate();
+  const certificateContents = await readFile(certificate.certPath);
+  const sockets = new Set<{ destroy(): void }>();
+  const server = https.createServer({
+    key: await readFile(certificate.keyPath),
+    cert: certificateContents,
+  }, (_request, response) => {
+    response.writeHead(200, { "content-length": 8 });
+    response.end("https-ok");
+  });
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+  });
+  await listen(server);
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("fetch HTTPS server did not bind a port");
+  }
+  return {
+    port: address.port,
+    certificate: certificateContents,
+    async close() {
+      for (const socket of sockets) {
+        socket.destroy();
+      }
+      await closeServer(server);
+      await rm(certificate.workDir, { recursive: true, force: true });
+    },
+  };
+}
+
 async function startSshBannerServer(): Promise<{
   readonly port: number;
   readonly connections: net.Socket[];
@@ -1718,4 +1926,14 @@ async function closeServer(server: net.Server | tls.Server): Promise<void> {
 
 function commandOutput(result: { readonly stdout: string; readonly stderr: string }): string {
   return `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`;
+}
+
+function concatenateBytes(...chunks: readonly Uint8Array[]): Uint8Array {
+  const result = new Uint8Array(chunks.reduce((size, chunk) => size + chunk.byteLength, 0));
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return result;
 }
