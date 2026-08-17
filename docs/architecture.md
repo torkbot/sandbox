@@ -313,11 +313,16 @@ decoded into guest listings. The 127-byte macOS name ceiling leaves 113 bytes
 for a complete guest name. File capabilities live in the complete record
 rather than a second xattr. Other `security.*`, every `trusted.*`, and every
 `system.*` operation fail with `EOPNOTSUPP` because the backend cannot enforce
-their Linux semantics faithfully.
+their Linux semantics faithfully. Sandbox therefore does not negotiate FUSE
+per-create security contexts; guests with an active LSM create files through
+the ordinary mode and ownership path instead of sending a label the backend
+would have to reject.
 
 Privilege removal replaces the complete record before a write or truncation
-mutates contents. A failed metadata replacement prevents the content change;
-if content mutation later fails, the conservative privilege removal remains.
+mutates contents. Linux file capabilities are removed for every content
+mutation; the FUSE killpriv flag controls whether setuid and setgid bits are
+also removed. A failed metadata replacement prevents the content change; if
+content mutation later fails, the conservative privilege removal remains.
 The combined read-modify-replace path relies on virtio-fs's current single
 request queue and synchronous worker. Parallel dispatch must add same-inode
 serialization before it can preserve POSIX attribute ordering.
@@ -329,9 +334,15 @@ syscall remains authoritative. Writable mask storage uses the same identity and
 metadata mode as the visible bind even though its files live under a different
 host root. A read-only xattrless source runs in native-only mode. macOS cannot
 create a directory entry and attach an xattr atomically, so the backend attaches
-metadata before reporting success and attempts cleanup on failure. A host crash
-in that narrow window may leave a native entry; Sandbox does not introduce a
-journal or sidecar to hide that host integrity boundary.
+metadata before reporting success. It first uses exclusive host creation to
+learn whether this request owns the new inode; if a host actor filled a
+cached-negative path, a non-exclusive guest create opens that existing inode
+without adopting it. If metadata attachment fails, the guest operation fails
+but the backend does not remove the final pathname: macOS has no unlink that is
+atomically conditional on inode identity, so cleanup could delete a host
+replacement. A crash or metadata failure may therefore leave a native entry;
+Sandbox does not introduce a journal or sidecar to hide that host integrity
+boundary.
 
 Durable filesystem implementations should be layered on top of the generic user-space filesystem hooks, not built into Sandbox as first-class mount types. Sandbox's responsibility is to provide correct guest filesystem operations and a stable JavaScript mount handle; storage engines belong above that boundary.
 

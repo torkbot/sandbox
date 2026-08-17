@@ -265,7 +265,7 @@ impl KrunContext {
                                     guest_uid: device.identity.guest_uid,
                                     guest_gid: device.identity.guest_gid,
                                 },
-                                xattrs_supported: device.xattrs_supported,
+                                xattrs_enabled: device.xattrs_enabled,
                             },
                         ),
                     );
@@ -610,7 +610,7 @@ pub struct HostDirectoryFsDevice {
     pub readonly: bool,
     pub mask: Option<HostDirectoryMaskFsDevice>,
     pub identity: HostDirectoryIdentityMapping,
-    pub xattrs_supported: bool,
+    pub xattrs_enabled: bool,
 }
 
 #[derive(Clone, Copy)]

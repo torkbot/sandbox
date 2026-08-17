@@ -834,19 +834,19 @@ fn virtio_fs_devices(
                 } => {
                     let tag = format!("vfs{index}");
                     #[cfg(target_os = "macos")]
-                    let xattrs_supported = volume_supports_xattrs(source)
+                    let xattrs_enabled = volume_supports_xattrs(source)
                         .ok()
                         .flatten()
                         .unwrap_or(true);
                     #[cfg(not(target_os = "macos"))]
-                    let xattrs_supported = true;
+                    let xattrs_enabled = true;
                     Some(VirtioFsDevice::HostDirectory(HostDirectoryFsDevice {
                         tag,
                         path: path.clone(),
                         source: source.to_string_lossy().into_owned(),
                         readonly: *access == sandbox::config::HostDirectoryAccess::ReadOnly,
                         identity,
-                        xattrs_supported,
+                        xattrs_enabled,
                         mask: mask.as_ref().map(|mask| HostDirectoryMaskFsDevice {
                             paths: mask.paths.clone(),
                             storage: mask

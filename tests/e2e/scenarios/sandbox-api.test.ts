@@ -24,6 +24,26 @@ async function testRootfsForVmTest(t: TestContext): Promise<RootfsImageConfig | 
   return await testRootfsImageOrSkip(t);
 }
 
+async function testRootfsForMacOsVmTest(t: TestContext): Promise<RootfsImageConfig | undefined> {
+  if (process.platform !== "darwin") {
+    t.skip("macOS-specific virtio-fs semantics");
+    return undefined;
+  }
+
+  return await testRootfsForVmTest(t);
+}
+
+function readHostXattr(
+  path: string,
+  name: string,
+  symlinkMode: "follow" | "no-follow",
+): string {
+  const args = symlinkMode === "no-follow"
+    ? ["-s", "-p", name, path]
+    : ["-p", name, path];
+  return execFileSync("/usr/bin/xattr", args, { encoding: "utf8" }).trim();
+}
+
 async function testRootfsForHostArtifactTest(t: TestContext): Promise<RootfsImageConfig | undefined> {
   if (!requireHostArtifact(t)) {
     return undefined;
@@ -843,17 +863,14 @@ test("host directory bind mounts use native virtio-fs access modes", async (t) =
 });
 
 test("macOS host directory binds map the sandbox-host identity to guest root", async (t) => {
-  if (process.platform !== "darwin") {
-    t.skip("macOS-specific virtio-fs identity semantics");
-    return;
-  }
-
-  const testRootfs = await testRootfsForVmTest(t);
+  const testRootfs = await testRootfsForMacOsVmTest(t);
   if (testRootfs === undefined) {
     return;
   }
 
   const source = await mkdtemp(join(tmpdir(), "sandbox-bind-identity-"));
+  const hostIdentity = await lstat(source);
+  const guestCreatedPath = join(source, "guest.txt");
   t.after(async () => {
     await rm(source, { recursive: true, force: true });
   });
@@ -863,27 +880,94 @@ test("macOS host directory binds map the sandbox-host identity to guest root", a
     rootfs: testRootfs,
   }).boot({
     mounts: {
-      "/tmp/identity": fs.bind({ source, access: "ro" }),
+      "/tmp/identity": fs.bind({ source, access: "rw" }),
     },
   });
 
-  const result = await sandbox.exec("/bin/stat", [
-    "-c",
-    "%u:%g",
-    "/tmp/identity/host.txt",
+  await writeFile(join(source, "live-host.txt"), "live host\n");
+
+  const result = await sandbox.exec("/bin/sh", [
+    "-lc",
+    [
+      "stat -c '%u:%g' /tmp/identity/host.txt /tmp/identity/live-host.txt",
+      "printf guest > /tmp/identity/guest.txt",
+      "stat -c '%u:%g' /tmp/identity/guest.txt",
+    ].join("\n"),
   ]);
 
   assert.equal(result.exitCode, 0, result.stderr);
-  assert.equal(result.stdout, "0:0\n");
+  assert.equal(result.stdout, "0:0\n0:0\n0:0\n");
+  const guestCreated = await lstat(guestCreatedPath);
+  assert.equal(guestCreated.uid, hostIdentity.uid);
+  assert.equal(guestCreated.gid, hostIdentity.gid);
+  assert.equal(guestCreated.mode & 0o7777, 0o600);
 });
 
-test("macOS host directory binds persist guest metadata without changing host metadata", async (t) => {
-  if (process.platform !== "darwin") {
-    t.skip("macOS-specific virtio-fs metadata semantics");
+test("macOS host directory binds use guest identity metadata for permission checks", async (t) => {
+  const testRootfs = await testRootfsForMacOsVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
-  const testRootfs = await testRootfsForVmTest(t);
+  const source = await mkdtemp(join(tmpdir(), "sandbox-bind-permissions-"));
+  t.after(async () => {
+    await rm(source, { recursive: true, force: true });
+  });
+  await chmod(source, 0o755);
+  await writeFile(join(source, "native.txt"), "native\n");
+  await writeFile(join(source, "adopted.txt"), "adopted\n");
+  await chmod(join(source, "native.txt"), 0o600);
+  await chmod(join(source, "adopted.txt"), 0o600);
+
+  await using sandbox = await defineSandbox({ rootfs: testRootfs }).boot({
+    mounts: {
+      "/tmp/permissions": fs.bind({ source, access: "rw" }),
+    },
+  });
+
+  const denied = await sandbox.exec("/usr/bin/python3", [
+    "-c",
+    [
+      "import os",
+      "path = '/tmp/permissions/native.txt'",
+      "assert (os.stat(path).st_uid, os.stat(path).st_gid) == (0, 0)",
+      "os.setgroups([])",
+      "os.setgid(456)",
+      "os.setuid(123)",
+      "try:",
+      "    open(path).read()",
+      "except PermissionError:",
+      "    pass",
+      "else:",
+      "    raise AssertionError('unmapped guest identity read owner-only native file')",
+    ].join("\n"),
+  ]);
+  assert.equal(denied.exitCode, 0, denied.stderr);
+
+  const adopt = await sandbox.exec("/bin/sh", [
+    "-lc",
+    "chown 123:456 /tmp/permissions/adopted.txt && chmod 600 /tmp/permissions/adopted.txt",
+  ]);
+  assert.equal(adopt.exitCode, 0, adopt.stderr);
+
+  const allowed = await sandbox.exec("/usr/bin/python3", [
+    "-c",
+    [
+      "import os",
+      "path = '/tmp/permissions/adopted.txt'",
+      "st = os.stat(path)",
+      "assert (st.st_uid, st.st_gid, st.st_mode & 0o777) == (123, 456, 0o600)",
+      "os.setgroups([])",
+      "os.setgid(456)",
+      "os.setuid(123)",
+      "assert open(path).read() == 'adopted\\n'",
+    ].join("\n"),
+  ]);
+  assert.equal(allowed.exitCode, 0, allowed.stderr);
+});
+
+test("macOS host directory binds persist guest metadata without changing host metadata", async (t) => {
+  const testRootfs = await testRootfsForMacOsVmTest(t);
   if (testRootfs === undefined) {
     return;
   }
@@ -943,35 +1027,23 @@ test("macOS host directory binds persist guest metadata without changing host me
   assert.equal(hostLinkAfter.uid, hostLinkBefore.uid);
   assert.equal(hostLinkAfter.gid, hostLinkBefore.gid);
   assert.equal(
-    execFileSync(
-      "/usr/bin/xattr",
-      ["-p", "user.torkbot.sandbox.metadata", hostPath],
-      { encoding: "utf8" },
-    ).trim(),
+    readHostXattr(hostPath, "user.torkbot.sandbox.metadata", "follow"),
     "123:456:0100751:-",
   );
   assert.equal(
-    execFileSync(
-      "/usr/bin/xattr",
-      ["-s", "-p", "user.torkbot.sandbox.metadata", hostLinkPath],
-      { encoding: "utf8" },
-    ).trim(),
+    readHostXattr(hostLinkPath, "user.torkbot.sandbox.metadata", "no-follow"),
     "234:567:0120755:-",
   );
   assert.equal(
-    execFileSync(
-      "/usr/bin/xattr",
-      ["-s", "-p", "user.torkbot.sandbox.metadata", join(source, "created-link")],
-      { encoding: "utf8" },
-    ).trim(),
+    readHostXattr(
+      join(source, "created-link"),
+      "user.torkbot.sandbox.metadata",
+      "no-follow",
+    ),
     "0:0:0120777:-",
   );
   assert.equal(
-    execFileSync(
-      "/usr/bin/xattr",
-      ["-p", "user.torkbot.sandbox.metadata", hostRacePath],
-      { encoding: "utf8" },
-    ).trim(),
+    readHostXattr(hostRacePath, "user.torkbot.sandbox.metadata", "follow"),
     "123:456:0100751:-",
   );
 
@@ -1012,12 +1084,7 @@ test("macOS host directory binds persist guest metadata without changing host me
 });
 
 test("macOS host directory binds isolate guest xattrs behind Sandbox carriers", async (t) => {
-  if (process.platform !== "darwin") {
-    t.skip("macOS-specific virtio-fs xattr semantics");
-    return;
-  }
-
-  const testRootfs = await testRootfsForVmTest(t);
+  const testRootfs = await testRootfsForMacOsVmTest(t);
   if (testRootfs === undefined) {
     return;
   }
@@ -1081,19 +1148,11 @@ test("macOS host directory binds isolate guest xattrs behind Sandbox carriers", 
   }
 
   assert.equal(
-    execFileSync(
-      "/usr/bin/xattr",
-      ["-p", "user.virtiofs.user.comment", hostPath],
-      { encoding: "utf8" },
-    ).trim(),
+    readHostXattr(hostPath, "user.virtiofs.user.comment", "follow"),
     "hello",
   );
   assert.equal(
-    execFileSync(
-      "/usr/bin/xattr",
-      ["-p", "user.torkbot.sandbox.metadata", hostPath],
-      { encoding: "utf8" },
-    ).trim(),
+    readHostXattr(hostPath, "user.torkbot.sandbox.metadata", "follow"),
     "123:456:0106755:0000000200000000000000000000000000000000",
   );
 
@@ -1125,22 +1184,13 @@ test("macOS host directory binds isolate guest xattrs behind Sandbox carriers", 
     assert.equal(result.exitCode, 0, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
   }
   assert.equal(
-    execFileSync(
-      "/usr/bin/xattr",
-      ["-p", "user.torkbot.sandbox.metadata", hostPath],
-      { encoding: "utf8" },
-    ).trim(),
+    readHostXattr(hostPath, "user.torkbot.sandbox.metadata", "follow"),
     "123:456:0106755:-",
   );
 });
 
 test("macOS host directory binds reject guest special files without host artifacts", async (t) => {
-  if (process.platform !== "darwin") {
-    t.skip("macOS-specific virtio-fs special-file semantics");
-    return;
-  }
-
-  const testRootfs = await testRootfsForVmTest(t);
+  const testRootfs = await testRootfsForMacOsVmTest(t);
   if (testRootfs === undefined) {
     return;
   }
@@ -1167,12 +1217,7 @@ test("macOS host directory binds reject guest special files without host artifac
 });
 
 test("macOS host directory binds reject malformed adopted metadata", async (t) => {
-  if (process.platform !== "darwin") {
-    t.skip("macOS-specific virtio-fs metadata semantics");
-    return;
-  }
-
-  const testRootfs = await testRootfsForVmTest(t);
+  const testRootfs = await testRootfsForMacOsVmTest(t);
   if (testRootfs === undefined) {
     return;
   }
@@ -1199,6 +1244,49 @@ test("macOS host directory binds reject malformed adopted metadata", async (t) =
 
   assert.notEqual(result.exitCode, 0);
   assert.match(result.stderr, /Invalid argument/);
+});
+
+test("macOS host directory binds ignore the legacy override-stat xattr", async (t) => {
+  const testRootfs = await testRootfsForMacOsVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const source = await mkdtemp(join(tmpdir(), "sandbox-bind-legacy-xattr-"));
+  const hostPath = join(source, "legacy.txt");
+  t.after(async () => {
+    await rm(source, { recursive: true, force: true });
+  });
+  await writeFile(hostPath, "legacy\n");
+  await chmod(hostPath, 0o640);
+  execFileSync("/usr/bin/xattr", [
+    "-w",
+    "user.containers.override_stat",
+    "123:456:0100751",
+    hostPath,
+  ]);
+
+  await using sandbox = await defineSandbox({ rootfs: testRootfs }).boot({
+    mounts: {
+      "/tmp/legacy": fs.bind({ source, access: "ro" }),
+    },
+  });
+  const result = await sandbox.exec("/usr/bin/python3", [
+    "-c",
+    [
+      "import os",
+      "path = '/tmp/legacy/legacy.txt'",
+      "st = os.stat(path)",
+      "assert (st.st_uid, st.st_gid, st.st_mode & 0o777) == (0, 0, 0o640)",
+      "assert 'user.containers.override_stat' not in os.listxattr(path)",
+    ].join("\n"),
+  ]);
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(
+    readHostXattr(hostPath, "user.containers.override_stat", "follow"),
+    "123:456:0100751",
+  );
 });
 
 test("read-only host directory masks hide lower host entries", async (t) => {
@@ -1339,11 +1427,11 @@ test("writable host directory masks store guest-created entries in host mask sto
   assert.equal(await readFile(join(storage, "preexisting"), "utf8"), "upper-preexisting\n");
   if (process.platform === "darwin") {
     assert.equal(
-      execFileSync(
-        "/usr/bin/xattr",
-        ["-p", "user.torkbot.sandbox.metadata", join(storage, "node_modules", "child.txt")],
-        { encoding: "utf8" },
-      ).trim(),
+      readHostXattr(
+        join(storage, "node_modules", "child.txt"),
+        "user.torkbot.sandbox.metadata",
+        "follow",
+      ),
       "0:0:0100644:-",
     );
   }
