@@ -863,9 +863,13 @@ mod tests {
     use std::fs;
     use std::future::Future;
     use std::pin::pin;
+    use std::process;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::task::{Context, Poll, Waker};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEMP_BASE_IMAGE: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn memory_cow_block_store_lists_reads_and_replaces_blocks() {
@@ -1169,7 +1173,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        env::temp_dir().join(format!("sandbox-cow-block-storage-test-{nanos}.img"))
+        env::temp_dir().join(format!(
+            "sandbox-cow-block-storage-test-{}-{nanos}-{}.img",
+            process::id(),
+            NEXT_TEMP_BASE_IMAGE.fetch_add(1, Ordering::Relaxed),
+        ))
     }
 
     fn block_on_ready<T>(future: impl Future<Output = T>) -> T {
