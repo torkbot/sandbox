@@ -1,5 +1,9 @@
 use std::env;
+#[cfg(target_os = "macos")]
+use std::ffi::{CStr, CString};
 use std::io::{self, ErrorKind, Read};
+#[cfg(target_os = "macos")]
+use std::mem::MaybeUninit;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,8 +28,8 @@ use sandbox::network_service::{
 };
 use sandbox::rootfs_image::{Qcow2FlattenOptions, flatten_rootfs_to_qcow2};
 use sandbox::runtime::{
-    ControlSocket, HostDirectoryFsDevice, HostDirectoryMaskFsDevice, HostServices,
-    StartStatusObserver, VirtioFsDevice, VirtualFsDevice,
+    ControlSocket, HostDirectoryFsDevice, HostDirectoryIdentityMapping, HostDirectoryMaskFsDevice,
+    HostServices, StartStatusObserver, VirtioFsDevice, VirtualFsDevice,
 };
 
 mod host_vfs;
@@ -147,6 +151,8 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
     drop(stdin);
 
     let spec = sandbox::MicroVmSpec::build(parse_spawn(spawn_document)?)?;
+    #[cfg(target_os = "macos")]
+    validate_writable_xattr_backing(&spec)?;
     let bridge = HostIoBridge::new();
     let (bridge_tx, bridge_rx) = mpsc::channel::<Result<(), String>>();
     let guest_writer_slot: Arc<(Mutex<Option<ControlSocket>>, Condvar)> =
@@ -787,6 +793,14 @@ fn virtio_fs_devices(
     spec: &sandbox::MicroVmSpec,
     bridge: std::sync::Arc<HostIoBridge>,
 ) -> Vec<VirtioFsDevice> {
+    // Capture once for the VM. Looking at each mount owner would give one
+    // guest identity several incompatible meanings across the same process.
+    let identity = HostDirectoryIdentityMapping {
+        host_uid: unsafe { libc::geteuid() },
+        host_gid: unsafe { libc::getegid() },
+        guest_uid: 0,
+        guest_gid: 0,
+    };
     let mut devices: Vec<VirtioFsDevice> = spec
         .network
         .as_ref()
@@ -823,11 +837,20 @@ fn virtio_fs_devices(
                     mask,
                 } => {
                     let tag = format!("vfs{index}");
+                    #[cfg(target_os = "macos")]
+                    let xattrs_enabled = volume_supports_xattrs(source)
+                        .ok()
+                        .flatten()
+                        .unwrap_or(true);
+                    #[cfg(not(target_os = "macos"))]
+                    let xattrs_enabled = true;
                     Some(VirtioFsDevice::HostDirectory(HostDirectoryFsDevice {
                         tag,
                         path: path.clone(),
                         source: source.to_string_lossy().into_owned(),
                         readonly: *access == sandbox::config::HostDirectoryAccess::ReadOnly,
+                        identity,
+                        xattrs_enabled,
                         mask: mask.as_ref().map(|mask| HostDirectoryMaskFsDevice {
                             paths: mask.paths.clone(),
                             storage: mask
@@ -840,6 +863,114 @@ fn virtio_fs_devices(
             }),
     );
     devices
+}
+
+#[cfg(target_os = "macos")]
+fn validate_writable_xattr_backing(spec: &sandbox::MicroVmSpec) -> io::Result<()> {
+    use std::collections::HashSet;
+
+    let mut roots = HashSet::new();
+    for mount in &spec.mounts {
+        let MountSpec::HostDirectory {
+            source,
+            access,
+            mask,
+            ..
+        } = mount
+        else {
+            continue;
+        };
+        if *access == sandbox::config::HostDirectoryAccess::ReadWrite {
+            roots.insert(source);
+        }
+        if let Some(storage) = mask.as_ref().and_then(|mask| mask.storage.as_ref()) {
+            roots.insert(&storage.source);
+        }
+    }
+
+    for source in roots {
+        if volume_supports_xattrs(source)? == Some(false) {
+            return Err(io::Error::new(
+                ErrorKind::Unsupported,
+                format!(
+                    "writable host directory backing volume does not support extended attributes: {}",
+                    source.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn volume_supports_xattrs(path: &Path) -> io::Result<Option<bool>> {
+    use std::mem::size_of;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[repr(C)]
+    struct VolumeCapabilitiesBuffer {
+        length: u32,
+        capabilities: libc::vol_capabilities_attr_t,
+    }
+
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            "host directory path contains a NUL byte",
+        )
+    })?;
+    let Ok(volume_root) = macos_volume_root(&path) else {
+        // Capability discovery is only an early diagnostic. The actual xattr
+        // operation remains authoritative when a filesystem cannot report it.
+        return Ok(None);
+    };
+    let mut attributes = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: 0,
+        // macOS requires ATTR_VOL_INFO whenever any volume attribute is
+        // requested, even though it contributes no data to the result buffer.
+        volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_CAPABILITIES,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut buffer = MaybeUninit::<VolumeCapabilitiesBuffer>::zeroed();
+    let result = unsafe {
+        libc::getattrlist(
+            volume_root.as_ptr(),
+            (&mut attributes as *mut libc::attrlist).cast(),
+            buffer.as_mut_ptr().cast(),
+            size_of::<VolumeCapabilitiesBuffer>(),
+            0,
+        )
+    };
+    if result != 0 {
+        // Capability discovery is only an early diagnostic. The actual xattr
+        // operation remains authoritative when a filesystem cannot report it.
+        return Ok(None);
+    }
+    let buffer = unsafe { buffer.assume_init() };
+    if buffer.length < size_of::<VolumeCapabilitiesBuffer>() as u32 {
+        return Ok(None);
+    }
+    let index = libc::VOL_CAPABILITIES_INTERFACES;
+    let flag = libc::VOL_CAP_INT_EXTENDED_ATTR;
+    if buffer.capabilities.valid[index] & flag == 0 {
+        return Ok(None);
+    }
+    Ok(Some(buffer.capabilities.capabilities[index] & flag != 0))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_volume_root(path: &CStr) -> io::Result<CString> {
+    let mut volume = MaybeUninit::<libc::statfs>::zeroed();
+    let result = unsafe { libc::statfs(path.as_ptr(), volume.as_mut_ptr()) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let volume = unsafe { volume.assume_init() };
+    Ok(unsafe { CStr::from_ptr(volume.f_mntonname.as_ptr()) }.to_owned())
 }
 
 fn parse_spawn(document: Document) -> Result<MicroVmSpecInput, Box<dyn std::error::Error>> {
@@ -1124,6 +1255,15 @@ fn optional_bool(document: &Document, key: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn volume_root_resolution_accepts_subdirectories() {
+        let path = CString::new(".").unwrap();
+        let volume_root = macos_volume_root(&path).unwrap();
+
+        assert!(volume_root.to_bytes().starts_with(b"/"));
+    }
 
     #[test]
     fn host_stdin_close_after_ready_is_normal_shutdown() {
