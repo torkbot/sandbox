@@ -920,7 +920,9 @@ fn volume_supports_xattrs(path: &Path) -> io::Result<Option<bool>> {
         bitmapcount: libc::ATTR_BIT_MAP_COUNT,
         reserved: 0,
         commonattr: 0,
-        volattr: libc::ATTR_VOL_CAPABILITIES,
+        // macOS requires ATTR_VOL_INFO whenever any volume attribute is
+        // requested, even though it contributes no data to the result buffer.
+        volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_CAPABILITIES,
         dirattr: 0,
         fileattr: 0,
         forkattr: 0,
