@@ -1,5 +1,9 @@
 use std::env;
+#[cfg(target_os = "macos")]
+use std::ffi::{CStr, CString};
 use std::io::{self, ErrorKind, Read};
+#[cfg(target_os = "macos")]
+use std::mem::MaybeUninit;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -900,8 +904,7 @@ fn validate_writable_xattr_backing(spec: &sandbox::MicroVmSpec) -> io::Result<()
 
 #[cfg(target_os = "macos")]
 fn volume_supports_xattrs(path: &Path) -> io::Result<Option<bool>> {
-    use std::ffi::CString;
-    use std::mem::{MaybeUninit, size_of};
+    use std::mem::size_of;
     use std::os::unix::ffi::OsStrExt;
 
     #[repr(C)]
@@ -916,6 +919,11 @@ fn volume_supports_xattrs(path: &Path) -> io::Result<Option<bool>> {
             "host directory path contains a NUL byte",
         )
     })?;
+    let Ok(volume_root) = macos_volume_root(&path) else {
+        // Capability discovery is only an early diagnostic. The actual xattr
+        // operation remains authoritative when a filesystem cannot report it.
+        return Ok(None);
+    };
     let mut attributes = libc::attrlist {
         bitmapcount: libc::ATTR_BIT_MAP_COUNT,
         reserved: 0,
@@ -930,7 +938,7 @@ fn volume_supports_xattrs(path: &Path) -> io::Result<Option<bool>> {
     let mut buffer = MaybeUninit::<VolumeCapabilitiesBuffer>::zeroed();
     let result = unsafe {
         libc::getattrlist(
-            path.as_ptr(),
+            volume_root.as_ptr(),
             (&mut attributes as *mut libc::attrlist).cast(),
             buffer.as_mut_ptr().cast(),
             size_of::<VolumeCapabilitiesBuffer>(),
@@ -952,6 +960,17 @@ fn volume_supports_xattrs(path: &Path) -> io::Result<Option<bool>> {
         return Ok(None);
     }
     Ok(Some(buffer.capabilities.capabilities[index] & flag != 0))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_volume_root(path: &CStr) -> io::Result<CString> {
+    let mut volume = MaybeUninit::<libc::statfs>::zeroed();
+    let result = unsafe { libc::statfs(path.as_ptr(), volume.as_mut_ptr()) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let volume = unsafe { volume.assume_init() };
+    Ok(unsafe { CStr::from_ptr(volume.f_mntonname.as_ptr()) }.to_owned())
 }
 
 fn parse_spawn(document: Document) -> Result<MicroVmSpecInput, Box<dyn std::error::Error>> {
@@ -1236,6 +1255,15 @@ fn optional_bool(document: &Document, key: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn volume_root_resolution_accepts_subdirectories() {
+        let path = CString::new(".").unwrap();
+        let volume_root = macos_volume_root(&path).unwrap();
+
+        assert!(volume_root.to_bytes().starts_with(b"/"));
+    }
 
     #[test]
     fn host_stdin_close_after_ready_is_normal_shutdown() {
