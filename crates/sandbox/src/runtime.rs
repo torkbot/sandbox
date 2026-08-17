@@ -241,35 +241,68 @@ impl KrunContext {
                 ),
             ),
             VirtioFsDevice::HostDirectory(device) => {
-                if let Some(mask) = &device.mask {
+                #[cfg(target_os = "macos")]
+                {
                     return check_krun(
-                        "krun_add_virtiofs_masked",
-                        krun::krun_add_virtiofs_masked(
+                        "krun_add_sandbox_virtiofs",
+                        krun::krun_add_sandbox_virtiofs(
                             self.id,
                             device.tag.clone(),
                             device.source.clone(),
                             Some(1 << 29),
                             device.readonly,
-                            Some(krun::FsPassthroughMaskConfig {
-                                paths: mask.paths.clone(),
-                                storage: mask.storage.clone(),
-                            }),
+                            device
+                                .mask
+                                .as_ref()
+                                .map(|mask| krun::FsPassthroughMaskConfig {
+                                    paths: mask.paths.clone(),
+                                    storage: mask.storage.clone(),
+                                }),
+                            krun::FsSandboxConfig {
+                                identity: krun::FsIdentityMapping {
+                                    host_uid: device.identity.host_uid,
+                                    host_gid: device.identity.host_gid,
+                                    guest_uid: device.identity.guest_uid,
+                                    guest_gid: device.identity.guest_gid,
+                                },
+                                xattrs_supported: device.xattrs_supported,
+                            },
                         ),
                     );
                 }
-                let tag = CString::new(device.tag.as_str())
-                    .map_err(|_| KrunError::new("krun_add_virtiofs3", -libc::EINVAL))?;
-                let source = CString::new(device.source.as_str())
-                    .map_err(|_| KrunError::new("krun_add_virtiofs3", -libc::EINVAL))?;
-                check_krun("krun_add_virtiofs3", unsafe {
-                    krun::krun_add_virtiofs3(
-                        self.id,
-                        tag.as_ptr(),
-                        source.as_ptr(),
-                        1 << 29,
-                        device.readonly,
-                    )
-                })
+
+                #[cfg(not(target_os = "macos"))]
+                {
+                    if let Some(mask) = &device.mask {
+                        return check_krun(
+                            "krun_add_virtiofs_masked",
+                            krun::krun_add_virtiofs_masked(
+                                self.id,
+                                device.tag.clone(),
+                                device.source.clone(),
+                                Some(1 << 29),
+                                device.readonly,
+                                Some(krun::FsPassthroughMaskConfig {
+                                    paths: mask.paths.clone(),
+                                    storage: mask.storage.clone(),
+                                }),
+                            ),
+                        );
+                    }
+                    let tag = CString::new(device.tag.as_str())
+                        .map_err(|_| KrunError::new("krun_add_virtiofs3", -libc::EINVAL))?;
+                    let source = CString::new(device.source.as_str())
+                        .map_err(|_| KrunError::new("krun_add_virtiofs3", -libc::EINVAL))?;
+                    check_krun("krun_add_virtiofs3", unsafe {
+                        krun::krun_add_virtiofs3(
+                            self.id,
+                            tag.as_ptr(),
+                            source.as_ptr(),
+                            1 << 29,
+                            device.readonly,
+                        )
+                    })
+                }
             }
         }
     }
@@ -576,6 +609,16 @@ pub struct HostDirectoryFsDevice {
     pub source: String,
     pub readonly: bool,
     pub mask: Option<HostDirectoryMaskFsDevice>,
+    pub identity: HostDirectoryIdentityMapping,
+    pub xattrs_supported: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct HostDirectoryIdentityMapping {
+    pub host_uid: u32,
+    pub host_gid: u32,
+    pub guest_uid: u32,
+    pub guest_gid: u32,
 }
 
 pub struct HostDirectoryMaskFsDevice {

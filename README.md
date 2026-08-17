@@ -720,6 +720,29 @@ fs.bind({
 Mounts an absolute host directory through native virtio-fs. `source` and
 `access` are required. `access` must be `"ro"` or `"rw"`.
 
+On macOS, Sandbox snapshots the `sandbox-host` process's effective UID and GID
+once per VM and presents those IDs as guest root (`0:0`) in every host-directory
+bind. Other host UID and GID components appear as `65534` rather than leaking
+unrelated macOS account numbers into the guest. The mapping is fixed until the
+next boot and does not depend on which user owns each mounted directory.
+
+Guest-created files and guest metadata changes are stored in a private host
+xattr, so guest `chmod` and `chown` survive restart without changing the host
+owner or backing mode. Host permissions remain a hard ceiling: a guest mode
+cannot grant `sandbox-host` access that macOS denies. Copy and backup workflows
+must preserve xattrs to preserve adopted guest ownership, mode, and Linux file
+capabilities. Do not mount the same writable directory into multiple VMs,
+especially VMs that will use different guest identities; Sandbox documents but
+does not prevent that unsupported arrangement.
+
+Guest `user.*` xattrs round-trip through private host carrier names. The full
+guest xattr name is limited to 113 bytes on macOS. `trusted.*`, security labels,
+and `system.*` attributes such as ACLs are unsupported; `security.capability` is
+the sole supported `security.*` attribute. Creating FIFOs, Unix sockets,
+character or block devices, and whiteouts in a macOS bind fails with
+`EOPNOTSUPP`. Writable backing volumes must support xattrs and are rejected at
+boot when macOS clearly reports otherwise.
+
 `mask.paths` are absolute paths inside the bound directory. In read-only bind
 mounts, masked paths are absent. In writable bind mounts, masked paths require
 `mask.storage`, and guest-created entries under those paths are stored in the

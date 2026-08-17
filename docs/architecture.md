@@ -272,6 +272,67 @@ Do not hide bindings behind `mount(...)`. Sandbox exposes `binding(...)` as the 
 
 Path-backed virtio-fs is adequate for simple guest-visible mounts, but it does not provide a programmable per-operation host API. The programmable filesystem should be a vhost-user backend owned by this project, with Node.js callbacks behind a Rust service boundary. That keeps guest filesystem traffic on a virtio device instead of inventing a guest agent protocol for normal file operations.
 
+### macOS host-directory identity
+
+`fs.bind(...)` deliberately has no identity option while Sandbox workloads run
+as guest root. `sandbox-host` snapshots its effective UID and GID once per VM
+and passes one required internal mapping to every host-directory device. Each
+matching host component maps to guest `0`; every other component maps to
+overflow ID `65534`. The mapping is VM-scoped rather than derived from each
+volume owner, so one guest process identity has the same meaning across all of
+its mounts.
+
+The macOS passthrough backend classifies each regular file, directory, or
+physical symlink as either native or adopted. A native inode has no private
+record and derives its guest UID, GID, and mode from mapped host `stat`. An
+adopted inode has exactly one complete record:
+
+```text
+user.torkbot.sandbox.metadata = uid:gid:mode:capability
+```
+
+The fields are canonical decimal UID and GID, octal mode including an inode
+kind that must match the backing inode, and either `-` or lowercase hexadecimal
+bytes for a valid Linux V2 or V3 `security.capability` value. The record is both
+the adoption marker and the authority for all four fields. Attribute-not-found
+is the only native result; a malformed or unreadable present record fails
+closed. Sandbox does not interpret the legacy
+`user.containers.override_stat` name.
+
+Guest creation, `chmod`, `chown`, capability changes, and required killpriv
+transitions adopt an inode by replacing the complete record. Adoption is
+monotonic unless a host operation removes the xattr or replaces the inode.
+Hard links therefore share metadata and rename preserves it. Guest `chown`
+never changes macOS ownership; guest `chmod` never changes an existing backing
+mode. New regular files use host mode `0600` and new directories use `0700`,
+with the requested Linux mode stored only in the record.
+
+Guest `user.*` attributes use the virtiofsd carrier convention: guest
+`user.comment` becomes host `user.virtiofs.user.comment`. Only carrier names are
+decoded into guest listings. The 127-byte macOS name ceiling leaves 113 bytes
+for a complete guest name. File capabilities live in the complete record
+rather than a second xattr. Other `security.*`, every `trusted.*`, and every
+`system.*` operation fail with `EOPNOTSUPP` because the backend cannot enforce
+their Linux semantics faithfully.
+
+Privilege removal replaces the complete record before a write or truncation
+mutates contents. A failed metadata replacement prevents the content change;
+if content mutation later fails, the conservative privilege removal remains.
+The combined read-modify-replace path relies on virtio-fs's current single
+request queue and synchronous worker. Parallel dispatch must add same-inode
+serialization before it can preserve POSIX attribute ordering.
+
+Writable sources and mask-storage roots are checked independently before the
+VM starts. A volume that explicitly reports no xattr support is rejected with
+the affected source path; unknown capability results proceed and each xattr
+syscall remains authoritative. Writable mask storage uses the same identity and
+metadata mode as the visible bind even though its files live under a different
+host root. A read-only xattrless source runs in native-only mode. macOS cannot
+create a directory entry and attach an xattr atomically, so the backend attaches
+metadata before reporting success and attempts cleanup on failure. A host crash
+in that narrow window may leave a native entry; Sandbox does not introduce a
+journal or sidecar to hide that host integrity boundary.
+
 Durable filesystem implementations should be layered on top of the generic user-space filesystem hooks, not built into Sandbox as first-class mount types. Sandbox's responsibility is to provide correct guest filesystem operations and a stable JavaScript mount handle; storage engines belong above that boundary.
 
 ## libkrun Fork

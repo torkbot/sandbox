@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { lstat, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -841,6 +842,365 @@ test("host directory bind mounts use native virtio-fs access modes", async (t) =
   assert.equal(await readFile(join(readWriteSource, "after.txt"), "utf8"), "from-guest");
 });
 
+test("macOS host directory binds map the sandbox-host identity to guest root", async (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("macOS-specific virtio-fs identity semantics");
+    return;
+  }
+
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const source = await mkdtemp(join(tmpdir(), "sandbox-bind-identity-"));
+  t.after(async () => {
+    await rm(source, { recursive: true, force: true });
+  });
+  await writeFile(join(source, "host.txt"), "host\n");
+
+  await using sandbox = await defineSandbox({
+    rootfs: testRootfs,
+  }).boot({
+    mounts: {
+      "/tmp/identity": fs.bind({ source, access: "ro" }),
+    },
+  });
+
+  const result = await sandbox.exec("/bin/stat", [
+    "-c",
+    "%u:%g",
+    "/tmp/identity/host.txt",
+  ]);
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(result.stdout, "0:0\n");
+});
+
+test("macOS host directory binds persist guest metadata without changing host metadata", async (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("macOS-specific virtio-fs metadata semantics");
+    return;
+  }
+
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const source = await mkdtemp(join(tmpdir(), "sandbox-bind-metadata-"));
+  const hostPath = join(source, "metadata.txt");
+  t.after(async () => {
+    await rm(source, { recursive: true, force: true });
+  });
+  await writeFile(hostPath, "metadata\n");
+  const hostRacePath = join(source, "race.txt");
+  await writeFile(hostRacePath, "race\n");
+  const hostLinkPath = join(source, "metadata-link");
+  await symlink("metadata.txt", hostLinkPath);
+  await chmod(hostPath, 0o640);
+  const hostBefore = await lstat(hostPath);
+  const hostLinkBefore = await lstat(hostLinkPath);
+
+  const definition = defineSandbox({ rootfs: testRootfs });
+  {
+    await using sandbox = await definition.boot({
+      mounts: {
+        "/tmp/metadata": fs.bind({ source, access: "rw" }),
+      },
+    });
+    const result = await sandbox.exec("/bin/sh", [
+      "-lc",
+      [
+        "set -e",
+        "chmod 751 /tmp/metadata/metadata.txt",
+        "chown 123:456 /tmp/metadata/metadata.txt",
+        "chown -h 234:567 /tmp/metadata/metadata-link",
+        "ln -s metadata.txt /tmp/metadata/created-link",
+        "for i in $(seq 1 25); do",
+        "  chmod 640 /tmp/metadata/race.txt",
+        "  chown 0:0 /tmp/metadata/race.txt",
+        "  chmod 751 /tmp/metadata/race.txt & chmod_pid=$!",
+        "  chown 123:456 /tmp/metadata/race.txt & chown_pid=$!",
+        "  wait $chmod_pid $chown_pid",
+        "  test \"$(stat -c '%u:%g:%a' /tmp/metadata/race.txt)\" = 123:456:751",
+        "done",
+        "stat -c '%u:%g:%a' /tmp/metadata/metadata.txt",
+        "stat -c '%u:%g:%a' /tmp/metadata/metadata-link",
+        "stat -c '%u:%g:%a' /tmp/metadata/created-link",
+      ].join("\n"),
+    ]);
+
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(result.stdout, "123:456:751\n234:567:755\n0:0:777\n");
+  }
+
+  const hostAfter = await lstat(hostPath);
+  assert.equal(hostAfter.uid, hostBefore.uid);
+  assert.equal(hostAfter.gid, hostBefore.gid);
+  assert.equal(hostAfter.mode & 0o7777, 0o640);
+  const hostLinkAfter = await lstat(hostLinkPath);
+  assert.equal(hostLinkAfter.uid, hostLinkBefore.uid);
+  assert.equal(hostLinkAfter.gid, hostLinkBefore.gid);
+  assert.equal(
+    execFileSync(
+      "/usr/bin/xattr",
+      ["-p", "user.torkbot.sandbox.metadata", hostPath],
+      { encoding: "utf8" },
+    ).trim(),
+    "123:456:0100751:-",
+  );
+  assert.equal(
+    execFileSync(
+      "/usr/bin/xattr",
+      ["-s", "-p", "user.torkbot.sandbox.metadata", hostLinkPath],
+      { encoding: "utf8" },
+    ).trim(),
+    "234:567:0120755:-",
+  );
+  assert.equal(
+    execFileSync(
+      "/usr/bin/xattr",
+      ["-s", "-p", "user.torkbot.sandbox.metadata", join(source, "created-link")],
+      { encoding: "utf8" },
+    ).trim(),
+    "0:0:0120777:-",
+  );
+  assert.equal(
+    execFileSync(
+      "/usr/bin/xattr",
+      ["-p", "user.torkbot.sandbox.metadata", hostRacePath],
+      { encoding: "utf8" },
+    ).trim(),
+    "123:456:0100751:-",
+  );
+
+  {
+    await using sandbox = await definition.boot({
+      mounts: {
+        "/tmp/metadata": fs.bind({ source, access: "ro" }),
+      },
+    });
+    const result = await sandbox.exec("/bin/stat", [
+      "-c",
+      "%u:%g:%a",
+      "/tmp/metadata/metadata.txt",
+      "/tmp/metadata/metadata-link",
+      "/tmp/metadata/created-link",
+    ]);
+
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(result.stdout, "123:456:751\n234:567:755\n0:0:777\n");
+  }
+
+  execFileSync("/usr/bin/xattr", ["-d", "user.torkbot.sandbox.metadata", hostPath]);
+  {
+    await using sandbox = await definition.boot({
+      mounts: {
+        "/tmp/metadata": fs.bind({ source, access: "ro" }),
+      },
+    });
+    const result = await sandbox.exec("/bin/stat", [
+      "-c",
+      "%u:%g:%a",
+      "/tmp/metadata/metadata.txt",
+    ]);
+
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(result.stdout, "0:0:640\n");
+  }
+});
+
+test("macOS host directory binds isolate guest xattrs behind Sandbox carriers", async (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("macOS-specific virtio-fs xattr semantics");
+    return;
+  }
+
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const source = await mkdtemp(join(tmpdir(), "sandbox-bind-xattrs-"));
+  const hostPath = join(source, "xattrs.txt");
+  t.after(async () => {
+    await rm(source, { recursive: true, force: true });
+  });
+  await writeFile(hostPath, "xattrs\n");
+
+  const definition = defineSandbox({ rootfs: testRootfs });
+  {
+    await using sandbox = await definition.boot({
+      mounts: {
+        "/tmp/xattrs": fs.bind({ source, access: "rw" }),
+      },
+    });
+    const result = await sandbox.exec("/usr/bin/python3", [
+      "-c",
+      [
+        "import errno, os, struct",
+        "path = b'/tmp/xattrs/xattrs.txt'",
+        "os.setxattr(path, b'user.comment', b'hello')",
+        "assert os.getxattr(path, b'user.comment') == b'hello'",
+        "assert 'user.comment' in os.listxattr(path)",
+        "assert 'user.torkbot.sandbox.metadata' not in os.listxattr(path)",
+        "for name in (b'trusted.note', b'security.selinux', b'system.posix_acl_access'):",
+        "    try:",
+        "        os.setxattr(path, name, b'value')",
+        "    except OSError as error:",
+        "        assert error.errno == errno.EOPNOTSUPP, (name, error)",
+        "    else:",
+        "        raise AssertionError(name)",
+        "long_name = b'user.' + (b'x' * 109)",
+        "try:",
+        "    os.setxattr(path, long_name, b'value')",
+        "except OSError as error:",
+        "    assert error.errno == errno.ERANGE, error",
+        "else:",
+        "    raise AssertionError('long xattr name accepted')",
+        "capability = struct.pack('<IIIII', 0x02000000, 0, 0, 0, 0)",
+        "os.chmod(path, 0o6755)",
+        "os.setxattr(path, b'security.capability', capability)",
+        "assert os.getxattr(path, b'security.capability') == capability",
+        "os.chown(path, 123, 456)",
+        "try:",
+        "    os.getxattr(path, b'security.capability')",
+        "except OSError as error:",
+        "    assert error.errno == errno.ENODATA, error",
+        "else:",
+        "    raise AssertionError('capability survived chown')",
+        "mode = os.stat(path).st_mode",
+        "assert mode & 0o6000 == 0, oct(mode)",
+        "os.chmod(path, 0o6755)",
+        "os.setxattr(path, b'security.capability', capability)",
+      ].join("\n"),
+    ]);
+
+    assert.equal(result.exitCode, 0, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+  }
+
+  assert.equal(
+    execFileSync(
+      "/usr/bin/xattr",
+      ["-p", "user.virtiofs.user.comment", hostPath],
+      { encoding: "utf8" },
+    ).trim(),
+    "hello",
+  );
+  assert.equal(
+    execFileSync(
+      "/usr/bin/xattr",
+      ["-p", "user.torkbot.sandbox.metadata", hostPath],
+      { encoding: "utf8" },
+    ).trim(),
+    "123:456:0106755:0000000200000000000000000000000000000000",
+  );
+
+  {
+    await using sandbox = await definition.boot({
+      mounts: {
+        "/tmp/xattrs": fs.bind({ source, access: "rw" }),
+      },
+    });
+    const result = await sandbox.exec("/usr/bin/python3", [
+      "-c",
+      [
+        "import errno, os, struct",
+        "path = b'/tmp/xattrs/xattrs.txt'",
+        "capability = struct.pack('<IIIII', 0x02000000, 0, 0, 0, 0)",
+        "assert os.getxattr(path, b'security.capability') == capability",
+        "assert os.stat(path).st_mode & 0o6000 == 0o6000",
+        "with open(path, 'ab') as file:",
+        "    file.write(b'changed')",
+        "try:",
+        "    os.getxattr(path, b'security.capability')",
+        "except OSError as error:",
+        "    assert error.errno == errno.ENODATA, error",
+        "else:",
+        "    raise AssertionError('capability survived content write')",
+      ].join("\n"),
+    ]);
+
+    assert.equal(result.exitCode, 0, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+  }
+  assert.equal(
+    execFileSync(
+      "/usr/bin/xattr",
+      ["-p", "user.torkbot.sandbox.metadata", hostPath],
+      { encoding: "utf8" },
+    ).trim(),
+    "123:456:0106755:-",
+  );
+});
+
+test("macOS host directory binds reject guest special files without host artifacts", async (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("macOS-specific virtio-fs special-file semantics");
+    return;
+  }
+
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const source = await mkdtemp(join(tmpdir(), "sandbox-bind-special-"));
+  t.after(async () => {
+    await rm(source, { recursive: true, force: true });
+  });
+
+  await using sandbox = await defineSandbox({
+    rootfs: testRootfs,
+  }).boot({
+    mounts: {
+      "/tmp/special": fs.bind({ source, access: "rw" }),
+    },
+  });
+  const result = await sandbox.exec("/bin/sh", [
+    "-lc",
+    "if mkfifo /tmp/special/pipe 2>/tmp/mkfifo.err; then exit 10; fi; test ! -e /tmp/special/pipe",
+  ]);
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  await assert.rejects(lstat(join(source, "pipe")), { code: "ENOENT" });
+});
+
+test("macOS host directory binds reject malformed adopted metadata", async (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("macOS-specific virtio-fs metadata semantics");
+    return;
+  }
+
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const source = await mkdtemp(join(tmpdir(), "sandbox-bind-malformed-"));
+  const hostPath = join(source, "malformed.txt");
+  t.after(async () => {
+    await rm(source, { recursive: true, force: true });
+  });
+  await writeFile(hostPath, "malformed\n");
+  execFileSync("/usr/bin/xattr", [
+    "-w",
+    "user.torkbot.sandbox.metadata",
+    "not-a-complete-record",
+    hostPath,
+  ]);
+
+  await using sandbox = await defineSandbox({ rootfs: testRootfs }).boot({
+    mounts: {
+      "/tmp/malformed": fs.bind({ source, access: "ro" }),
+    },
+  });
+  const result = await sandbox.exec("/bin/stat", ["/tmp/malformed/malformed.txt"]);
+
+  assert.notEqual(result.exitCode, 0);
+  assert.match(result.stderr, /Invalid argument/);
+});
+
 test("read-only host directory masks hide lower host entries", async (t) => {
   const testRootfs = await testRootfsForVmTest(t);
   if (testRootfs === undefined) {
@@ -944,6 +1304,9 @@ test("writable host directory masks store guest-created entries in host mask sto
       "if ls -a /tmp/workspace | grep -E '^(node_modules|\\.cache)$'; then exit 10; fi",
       "if ! ls -a /tmp/workspace | grep -q -E '^preexisting$'; then exit 12; fi",
       "cat /tmp/workspace/preexisting",
+      ...(process.platform === "darwin"
+        ? ["test \"$(stat -c '%u:%g' /tmp/workspace/preexisting)\" = 0:0"]
+        : []),
       "printf file-entry > /tmp/workspace/node_modules",
       "test -f /tmp/workspace/node_modules",
       "cat /tmp/workspace/node_modules",
@@ -974,6 +1337,16 @@ test("writable host directory masks store guest-created entries in host mask sto
   assert.equal(await readFile(join(storage, ".cache", "value.txt"), "utf8"), "cached");
   assert.equal(await readFile(join(storage, "packages", "a", "node_modules", "pkg.txt"), "utf8"), "package");
   assert.equal(await readFile(join(storage, "preexisting"), "utf8"), "upper-preexisting\n");
+  if (process.platform === "darwin") {
+    assert.equal(
+      execFileSync(
+        "/usr/bin/xattr",
+        ["-p", "user.torkbot.sandbox.metadata", join(storage, "node_modules", "child.txt")],
+        { encoding: "utf8" },
+      ).trim(),
+      "0:0:0100644:-",
+    );
+  }
 });
 
 test("writable host directory masks persist storage beneath another masked source path", async (t) => {

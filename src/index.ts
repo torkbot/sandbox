@@ -962,6 +962,13 @@ function virtualFs(fileSystem: SandboxFileSystem): SandboxFileSystemSource {
   };
 }
 
+/**
+ * Describes a native host-directory bind. On macOS, the sandbox-host effective
+ * identity appears as guest root while unrelated host IDs appear as 65534.
+ * Guest-owned Linux metadata is persisted privately without changing host
+ * ownership or mode. The descriptor is pure; backing-volume checks occur at
+ * boot.
+ */
 function bindHostDirectory(options: {
   readonly source: string;
   readonly access: "ro";

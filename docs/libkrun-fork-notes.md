@@ -29,6 +29,8 @@ The fork carries the following integration seams on top of upstream 2.0:
 - in-process virtual virtio-fs backends;
 - a virtio-fs mask layer that hides selected lower paths and can route
   guest-created masked entries into writable host storage; and
+- macOS host-directory identity mapping and private guest metadata, configured
+  through a required Sandbox-only Rust passthrough mode;
 - direct Rust init configuration.
 
 The mask layer belongs in the virtio-fs backend, below the guest syscall
