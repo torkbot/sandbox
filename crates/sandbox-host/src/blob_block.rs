@@ -69,6 +69,8 @@ impl BlobBlockVolume {
         let ready = runtime.block_on(read_json::<VolumeMetadata>(&provider.store, &ready_path))?;
         let db = if let Some(ready) = ready {
             ready.validate(size_bytes)?;
+            // Opening a writer claims a new SlateDB epoch and fences every older
+            // handle before returning, including a holder replaced after lease expiry.
             runtime.block_on(Db::open(db_path, provider.store.clone()))?
         } else {
             let provisioning = runtime
@@ -923,6 +925,7 @@ mod tests {
     use slatedb::object_store::ObjectStore;
     use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::path::Path as ObjectPath;
+    use slatedb::{CloseReason, Db, ErrorKind};
     use tokio::runtime::Runtime;
 
     use super::{BlobBlockVolume, ObjectLease};
@@ -1016,6 +1019,36 @@ mod tests {
 
         let reacquired = acquire().expect("reacquire released object lease");
         drop(reacquired);
+    }
+
+    #[test]
+    fn opening_a_new_writer_fences_the_previous_slate_db_handle() {
+        let runtime = Runtime::new().expect("create SlateDB fencing test runtime");
+        runtime.block_on(async {
+            let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+            let path = ObjectPath::from("volumes/workspace/data");
+            let first = Db::open(path.clone(), store.clone())
+                .await
+                .expect("open first writer");
+            first
+                .put(b"before", b"first")
+                .await
+                .expect("write first value");
+
+            let second = Db::open(path, store)
+                .await
+                .expect("open replacement writer");
+            let error = first
+                .put(b"after", b"stale")
+                .await
+                .expect_err("replacement writer must fence the previous handle");
+            assert_eq!(error.kind(), ErrorKind::Closed(CloseReason::Fenced));
+            second
+                .put(b"after", b"replacement")
+                .await
+                .expect("replacement writer remains writable");
+            second.close().await.expect("close replacement writer");
+        });
     }
 
     fn allocated_bytes(path: &Path) -> u64 {

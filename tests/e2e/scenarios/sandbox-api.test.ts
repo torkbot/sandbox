@@ -685,15 +685,20 @@ test("blob block acquisition provisions, leases, and reopens a mounted disk", as
       /block volume workspace is already leased/,
     );
 
-    const first = await defineSandbox({ rootfs: testRootfs }).boot({
+    const first = await defineSandbox({
+      rootfs: testRootfs,
+      network: network.policy((conn) => {
+        conn.accept();
+      }),
+    }).boot({
       mounts: {
-        "/workspace": firstDisk,
+        "/run/sandbox/http-ca": firstDisk,
       },
     });
     try {
       const write = await first.exec("/bin/sh", [
         "-lc",
-        "printf '%s' persisted > /workspace/state.txt && sync",
+        "printf '%s' persisted > /run/sandbox/http-ca/state.txt && sync",
       ]);
       assert.equal(write.exitCode, 0, write.stderr);
     } finally {
