@@ -32,6 +32,7 @@ use sandbox::runtime::{
     HostServices, StartStatusObserver, VirtioFsDevice, VirtualFsDevice,
 };
 
+mod blob_block;
 mod host_vfs;
 
 use host_vfs::{HostIoBridge, NodeVirtualFs, StaticFileVirtualFs};
@@ -146,14 +147,36 @@ fn run_stdio() -> ExitCode {
 }
 
 fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
+    let bridge = HostIoBridge::new();
     let mut stdin = io::stdin().lock();
-    let spawn_document = read_document_packet(&mut stdin)?;
+    let first_document = read_document_packet(&mut stdin)?;
+    let (spawn_document, blob_volume) =
+        if matches!(first_document.get_str("type"), Ok("host.block.acquire")) {
+            match blob_block::BlobBlockVolume::acquire(first_document) {
+                Ok(volume) => {
+                    bridge.write_raw_packet(&encode_document_packet(&doc! {
+                        "type": "host.block.acquire.result",
+                        "ok": true,
+                    })?)?;
+                    (read_document_packet(&mut stdin)?, Some(volume))
+                }
+                Err(error) => {
+                    bridge.write_raw_packet(&encode_document_packet(&doc! {
+                        "type": "host.block.acquire.result",
+                        "ok": false,
+                        "error": error.to_string(),
+                    })?)?;
+                    return Err(error);
+                }
+            }
+        } else {
+            (first_document, None)
+        };
     drop(stdin);
 
     let spec = sandbox::MicroVmSpec::build(parse_spawn(spawn_document)?)?;
     #[cfg(target_os = "macos")]
     validate_writable_xattr_backing(&spec)?;
-    let bridge = HostIoBridge::new();
     let (bridge_tx, bridge_rx) = mpsc::channel::<Result<(), String>>();
     let guest_writer_slot: Arc<(Mutex<Option<ControlSocket>>, Condvar)> =
         Arc::new((Mutex::new(None), Condvar::new()));
@@ -231,6 +254,9 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
                 sandbox::config::RootfsStorageSpec::EphemeralCow { .. } => None,
                 sandbox::config::RootfsStorageSpec::PersistentQcow2Overlay { .. } => None,
             }),
+        block_device: blob_volume
+            .as_ref()
+            .map(blob_block::BlobBlockVolume::service),
     };
     let mut vm = sandbox::runtime::KrunVm::create_with_services(&spec, virtual_fs, services)?;
     vm.start()?;
@@ -860,6 +886,7 @@ fn virtio_fs_devices(
                         }),
                     }))
                 }
+                MountSpec::BlockDevice { .. } => None,
             }),
     );
     devices

@@ -204,10 +204,14 @@ impl MitmTlsAuthority {
             .signed_by(&key_pair, &ca)
             .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
         let private_key = rustls::pki_types::PrivateKeyDer::Pkcs8(key_pair.serialize_der().into());
-        let mut config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![certificate.der().clone()], private_key)
-            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
+        let mut config = rustls::ServerConfig::builder_with_provider(
+            rustls::crypto::ring::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default TLS protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate.der().clone()], private_key)
+        .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         rustls::ServerConnection::new(Arc::new(config))
             .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))

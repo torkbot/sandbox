@@ -9,6 +9,7 @@ use imago::io_buffers::{IoVector, IoVectorMut};
 use imago::storage::PreallocateMode;
 use imago::storage::drivers::CommonStorageHelper;
 use imago::{DynStorage, FormatAccess, Storage};
+use mkext4::{FsBuilder, Options, RegionSink};
 
 pub trait CowBlockStore: Send + Sync {
     fn block_size(&self) -> u64;
@@ -254,6 +255,39 @@ impl BlockStoreImageStorage {
             })),
             helper: CommonStorageHelper::default(),
         })
+    }
+}
+
+pub fn format_empty_ext4(
+    store: Arc<dyn CowBlockStore>,
+    size: u64,
+    fs_uuid: [u8; 16],
+) -> io::Result<()> {
+    let storage = BlockStoreImageStorage::new(store.clone(), size)?;
+    let mut options = Options::new(size, fs_uuid, 0);
+    options.label = Some("sandbox".to_string());
+    let layout = FsBuilder::new(options)
+        .and_then(FsBuilder::seal)
+        .map_err(io::Error::other)?;
+    let mut sink = EmptyBlockStoreSink { storage };
+    layout
+        .writer(&mut sink)
+        .and_then(|writer| writer.finish())
+        .map_err(io::Error::other)?;
+    store.flush()
+}
+
+struct EmptyBlockStoreSink {
+    storage: BlockStoreImageStorage,
+}
+
+impl RegionSink for EmptyBlockStoreSink {
+    fn data(&mut self, offset: u64, bytes: &[u8]) -> io::Result<()> {
+        self.storage.write_from(bytes, offset)
+    }
+
+    fn zeros(&mut self, _offset: u64, _len: u64) -> io::Result<()> {
+        Ok(())
     }
 }
 

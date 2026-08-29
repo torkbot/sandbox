@@ -79,6 +79,9 @@ pub enum MountSpec {
         access: HostDirectoryAccess,
         mask: Option<HostDirectoryMask>,
     },
+    BlockDevice {
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,6 +251,14 @@ impl MicroVmSpec {
             .into_iter()
             .map(MountSpec::parse)
             .collect::<Result<Vec<_>, _>>()?;
+        if mounts
+            .iter()
+            .filter(|mount| matches!(mount, MountSpec::BlockDevice { .. }))
+            .count()
+            > 1
+        {
+            return Err(SpecError::new("only one block-device mount is supported"));
+        }
         crate::mounts::MountTable::plan(&mounts)
             .map_err(|error| SpecError::new(error.to_string()))?;
 
@@ -358,6 +369,7 @@ impl MountSpec {
                     mask,
                 })
             }
+            "block-device" => Ok(Self::BlockDevice { path: input.path }),
             other => Err(SpecError::new(format!("unsupported mount.kind: {other}"))),
         }
     }

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import {
+  block,
   defineSandbox,
   fs,
   network,
@@ -654,6 +655,75 @@ test("boot options provide instance-specific virtual mounts", async (t) => {
 
   assert.equal(result.exitCode, 0, result.stderr);
   assert.equal(result.stdout, "lane-private");
+});
+
+test("blob block acquisition provisions, leases, and reopens a mounted disk", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const objectStore = await mkdtemp(join(tmpdir(), "sandbox-blob-block-"));
+  t.after(async () => {
+    await rm(objectStore, { recursive: true, force: true });
+  });
+  const acquisition = {
+    provider: {
+      kind: "local" as const,
+      path: objectStore,
+    },
+    volume: "workspace",
+    sizeBytes: 64n * 1024n * 1024n,
+  };
+
+  const firstDisk = await block.blob.acquire(acquisition);
+  const firstLifecycle = firstDisk.getLifecycle?.();
+  assert.ok(firstLifecycle);
+  try {
+    await assert.rejects(
+      block.blob.acquire(acquisition),
+      /block volume workspace is already leased/,
+    );
+
+    const first = await defineSandbox({ rootfs: testRootfs }).boot({
+      mounts: {
+        "/workspace": firstDisk,
+      },
+    });
+    try {
+      const write = await first.exec("/bin/sh", [
+        "-lc",
+        "printf '%s' persisted > /workspace/state.txt && sync",
+      ]);
+      assert.equal(write.exitCode, 0, write.stderr);
+    } finally {
+      await first.close();
+    }
+    await firstLifecycle.closed;
+  } finally {
+    await firstLifecycle.close();
+  }
+
+  const secondDisk = await block.blob.acquire(acquisition);
+  const secondLifecycle = secondDisk.getLifecycle?.();
+  assert.ok(secondLifecycle);
+  try {
+    const second = await defineSandbox({ rootfs: testRootfs }).boot({
+      mounts: {
+        "/workspace": secondDisk,
+      },
+    });
+    try {
+      const read = await second.exec("/bin/cat", ["/workspace/state.txt"]);
+      assert.equal(read.exitCode, 0, read.stderr);
+      assert.equal(read.stdout, "persisted");
+    } finally {
+      await second.close();
+    }
+    await secondLifecycle.closed;
+  } finally {
+    await secondLifecycle.close();
+  }
 });
 
 test("running sandbox exposes a remote-friendly guest filesystem API", async (t) => {

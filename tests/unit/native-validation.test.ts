@@ -4,6 +4,7 @@ import { link, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  block,
   defineSandbox,
   fs,
   rootfs,
@@ -30,6 +31,65 @@ const testRootfs = {
     },
   ],
 } satisfies RootfsImageConfig;
+
+test("block.blob.acquire validates its byte size and provider before spawning a host", async () => {
+  await assert.rejects(
+    block.blob.acquire({
+      provider: { kind: "local", path: "/tmp/blob-block" },
+      volume: "workspace",
+      sizeBytes: 1n,
+    }),
+    /sizeBytes must be a 4096-byte multiple between 8 MiB and u64::MAX/,
+  );
+  await assert.rejects(
+    block.blob.acquire({
+      provider: {
+        kind: "s3",
+        bucket: "sandbox",
+        region: "us-east-1",
+        auth: undefined,
+      } as never,
+      volume: "workspace",
+      sizeBytes: 64n * 1024n * 1024n,
+    }),
+    /provider\.auth is required/,
+  );
+  await assert.rejects(
+    block.blob.acquire({
+      provider: {
+        kind: "local",
+        path: "/tmp/blob-block",
+        prefix: "../escape",
+      },
+      volume: "workspace",
+      sizeBytes: 64n * 1024n * 1024n,
+    }),
+    /provider\.prefix must be a non-empty relative object path/,
+  );
+});
+
+test("sandbox.boot rejects forged block device handles", async () => {
+  await assert.rejects(
+    defineSandbox({ rootfs: testRootfs }).boot({
+      mounts: {
+        "/workspace": { kind: "block-device" },
+      },
+    }),
+    /block device was not acquired by this runtime/,
+  );
+});
+
+test("sandbox.boot rejects block devices nested beneath another mount", async () => {
+  await assert.rejects(
+    defineSandbox({ rootfs: testRootfs }).boot({
+      mounts: {
+        "/workspace": { kind: "virtual-fs", fileSystem: fs.memory() },
+        "/workspace/disk": { kind: "block-device" },
+      },
+    }),
+    /block device mount must not be nested beneath another mount: \/workspace\/disk/,
+  );
+});
 
 test("defineSandbox rejects non-image rootfs objects", () => {
   assert.throws(

@@ -5,6 +5,7 @@ control of files, durable machine state, network egress, and credentials.
 
 ```ts
 import {
+  block,
   defineSandbox,
   fs,
   network,
@@ -675,6 +676,64 @@ mismatched snapshots, or migrate state.
 `write()` receives block bytes owned by the block store. Sandbox will not
 mutate those `Uint8Array` values after passing them to `write()`, so stores may
 retain them for delayed persistence.
+
+### `block.blob.acquire(options)`
+
+Acquires a single-writer logical disk backed by object storage. There is no
+separate create operation: acquiring an absent volume atomically provisions a
+sparse ext4 filesystem, while acquiring an existing volume requires the same
+explicit `sizeBytes`.
+
+```ts
+const disk = await block.blob.acquire({
+  provider: {
+    kind: "s3",
+    bucket: "agent-disks",
+    region: "us-east-1",
+    auth: { kind: "environment" },
+  },
+  volume: "agent-42-workspace",
+  sizeBytes: 64n * 1024n * 1024n,
+});
+
+const lifecycle = disk.getLifecycle?.();
+try {
+  await using vm = await sandbox.boot({
+    mounts: {
+      "/workspace": disk,
+    },
+    cwd: "/workspace",
+  });
+  await vm.exec("sh", ["-lc", "printf '%s' ready > state.txt"]);
+} finally {
+  await lifecycle?.close();
+}
+```
+
+`acquire()` obtains and starts renewing the exclusive writer lease before it
+returns the mountable handle. If another writer owns the volume, acquisition
+rejects and no VM is started. Closing the sandbox closes the native host and
+releases the lease; call the lifecycle's `close()` yourself when an acquired
+device is never booted. `closed` resolves whenever that host closes, whether
+closure was requested or unexpected.
+
+Blob-backed devices currently use ext4, are writable, are single-use, and are
+limited to one per sandbox. Their mount path cannot be nested beneath another
+mount, though other mounts may be nested beneath the block device. Provider
+credentials remain in the native host and are not mounted into the guest.
+Supported provider and authentication shapes are:
+
+- `local`: absolute `path`, with no authentication. Intended for development
+  and testing.
+- `s3`: `bucket`, `region`, and either `environment` or `access-key`
+  authentication. `endpoint` supports S3-compatible services.
+- `gcs`: `bucket` and `environment`, JSON `service-account`, or static
+  `bearer-token` authentication.
+- `azure`: `account`, `container`, and `environment`, `access-key`, static
+  `bearer-token`, or `client-secret` authentication. `endpoint` is optional.
+
+Every provider accepts an optional relative object `prefix`. Static bearer
+tokens are not refreshed by Sandbox.
 
 ### `fs.memory(options)`
 

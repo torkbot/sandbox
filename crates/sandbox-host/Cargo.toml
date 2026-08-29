@@ -6,7 +6,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-bson = "3.1"
+bson = { version = "3.1", features = ["serde"] }
+futures-util = "0.3"
 libc = "0.2"
 sandbox = { path = "../sandbox" }
-tokio = { version = "1.52", features = ["rt"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+slatedb = { version = "0.15", default-features = false, features = ["aws", "azure", "gcp", "moka"] }
+tokio = { version = "1.52", features = ["rt-multi-thread", "sync", "time"] }

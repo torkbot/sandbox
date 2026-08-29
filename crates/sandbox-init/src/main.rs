@@ -53,6 +53,11 @@ fn run() -> Result<(), InitError> {
         std::env::var("SANDBOX_VIRTIOFS_MOUNTS").ok(),
     )?;
     let mut mounted_virtual_paths = Vec::new();
+    mount_configured_block(
+        std::env::args().skip(1),
+        std::env::var("SANDBOX_BLOCK_MOUNT").ok(),
+        &mut mounted_virtual_paths,
+    )?;
     mount_internal_http_ca(&mounts, &mut mounted_virtual_paths)?;
     mount_virtual_filesystems_before_http_ca(&mounts, &mut mounted_virtual_paths)?;
     install_http_ca(root_readonly)?;
@@ -908,6 +913,55 @@ fn virtual_fs_mounts(
 }
 
 #[cfg(target_os = "linux")]
+fn mount_configured_block(
+    args: impl Iterator<Item = String>,
+    env_mount: Option<String>,
+    mounted_paths: &mut Vec<std::path::PathBuf>,
+) -> Result<(), InitError> {
+    let encoded = args
+        .filter_map(|arg| arg.strip_prefix("--block-mount=").map(str::to_string))
+        .next()
+        .or(env_mount)
+        .filter(|value| !value.is_empty());
+    let Some(path) = encoded
+        .map(|value| decode_mount_field(&value))
+        .transpose()?
+    else {
+        return Ok(());
+    };
+    ensure_mount_point(&path, mounted_paths)?;
+    mount_block_device(&path)?;
+    mounted_paths.push(std::path::PathBuf::from(path));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn mount_block_device(path: &str) -> Result<(), InitError> {
+    use std::ffi::CString;
+
+    let source = CString::new("/dev/vdb").unwrap();
+    let target = CString::new(path)
+        .map_err(|_| InitError(format!("block mount path contains nul: {path}")))?;
+    let fstype = CString::new("ext4").unwrap();
+    let options = CString::new("rw,data=ordered").unwrap();
+    let result = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            0,
+            options.as_ptr().cast(),
+        )
+    };
+    if result < 0 {
+        return Err(InitError::last_os(&format!(
+            "mount block device /dev/vdb at {path}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 struct VirtualFsMount {
     tag: String,
     path: String,
@@ -1069,6 +1123,15 @@ fn virtual_fs_mounts(
     _env_mounts: Option<String>,
 ) -> Result<Vec<VirtualFsMount>, InitError> {
     Ok(Vec::new())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_configured_block(
+    _args: impl Iterator<Item = String>,
+    _env_mount: Option<String>,
+    _mounted_paths: &mut Vec<std::path::PathBuf>,
+) -> Result<(), InitError> {
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -2752,9 +2815,13 @@ fn connect_guest_tls(
             .add(certificate)
             .map_err(|error| InitError(format!("add guest TLS root: {error}")))?;
     }
-    let mut config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let mut config = rustls::ClientConfig::builder_with_provider(
+        rustls::crypto::ring::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .expect("ring supports the default TLS protocol versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     let server_name = rustls::pki_types::ServerName::try_from(server_name)
         .map_err(|error| InitError(format!("invalid TLS server name: {error}")))?;
