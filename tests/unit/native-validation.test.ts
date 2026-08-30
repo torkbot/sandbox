@@ -91,6 +91,17 @@ test("sandbox.boot rejects block devices nested beneath another mount", async ()
   );
 });
 
+test("sandbox.boot rejects block devices beneath the internal HTTP CA mount", async () => {
+  await assert.rejects(
+    defineSandbox({ rootfs: testRootfs }).boot({
+      mounts: {
+        "/run/sandbox/http-ca/state": { kind: "block-device" },
+      },
+    }),
+    /block device mount must not be nested beneath \/run\/sandbox\/http-ca/,
+  );
+});
+
 test("defineSandbox rejects non-image rootfs objects", () => {
   assert.throws(
     () => defineSandbox({

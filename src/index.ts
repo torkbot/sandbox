@@ -2694,6 +2694,9 @@ function validateSandboxBootOptions(options: SandboxBootOptions): void {
     mountPaths.add(path);
   }
   if (blockDevice !== undefined && blockDevicePath !== undefined) {
+    if (guestPathIsStrictAncestor("/run/sandbox/http-ca", blockDevicePath)) {
+      throw new Error(`invalid sandbox boot options: block device mount must not be nested beneath /run/sandbox/http-ca: ${blockDevicePath}`);
+    }
     const parent = [...mountPaths].find((path) => (
       path !== blockDevicePath && guestPathIsStrictAncestor(path, blockDevicePath)
     ));

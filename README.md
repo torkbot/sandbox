@@ -719,9 +719,10 @@ closure was requested or unexpected.
 
 Blob-backed devices currently use ext4, are writable, are single-use, and are
 limited to one per sandbox. Their mount path cannot be nested beneath another
-mount, though other mounts may be nested beneath the block device. Provider
-credentials remain in the native host and are not mounted into the guest.
-Supported provider and authentication shapes are:
+mount or beneath `/run/sandbox/http-ca`, though other mounts may be nested
+beneath the block device. Provider credentials remain in the native host and
+are not mounted into the guest. Supported provider and authentication shapes
+are:
 
 - `local`: absolute `path`, with no authentication. Intended for development
   and testing.

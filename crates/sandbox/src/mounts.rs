@@ -45,14 +45,22 @@ impl MountTable {
 
         if let Some(block_path) = table.iter().find_map(|(path, mount)| {
             (mount == &PlannedMount::BlockDevice).then_some(path.as_str())
-        }) && table.keys().any(|path| {
-            let parent = Path::new(path);
-            let block = Path::new(block_path);
-            parent != block && block.starts_with(parent)
         }) {
-            return Err(MountError::new(format!(
-                "block device mount must not be nested beneath another mount: {block_path}"
-            )));
+            let block = Path::new(block_path);
+            let http_ca = Path::new("/run/sandbox/http-ca");
+            if block != http_ca && block.starts_with(http_ca) {
+                return Err(MountError::new(format!(
+                    "block device mount must not be nested beneath /run/sandbox/http-ca: {block_path}"
+                )));
+            }
+            if table.keys().any(|path| {
+                let parent = Path::new(path);
+                parent != block && block.starts_with(parent)
+            }) {
+                return Err(MountError::new(format!(
+                    "block device mount must not be nested beneath another mount: {block_path}"
+                )));
+            }
         }
 
         Ok(Self { mounts: table })
@@ -189,6 +197,19 @@ mod tests {
         assert_eq!(
             table.get("/workspace/cache"),
             Some(&PlannedMount::VirtualFs)
+        );
+    }
+
+    #[test]
+    fn rejects_block_device_beneath_internal_http_ca_mount() {
+        let err = MountTable::plan(&[MountSpec::BlockDevice {
+            path: "/run/sandbox/http-ca/state".to_string(),
+        }])
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "block device mount must not be nested beneath /run/sandbox/http-ca: /run/sandbox/http-ca/state"
         );
     }
 }

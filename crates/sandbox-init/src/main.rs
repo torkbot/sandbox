@@ -946,9 +946,7 @@ fn mount_configured_block(
 }
 
 fn block_mount_after_http_ca(path: &str) -> bool {
-    normalized_mount_path(path).is_some_and(|path| {
-        path == "/run/sandbox/http-ca" || path.starts_with("/run/sandbox/http-ca/")
-    })
+    normalized_mount_path(path).as_deref() == Some("/run/sandbox/http-ca")
 }
 
 #[cfg(target_os = "linux")]
@@ -3522,9 +3520,9 @@ mod tests {
     }
 
     #[test]
-    fn block_mounts_at_or_below_internal_http_ca_are_delayed() {
+    fn block_mount_at_internal_http_ca_is_delayed() {
         assert!(super::block_mount_after_http_ca("/run/sandbox/http-ca"));
-        assert!(super::block_mount_after_http_ca(
+        assert!(!super::block_mount_after_http_ca(
             "/run/sandbox/http-ca/state"
         ));
         assert!(!super::block_mount_after_http_ca("/run/sandbox"));
