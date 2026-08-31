@@ -9,7 +9,6 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use bson::Document;
-use futures_util::TryStreamExt;
 use sandbox::block_storage::{CowBlockStore, format_empty_ext4};
 use sandbox::runtime::BlockDeviceService;
 use serde::{Deserialize, Serialize};
@@ -63,44 +62,34 @@ impl BlobBlockVolume {
             },
         };
 
-        let ready_path = volume_root.clone().join("metadata.json");
-        let provisioning_path = volume_root.clone().join("provisioning.json");
-        let db_path = volume_root.join("data");
-        let ready = runtime.block_on(read_json::<VolumeMetadata>(&provider.store, &ready_path))?;
-        let db = if let Some(ready) = ready {
-            ready.validate(size_bytes)?;
-            // Opening a writer claims a new SlateDB epoch and fences every older
-            // handle before returning, including a holder replaced after lease expiry.
-            runtime.block_on(Db::open(db_path, provider.store.clone()))?
-        } else {
-            let provisioning = runtime
-                .block_on(read_json::<ProvisioningMetadata>(
-                    &provider.store,
-                    &provisioning_path,
-                ))?
-                .unwrap_or_else(ProvisioningMetadata::new);
-            runtime.block_on(put_json_create_if_absent(
-                &provider.store,
-                &provisioning_path,
-                &provisioning,
+        let metadata_path = volume_root.clone().join("metadata.json");
+        let metadata =
+            runtime.block_on(read_json::<VolumeMetadata>(&provider.store, &metadata_path))?;
+        lease.revalidate()?;
+        let db = if let Some(metadata) = metadata {
+            metadata.validate(size_bytes)?;
+            let db = runtime.block_on(Db::open(
+                volume_root.join("data").join(metadata.generation.as_str()),
+                provider.store.clone(),
             ))?;
-            runtime.block_on(clear_prefix(&provider.store, &db_path))?;
-            let db = runtime.block_on(Db::open(db_path, provider.store.clone()))?;
+            lease.revalidate()?;
+            db
+        } else {
+            let metadata = VolumeMetadata::new(size_bytes);
+            // ponytail: interrupted provisioning can leave an unreachable generation;
+            // add provider garbage collection when volume deletion is introduced.
+            let db = runtime.block_on(Db::open(
+                volume_root.join("data").join(metadata.generation.as_str()),
+                provider.store.clone(),
+            ))?;
             let store = Arc::new(SlateDbBlockStore::new(
                 runtime.clone(),
                 db.clone(),
                 size_bytes,
             ));
-            format_empty_ext4(store, size_bytes, provisioning.fs_uuid)?;
-            runtime.block_on(put_json_create(
-                &provider.store,
-                &ready_path,
-                &VolumeMetadata {
-                    version: 1,
-                    size_bytes,
-                    fs_uuid: provisioning.fs_uuid,
-                },
-            ))?;
+            format_empty_ext4(store, size_bytes, metadata.fs_uuid)?;
+            runtime.block_on(put_json_create(&provider.store, &metadata_path, &metadata))?;
+            lease.revalidate()?;
             db
         };
         let store = Arc::new(SlateDbBlockStore::new(runtime, db, size_bytes));
@@ -432,6 +421,22 @@ impl ProviderStore {
 enum VolumeLease {
     Local { _lease: LocalLease },
     Object { _lease: ObjectLease },
+}
+
+impl VolumeLease {
+    fn revalidate(&self) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            Self::Local { .. } => Ok(()),
+            Self::Object { _lease } => {
+                _lease
+                    .runtime
+                    .block_on(_lease.state.renew())
+                    .map_err(|error| {
+                        format!("block volume lease lost during acquisition: {error}").into()
+                    })
+            }
+        }
+    }
 }
 
 struct LocalLease {
@@ -774,9 +779,24 @@ struct VolumeMetadata {
     version: u32,
     size_bytes: u64,
     fs_uuid: [u8; 16],
+    generation: String,
 }
 
 impl VolumeMetadata {
+    fn new(size_bytes: u64) -> Self {
+        let first = bson::oid::ObjectId::new().bytes();
+        let second = bson::oid::ObjectId::new().bytes();
+        let mut fs_uuid = [0; 16];
+        fs_uuid[..12].copy_from_slice(&first);
+        fs_uuid[12..].copy_from_slice(&second[..4]);
+        Self {
+            version: 1,
+            size_bytes,
+            fs_uuid,
+            generation: bson::oid::ObjectId::new().to_hex(),
+        }
+    }
+
     fn validate(&self, requested_size: u64) -> Result<(), Box<dyn std::error::Error>> {
         if self.version != 1 {
             return Err(format!("unsupported blob block volume version: {}", self.version).into());
@@ -788,24 +808,12 @@ impl VolumeMetadata {
             )
             .into());
         }
+        if self.generation.len() != 24
+            || !self.generation.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("invalid blob block volume generation".into());
+        }
         Ok(())
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ProvisioningMetadata {
-    fs_uuid: [u8; 16],
-}
-
-impl ProvisioningMetadata {
-    fn new() -> Self {
-        let first = bson::oid::ObjectId::new().bytes();
-        let second = bson::oid::ObjectId::new().bytes();
-        let mut fs_uuid = [0; 16];
-        fs_uuid[..12].copy_from_slice(&first);
-        fs_uuid[12..].copy_from_slice(&second[..4]);
-        Self { fs_uuid }
     }
 }
 
@@ -832,37 +840,6 @@ async fn put_json_create<T: Serialize>(
             PutMode::Create.into(),
         )
         .await?;
-    Ok(())
-}
-
-async fn put_json_create_if_absent<T: Serialize>(
-    store: &Arc<dyn ObjectStore>,
-    path: &Path,
-    value: &T,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match put_json_create(store, path, value).await {
-        Ok(()) => Ok(()),
-        Err(error)
-            if error
-                .downcast_ref::<slatedb::object_store::Error>()
-                .is_some_and(|error| {
-                    matches!(error, slatedb::object_store::Error::AlreadyExists { .. })
-                }) =>
-        {
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
-}
-
-async fn clear_prefix(
-    store: &Arc<dyn ObjectStore>,
-    prefix: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut objects = store.list(Some(prefix));
-    while let Some(object) = objects.try_next().await? {
-        store.delete(&object.location).await?;
-    }
     Ok(())
 }
 
@@ -939,7 +916,7 @@ mod tests {
     use slatedb::{CloseReason, Db, ErrorKind};
     use tokio::runtime::Runtime;
 
-    use super::{BlobBlockVolume, ObjectLease, lease_is_expired};
+    use super::{BlobBlockVolume, ObjectLease, VolumeMetadata, lease_is_expired};
 
     const TEST_SIZE: u64 = 64 * 1024 * 1024;
 
@@ -1037,6 +1014,18 @@ mod tests {
         assert!(!lease_is_expired(1_000, 30_999));
         assert!(lease_is_expired(1_000, 31_000));
         assert!(!lease_is_expired(31_000, 1_000));
+    }
+
+    #[test]
+    fn provisioning_attempts_use_isolated_generations() {
+        let first = VolumeMetadata::new(TEST_SIZE);
+        let second = VolumeMetadata::new(TEST_SIZE);
+
+        assert_ne!(first.generation, second.generation);
+        first.validate(TEST_SIZE).expect("validate first metadata");
+        second
+            .validate(TEST_SIZE)
+            .expect("validate second metadata");
     }
 
     #[test]
