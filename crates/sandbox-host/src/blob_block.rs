@@ -720,10 +720,20 @@ impl ObjectLeaseState {
 
     async fn renew(&self) -> Result<(), Box<dyn std::error::Error>> {
         let mut record = self.record.lock().await;
+        let metadata = record.metadata.clone();
+        self.update_document(&mut record, false, metadata).await
+    }
+
+    async fn update_document(
+        &self,
+        record: &mut ObjectLeaseRecord,
+        released: bool,
+        metadata: Option<VolumeMetadata>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let payload = serde_json::to_vec(&LeaseDocument {
             owner: self.owner.clone(),
-            released: false,
-            metadata: record.metadata.clone(),
+            released,
+            metadata,
         })?;
         let result = match self
             .store
@@ -766,41 +776,16 @@ impl ObjectLeaseState {
         metadata: VolumeMetadata,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut record = self.record.lock().await;
-        let payload = serde_json::to_vec(&LeaseDocument {
-            owner: self.owner.clone(),
-            released: false,
-            metadata: Some(metadata.clone()),
-        })?;
-        let result = self
-            .store
-            .put_opts(
-                &self.path,
-                payload.into(),
-                PutMode::Update(record.version.clone()).into(),
-            )
+        self.update_document(&mut record, false, Some(metadata.clone()))
             .await?;
-        record.version = UpdateVersion::from(result);
         record.metadata = Some(metadata);
         Ok(())
     }
 
     async fn release(&self) -> Result<(), Box<dyn std::error::Error>> {
         let mut record = self.record.lock().await;
-        let payload = serde_json::to_vec(&LeaseDocument {
-            owner: self.owner.clone(),
-            released: true,
-            metadata: record.metadata.clone(),
-        })?;
-        let result = self
-            .store
-            .put_opts(
-                &self.path,
-                payload.into(),
-                PutMode::Update(record.version.clone()).into(),
-            )
-            .await?;
-        record.version = UpdateVersion::from(result);
-        Ok(())
+        let metadata = record.metadata.clone();
+        self.update_document(&mut record, true, metadata).await
     }
 }
 
@@ -1210,6 +1195,18 @@ mod tests {
             competing.to_string(),
             "block volume workspace is already leased"
         );
+        runtime.block_on(async {
+            let current = store.get(&path).await.expect("read current lease");
+            let version = UpdateVersion {
+                e_tag: current.meta.e_tag.clone(),
+                version: current.meta.version.clone(),
+            };
+            let payload = current.bytes().await.expect("read lease bytes");
+            store
+                .put_opts(&path, payload.into(), PutMode::Update(version).into())
+                .await
+                .expect("simulate renewal with a lost response");
+        });
         drop(first);
 
         let reacquired = acquire().expect("reacquire released object lease");
