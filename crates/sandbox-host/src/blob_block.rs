@@ -6,7 +6,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, mpsc};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use bson::Document;
 use futures_util::TryStreamExt;
@@ -524,9 +524,11 @@ impl ObjectLease {
             Ok(result) => {
                 let meta = result.meta.clone();
                 let existing: LeaseDocument = serde_json::from_slice(&result.bytes().await?)?;
-                let age_ms = now_millis().saturating_sub(meta.last_modified.timestamp_millis());
-                if !existing.released && age_ms < LEASE_DURATION.as_millis() as i64 {
-                    return Err(format!("block volume {volume} is already leased").into());
+                if !existing.released {
+                    let server_now = object_store_now_millis(&store, &path).await?;
+                    if !lease_is_expired(meta.last_modified.timestamp_millis(), server_now) {
+                        return Err(format!("block volume {volume} is already leased").into());
+                    }
                 }
                 let prior = UpdateVersion {
                     e_tag: meta.e_tag,
@@ -577,6 +579,23 @@ impl ObjectLease {
             task: Some(task),
         })
     }
+}
+
+async fn object_store_now_millis(
+    store: &Arc<dyn ObjectStore>,
+    lease_path: &Path,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let probe_path = Path::from(format!("{lease_path}.clock"));
+    store.put(&probe_path, Vec::<u8>::new().into()).await?;
+    Ok(store
+        .head(&probe_path)
+        .await?
+        .last_modified
+        .timestamp_millis())
+}
+
+fn lease_is_expired(last_modified_ms: i64, server_now_ms: i64) -> bool {
+    server_now_ms.saturating_sub(last_modified_ms) >= LEASE_DURATION.as_millis() as i64
 }
 
 impl ObjectLeaseState {
@@ -854,14 +873,6 @@ fn block_key(index: u64) -> [u8; 9] {
     key
 }
 
-fn now_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(i64::MAX as u128) as i64
-}
-
 fn validate_volume(volume: &str) -> Result<(), Box<dyn std::error::Error>> {
     if volume.is_empty()
         || volume.len() > 128
@@ -928,7 +939,7 @@ mod tests {
     use slatedb::{CloseReason, Db, ErrorKind};
     use tokio::runtime::Runtime;
 
-    use super::{BlobBlockVolume, ObjectLease};
+    use super::{BlobBlockVolume, ObjectLease, lease_is_expired};
 
     const TEST_SIZE: u64 = 64 * 1024 * 1024;
 
@@ -1019,6 +1030,13 @@ mod tests {
 
         let reacquired = acquire().expect("reacquire released object lease");
         drop(reacquired);
+    }
+
+    #[test]
+    fn lease_expiry_uses_provider_timestamps() {
+        assert!(!lease_is_expired(1_000, 30_999));
+        assert!(lease_is_expired(1_000, 31_000));
+        assert!(!lease_is_expired(31_000, 1_000));
     }
 
     #[test]
