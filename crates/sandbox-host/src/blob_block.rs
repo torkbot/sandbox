@@ -5,6 +5,7 @@ use std::future::Future;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::{Path as FsPath, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
@@ -29,6 +30,10 @@ use tokio::task::JoinHandle;
 const BLOCK_SIZE: u64 = 64 * 1024;
 const LEASE_DURATION: Duration = Duration::from_secs(30);
 const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(10);
+const LEASE_RENEW_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const LEASE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const LEASE_RENEW_DEADLINE: Duration = Duration::from_secs(25);
+const LEASE_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct BlobBlockVolume {
     store: Arc<SlateDbBlockStore>,
@@ -562,6 +567,7 @@ struct ObjectLeaseState {
     path: Path,
     owner: String,
     record: tokio::sync::Mutex<ObjectLeaseRecord>,
+    ownership_lost: AtomicBool,
 }
 
 struct ObjectLeaseRecord {
@@ -639,16 +645,38 @@ impl ObjectLease {
             path,
             owner,
             record: tokio::sync::Mutex::new(ObjectLeaseRecord { version, metadata }),
+            ownership_lost: AtomicBool::new(false),
         });
         let (stop, mut stopped) = watch::channel(false);
         let renewal_state = state.clone();
         let task = runtime.spawn(async move {
+            let mut last_renewed = tokio::time::Instant::now();
+            let mut next_renewal = LEASE_RENEW_INTERVAL;
             loop {
                 tokio::select! {
-                    _ = tokio::time::sleep(LEASE_RENEW_INTERVAL) => {
-                        if let Err(error) = renewal_state.renew().await {
-                            eprintln!("sandbox-host: blob block lease renewal failed: {error}");
-                            std::process::exit(1);
+                    _ = tokio::time::sleep(next_renewal) => {
+                        match tokio::time::timeout(LEASE_REQUEST_TIMEOUT, renewal_state.renew()).await {
+                            Ok(Ok(())) => {
+                                last_renewed = tokio::time::Instant::now();
+                                next_renewal = LEASE_RENEW_INTERVAL;
+                            }
+                            result => {
+                                let error = match result {
+                                    Ok(Err(error)) => error.to_string(),
+                                    Err(_) => "request timed out".to_string(),
+                                    Ok(Ok(())) => unreachable!(),
+                                };
+                                if renewal_state.ownership_lost.load(Ordering::Relaxed) {
+                                    eprintln!("sandbox-host: blob block lease ownership was lost: {error}");
+                                    std::process::exit(1);
+                                }
+                                if last_renewed.elapsed() >= LEASE_RENEW_DEADLINE {
+                                    eprintln!("sandbox-host: blob block lease could not be renewed before its safety deadline: {error}");
+                                    std::process::exit(1);
+                                }
+                                eprintln!("sandbox-host: blob block lease renewal failed; retrying: {error}");
+                                next_renewal = LEASE_RENEW_RETRY_INTERVAL;
+                            }
                         }
                     }
                     changed = stopped.changed() => {
@@ -697,14 +725,38 @@ impl ObjectLeaseState {
             released: false,
             metadata: record.metadata.clone(),
         })?;
-        let result = self
+        let result = match self
             .store
             .put_opts(
                 &self.path,
-                payload.into(),
+                payload.clone().into(),
                 PutMode::Update(record.version.clone()).into(),
             )
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(slatedb::object_store::Error::Precondition { .. }) => {
+                let current = self.store.get(&self.path).await?;
+                let current_meta = current.meta.clone();
+                let document: LeaseDocument = serde_json::from_slice(&current.bytes().await?)?;
+                if document.released || document.owner != self.owner {
+                    self.ownership_lost.store(true, Ordering::Relaxed);
+                    return Err("blob block lease ownership was lost".into());
+                }
+                record.version = UpdateVersion {
+                    e_tag: current_meta.e_tag,
+                    version: current_meta.version,
+                };
+                self.store
+                    .put_opts(
+                        &self.path,
+                        payload.into(),
+                        PutMode::Update(record.version.clone()).into(),
+                    )
+                    .await?
+            }
+            Err(error) => return Err(error.into()),
+        };
         record.version = UpdateVersion::from(result);
         Ok(())
     }
@@ -755,10 +807,20 @@ impl ObjectLeaseState {
 impl Drop for ObjectLease {
     fn drop(&mut self) {
         let _ = self.stop.send(true);
-        if let Some(task) = self.task.take() {
-            let _ = self.runtime.block_on(task);
+        if let Some(mut task) = self.task.take() {
+            self.runtime.block_on(async {
+                if tokio::time::timeout(LEASE_CLOSE_TIMEOUT, &mut task)
+                    .await
+                    .is_err()
+                {
+                    task.abort();
+                    let _ = task.await;
+                }
+            });
         }
-        let _ = self.runtime.block_on(self.state.release());
+        let _ = self.runtime.block_on(async {
+            tokio::time::timeout(LEASE_CLOSE_TIMEOUT, self.state.release()).await
+        });
     }
 }
 
@@ -1044,6 +1106,7 @@ fn require_string(value: &str, field: &str) -> Result<(), Box<dyn std::error::Er
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
 
     use bson::doc;
 
@@ -1052,6 +1115,7 @@ mod tests {
     use slatedb::Db;
     use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::path::Path as ObjectPath;
+    use slatedb::object_store::throttle::{ThrottleConfig, ThrottledStore};
     use slatedb::object_store::{ObjectStore, ObjectStoreExt};
     use slatedb::object_store::{PutMode, UpdateVersion};
     use tokio::runtime::Runtime;
@@ -1199,6 +1263,42 @@ mod tests {
             assert!(document.metadata.is_none());
         });
         drop(first);
+    }
+
+    #[test]
+    fn object_lease_close_aborts_a_stuck_renewal() {
+        let runtime = Arc::new(Runtime::new().expect("create object lease test runtime"));
+        let throttled = Arc::new(ThrottledStore::new(
+            InMemory::new(),
+            ThrottleConfig::default(),
+        ));
+        let store = throttled.clone() as Arc<dyn ObjectStore>;
+        let path = ObjectPath::from("volumes/workspace/lease.json");
+        let mut lease = runtime
+            .block_on(ObjectLease::acquire(
+                runtime.clone(),
+                store,
+                path,
+                "workspace".to_string(),
+            ))
+            .expect("acquire object lease");
+        lease.stop.send(true).expect("stop normal renewal task");
+        runtime
+            .block_on(lease.task.take().expect("normal renewal task"))
+            .expect("join normal renewal task");
+
+        throttled.config_mut(|config| {
+            config.wait_put_per_call = Duration::from_secs(30);
+        });
+        let state = lease.state.clone();
+        lease.task = Some(runtime.spawn(async move {
+            let _ = state.renew().await;
+        }));
+        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(50)).await });
+
+        let started_at = Instant::now();
+        drop(lease);
+        assert!(started_at.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
