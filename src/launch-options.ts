@@ -4,6 +4,7 @@ import type {
   NetworkConnectionRequestHandler,
   SandboxBlockStore,
   SandboxBlockStoreContext,
+  SandboxBlockDevice,
 } from "./index.ts";
 
 export interface SandboxHttpRequestSelector {
@@ -66,6 +67,11 @@ export type InternalMount =
           readonly access: "rw";
         };
       };
+    }
+  | {
+      readonly kind: "block-device";
+      readonly path: string;
+      readonly device: SandboxBlockDevice;
     };
 
 export interface InternalSandboxOptions {

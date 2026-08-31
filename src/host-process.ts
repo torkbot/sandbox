@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { Binary, BSON } from "bson";
 import { hostBinaryPath, macosHostSigningError } from "./artifacts.ts";
 import type { HostControlChannel } from "./control.ts";
-import type { HostSpawnSandboxOptions } from "./spawn-options.ts";
+import type { HostBlobBlockAcquireOptions, HostSpawnSandboxOptions } from "./spawn-options.ts";
 import { isSandboxWritableFileSystem } from "./vfs.ts";
 import type {
   SandboxFileSystem,
@@ -35,25 +35,53 @@ import type {
 } from "./index.ts";
 
 const DEFAULT_LAUNCH_TIMEOUT_MS = 60_000;
+const FAILED_ACQUISITION_CLOSE_GRACE_MS = 2_000;
+const BLOB_BLOCK_CLOSE_GRACE_MS = 5_000;
+
+export type SandboxBlockDeviceErrorCode =
+  | "volume-locked"
+  | "volume-mismatch"
+  | "authentication-failed"
+  | "provider-error"
+  | "lease-lost"
+  | "lease-authentication-failed"
+  | "lease-provider-error"
+  | "storage-error"
+  | "host-error";
+
+export class SandboxBlockDeviceError extends Error {
+  readonly code: SandboxBlockDeviceErrorCode;
+  readonly retryAfterMs?: number;
+
+  constructor(code: SandboxBlockDeviceErrorCode, message: string, retryAfterMs?: number) {
+    super(message);
+    this.name = "SandboxBlockDeviceError";
+    this.code = code;
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+export type SandboxBlockDeviceClosed =
+  | { readonly reason: "closed" }
+  | { readonly reason: "failed"; readonly error: SandboxBlockDeviceError };
 
 export class HostProcessSandboxVm implements HostControlChannel {
   readonly hasControlSocket = true;
   readonly packets: AsyncIterable<Uint8Array>;
+  readonly closed: Promise<void>;
+  readonly blockDeviceClosed: Promise<SandboxBlockDeviceClosed>;
 
   readonly #child: ChildProcessWithoutNullStreams;
-  readonly #options: InternalSandboxOptions;
   readonly #packets = new AsyncQueue<Uint8Array>();
   readonly #packetActivity = new AsyncSignal();
   readonly #launchReady = new AsyncSignal("sandbox-host launch acknowledgement closed");
   readonly #hostFs = new Map<string, SandboxFileSystem>();
-  readonly #rootBlockStore?: SandboxBlockStore;
-  readonly #rootBlockStoreContext?: SandboxBlockStoreContext;
   readonly #blockStores = new Map<string, {
     readonly blockStore: SandboxBlockStore;
     readonly context: SandboxBlockStoreContext;
   }>();
-  readonly #requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook>;
-  readonly #networkConnectionHook?: RegisteredNetworkConnectionHook;
+  #requestHeaderHooks = new Map<string, RegisteredHttpRequestHeadersHook>();
+  #networkConnectionHook?: RegisteredNetworkConnectionHook;
   readonly #httpMiddlewareByFlow = new Map<string, HttpRequestMiddleware | undefined>();
   readonly #consoleOutputPath?: string;
   readonly #consoleOutputCleanupPath?: string;
@@ -62,39 +90,29 @@ export class HostProcessSandboxVm implements HostControlChannel {
   #closed = false;
   #exitError: Error | null = null;
   #stdinError: Error | null = null;
+  #configured = false;
+  #spawnSent = false;
+  #mayHoldBlobBlockLease = false;
+  #resolveClosed!: () => void;
+  #pendingBlockDeviceClosure?: SandboxBlockDeviceClosed;
+  #blockDeviceClosure?: SandboxBlockDeviceClosed;
+  #resolveBlockDeviceClosed!: (closure: SandboxBlockDeviceClosed) => void;
 
   private constructor(
     child: ChildProcessWithoutNullStreams,
-    options: InternalSandboxOptions,
-    requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook>,
-    networkConnectionHook?: RegisteredNetworkConnectionHook,
     consoleOutputPath?: string,
     consoleOutputCleanupPath?: string,
   ) {
     this.#child = child;
-    this.#options = options;
     this.packets = this.#packets;
-    this.#requestHeaderHooks = requestHeaderHooks;
-    this.#networkConnectionHook = networkConnectionHook;
+    this.closed = new Promise((resolve) => {
+      this.#resolveClosed = resolve;
+    });
+    this.blockDeviceClosed = new Promise((resolve) => {
+      this.#resolveBlockDeviceClosed = resolve;
+    });
     this.#consoleOutputPath = consoleOutputPath;
     this.#consoleOutputCleanupPath = consoleOutputCleanupPath;
-    this.#rootBlockStore = options.rootfs.storage?.kind === "cow-block-store"
-      ? options.rootfs.storage.blockStore
-      : undefined;
-    this.#rootBlockStoreContext = options.rootfs.storage?.kind === "cow-block-store"
-      ? options.rootfs.storage.context
-      : undefined;
-    if (this.#rootBlockStore !== undefined && this.#rootBlockStoreContext !== undefined) {
-      this.#blockStores.set("host.block", {
-        blockStore: this.#rootBlockStore,
-        context: this.#rootBlockStoreContext,
-      });
-    }
-    for (const mount of options.mounts ?? []) {
-      if (mount.kind === "virtual-fs") {
-        this.#hostFs.set(mount.path, mount.fileSystem);
-      }
-    }
     child.stdout.on("data", (chunk: Buffer) => {
       this.#receive(chunk);
     });
@@ -114,7 +132,9 @@ export class HostProcessSandboxVm implements HostControlChannel {
       }
     });
     child.on("exit", (code, signal) => {
+      this.#resolveClosed();
       if (this.#closed) {
+        this.#cleanupConsoleOutput();
         return;
       }
 
@@ -130,6 +150,21 @@ export class HostProcessSandboxVm implements HostControlChannel {
       this.#packetActivity.close(this.#exitError);
       this.#launchReady.close(this.#exitError);
     });
+    child.on("close", (code, signal) => {
+      if (this.#mayHoldBlobBlockLease && this.#blockDeviceClosure === undefined) {
+        this.#settleBlockDeviceClosed(
+          this.#pendingBlockDeviceClosure ?? {
+            reason: "failed",
+            error: new SandboxBlockDeviceError(
+              "host-error",
+              signal === null
+                ? `sandbox-host exited with ${code ?? "unknown status"}`
+                : `sandbox-host exited from signal ${signal}`,
+            ),
+          },
+        );
+      }
+    });
   }
 
   static async spawn(
@@ -138,8 +173,50 @@ export class HostProcessSandboxVm implements HostControlChannel {
     requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook> = new Map(),
     networkConnectionHook?: RegisteredNetworkConnectionHook,
   ): Promise<HostProcessSandboxVm> {
-    let vm: HostProcessSandboxVm | undefined;
+    const vm = await HostProcessSandboxVm.#start();
+    try {
+      return await vm.attach(
+        options,
+        hostOptions,
+        requestHeaderHooks,
+        networkConnectionHook,
+      );
+    } catch (error) {
+      await vm.close();
+      throw error;
+    }
+  }
+
+  static async acquireBlobBlock(
+    options: HostBlobBlockAcquireOptions,
+  ): Promise<HostProcessSandboxVm> {
+    const vm = await HostProcessSandboxVm.#start();
+    try {
+      const response = vm.#nextPacket();
+      vm.#mayHoldBlobBlockLease = true;
+      vm.#writeToHost(encodeHostBlobBlockAcquire(options));
+      const packet = await response;
+      const document = BSON.deserialize(packet.slice(4)) as Record<string, unknown>;
+      if (document.type !== "host.block.acquire.result") {
+        throw new Error("sandbox-host returned an invalid blob block acquisition response");
+      }
+      if (document.ok !== true) {
+        throw new SandboxBlockDeviceError(
+          parseBlockDeviceErrorCode(document.code),
+          typeof document.error === "string" ? document.error : "sandbox-host blob block acquisition failed",
+          parseRetryAfterMs(document.retryAfterMs),
+        );
+      }
+      return vm;
+    } catch (error) {
+      await vm.#closeFailedBlobBlockAcquisition();
+      throw error;
+    }
+  }
+
+  static async #start(): Promise<HostProcessSandboxVm> {
     const hostPath = hostBinaryPath();
+    let vm: HostProcessSandboxVm | undefined;
     try {
       const consoleOutput = launchConsoleOutput();
       const child = spawn(hostPath, ["--stdio"], {
@@ -151,9 +228,6 @@ export class HostProcessSandboxVm implements HostControlChannel {
       });
       vm = new HostProcessSandboxVm(
         child,
-        options,
-        requestHeaderHooks,
-        networkConnectionHook,
         consoleOutput?.path,
         consoleOutput?.cleanupPath,
       );
@@ -163,8 +237,6 @@ export class HostProcessSandboxVm implements HostControlChannel {
           throw error;
         }),
       ]);
-      vm.#writeToHost(encodeHostSpawn(hostOptions));
-      await vm.#waitForLaunch();
       return vm;
     } catch (error) {
       await vm?.close();
@@ -172,6 +244,27 @@ export class HostProcessSandboxVm implements HostControlChannel {
       if (signingError !== null) {
         throw signingError;
       }
+      throw error;
+    }
+  }
+
+  async attach(
+    options: InternalSandboxOptions,
+    hostOptions: HostSpawnSandboxOptions,
+    requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook> = new Map(),
+    networkConnectionHook?: RegisteredNetworkConnectionHook,
+  ): Promise<HostProcessSandboxVm> {
+    if (this.#spawnSent) {
+      throw new Error("sandbox block device has already been attached");
+    }
+    this.#configure(options, requestHeaderHooks, networkConnectionHook);
+    this.#spawnSent = true;
+    try {
+      this.#writeToHost(encodeHostSpawn(hostOptions));
+      await this.#waitForLaunch();
+      return this;
+    } catch (error) {
+      await this.close();
       throw error;
     }
   }
@@ -191,12 +284,6 @@ export class HostProcessSandboxVm implements HostControlChannel {
     });
     const host = new HostProcessSandboxVm(
       child,
-      {
-        hostname: "flatten-qcow2",
-        cwd: "/",
-        rootfs: { path: input.basePath, readonly: true, format: "qcow2" },
-      },
-      new Map(),
     );
     host.#blockStores.set("host.block.source", {
       blockStore: input.overlay,
@@ -275,26 +362,48 @@ export class HostProcessSandboxVm implements HostControlChannel {
       ? Promise.resolve()
       : once(this.#child, "exit").then(() => undefined);
 
-    this.#child.stdin.destroy();
-    this.#child.kill("SIGTERM");
-    await Promise.race([
-      exited,
-      delay(500),
-    ]);
-
     try {
+      this.#child.stdin.end();
+      await Promise.race([
+        exited,
+        delay(this.#mayHoldBlobBlockLease ? BLOB_BLOCK_CLOSE_GRACE_MS : 500),
+      ]);
       if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
         return;
       }
 
-      this.#child.kill("SIGKILL");
+      this.#child.kill("SIGTERM");
       await Promise.race([
         exited,
-        delay(1_000),
+        delay(500),
       ]);
+      if (this.#child.exitCode === null && this.#child.signalCode === null) {
+        this.#child.kill("SIGKILL");
+        await Promise.race([
+          exited,
+          delay(1_000),
+        ]);
+      }
     } finally {
       this.#cleanupConsoleOutput();
     }
+  }
+
+  async #closeFailedBlobBlockAcquisition(): Promise<void> {
+    const closing = this.close();
+    await Promise.race([closing, delay(FAILED_ACQUISITION_CLOSE_GRACE_MS)]);
+    if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
+      return;
+    }
+
+    this.#child.kill("SIGTERM");
+    await Promise.race([closing, delay(500)]);
+    if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
+      return;
+    }
+
+    this.#child.kill("SIGKILL");
+    await Promise.race([closing, delay(1_000)]);
   }
 
   async terminateHostForTest(): Promise<void> {
@@ -326,6 +435,47 @@ export class HostProcessSandboxVm implements HostControlChannel {
     if (this.#exitError !== null) {
       throw this.#exitError;
     }
+  }
+
+  #configure(
+    options: InternalSandboxOptions,
+    requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook>,
+    networkConnectionHook?: RegisteredNetworkConnectionHook,
+  ): void {
+    if (this.#configured) {
+      throw new Error("sandbox-host process is already configured");
+    }
+    this.#configured = true;
+    this.#requestHeaderHooks = requestHeaderHooks;
+    this.#networkConnectionHook = networkConnectionHook;
+    if (options.rootfs.storage?.kind === "cow-block-store") {
+      this.#blockStores.set("host.block", {
+        blockStore: options.rootfs.storage.blockStore,
+        context: options.rootfs.storage.context,
+      });
+    }
+    for (const mount of options.mounts ?? []) {
+      if (mount.kind === "virtual-fs") {
+        this.#hostFs.set(mount.path, mount.fileSystem);
+      }
+    }
+  }
+
+  async #nextPacket(): Promise<Uint8Array> {
+    const next = this.#packets[Symbol.asyncIterator]().next();
+    const result = await Promise.race([
+      next,
+      once(this.#child, "close").then(() => {
+        throw this.#exitError ?? new Error("sandbox-host exited before responding");
+      }),
+      unrefDelay(launchTimeoutMs()).then(() => {
+        throw new Error("sandbox-host did not respond before the launch timeout");
+      }),
+    ]);
+    if (result.value === undefined) {
+      throw new Error("sandbox-host closed before responding");
+    }
+    return result.value;
   }
 
   #cleanupConsoleOutput(): void {
@@ -404,6 +554,10 @@ export class HostProcessSandboxVm implements HostControlChannel {
     }
 
     const type = document.type;
+    if (type === "host.block.closed") {
+      this.#handleBlockDeviceClosed(document);
+      return true;
+    }
     if (
       type !== "host.vfs.stat"
       && type !== "host.vfs.list"
@@ -469,6 +623,33 @@ export class HostProcessSandboxVm implements HostControlChannel {
       void this.#handleVirtualFsRequest(document);
     }
     return true;
+  }
+
+  #handleBlockDeviceClosed(document: Record<string, unknown>): void {
+    if (this.#pendingBlockDeviceClosure !== undefined) {
+      return;
+    }
+    if (document.reason === "closed") {
+      this.#pendingBlockDeviceClosure = { reason: "closed" };
+      return;
+    }
+    this.#pendingBlockDeviceClosure = {
+      reason: "failed",
+      error: new SandboxBlockDeviceError(
+        parseBlockDeviceErrorCode(document.code),
+        typeof document.error === "string" ? document.error : "sandbox block device failed",
+        parseRetryAfterMs(document.retryAfterMs),
+      ),
+    };
+    void this.close();
+  }
+
+  #settleBlockDeviceClosed(closure: SandboxBlockDeviceClosed): void {
+    if (this.#blockDeviceClosure !== undefined) {
+      return;
+    }
+    this.#blockDeviceClosure = closure;
+    this.#resolveBlockDeviceClosed(closure);
   }
 
   async #handleNetworkConnection(document: Record<string, unknown>): Promise<void> {
@@ -1658,6 +1839,37 @@ function encodeHostSpawn(options: HostSpawnSandboxOptions): Uint8Array {
     networkHttp: options.network?.http === undefined ? undefined : options.network.http,
     networkPolicy: options.network?.policy === undefined ? undefined : options.network.policy,
   });
+}
+
+function encodeHostBlobBlockAcquire(options: HostBlobBlockAcquireOptions): Uint8Array {
+  return encodePacket({
+    type: "host.block.acquire",
+    provider: options.provider,
+    volume: options.volume,
+    sizeBytes: options.sizeBytes.toString(),
+  });
+}
+
+function parseBlockDeviceErrorCode(value: unknown): SandboxBlockDeviceErrorCode {
+  switch (value) {
+    case "volume-locked":
+    case "volume-mismatch":
+    case "authentication-failed":
+    case "provider-error":
+    case "lease-lost":
+    case "lease-authentication-failed":
+    case "lease-provider-error":
+    case "storage-error":
+      return value;
+    default:
+      return "host-error";
+  }
+}
+
+function parseRetryAfterMs(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
 }
 
 function parseBlockStoreRequest(type: unknown): {

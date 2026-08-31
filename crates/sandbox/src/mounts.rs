@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::Path;
 
 use crate::config::MountSpec;
 
@@ -12,6 +13,7 @@ pub struct MountTable {
 pub enum PlannedMount {
     VirtualFs,
     HostDirectory,
+    BlockDevice,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,14 +31,40 @@ impl MountTable {
                 MountSpec::HostDirectory { path, .. } => {
                     (path.as_str(), PlannedMount::HostDirectory)
                 }
+                MountSpec::BlockDevice { path } => (path.as_str(), PlannedMount::BlockDevice),
             };
 
-            if path == "/" {
+            let canonical_path = Path::new(path)
+                .components()
+                .collect::<std::path::PathBuf>()
+                .to_string_lossy()
+                .into_owned();
+            if canonical_path == "/" {
                 return Err(MountError::new("mount.path must not be /"));
             }
 
-            if table.insert(path.to_string(), planned).is_some() {
+            if table.insert(canonical_path, planned).is_some() {
                 return Err(MountError::new(format!("duplicate mount path: {path}")));
+            }
+        }
+
+        if let Some(block_path) = table.iter().find_map(|(path, mount)| {
+            (mount == &PlannedMount::BlockDevice).then_some(path.as_str())
+        }) {
+            let block = Path::new(block_path);
+            let http_ca = Path::new("/run/sandbox/http-ca");
+            if block != http_ca && block.starts_with(http_ca) {
+                return Err(MountError::new(format!(
+                    "block device mount must not be nested beneath /run/sandbox/http-ca: {block_path}"
+                )));
+            }
+            if table.keys().any(|path| {
+                let parent = Path::new(path);
+                parent != block && block.starts_with(parent)
+            }) {
+                return Err(MountError::new(format!(
+                    "block device mount must not be nested beneath another mount: {block_path}"
+                )));
             }
         }
 
@@ -106,9 +134,33 @@ mod tests {
     }
 
     #[test]
+    fn rejects_canonically_duplicate_mount_paths() {
+        let err = MountTable::plan(&[
+            MountSpec::VirtualFs {
+                path: "/workspace".to_string(),
+                writable: false,
+            },
+            MountSpec::BlockDevice {
+                path: "/workspace/".to_string(),
+            },
+        ])
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "duplicate mount path: /workspace/");
+    }
+
+    #[test]
     fn rejects_mounting_over_root() {
         let err = MountTable::plan(&[MountSpec::VirtualFs {
             path: "/".to_string(),
+            writable: false,
+        }])
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "mount.path must not be /");
+
+        let err = MountTable::plan(&[MountSpec::VirtualFs {
+            path: "////".to_string(),
             writable: false,
         }])
         .unwrap_err();
@@ -135,6 +187,58 @@ mod tests {
         assert_eq!(
             table.get("/workspace/cache"),
             Some(&PlannedMount::VirtualFs)
+        );
+    }
+
+    #[test]
+    fn rejects_block_device_nested_beneath_another_mount() {
+        let err = MountTable::plan(&[
+            MountSpec::VirtualFs {
+                path: "/workspace".to_string(),
+                writable: false,
+            },
+            MountSpec::BlockDevice {
+                path: "/workspace/disk".to_string(),
+            },
+        ])
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "block device mount must not be nested beneath another mount: /workspace/disk"
+        );
+    }
+
+    #[test]
+    fn allows_mounts_nested_beneath_block_device() {
+        let table = MountTable::plan(&[
+            MountSpec::BlockDevice {
+                path: "/workspace".to_string(),
+            },
+            MountSpec::VirtualFs {
+                path: "/workspace/cache".to_string(),
+                writable: true,
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(table.get("/workspace"), Some(&PlannedMount::BlockDevice));
+        assert_eq!(
+            table.get("/workspace/cache"),
+            Some(&PlannedMount::VirtualFs)
+        );
+    }
+
+    #[test]
+    fn rejects_block_device_beneath_internal_http_ca_mount() {
+        let err = MountTable::plan(&[MountSpec::BlockDevice {
+            path: "/run/sandbox/http-ca/state".to_string(),
+        }])
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "block device mount must not be nested beneath /run/sandbox/http-ca: /run/sandbox/http-ca/state"
         );
     }
 }

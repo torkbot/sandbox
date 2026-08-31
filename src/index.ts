@@ -15,13 +15,23 @@ import { open } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { HostControlTransport } from "./control.ts";
 import { GuestFetch } from "./guest-fetch.ts";
-import { HostProcessSandboxVm } from "./host-process.ts";
+import {
+  HostProcessSandboxVm,
+  SandboxBlockDeviceError,
+  type SandboxBlockDeviceClosed,
+  type SandboxBlockDeviceErrorCode,
+} from "./host-process.ts";
 import { createMemoryFileSystem } from "./memory-fs.ts";
 import {
   isSandboxPosixFileSystem,
   isSandboxWritableFileSystem,
 } from "./vfs.ts";
-import type { HostSpawnMount, HostSpawnSandboxOptions } from "./spawn-options.ts";
+import type {
+  HostBlobBlockAcquireOptions,
+  HostBlobBlockProvider,
+  HostSpawnMount,
+  HostSpawnSandboxOptions,
+} from "./spawn-options.ts";
 import type { ControlBackedSandboxProcess, ControlBackedSandboxPty, SandboxControl } from "./control.ts";
 import type { SandboxControlEvent } from "./control-codec.ts";
 import type { Request, Response } from "undici";
@@ -58,6 +68,12 @@ export type SandboxFileStat = {
   readonly mediaType: string | null;
   readonly modifiedAtMs: number | null;
   readonly writable?: boolean;
+};
+
+export {
+  SandboxBlockDeviceError,
+  type SandboxBlockDeviceClosed,
+  type SandboxBlockDeviceErrorCode,
 };
 
 export type SandboxDirectoryEntry = {
@@ -240,7 +256,24 @@ export type SandboxReadWriteHostDirectorySource = {
 
 export type SandboxHostDirectorySource = SandboxReadOnlyHostDirectorySource | SandboxReadWriteHostDirectorySource;
 
-export type SandboxMountSource = SandboxFileSystemSource | SandboxHostDirectorySource;
+export interface SandboxBlockDeviceLifecycle {
+  /** Resolves with the reason after the device has closed. */
+  readonly closed: Promise<SandboxBlockDeviceClosed>;
+  /** Closes the device and releases its host-side resources. */
+  close(): Promise<void>;
+}
+
+export interface SandboxBlockDevice {
+  readonly kind: "block-device";
+  /** Returns lifecycle controls when the device owns host-side resources. */
+  getLifecycle?(): SandboxBlockDeviceLifecycle;
+}
+
+export type SandboxBlobBlockProvider = HostBlobBlockProvider;
+
+export type SandboxBlobBlockAcquireOptions = HostBlobBlockAcquireOptions;
+
+export type SandboxMountSource = SandboxFileSystemSource | SandboxHostDirectorySource | SandboxBlockDevice;
 
 type HostDirectorySourceForValidation = {
   readonly kind: "host-directory";
@@ -289,6 +322,194 @@ const rootfsImageStorage = new WeakMap<Qcow2RootfsImage, {
   readonly blockStore: SandboxBlockStore;
   readonly context: SandboxBlockStoreContext;
 }>();
+const blockDeviceHosts = new WeakMap<SandboxBlockDevice, HostProcessSandboxVm>();
+
+/** Native block devices backed by blob/object storage. */
+export const block = {
+  blob: {
+    /**
+     * Acquires an exclusive writer lease and returns a mountable device.
+     * An absent volume is provisioned as a sparse ext4 filesystem before
+     * this promise resolves.
+     */
+    acquire: acquireBlobBlockDevice,
+  },
+} as const;
+
+async function acquireBlobBlockDevice(
+  options: SandboxBlobBlockAcquireOptions,
+): Promise<SandboxBlockDevice> {
+  validateBlobBlockAcquireOptions(options);
+  const host = await HostProcessSandboxVm.acquireBlobBlock(options);
+  const lifecycle: SandboxBlockDeviceLifecycle = {
+    closed: host.blockDeviceClosed,
+    close: async () => {
+      await host.close();
+      const closure = await host.blockDeviceClosed;
+      if (closure.reason === "failed") {
+        throw closure.error;
+      }
+    },
+  };
+  const device: SandboxBlockDevice = {
+    kind: "block-device",
+    getLifecycle: () => lifecycle,
+  };
+  blockDeviceHosts.set(device, host);
+  return Object.freeze(device);
+}
+
+function validateBlobBlockAcquireOptions(options: SandboxBlobBlockAcquireOptions): void {
+  if (options === null || typeof options !== "object") {
+    throw new Error("invalid blob block acquisition: options are required");
+  }
+  if (
+    typeof options.volume !== "string"
+    || options.volume.length === 0
+    || options.volume.length > 128
+    || !/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(options.volume)
+  ) {
+    throw new Error("invalid blob block acquisition: volume must be 1-128 letters, digits, '.', '_', or '-'");
+  }
+  if (
+    typeof options.sizeBytes !== "bigint"
+    || options.sizeBytes < 8n * 1024n * 1024n
+    || options.sizeBytes % 4096n !== 0n
+    || options.sizeBytes > 18_446_744_073_709_551_615n
+  ) {
+    throw new Error("invalid blob block acquisition: sizeBytes must be a 4096-byte multiple between 8 MiB and u64::MAX");
+  }
+  validateBlobBlockProvider(options.provider);
+}
+
+function validateBlobBlockProvider(provider: SandboxBlobBlockProvider): void {
+  if (provider === null || typeof provider !== "object") {
+    throw new Error("invalid blob block acquisition: provider is required");
+  }
+  validateBlobPrefix(provider.prefix);
+  switch (provider.kind) {
+    case "local":
+      requireBlobString(provider.path, "provider.path");
+      if (!isAbsolute(provider.path)) {
+        throw new Error("invalid blob block acquisition: provider.path must be absolute");
+      }
+      return;
+    case "s3":
+      requireBlobString(provider.bucket, "provider.bucket");
+      requireBlobString(provider.region, "provider.region");
+      validateBlobEndpoint(provider.endpoint);
+      validateS3Auth(provider.auth);
+      return;
+    case "gcs":
+      requireBlobString(provider.bucket, "provider.bucket");
+      validateGcsAuth(provider.auth);
+      return;
+    case "azure":
+      requireBlobString(provider.account, "provider.account");
+      requireBlobString(provider.container, "provider.container");
+      validateBlobEndpoint(provider.endpoint);
+      validateAzureAuth(provider.auth);
+      return;
+    default:
+      throw new Error("invalid blob block acquisition: unsupported provider.kind");
+  }
+}
+
+function validateBlobPrefix(prefix: string | undefined): void {
+  if (prefix === undefined) {
+    return;
+  }
+  if (
+    typeof prefix !== "string"
+    || prefix.length === 0
+    || prefix.includes("\0")
+    || prefix.startsWith("/")
+    || prefix.endsWith("/")
+    || prefix.split("/").some((part) => part.length === 0 || part === "." || part === "..")
+  ) {
+    throw new Error("invalid blob block acquisition: provider.prefix must be a non-empty relative object path");
+  }
+}
+
+function validateBlobEndpoint(endpoint: string | undefined): void {
+  if (endpoint === undefined) {
+    return;
+  }
+  requireBlobString(endpoint, "provider.endpoint");
+  let url: URL;
+  try {
+    url = new URL(endpoint);
+  } catch {
+    throw new Error("invalid blob block acquisition: provider.endpoint must be an HTTP(S) URL");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("invalid blob block acquisition: provider.endpoint must be an HTTP(S) URL");
+  }
+}
+
+function validateS3Auth(auth: Extract<SandboxBlobBlockProvider, { kind: "s3" }>["auth"]): void {
+  if (auth === null || typeof auth !== "object") {
+    throw new Error("invalid blob block acquisition: provider.auth is required");
+  }
+  if (auth.kind === "environment") {
+    return;
+  }
+  if (auth.kind !== "access-key") {
+    throw new Error("invalid blob block acquisition: unsupported S3 auth.kind");
+  }
+  requireBlobString(auth.accessKeyId, "provider.auth.accessKeyId");
+  requireBlobString(auth.secretAccessKey, "provider.auth.secretAccessKey");
+  if (auth.sessionToken !== undefined) {
+    requireBlobString(auth.sessionToken, "provider.auth.sessionToken");
+  }
+}
+
+function validateGcsAuth(auth: Extract<SandboxBlobBlockProvider, { kind: "gcs" }>["auth"]): void {
+  if (auth === null || typeof auth !== "object") {
+    throw new Error("invalid blob block acquisition: provider.auth is required");
+  }
+  switch (auth.kind) {
+    case "environment":
+      return;
+    case "service-account":
+      requireBlobString(auth.key, "provider.auth.key");
+      return;
+    case "bearer-token":
+      requireBlobString(auth.token, "provider.auth.token");
+      return;
+    default:
+      throw new Error("invalid blob block acquisition: unsupported GCS auth.kind");
+  }
+}
+
+function validateAzureAuth(auth: Extract<SandboxBlobBlockProvider, { kind: "azure" }>["auth"]): void {
+  if (auth === null || typeof auth !== "object") {
+    throw new Error("invalid blob block acquisition: provider.auth is required");
+  }
+  switch (auth.kind) {
+    case "environment":
+      return;
+    case "access-key":
+      requireBlobString(auth.accessKey, "provider.auth.accessKey");
+      return;
+    case "bearer-token":
+      requireBlobString(auth.token, "provider.auth.token");
+      return;
+    case "client-secret":
+      requireBlobString(auth.clientId, "provider.auth.clientId");
+      requireBlobString(auth.clientSecret, "provider.auth.clientSecret");
+      requireBlobString(auth.tenantId, "provider.auth.tenantId");
+      return;
+    default:
+      throw new Error("invalid blob block acquisition: unsupported Azure auth.kind");
+  }
+}
+
+function requireBlobString(value: string, field: string): void {
+  if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
+    throw new Error(`invalid blob block acquisition: ${field} must be a non-empty string without NUL bytes`);
+  }
+}
 
 /**
  * Middleware invoked for an HTTP request allowed by a network policy.
@@ -1291,12 +1512,26 @@ class DefinedSandbox implements SandboxDefinition {
     try {
       validateInternalSandboxOptions(launchOptions);
       const hostOptions = toHostSpawnOptions(launchOptions, networkPolicy?.hooks ?? []);
-      const hostVm = await HostProcessSandboxVm.spawn(
-        launchOptions,
-        hostOptions,
-        new Map((networkPolicy?.hooks ?? []).map((hook) => [hook.id, hook])),
-        networkPolicy?.connectionHook,
+      const requestHeaderHooks = new Map(
+        (networkPolicy?.hooks ?? []).map((hook) => [hook.id, hook]),
       );
+      const blockMount = launchOptions.mounts?.find((mount) => mount.kind === "block-device");
+      const acquiredHost = blockMount === undefined
+        ? undefined
+        : blockDeviceHosts.get(blockMount.device);
+      const hostVm = acquiredHost === undefined
+        ? await HostProcessSandboxVm.spawn(
+          launchOptions,
+          hostOptions,
+          requestHeaderHooks,
+          networkPolicy?.connectionHook,
+        )
+        : await acquiredHost.attach(
+          launchOptions,
+          hostOptions,
+          requestHeaderHooks,
+          networkPolicy?.connectionHook,
+        );
       return new HostBackedSandboxVm(hostVm, launchOptions, configEnvironmentFacts);
     } catch (error) {
       throw error;
@@ -1386,7 +1621,10 @@ class HostBackedSandboxVm implements SandboxVm {
     this.#closed = true;
     await this.#fetch.close();
     let syncError: unknown;
-    if (this.#options.rootfs.storage !== undefined) {
+    if (
+      this.#options.rootfs.storage !== undefined
+      || this.#options.mounts?.some((mount) => mount.kind === "block-device") === true
+    ) {
       try {
         for (let attempt = 0; attempt < 2; attempt += 1) {
           const result = await this.#rootExec.exec("/bin/sync", []);
@@ -1765,6 +2003,12 @@ function lowerInternalMount(path: string, source: SandboxMountSource): InternalM
         access: source.access,
         mask: lowerHostDirectoryMask(source.mask),
       };
+    case "block-device":
+      return {
+        kind: "block-device",
+        path,
+        device: source,
+      };
   }
 }
 
@@ -1802,6 +2046,11 @@ function lowerHostSpawnMount(mount: InternalMount): HostSpawnMount {
         source: mount.source,
         access: mount.access,
         mask: mount.mask,
+      };
+    case "block-device":
+      return {
+        kind: "block-device",
+        path: mount.path,
       };
   }
 }
@@ -2434,9 +2683,12 @@ function validateSandboxBootOptions(options: SandboxBootOptions): void {
     validateHostname(options.hostname, "hostname");
   }
   const mountPaths = new Set<string>();
+  let blockDevice: SandboxBlockDevice | undefined;
+  let blockDevicePath: string | undefined;
   for (const [path, source] of Object.entries(options.mounts ?? {})) {
     validateGuestPath(path, "mount.path");
-    if (mountPaths.has(path)) {
+    const canonicalPath = canonicalGuestPath(path);
+    if (mountPaths.has(canonicalPath)) {
       throw new Error(`invalid sandbox boot options: duplicate mount path: ${path}`);
     }
     if (
@@ -2450,11 +2702,44 @@ function validateSandboxBootOptions(options: SandboxBootOptions): void {
     if (source.kind === "host-directory") {
       validateHostDirectorySource(source);
     }
-    mountPaths.add(path);
+    if (source.kind === "block-device") {
+      if (blockDevice !== undefined) {
+        throw new Error("invalid sandbox boot options: only one block device is supported");
+      }
+      blockDevice = source;
+      blockDevicePath = path;
+    }
+    mountPaths.add(canonicalPath);
+  }
+  if (blockDevice !== undefined && blockDevicePath !== undefined) {
+    if (guestPathIsStrictAncestor("/run/sandbox/http-ca", blockDevicePath)) {
+      throw new Error(`invalid sandbox boot options: block device mount must not be nested beneath /run/sandbox/http-ca: ${blockDevicePath}`);
+    }
+    const canonicalBlockDevicePath = canonicalGuestPath(blockDevicePath);
+    const parent = [...mountPaths].find((path) => (
+      path !== canonicalBlockDevicePath && guestPathIsStrictAncestor(path, canonicalBlockDevicePath)
+    ));
+    if (parent !== undefined) {
+      throw new Error(`invalid sandbox boot options: block device mount must not be nested beneath another mount: ${blockDevicePath}`);
+    }
+    if (!blockDeviceHosts.has(blockDevice)) {
+      throw new Error("invalid sandbox boot options: block device was not acquired by this runtime");
+    }
   }
   if (options.cwd !== undefined && !options.cwd.startsWith("/")) {
     throw new Error("invalid sandbox boot options: cwd must be absolute");
   }
+}
+
+function canonicalGuestPath(path: string): string {
+  return `/${path.split("/").filter(Boolean).join("/")}`;
+}
+
+function guestPathIsStrictAncestor(parent: string, child: string): boolean {
+  const parentComponents = parent.split("/").filter(Boolean);
+  const childComponents = child.split("/").filter(Boolean);
+  return parentComponents.length < childComponents.length
+    && parentComponents.every((component, index) => component === childComponents[index]);
 }
 
 function validateHostDirectorySource(source: HostDirectorySourceForValidation): void {
@@ -2749,13 +3034,14 @@ function validateInternalSandboxOptions(options: InternalSandboxOptions): void {
   const mountPaths = new Set<string>();
   for (const mount of options.mounts ?? []) {
     validateGuestPath(mount.path, "mount.path");
-    if (mountPaths.has(mount.path)) {
+    const canonicalPath = canonicalGuestPath(mount.path);
+    if (mountPaths.has(canonicalPath)) {
       throw new Error(`invalid sandbox options: duplicate mount path: ${mount.path}`);
     }
     if (mount.kind === "host-directory") {
       validateHostDirectorySource(mount);
     }
-    mountPaths.add(mount.path);
+    mountPaths.add(canonicalPath);
   }
 
   if (options.network?.outbound?.policy !== undefined && options.network.outbound.policy !== "deny") {
@@ -2773,7 +3059,7 @@ function validateGuestPath(path: string, field: "mount.path"): void {
   if (!path.startsWith("/")) {
     throw new Error(`invalid sandbox options: ${field} must be absolute`);
   }
-  if (path === "/") {
+  if (canonicalGuestPath(path) === "/") {
     throw new Error(`invalid sandbox options: ${field} must not be root`);
   }
   if (path.includes("\0")) {

@@ -1,14 +1,17 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { chmod, lstat, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import {
+  block,
   defineSandbox,
   fs,
   network,
   rootfs,
+  SandboxBlockDeviceError,
   type SandboxBlockStore,
   type SandboxEnvironmentFact,
   type RootfsImageConfig,
@@ -654,6 +657,133 @@ test("boot options provide instance-specific virtual mounts", async (t) => {
 
   assert.equal(result.exitCode, 0, result.stderr);
   assert.equal(result.stdout, "lane-private");
+});
+
+test("blob block acquisition provisions, leases, and reopens a mounted disk", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const objectStore = await mkdtemp(join(tmpdir(), "sandbox-blob-block-"));
+  t.after(async () => {
+    await rm(objectStore, { recursive: true, force: true });
+  });
+  const acquisition = {
+    provider: {
+      kind: "local" as const,
+      path: objectStore,
+    },
+    volume: "workspace",
+    sizeBytes: 64n * 1024n * 1024n,
+  };
+
+  const unusedDisk = await block.blob.acquire(acquisition);
+  const unusedLifecycle = unusedDisk.getLifecycle?.();
+  assert.ok(unusedLifecycle);
+  await unusedLifecycle.close();
+  assert.deepEqual(await unusedLifecycle.closed, { reason: "closed" });
+
+  const firstDisk = await block.blob.acquire(acquisition);
+  const firstLifecycle = firstDisk.getLifecycle?.();
+  assert.ok(firstLifecycle);
+  try {
+    await assert.rejects(block.blob.acquire(acquisition), (error) => {
+      assert.ok(error instanceof SandboxBlockDeviceError);
+      assert.equal(error.code, "volume-locked");
+      assert.match(error.message, /block volume workspace is already leased/);
+      return true;
+    });
+
+    const first = await defineSandbox({
+      rootfs: testRootfs,
+      network: network.policy((conn) => {
+        conn.accept();
+      }),
+    }).boot({
+      mounts: {
+        "/run/sandbox/http-ca": firstDisk,
+      },
+    });
+    try {
+      const write = await first.exec("/bin/sh", [
+        "-lc",
+        "printf '%s' persisted > /run/sandbox/http-ca/state.txt && sync",
+      ]);
+      assert.equal(write.exitCode, 0, write.stderr);
+    } finally {
+      await first.close();
+    }
+    assert.deepEqual(await firstLifecycle.closed, { reason: "closed" });
+  } finally {
+    await firstLifecycle.close();
+  }
+
+  const secondDisk = await block.blob.acquire(acquisition);
+  const secondLifecycle = secondDisk.getLifecycle?.();
+  assert.ok(secondLifecycle);
+  try {
+    const second = await defineSandbox({ rootfs: testRootfs }).boot({
+      mounts: {
+        "/workspace": secondDisk,
+      },
+    });
+    try {
+      const read = await second.exec("/bin/cat", ["/workspace/state.txt"]);
+      assert.equal(read.exitCode, 0, read.stderr);
+      assert.equal(read.stdout, "persisted");
+    } finally {
+      await second.close();
+    }
+    assert.deepEqual(await secondLifecycle.closed, { reason: "closed" });
+  } finally {
+    await secondLifecycle.close();
+  }
+});
+
+test("timed out blob block acquisition terminates a stuck host", async (t) => {
+  if (!requireHostArtifact(t)) {
+    return;
+  }
+
+  const server = createServer(() => {});
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  const address = server.address();
+  assert.ok(address !== null && typeof address !== "string");
+  const priorTimeout = process.env.SANDBOX_LAUNCH_TIMEOUT_MS;
+  process.env.SANDBOX_LAUNCH_TIMEOUT_MS = "100";
+  const startedAt = performance.now();
+  try {
+    await assert.rejects(
+      block.blob.acquire({
+        provider: {
+          kind: "s3",
+          bucket: "agent-disks",
+          region: "us-east-1",
+          endpoint: `http://127.0.0.1:${address.port}`,
+          auth: {
+            kind: "access-key",
+            accessKeyId: "test",
+            secretAccessKey: "test",
+          },
+        },
+        volume: "stuck-acquisition",
+        sizeBytes: 64n * 1024n * 1024n,
+      }),
+      /sandbox-host did not respond before the launch timeout/,
+    );
+  } finally {
+    if (priorTimeout === undefined) {
+      delete process.env.SANDBOX_LAUNCH_TIMEOUT_MS;
+    } else {
+      process.env.SANDBOX_LAUNCH_TIMEOUT_MS = priorTimeout;
+    }
+  }
+  assert.ok(performance.now() - startedAt < 4_000);
 });
 
 test("running sandbox exposes a remote-friendly guest filesystem API", async (t) => {

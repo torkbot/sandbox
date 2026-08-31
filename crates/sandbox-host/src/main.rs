@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use bson::{Bson, Document, doc};
 use sandbox::block_storage::CowBlockStore;
@@ -32,11 +33,13 @@ use sandbox::runtime::{
     HostServices, StartStatusObserver, VirtioFsDevice, VirtualFsDevice,
 };
 
+mod blob_block;
 mod host_vfs;
 
 use host_vfs::{HostIoBridge, NodeVirtualFs, StaticFileVirtualFs};
 
 const USAGE: &str = "usage: sandbox-host --capabilities | --stdio | --flatten-qcow2";
+const BLOB_BLOCK_FAILURE_EXIT_GRACE: Duration = Duration::from_secs(5);
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
@@ -146,15 +149,70 @@ fn run_stdio() -> ExitCode {
 }
 
 fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
+    let bridge = HostIoBridge::new();
     let mut stdin = io::stdin().lock();
-    let spawn_document = read_document_packet(&mut stdin)?;
+    let first_document = read_document_packet(&mut stdin)?;
+    let (spawn_document, mut blob_volume) =
+        if matches!(first_document.get_str("type"), Ok("host.block.acquire")) {
+            match blob_block::BlobBlockVolume::acquire(first_document) {
+                Ok(volume) => {
+                    bridge.write_raw_packet(&encode_document_packet(&doc! {
+                        "type": "host.block.acquire.result",
+                        "ok": true,
+                    })?)?;
+                    match read_document_packet(&mut stdin) {
+                        Ok(spawn_document) => (spawn_document, Some(volume)),
+                        Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+                            let mut volume = volume;
+                            match volume.close() {
+                                Ok(()) => {
+                                    write_blob_block_closed(&bridge, None)?;
+                                    return Ok(());
+                                }
+                                Err(failure) => {
+                                    write_blob_block_closed(&bridge, Some(&failure))?;
+                                    return Err(Box::new(failure));
+                                }
+                            }
+                        }
+                        Err(error) => return Err(Box::new(error)),
+                    }
+                }
+                Err(error) => {
+                    let mut response = doc! {
+                        "type": "host.block.acquire.result",
+                        "ok": false,
+                    };
+                    append_blob_block_failure(&mut response, &error);
+                    bridge.write_raw_packet(&encode_document_packet(&response)?)?;
+                    return Err(Box::new(error));
+                }
+            }
+        } else {
+            (first_document, None)
+        };
     drop(stdin);
 
     let spec = sandbox::MicroVmSpec::build(parse_spawn(spawn_document)?)?;
     #[cfg(target_os = "macos")]
     validate_writable_xattr_backing(&spec)?;
-    let bridge = HostIoBridge::new();
     let (bridge_tx, bridge_rx) = mpsc::channel::<Result<(), String>>();
+    if let Some(failures) = blob_volume
+        .as_mut()
+        .and_then(blob_block::BlobBlockVolume::take_failure_receiver)
+    {
+        let failure_bridge = bridge.clone();
+        let failure_tx = bridge_tx.clone();
+        thread::spawn(move || {
+            let Ok(failure) = failures.recv() else {
+                return;
+            };
+            let _ = write_blob_block_closed(&failure_bridge, Some(&failure));
+            let _ = failure_tx.send(Err(failure.message));
+            thread::sleep(BLOB_BLOCK_FAILURE_EXIT_GRACE);
+            std::process::exit(1);
+        });
+    }
     let guest_writer_slot: Arc<(Mutex<Option<ControlSocket>>, Condvar)> =
         Arc::new((Mutex::new(None), Condvar::new()));
     let start_status_slot: Arc<Mutex<Option<StartStatusObserver>>> = Arc::new(Mutex::new(None));
@@ -231,6 +289,9 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
                 sandbox::config::RootfsStorageSpec::EphemeralCow { .. } => None,
                 sandbox::config::RootfsStorageSpec::PersistentQcow2Overlay { .. } => None,
             }),
+        block_device: blob_volume
+            .as_ref()
+            .map(blob_block::BlobBlockVolume::service),
     };
     let mut vm = sandbox::runtime::KrunVm::create_with_services(&spec, virtual_fs, services)?;
     vm.start()?;
@@ -260,6 +321,7 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
 
     let guest_tx = bridge_tx.clone();
     let guest_launch_ready = launch_ready.clone();
+    let guest_bridge = bridge.clone();
     thread::spawn(move || {
         loop {
             let packet = match guest_reader.read_packet() {
@@ -272,14 +334,14 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
             if is_init_ready_packet(&packet) {
                 guest_launch_ready.store(true, Ordering::SeqCst);
             }
-            if let Err(error) = bridge.write_raw_packet(&packet) {
+            if let Err(error) = guest_bridge.write_raw_packet(&packet) {
                 let _ = guest_tx.send(Err(format!("write host control packet: {error}")));
                 return;
             }
         }
     });
 
-    match bridge_rx.recv() {
+    let run_result: Result<(), Box<dyn std::error::Error>> = match bridge_rx.recv() {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => {
             if let Some(result) = vm.start_status() {
@@ -288,7 +350,51 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
             Err(error.into())
         }
         Err(error) => Err(format!("control bridge stopped: {error}").into()),
+    };
+    drop(vm);
+
+    let lease_failure_reported = blob_volume
+        .as_ref()
+        .is_some_and(blob_block::BlobBlockVolume::failed);
+    let close_result = blob_volume.as_mut().map(blob_block::BlobBlockVolume::close);
+    if !lease_failure_reported {
+        match close_result.as_ref() {
+            Some(Err(failure)) => {
+                write_blob_block_closed(&bridge, Some(failure))?;
+            }
+            Some(Ok(())) if run_result.is_ok() => {
+                write_blob_block_closed(&bridge, None)?;
+            }
+            _ => {}
+        }
     }
+    run_result?;
+    if let Some(result) = close_result {
+        result?;
+    }
+    Ok(())
+}
+
+fn append_blob_block_failure(document: &mut Document, failure: &blob_block::BlobBlockFailure) {
+    document.insert("code", failure.code);
+    document.insert("error", failure.message.clone());
+    if let Some(retry_after_ms) = failure.retry_after_ms {
+        document.insert("retryAfterMs", retry_after_ms as i64);
+    }
+}
+
+fn write_blob_block_closed(
+    bridge: &HostIoBridge,
+    failure: Option<&blob_block::BlobBlockFailure>,
+) -> io::Result<()> {
+    let mut document = doc! {
+        "type": "host.block.closed",
+        "reason": if failure.is_some() { "failed" } else { "closed" },
+    };
+    if let Some(failure) = failure {
+        append_blob_block_failure(&mut document, failure);
+    }
+    bridge.write_raw_packet(&encode_document_packet(&document)?)
 }
 
 fn host_stdin_closed_result(
@@ -759,7 +865,7 @@ fn response_header_pairs(document: &Document) -> io::Result<Vec<(String, String)
         .collect()
 }
 
-fn read_document_packet(reader: &mut impl Read) -> Result<Document, Box<dyn std::error::Error>> {
+fn read_document_packet(reader: &mut impl Read) -> io::Result<Document> {
     let (_packet, document) = read_packet(reader)?;
     Ok(document)
 }
@@ -860,6 +966,7 @@ fn virtio_fs_devices(
                         }),
                     }))
                 }
+                MountSpec::BlockDevice { .. } => None,
             }),
     );
     devices
@@ -1255,6 +1362,16 @@ fn optional_bool(document: &Document, key: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blob_block_failure_forces_exit_before_lease_expiry() {
+        assert!(
+            blob_block::LEASE_RENEW_INTERVAL
+                + blob_block::LEASE_REQUEST_TIMEOUT
+                + BLOB_BLOCK_FAILURE_EXIT_GRACE
+                < blob_block::LEASE_DURATION
+        );
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

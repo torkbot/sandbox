@@ -215,9 +215,13 @@ fn build_native_root_tls_connector_data() -> io::Result<TlsConnectorData> {
 }
 
 pub(super) fn tls_connector_data_from_roots(roots: rustls::RootCertStore) -> TlsConnectorData {
-    let mut config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let mut config = rustls::ClientConfig::builder_with_provider(
+        rustls::crypto::ring::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .expect("ring supports the default TLS protocol versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     TlsConnectorData::from(config)
 }

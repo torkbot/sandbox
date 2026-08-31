@@ -7,6 +7,10 @@ export type HostSpawnMount =
       readonly writable?: boolean;
     }
   | {
+      readonly kind: "block-device";
+      readonly path: string;
+    }
+  | {
       readonly kind: "host-directory";
       readonly path: string;
       readonly source: string;
@@ -20,6 +24,60 @@ export type HostSpawnMount =
         };
       };
     };
+
+export type HostBlobBlockProvider =
+  | {
+      readonly kind: "local";
+      readonly path: string;
+      readonly prefix?: string;
+    }
+  | {
+      readonly kind: "s3";
+      readonly bucket: string;
+      readonly region: string;
+      readonly endpoint?: string;
+      readonly prefix?: string;
+      readonly auth:
+        | { readonly kind: "environment" }
+        | {
+            readonly kind: "access-key";
+            readonly accessKeyId: string;
+            readonly secretAccessKey: string;
+            readonly sessionToken?: string;
+          };
+    }
+  | {
+      readonly kind: "gcs";
+      readonly bucket: string;
+      readonly prefix?: string;
+      readonly auth:
+        | { readonly kind: "environment" }
+        | { readonly kind: "service-account"; readonly key: string }
+        | { readonly kind: "bearer-token"; readonly token: string };
+    }
+  | {
+      readonly kind: "azure";
+      readonly account: string;
+      readonly container: string;
+      readonly endpoint?: string;
+      readonly prefix?: string;
+      readonly auth:
+        | { readonly kind: "environment" }
+        | { readonly kind: "access-key"; readonly accessKey: string }
+        | { readonly kind: "bearer-token"; readonly token: string }
+        | {
+            readonly kind: "client-secret";
+            readonly clientId: string;
+            readonly clientSecret: string;
+            readonly tenantId: string;
+          };
+    };
+
+export type HostBlobBlockAcquireOptions = {
+  readonly provider: HostBlobBlockProvider;
+  readonly volume: string;
+  readonly sizeBytes: bigint;
+};
 
 export type HostSpawnSandboxOptions = {
   readonly name?: string;

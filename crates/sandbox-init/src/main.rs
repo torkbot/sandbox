@@ -53,9 +53,21 @@ fn run() -> Result<(), InitError> {
         std::env::var("SANDBOX_VIRTIOFS_MOUNTS").ok(),
     )?;
     let mut mounted_virtual_paths = Vec::new();
+    mount_configured_block(
+        std::env::args().skip(1),
+        std::env::var("SANDBOX_BLOCK_MOUNT").ok(),
+        &mut mounted_virtual_paths,
+        false,
+    )?;
     mount_internal_http_ca(&mounts, &mut mounted_virtual_paths)?;
     mount_virtual_filesystems_before_http_ca(&mounts, &mut mounted_virtual_paths)?;
     install_http_ca(root_readonly)?;
+    mount_configured_block(
+        std::env::args().skip(1),
+        std::env::var("SANDBOX_BLOCK_MOUNT").ok(),
+        &mut mounted_virtual_paths,
+        true,
+    )?;
     mount_virtual_filesystems_after_http_ca(&mounts, &mut mounted_virtual_paths)?;
     let packet = init_ready_packet(root_readonly)?;
     let mut control = connect_control()?;
@@ -870,7 +882,6 @@ fn hides_internal_http_ca_mount(path: &str) -> bool {
     normalized_mount_path(path).is_some_and(|path| path == "/run" || path.starts_with("/run/"))
 }
 
-#[cfg(target_os = "linux")]
 fn normalized_mount_path(path: &str) -> Option<String> {
     use std::path::Component;
 
@@ -905,6 +916,63 @@ fn virtual_fs_mounts(
         .filter(|mount| !mount.is_empty())
         .map(parse_virtual_fs_mount)
         .collect::<Result<Vec<_>, _>>()
+}
+
+#[cfg(target_os = "linux")]
+fn mount_configured_block(
+    args: impl Iterator<Item = String>,
+    env_mount: Option<String>,
+    mounted_paths: &mut Vec<std::path::PathBuf>,
+    after_http_ca: bool,
+) -> Result<(), InitError> {
+    let encoded = args
+        .filter_map(|arg| arg.strip_prefix("--block-mount=").map(str::to_string))
+        .next()
+        .or(env_mount)
+        .filter(|value| !value.is_empty());
+    let Some(path) = encoded
+        .map(|value| decode_mount_field(&value))
+        .transpose()?
+    else {
+        return Ok(());
+    };
+    if block_mount_after_http_ca(&path) != after_http_ca {
+        return Ok(());
+    }
+    ensure_mount_point(&path, mounted_paths)?;
+    mount_block_device(&path)?;
+    mounted_paths.push(std::path::PathBuf::from(path));
+    Ok(())
+}
+
+fn block_mount_after_http_ca(path: &str) -> bool {
+    normalized_mount_path(path).as_deref() == Some("/run/sandbox/http-ca")
+}
+
+#[cfg(target_os = "linux")]
+fn mount_block_device(path: &str) -> Result<(), InitError> {
+    use std::ffi::CString;
+
+    let source = CString::new("/dev/vdb").unwrap();
+    let target = CString::new(path)
+        .map_err(|_| InitError(format!("block mount path contains nul: {path}")))?;
+    let fstype = CString::new("ext4").unwrap();
+    let options = CString::new("rw,data=ordered").unwrap();
+    let result = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            0,
+            options.as_ptr().cast(),
+        )
+    };
+    if result < 0 {
+        return Err(InitError::last_os(&format!(
+            "mount block device /dev/vdb at {path}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1069,6 +1137,16 @@ fn virtual_fs_mounts(
     _env_mounts: Option<String>,
 ) -> Result<Vec<VirtualFsMount>, InitError> {
     Ok(Vec::new())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_configured_block(
+    _args: impl Iterator<Item = String>,
+    _env_mount: Option<String>,
+    _mounted_paths: &mut Vec<std::path::PathBuf>,
+    _after_http_ca: bool,
+) -> Result<(), InitError> {
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -2752,9 +2830,13 @@ fn connect_guest_tls(
             .add(certificate)
             .map_err(|error| InitError(format!("add guest TLS root: {error}")))?;
     }
-    let mut config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let mut config = rustls::ClientConfig::builder_with_provider(
+        rustls::crypto::ring::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .expect("ring supports the default TLS protocol versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     let server_name = rustls::pki_types::ServerName::try_from(server_name)
         .map_err(|error| InitError(format!("invalid TLS server name: {error}")))?;
@@ -3435,6 +3517,16 @@ mod tests {
             decode_mount_field(&encoded).unwrap(),
             "/mnt/with=equals;semicolon",
         );
+    }
+
+    #[test]
+    fn block_mount_at_internal_http_ca_is_delayed() {
+        assert!(super::block_mount_after_http_ca("/run/sandbox/http-ca"));
+        assert!(!super::block_mount_after_http_ca(
+            "/run/sandbox/http-ca/state"
+        ));
+        assert!(!super::block_mount_after_http_ca("/run/sandbox"));
+        assert!(!super::block_mount_after_http_ca("/workspace"));
     }
 
     #[test]

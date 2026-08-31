@@ -17,8 +17,10 @@ use imago::{
 };
 
 use crate::MicroVmSpec;
-use crate::block_storage::{CowBlockStorage, CowBlockStore, MemoryCowBlockStore};
-use crate::config::{KernelFormat, RootfsFormat, RootfsStorageSpec};
+use crate::block_storage::{
+    BlockStoreImageStorage, CowBlockStorage, CowBlockStore, MemoryCowBlockStore,
+};
+use crate::config::{KernelFormat, MountSpec, RootfsFormat, RootfsStorageSpec};
 use crate::control::INIT_CONTROL_PORT;
 use crate::http_flow::HttpInterceptRuntime;
 use crate::network::OutboundRulePlan;
@@ -154,6 +156,13 @@ pub struct HostServices {
     pub http: Option<Arc<dyn HttpInterceptRuntime>>,
     pub network_policy: Option<Arc<dyn NetworkPolicyRuntime>>,
     pub root_storage: Option<Arc<dyn CowBlockStore>>,
+    pub block_device: Option<BlockDeviceService>,
+}
+
+#[derive(Clone)]
+pub struct BlockDeviceService {
+    pub storage: Arc<dyn CowBlockStore>,
+    pub size: u64,
 }
 
 #[derive(Debug)]
@@ -221,6 +230,7 @@ impl KrunContext {
         context.apply_console_output()?;
         context.apply_kernel(spec)?;
         context.apply_rootfs(spec, &services)?;
+        context.apply_block_device(spec, &services)?;
         context.apply_network(spec, &services)?;
         for device in virtual_fs {
             context.add_virtio_fs(device)?;
@@ -532,6 +542,40 @@ impl KrunContext {
         }
     }
 
+    fn apply_block_device(
+        &self,
+        spec: &MicroVmSpec,
+        services: &HostServices,
+    ) -> Result<(), KrunError> {
+        let mount = spec
+            .mounts
+            .iter()
+            .find(|mount| matches!(mount, MountSpec::BlockDevice { .. }));
+        match (mount, services.block_device.as_ref()) {
+            (None, None) => Ok(()),
+            (None, Some(_)) => Err(KrunError::new("unused block device service", -libc::EINVAL)),
+            (Some(_), None) => Err(KrunError::new(
+                "block device service missing",
+                -libc::EINVAL,
+            )),
+            (Some(_), Some(service)) => {
+                let storage = BlockStoreImageStorage::new(service.storage.clone(), service.size)
+                    .map_err(|_| KrunError::new("BlockStoreImageStorage::new", -libc::EIO))?;
+                let disk = open_raw_disk(Box::new(storage), true)?;
+                check_krun(
+                    "krun_add_storage_disk",
+                    krun::krun_add_storage_disk(
+                        self.id,
+                        "blob0".to_string(),
+                        Arc::new(Mutex::new(disk)),
+                        false,
+                        sync_mode(),
+                    ),
+                )
+            }
+        }
+    }
+
     fn apply_init(
         &self,
         spec: &MicroVmSpec,
@@ -543,10 +587,13 @@ impl KrunContext {
         let stage_arg = CString::new(format!("--stage={}", project_init_stage())).unwrap();
         let encoded_mounts = encode_virtual_fs_mounts(virtual_fs);
         let mount_arg = CString::new(format!("--virtiofs-mounts={encoded_mounts}")).unwrap();
+        let block_mount = encode_block_mount(spec);
+        let block_mount_arg = CString::new(format!("--block-mount={block_mount}")).unwrap();
         let hostname_arg = CString::new(format!("--hostname={}", spec.hostname)).unwrap();
         let http_network_arg = CString::new("--http-network").unwrap();
         let network_enabled = spec.network.is_some();
         let mount_env = CString::new(format!("SANDBOX_VIRTIOFS_MOUNTS={encoded_mounts}")).unwrap();
+        let block_mount_env = CString::new(format!("SANDBOX_BLOCK_MOUNT={block_mount}")).unwrap();
         let hostname_env = CString::new(format!("SANDBOX_HOSTNAME={}", spec.hostname)).unwrap();
         let rootfs_readonly_env = CString::new(format!(
             "SANDBOX_ROOTFS_READONLY={}",
@@ -558,10 +605,12 @@ impl KrunContext {
             exec_path.as_ptr(),
             stage_arg.as_ptr(),
             mount_arg.as_ptr(),
+            block_mount_arg.as_ptr(),
             hostname_arg.as_ptr(),
         ];
         let mut envp = vec![
             mount_env.as_ptr(),
+            block_mount_env.as_ptr(),
             hostname_env.as_ptr(),
             rootfs_readonly_env.as_ptr(),
         ];
@@ -662,6 +711,18 @@ fn encode_virtual_fs_mounts(virtual_fs: &[VirtioFsDevice]) -> String {
         value.push_str(if device.readonly() { "ro" } else { "rw" });
     }
     value
+}
+
+fn encode_block_mount(spec: &MicroVmSpec) -> String {
+    spec.mounts
+        .iter()
+        .find_map(|mount| match mount {
+            MountSpec::BlockDevice { path } => {
+                Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(path))
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 fn open_qcow2_disk(
