@@ -259,14 +259,9 @@ export class HostProcessSandboxVm implements HostControlChannel {
     }
     this.#configure(options, requestHeaderHooks, networkConnectionHook);
     this.#spawnSent = true;
-    try {
-      this.#writeToHost(encodeHostSpawn(hostOptions));
-      await this.#waitForLaunch();
-      return this;
-    } catch (error) {
-      await this.close();
-      throw error;
-    }
+    this.#writeToHost(encodeHostSpawn(hostOptions));
+    await this.#waitForLaunch();
+    return this;
   }
 
   static async flattenQcow2(input: {

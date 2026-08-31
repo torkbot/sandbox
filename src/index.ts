@@ -1546,7 +1546,19 @@ class DefinedSandbox implements SandboxDefinition {
         blockDeviceLifecycle,
       );
     } catch (error) {
-      await blockDeviceLifecycle?.close();
+      try {
+        await blockDeviceLifecycle?.close();
+      } catch (cleanupError) {
+        if (error instanceof Error && error.cause === undefined) {
+          error.cause = cleanupError;
+          throw error;
+        }
+        throw new AggregateError(
+          [error, cleanupError],
+          "sandbox boot failed and block device cleanup also failed",
+          { cause: error },
+        );
+      }
       throw error;
     }
   }

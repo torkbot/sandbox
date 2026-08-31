@@ -737,6 +737,14 @@ test("sandbox owns an attached blob block device lifecycle", async (t) => {
         "/workspace": failedBootDisk,
       },
     }),
+    (error) => {
+      assert.ok(error instanceof Error);
+      assert.ok(!(error instanceof SandboxBlockDeviceError));
+      assert.match(error.message, /rootfs|qcow2|No such file/i);
+      assert.ok(error.cause instanceof SandboxBlockDeviceError);
+      assert.equal(error.cause.code, "host-error");
+      return true;
+    },
   );
   const reacquiredAfterFailedBoot = await block.blob.acquire(failedBootAcquisition);
   const reacquiredLifecycle = reacquiredAfterFailedBoot.getLifecycle?.();
