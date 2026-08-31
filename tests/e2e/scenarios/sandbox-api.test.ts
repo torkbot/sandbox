@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { chmod, lstat, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -729,6 +730,51 @@ test("blob block acquisition provisions, leases, and reopens a mounted disk", as
   } finally {
     await secondLifecycle.close();
   }
+});
+
+test("timed out blob block acquisition terminates a stuck host", async (t) => {
+  if (!requireHostArtifact(t)) {
+    return;
+  }
+
+  const server = createServer(() => {});
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  const address = server.address();
+  assert.ok(address !== null && typeof address !== "string");
+  const priorTimeout = process.env.SANDBOX_LAUNCH_TIMEOUT_MS;
+  process.env.SANDBOX_LAUNCH_TIMEOUT_MS = "100";
+  const startedAt = performance.now();
+  try {
+    await assert.rejects(
+      block.blob.acquire({
+        provider: {
+          kind: "s3",
+          bucket: "agent-disks",
+          region: "us-east-1",
+          endpoint: `http://127.0.0.1:${address.port}`,
+          auth: {
+            kind: "access-key",
+            accessKeyId: "test",
+            secretAccessKey: "test",
+          },
+        },
+        volume: "stuck-acquisition",
+        sizeBytes: 64n * 1024n * 1024n,
+      }),
+      /sandbox-host did not respond before the launch timeout/,
+    );
+  } finally {
+    if (priorTimeout === undefined) {
+      delete process.env.SANDBOX_LAUNCH_TIMEOUT_MS;
+    } else {
+      process.env.SANDBOX_LAUNCH_TIMEOUT_MS = priorTimeout;
+    }
+  }
+  assert.ok(performance.now() - startedAt < 4_000);
 });
 
 test("running sandbox exposes a remote-friendly guest filesystem API", async (t) => {

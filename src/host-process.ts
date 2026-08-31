@@ -35,6 +35,7 @@ import type {
 } from "./index.ts";
 
 const DEFAULT_LAUNCH_TIMEOUT_MS = 60_000;
+const FAILED_ACQUISITION_CLOSE_GRACE_MS = 2_000;
 
 export class HostProcessSandboxVm implements HostControlChannel {
   readonly hasControlSocket = true;
@@ -158,7 +159,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
       }
       return vm;
     } catch (error) {
-      await vm.close();
+      await vm.#closeFailedBlobBlockAcquisition();
       throw error;
     }
   }
@@ -340,6 +341,23 @@ export class HostProcessSandboxVm implements HostControlChannel {
     } finally {
       this.#cleanupConsoleOutput();
     }
+  }
+
+  async #closeFailedBlobBlockAcquisition(): Promise<void> {
+    const closing = this.close();
+    await Promise.race([closing, delay(FAILED_ACQUISITION_CLOSE_GRACE_MS)]);
+    if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
+      return;
+    }
+
+    this.#child.kill("SIGTERM");
+    await Promise.race([closing, delay(500)]);
+    if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
+      return;
+    }
+
+    this.#child.kill("SIGKILL");
+    await Promise.race([closing, delay(1_000)]);
   }
 
   async terminateHostForTest(): Promise<void> {
