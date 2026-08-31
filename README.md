@@ -696,28 +696,24 @@ const disk = await block.blob.acquire({
   sizeBytes: 64n * 1024n * 1024n,
 });
 
-const lifecycle = disk.getLifecycle?.();
-try {
-  await using vm = await sandbox.boot({
-    mounts: {
-      "/workspace": disk,
-    },
-    cwd: "/workspace",
-  });
-  await vm.exec("sh", ["-lc", "printf '%s' ready > state.txt"]);
-} finally {
-  await lifecycle?.close();
-}
+await using vm = await sandbox.boot({
+  mounts: {
+    "/workspace": disk,
+  },
+  cwd: "/workspace",
+});
+await vm.exec("sh", ["-lc", "printf '%s' ready > state.txt"]);
 ```
 
 `acquire()` obtains and starts renewing the exclusive writer lease before it
 returns the mountable handle. If another writer owns the volume, acquisition
-rejects and no VM is started. Closing the sandbox closes the native host and
-releases the lease; call the lifecycle's `close()` yourself when an acquired
-device is never booted. `closed` resolves to `{ reason: "closed" }` after a
-clean close, or `{ reason: "failed", error }` after the host has failed closed.
-`close()` rejects with that same error when clean storage shutdown and lease
-release cannot be confirmed.
+rejects and no VM is started. After `boot()` succeeds, the sandbox owns the
+device lifecycle: closing the sandbox closes the native host, waits for the
+device outcome, and releases the lease. Call the lifecycle's `close()` yourself
+only when an acquired device is never booted. `closed` resolves to
+`{ reason: "closed" }` after a clean close, or `{ reason: "failed", error }`
+after the host has failed closed. `close()` rejects with that same error when
+clean storage shutdown and lease release cannot be confirmed.
 
 Acquisition and lifecycle failures are `SandboxBlockDeviceError` instances.
 Their stable `code` is `volume-locked`, `volume-mismatch`, `provider-error`,
