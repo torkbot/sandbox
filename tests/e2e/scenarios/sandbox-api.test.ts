@@ -659,7 +659,7 @@ test("boot options provide instance-specific virtual mounts", async (t) => {
   assert.equal(result.stdout, "lane-private");
 });
 
-test("blob block acquisition provisions, leases, and reopens a mounted disk", async (t) => {
+test("sandbox owns an attached blob block device lifecycle", async (t) => {
   const testRootfs = await testRootfsForVmTest(t);
   if (testRootfs === undefined) {
     return;
@@ -681,64 +681,94 @@ test("blob block acquisition provisions, leases, and reopens a mounted disk", as
   const unusedDisk = await block.blob.acquire(acquisition);
   const unusedLifecycle = unusedDisk.getLifecycle?.();
   assert.ok(unusedLifecycle);
-  await unusedLifecycle.close();
+  assert.equal(unusedDisk.getLifecycle?.(), unusedLifecycle);
+  await Promise.all([unusedLifecycle.close(), unusedLifecycle.close()]);
   assert.deepEqual(await unusedLifecycle.closed, { reason: "closed" });
 
   const firstDisk = await block.blob.acquire(acquisition);
-  const firstLifecycle = firstDisk.getLifecycle?.();
-  assert.ok(firstLifecycle);
-  try {
-    await assert.rejects(block.blob.acquire(acquisition), (error) => {
-      assert.ok(error instanceof SandboxBlockDeviceError);
-      assert.equal(error.code, "volume-locked");
-      assert.match(error.message, /block volume workspace is already leased/);
-      return true;
-    });
+  await assert.rejects(block.blob.acquire(acquisition), (error) => {
+    assert.ok(error instanceof SandboxBlockDeviceError);
+    assert.equal(error.code, "volume-locked");
+    assert.match(error.message, /block volume workspace is already leased/);
+    return true;
+  });
 
-    const first = await defineSandbox({
-      rootfs: testRootfs,
-      network: network.policy((conn) => {
-        conn.accept();
-      }),
-    }).boot({
-      mounts: {
-        "/run/sandbox/http-ca": firstDisk,
-      },
-    });
-    try {
-      const write = await first.exec("/bin/sh", [
-        "-lc",
-        "printf '%s' persisted > /run/sandbox/http-ca/state.txt && sync",
-      ]);
-      assert.equal(write.exitCode, 0, write.stderr);
-    } finally {
-      await first.close();
-    }
-    assert.deepEqual(await firstLifecycle.closed, { reason: "closed" });
+  const first = await defineSandbox({
+    rootfs: testRootfs,
+    network: network.policy((conn) => {
+      conn.accept();
+    }),
+  }).boot({
+    mounts: {
+      "/run/sandbox/http-ca": firstDisk,
+    },
+  });
+  try {
+    const write = await first.exec("/bin/sh", [
+      "-lc",
+      "printf '%s' persisted > /run/sandbox/http-ca/state.txt && sync",
+    ]);
+    assert.equal(write.exitCode, 0, write.stderr);
   } finally {
-    await firstLifecycle.close();
+    await first.close();
   }
 
   const secondDisk = await block.blob.acquire(acquisition);
-  const secondLifecycle = secondDisk.getLifecycle?.();
-  assert.ok(secondLifecycle);
+  const second = await defineSandbox({ rootfs: testRootfs }).boot({
+    mounts: {
+      "/workspace": secondDisk,
+    },
+  });
   try {
-    const second = await defineSandbox({ rootfs: testRootfs }).boot({
-      mounts: {
-        "/workspace": secondDisk,
-      },
-    });
-    try {
-      const read = await second.exec("/bin/cat", ["/workspace/state.txt"]);
-      assert.equal(read.exitCode, 0, read.stderr);
-      assert.equal(read.stdout, "persisted");
-    } finally {
-      await second.close();
-    }
-    assert.deepEqual(await secondLifecycle.closed, { reason: "closed" });
+    const read = await second.exec("/bin/cat", ["/workspace/state.txt"]);
+    assert.equal(read.exitCode, 0, read.stderr);
+    assert.equal(read.stdout, "persisted");
   } finally {
-    await secondLifecycle.close();
+    await second.close();
   }
+
+  const failedBootAcquisition = { ...acquisition, volume: "failed-boot" };
+  const failedBootDisk = await block.blob.acquire(failedBootAcquisition);
+  await assert.rejects(
+    defineSandbox({
+      rootfs: { ...testRootfs, path: join(objectStore, "missing.qcow2") },
+    }).boot({
+      mounts: {
+        "/workspace": failedBootDisk,
+      },
+    }),
+    (error) => {
+      assert.ok(error instanceof Error);
+      assert.ok(!(error instanceof SandboxBlockDeviceError));
+      assert.match(error.message, /rootfs|qcow2|No such file/i);
+      assert.ok(error.cause instanceof SandboxBlockDeviceError);
+      assert.equal(error.cause.code, "host-error");
+      return true;
+    },
+  );
+  const reacquiredAfterFailedBoot = await block.blob.acquire(failedBootAcquisition);
+  const reacquiredLifecycle = reacquiredAfterFailedBoot.getLifecycle?.();
+  assert.ok(reacquiredLifecycle);
+  await reacquiredLifecycle.close();
+
+  const failedDisk = await block.blob.acquire({ ...acquisition, volume: "failed-host" });
+  const failed = await defineSandbox({ rootfs: testRootfs }).boot({
+    mounts: {
+      "/workspace": failedDisk,
+    },
+  });
+  const diagnostics = Reflect.get(failed, "diagnostics");
+  assert.ok(diagnostics);
+  const terminateHostForTest = Reflect.get(diagnostics, "terminateHostForTest");
+  assert.equal(typeof terminateHostForTest, "function");
+  await terminateHostForTest();
+  const assertHostFailure = (error: unknown) => {
+    assert.ok(error instanceof SandboxBlockDeviceError);
+    assert.equal(error.code, "host-error");
+    return true;
+  };
+  await assert.rejects(failed.close(), assertHostFailure);
+  await assert.rejects(failed.close(), assertHostFailure);
 });
 
 test("timed out blob block acquisition terminates a stuck host", async (t) => {

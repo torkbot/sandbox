@@ -259,13 +259,13 @@ export type SandboxHostDirectorySource = SandboxReadOnlyHostDirectorySource | Sa
 export interface SandboxBlockDeviceLifecycle {
   /** Resolves with the reason after the device has closed. */
   readonly closed: Promise<SandboxBlockDeviceClosed>;
-  /** Closes the device and releases its host-side resources. */
+  /** Idempotently closes the device and releases its host-side resources. */
   close(): Promise<void>;
 }
 
 export interface SandboxBlockDevice {
   readonly kind: "block-device";
-  /** Returns lifecycle controls when the device owns host-side resources. */
+  /** Returns shared lifecycle controls for Sandbox to own while attached. */
   getLifecycle?(): SandboxBlockDeviceLifecycle;
 }
 
@@ -341,16 +341,20 @@ async function acquireBlobBlockDevice(
 ): Promise<SandboxBlockDevice> {
   validateBlobBlockAcquireOptions(options);
   const host = await HostProcessSandboxVm.acquireBlobBlock(options);
-  const lifecycle: SandboxBlockDeviceLifecycle = {
+  let closePromise: Promise<void> | undefined;
+  const lifecycle: SandboxBlockDeviceLifecycle = Object.freeze({
     closed: host.blockDeviceClosed,
-    close: async () => {
-      await host.close();
-      const closure = await host.blockDeviceClosed;
-      if (closure.reason === "failed") {
-        throw closure.error;
-      }
+    close: () => {
+      closePromise ??= (async () => {
+        await host.close();
+        const closure = await host.blockDeviceClosed;
+        if (closure.reason === "failed") {
+          throw closure.error;
+        }
+      })();
+      return closePromise;
     },
-  };
+  });
   const device: SandboxBlockDevice = {
     kind: "block-device",
     getLifecycle: () => lifecycle,
@@ -1500,16 +1504,19 @@ class DefinedSandbox implements SandboxDefinition {
 
   async boot(options: SandboxBootOptions = {}): Promise<SandboxInstance> {
     validateSandboxBootOptions(options);
-    const networkPolicy = this.#options.network === undefined
-      ? undefined
-      : createNetworkPolicyHookRegistration(this.#options.network);
-    const configEnvironmentFacts = environmentFactsForDefinition(this.#options);
-    const launchOptions = await toInternalSandboxOptions(
-      this.#options,
-      options,
-      networkPolicy?.network,
-    );
+    const blockDeviceLifecycle = Object.values(options.mounts ?? {})
+      .find((source) => source.kind === "block-device")
+      ?.getLifecycle?.();
     try {
+      const networkPolicy = this.#options.network === undefined
+        ? undefined
+        : createNetworkPolicyHookRegistration(this.#options.network);
+      const configEnvironmentFacts = environmentFactsForDefinition(this.#options);
+      const launchOptions = await toInternalSandboxOptions(
+        this.#options,
+        options,
+        networkPolicy?.network,
+      );
       validateInternalSandboxOptions(launchOptions);
       const hostOptions = toHostSpawnOptions(launchOptions, networkPolicy?.hooks ?? []);
       const requestHeaderHooks = new Map(
@@ -1532,8 +1539,26 @@ class DefinedSandbox implements SandboxDefinition {
           requestHeaderHooks,
           networkPolicy?.connectionHook,
         );
-      return new HostBackedSandboxVm(hostVm, launchOptions, configEnvironmentFacts);
+      return new HostBackedSandboxVm(
+        hostVm,
+        launchOptions,
+        configEnvironmentFacts,
+        blockDeviceLifecycle,
+      );
     } catch (error) {
+      try {
+        await blockDeviceLifecycle?.close();
+      } catch (cleanupError) {
+        if (error instanceof Error && error.cause === undefined) {
+          error.cause = cleanupError;
+          throw error;
+        }
+        throw new AggregateError(
+          [error, cleanupError],
+          "sandbox boot failed and block device cleanup also failed",
+          { cause: error },
+        );
+      }
       throw error;
     }
   }
@@ -1548,6 +1573,7 @@ class HostBackedSandboxVm implements SandboxVm {
   readonly #fetch: GuestFetch;
   readonly #options: InternalSandboxOptions;
   readonly #configEnvironmentFacts: readonly SandboxEnvironmentFact[];
+  readonly #blockDeviceLifecycle?: SandboxBlockDeviceLifecycle;
 
   readonly #hostVm: {
     readonly hasControlSocket: boolean;
@@ -1557,7 +1583,7 @@ class HostBackedSandboxVm implements SandboxVm {
     hostPid?(): number;
     terminateHostForTest?(): Promise<void>;
   };
-  #closed = false;
+  #closePromise?: Promise<void>;
 
   constructor(
     hostVm: {
@@ -1570,10 +1596,12 @@ class HostBackedSandboxVm implements SandboxVm {
     },
     options: InternalSandboxOptions,
     configEnvironmentFacts: readonly SandboxEnvironmentFact[],
+    blockDeviceLifecycle?: SandboxBlockDeviceLifecycle,
   ) {
     this.#hostVm = hostVm;
     this.#options = options;
     this.#configEnvironmentFacts = configEnvironmentFacts;
+    this.#blockDeviceLifecycle = blockDeviceLifecycle;
     this.control = new HostControlTransport({
       connected: hostVm.hasControlSocket,
       channel: hostVm,
@@ -1613,13 +1641,17 @@ class HostBackedSandboxVm implements SandboxVm {
     ];
   }
 
-  async close(): Promise<void> {
-    if (this.#closed) {
-      return;
-    }
+  close(): Promise<void> {
+    return this.#closePromise ??= this.#close();
+  }
 
-    this.#closed = true;
-    await this.#fetch.close();
+  async #close(): Promise<void> {
+    let closeError: unknown;
+    try {
+      await this.#fetch.close();
+    } catch (error) {
+      closeError = error;
+    }
     let syncError: unknown;
     if (
       this.#options.rootfs.storage !== undefined
@@ -1641,8 +1673,24 @@ class HostBackedSandboxVm implements SandboxVm {
     }
     try {
       await this.control.close();
-      await this.#hostVm.close();
-    } finally {
+    } catch (error) {
+      closeError ??= error;
+    }
+    let lifecycleError: unknown;
+    try {
+      if (this.#blockDeviceLifecycle === undefined) {
+        await this.#hostVm.close();
+      } else {
+        await this.#blockDeviceLifecycle.close();
+      }
+    } catch (error) {
+      lifecycleError = error;
+    }
+    if (lifecycleError !== undefined) {
+      throw lifecycleError;
+    }
+    if (closeError !== undefined) {
+      throw closeError;
     }
     if (syncError !== undefined) {
       throw syncError;
