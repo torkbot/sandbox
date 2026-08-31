@@ -2670,7 +2670,8 @@ function validateSandboxBootOptions(options: SandboxBootOptions): void {
   let blockDevicePath: string | undefined;
   for (const [path, source] of Object.entries(options.mounts ?? {})) {
     validateGuestPath(path, "mount.path");
-    if (mountPaths.has(path)) {
+    const canonicalPath = canonicalGuestPath(path);
+    if (mountPaths.has(canonicalPath)) {
       throw new Error(`invalid sandbox boot options: duplicate mount path: ${path}`);
     }
     if (
@@ -2691,14 +2692,15 @@ function validateSandboxBootOptions(options: SandboxBootOptions): void {
       blockDevice = source;
       blockDevicePath = path;
     }
-    mountPaths.add(path);
+    mountPaths.add(canonicalPath);
   }
   if (blockDevice !== undefined && blockDevicePath !== undefined) {
     if (guestPathIsStrictAncestor("/run/sandbox/http-ca", blockDevicePath)) {
       throw new Error(`invalid sandbox boot options: block device mount must not be nested beneath /run/sandbox/http-ca: ${blockDevicePath}`);
     }
+    const canonicalBlockDevicePath = canonicalGuestPath(blockDevicePath);
     const parent = [...mountPaths].find((path) => (
-      path !== blockDevicePath && guestPathIsStrictAncestor(path, blockDevicePath)
+      path !== canonicalBlockDevicePath && guestPathIsStrictAncestor(path, canonicalBlockDevicePath)
     ));
     if (parent !== undefined) {
       throw new Error(`invalid sandbox boot options: block device mount must not be nested beneath another mount: ${blockDevicePath}`);
@@ -2710,6 +2712,10 @@ function validateSandboxBootOptions(options: SandboxBootOptions): void {
   if (options.cwd !== undefined && !options.cwd.startsWith("/")) {
     throw new Error("invalid sandbox boot options: cwd must be absolute");
   }
+}
+
+function canonicalGuestPath(path: string): string {
+  return `/${path.split("/").filter(Boolean).join("/")}`;
 }
 
 function guestPathIsStrictAncestor(parent: string, child: string): boolean {
@@ -3011,13 +3017,14 @@ function validateInternalSandboxOptions(options: InternalSandboxOptions): void {
   const mountPaths = new Set<string>();
   for (const mount of options.mounts ?? []) {
     validateGuestPath(mount.path, "mount.path");
-    if (mountPaths.has(mount.path)) {
+    const canonicalPath = canonicalGuestPath(mount.path);
+    if (mountPaths.has(canonicalPath)) {
       throw new Error(`invalid sandbox options: duplicate mount path: ${mount.path}`);
     }
     if (mount.kind === "host-directory") {
       validateHostDirectorySource(mount);
     }
-    mountPaths.add(mount.path);
+    mountPaths.add(canonicalPath);
   }
 
   if (options.network?.outbound?.policy !== undefined && options.network.outbound.policy !== "deny") {
@@ -3035,7 +3042,7 @@ function validateGuestPath(path: string, field: "mount.path"): void {
   if (!path.startsWith("/")) {
     throw new Error(`invalid sandbox options: ${field} must be absolute`);
   }
-  if (path === "/") {
+  if (canonicalGuestPath(path) === "/") {
     throw new Error(`invalid sandbox options: ${field} must not be root`);
   }
   if (path.includes("\0")) {

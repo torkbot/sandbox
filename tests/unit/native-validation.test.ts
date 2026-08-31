@@ -91,6 +91,18 @@ test("sandbox.boot rejects block devices nested beneath another mount", async ()
   );
 });
 
+test("sandbox.boot rejects canonically duplicate block device mount paths", async () => {
+  await assert.rejects(
+    defineSandbox({ rootfs: testRootfs }).boot({
+      mounts: {
+        "/workspace": { kind: "virtual-fs", fileSystem: fs.memory() },
+        "/workspace/": { kind: "block-device" },
+      },
+    }),
+    /duplicate mount path: \/workspace\//,
+  );
+});
+
 test("sandbox.boot rejects block devices beneath the internal HTTP CA mount", async () => {
   await assert.rejects(
     defineSandbox({ rootfs: testRootfs }).boot({
@@ -293,6 +305,15 @@ test("boot rejects root and dot-component mount paths before runtime launch", as
     sandbox.boot({
       mounts: {
         "/": fs.virtual(writableFileSystem()),
+      },
+    }),
+    /invalid sandbox options: mount\.path must not be root/,
+  );
+
+  await assert.rejects(
+    sandbox.boot({
+      mounts: {
+        "////": fs.virtual(writableFileSystem()),
       },
     }),
     /invalid sandbox options: mount\.path must not be root/,

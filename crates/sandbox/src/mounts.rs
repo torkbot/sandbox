@@ -34,11 +34,16 @@ impl MountTable {
                 MountSpec::BlockDevice { path } => (path.as_str(), PlannedMount::BlockDevice),
             };
 
-            if path == "/" {
+            let canonical_path = Path::new(path)
+                .components()
+                .collect::<std::path::PathBuf>()
+                .to_string_lossy()
+                .into_owned();
+            if canonical_path == "/" {
                 return Err(MountError::new("mount.path must not be /"));
             }
 
-            if table.insert(path.to_string(), planned).is_some() {
+            if table.insert(canonical_path, planned).is_some() {
                 return Err(MountError::new(format!("duplicate mount path: {path}")));
             }
         }
@@ -129,9 +134,33 @@ mod tests {
     }
 
     #[test]
+    fn rejects_canonically_duplicate_mount_paths() {
+        let err = MountTable::plan(&[
+            MountSpec::VirtualFs {
+                path: "/workspace".to_string(),
+                writable: false,
+            },
+            MountSpec::BlockDevice {
+                path: "/workspace/".to_string(),
+            },
+        ])
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "duplicate mount path: /workspace/");
+    }
+
+    #[test]
     fn rejects_mounting_over_root() {
         let err = MountTable::plan(&[MountSpec::VirtualFs {
             path: "/".to_string(),
+            writable: false,
+        }])
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "mount.path must not be /");
+
+        let err = MountTable::plan(&[MountSpec::VirtualFs {
+            path: "////".to_string(),
             writable: false,
         }])
         .unwrap_err();
