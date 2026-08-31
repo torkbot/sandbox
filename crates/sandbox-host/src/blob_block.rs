@@ -12,6 +12,7 @@ use bson::Document;
 use sandbox::block_storage::{CowBlockStore, format_empty_ext4};
 use sandbox::runtime::BlockDeviceService;
 use serde::{Deserialize, Serialize};
+use slatedb::admin::{AdminBuilder, CloneSourceSpec};
 use slatedb::config::WriteOptions;
 use slatedb::object_store::aws::AmazonS3Builder;
 use slatedb::object_store::azure::MicrosoftAzureBuilder;
@@ -63,20 +64,57 @@ impl BlobBlockVolume {
         };
 
         let metadata_path = volume_root.clone().join("metadata.json");
-        let metadata =
-            runtime.block_on(read_json::<VolumeMetadata>(&provider.store, &metadata_path))?;
+        let metadata = runtime.block_on(read_versioned_json::<VolumeMetadata>(
+            &provider.store,
+            &metadata_path,
+        ))?;
         lease.revalidate()?;
-        let db = if let Some(metadata) = metadata {
-            metadata.validate(size_bytes)?;
-            let db = runtime.block_on(Db::open(
-                volume_root.join("data").join(metadata.generation.as_str()),
-                provider.store.clone(),
-            ))?;
-            lease.revalidate()?;
-            db
+        let db = if let Some(current) = metadata {
+            current.value.validate(size_bytes)?;
+            if lease.requires_isolated_generation() {
+                let next = current.value.next_generation();
+                let source_path = volume_root
+                    .clone()
+                    .join("data")
+                    .join(current.value.generation.as_str());
+                let next_path = volume_root
+                    .clone()
+                    .join("data")
+                    .join(next.generation.as_str());
+                runtime.block_on(clone_db_generation(
+                    provider.store.clone(),
+                    source_path,
+                    next_path.clone(),
+                ))?;
+                lease.revalidate()?;
+                let db = runtime.block_on(Db::open(next_path, provider.store.clone()))?;
+                lease.revalidate()?;
+                if let Err(error) = runtime.block_on(put_json_update(
+                    &provider.store,
+                    &metadata_path,
+                    &next,
+                    current.version,
+                )) {
+                    let _ = runtime.block_on(db.close());
+                    return Err(error);
+                }
+                if let Err(error) = lease.revalidate() {
+                    let _ = runtime.block_on(db.close());
+                    return Err(error);
+                }
+                db
+            } else {
+                runtime.block_on(Db::open(
+                    volume_root
+                        .clone()
+                        .join("data")
+                        .join(current.value.generation.as_str()),
+                    provider.store.clone(),
+                ))?
+            }
         } else {
             let metadata = VolumeMetadata::new(size_bytes);
-            // ponytail: interrupted provisioning can leave an unreachable generation;
+            // ponytail: interrupted provisioning or handoff can leave an unreachable generation;
             // add provider garbage collection when volume deletion is introduced.
             let db = runtime.block_on(Db::open(
                 volume_root.join("data").join(metadata.generation.as_str()),
@@ -89,7 +127,10 @@ impl BlobBlockVolume {
             ));
             format_empty_ext4(store, size_bytes, metadata.fs_uuid)?;
             runtime.block_on(put_json_create(&provider.store, &metadata_path, &metadata))?;
-            lease.revalidate()?;
+            if let Err(error) = lease.revalidate() {
+                let _ = runtime.block_on(db.close());
+                return Err(error);
+            }
             db
         };
         let store = Arc::new(SlateDbBlockStore::new(runtime, db, size_bytes));
@@ -424,6 +465,10 @@ enum VolumeLease {
 }
 
 impl VolumeLease {
+    fn requires_isolated_generation(&self) -> bool {
+        matches!(self, Self::Object { .. })
+    }
+
     fn revalidate(&self) -> Result<(), Box<dyn std::error::Error>> {
         match self {
             Self::Local { .. } => Ok(()),
@@ -797,6 +842,15 @@ impl VolumeMetadata {
         }
     }
 
+    fn next_generation(&self) -> Self {
+        Self {
+            version: self.version,
+            size_bytes: self.size_bytes,
+            fs_uuid: self.fs_uuid,
+            generation: bson::oid::ObjectId::new().to_hex(),
+        }
+    }
+
     fn validate(&self, requested_size: u64) -> Result<(), Box<dyn std::error::Error>> {
         if self.version != 1 {
             return Err(format!("unsupported blob block volume version: {}", self.version).into());
@@ -817,15 +871,42 @@ impl VolumeMetadata {
     }
 }
 
-async fn read_json<T: for<'de> Deserialize<'de>>(
+struct VersionedJson<T> {
+    value: T,
+    version: UpdateVersion,
+}
+
+async fn read_versioned_json<T: for<'de> Deserialize<'de>>(
     store: &Arc<dyn ObjectStore>,
     path: &Path,
-) -> Result<Option<T>, Box<dyn std::error::Error>> {
+) -> Result<Option<VersionedJson<T>>, Box<dyn std::error::Error>> {
     match store.get(path).await {
-        Ok(result) => Ok(Some(serde_json::from_slice(&result.bytes().await?)?)),
+        Ok(result) => {
+            let version = UpdateVersion {
+                e_tag: result.meta.e_tag.clone(),
+                version: result.meta.version.clone(),
+            };
+            Ok(Some(VersionedJson {
+                value: serde_json::from_slice(&result.bytes().await?)?,
+                version,
+            }))
+        }
         Err(slatedb::object_store::Error::NotFound { .. }) => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+
+async fn clone_db_generation(
+    store: Arc<dyn ObjectStore>,
+    source_path: Path,
+    target_path: Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    AdminBuilder::new(target_path, store)
+        .build()
+        .create_clone_builder_from_source(CloneSourceSpec::new(source_path))
+        .build()
+        .await?;
+    Ok(())
 }
 
 async fn put_json_create<T: Serialize>(
@@ -838,6 +919,22 @@ async fn put_json_create<T: Serialize>(
             path,
             serde_json::to_vec(value)?.into(),
             PutMode::Create.into(),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn put_json_update<T: Serialize>(
+    store: &Arc<dyn ObjectStore>,
+    path: &Path,
+    value: &T,
+    version: UpdateVersion,
+) -> Result<(), Box<dyn std::error::Error>> {
+    store
+        .put_opts(
+            path,
+            serde_json::to_vec(value)?.into(),
+            PutMode::Update(version).into(),
         )
         .await?;
     Ok(())
@@ -910,13 +1007,15 @@ mod tests {
 
     use std::sync::Arc;
 
+    use slatedb::Db;
     use slatedb::object_store::ObjectStore;
     use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::path::Path as ObjectPath;
-    use slatedb::{CloseReason, Db, ErrorKind};
     use tokio::runtime::Runtime;
 
-    use super::{BlobBlockVolume, ObjectLease, VolumeMetadata, lease_is_expired};
+    use super::{
+        BlobBlockVolume, ObjectLease, VolumeMetadata, clone_db_generation, lease_is_expired,
+    };
 
     const TEST_SIZE: u64 = 64 * 1024 * 1024;
 
@@ -1029,32 +1128,45 @@ mod tests {
     }
 
     #[test]
-    fn opening_a_new_writer_fences_the_previous_slate_db_handle() {
-        let runtime = Runtime::new().expect("create SlateDB fencing test runtime");
+    fn handed_off_generations_do_not_fence_each_other() {
+        let runtime = Runtime::new().expect("create SlateDB generation test runtime");
         runtime.block_on(async {
             let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
-            let path = ObjectPath::from("volumes/workspace/data");
-            let first = Db::open(path.clone(), store.clone())
+            let source_path = ObjectPath::from("volumes/workspace/data/source");
+            let source = Db::open(source_path.clone(), store.clone())
                 .await
-                .expect("open first writer");
-            first
+                .expect("open source generation");
+            source
                 .put(b"before", b"first")
                 .await
-                .expect("write first value");
+                .expect("write source value");
+            source.close().await.expect("close source generation");
 
-            let second = Db::open(path, store)
+            let active_path = ObjectPath::from("volumes/workspace/data/active");
+            clone_db_generation(store.clone(), source_path.clone(), active_path.clone())
                 .await
-                .expect("open replacement writer");
-            let error = first
+                .expect("clone active generation");
+            let active = Db::open(active_path, store.clone())
+                .await
+                .expect("open active generation");
+
+            let stale_path = ObjectPath::from("volumes/workspace/data/stale");
+            clone_db_generation(store.clone(), source_path, stale_path.clone())
+                .await
+                .expect("clone stale generation");
+            let stale = Db::open(stale_path, store)
+                .await
+                .expect("open stale generation");
+            stale
                 .put(b"after", b"stale")
                 .await
-                .expect_err("replacement writer must fence the previous handle");
-            assert_eq!(error.kind(), ErrorKind::Closed(CloseReason::Fenced));
-            second
+                .expect("stale generation remains isolated");
+            active
                 .put(b"after", b"replacement")
                 .await
-                .expect("replacement writer remains writable");
-            second.close().await.expect("close replacement writer");
+                .expect("active generation remains writable");
+            active.close().await.expect("close active generation");
+            stale.close().await.expect("close stale generation");
         });
     }
 
