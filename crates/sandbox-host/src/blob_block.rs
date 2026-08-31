@@ -64,19 +64,16 @@ impl BlobBlockVolume {
         };
 
         let metadata_path = volume_root.clone().join("metadata.json");
-        let metadata = runtime.block_on(read_versioned_json::<VolumeMetadata>(
-            &provider.store,
-            &metadata_path,
-        ))?;
+        let metadata = lease.metadata(&runtime, &provider.store, &metadata_path)?;
         lease.revalidate()?;
         let db = if let Some(current) = metadata {
-            current.value.validate(size_bytes)?;
+            current.validate(size_bytes)?;
             if lease.requires_isolated_generation() {
-                let next = current.value.next_generation();
+                let next = current.next_generation();
                 let source_path = volume_root
                     .clone()
                     .join("data")
-                    .join(current.value.generation.as_str());
+                    .join(current.generation.as_str());
                 let next_path = volume_root
                     .clone()
                     .join("data")
@@ -89,12 +86,9 @@ impl BlobBlockVolume {
                 lease.revalidate()?;
                 let db = runtime.block_on(Db::open(next_path, provider.store.clone()))?;
                 lease.revalidate()?;
-                if let Err(error) = runtime.block_on(put_json_update(
-                    &provider.store,
-                    &metadata_path,
-                    &next,
-                    current.version,
-                )) {
+                if let Err(error) =
+                    lease.commit_metadata(&runtime, &provider.store, &metadata_path, &next)
+                {
                     let _ = runtime.block_on(db.close());
                     return Err(error);
                 }
@@ -108,7 +102,7 @@ impl BlobBlockVolume {
                     volume_root
                         .clone()
                         .join("data")
-                        .join(current.value.generation.as_str()),
+                        .join(current.generation.as_str()),
                     provider.store.clone(),
                 ))?
             }
@@ -126,8 +120,9 @@ impl BlobBlockVolume {
                 size_bytes,
             ));
             format_empty_ext4(store, size_bytes, metadata.fs_uuid)?;
-            runtime.block_on(put_json_create(&provider.store, &metadata_path, &metadata))?;
-            if let Err(error) = lease.revalidate() {
+            if let Err(error) =
+                lease.commit_metadata(&runtime, &provider.store, &metadata_path, &metadata)
+            {
                 let _ = runtime.block_on(db.close());
                 return Err(error);
             }
@@ -482,6 +477,35 @@ impl VolumeLease {
             }
         }
     }
+
+    fn metadata(
+        &self,
+        runtime: &Arc<Runtime>,
+        store: &Arc<dyn ObjectStore>,
+        path: &Path,
+    ) -> Result<Option<VolumeMetadata>, Box<dyn std::error::Error>> {
+        match self {
+            Self::Local { .. } => runtime.block_on(read_json(store, path)),
+            Self::Object { _lease } => runtime.block_on(_lease.state.metadata()),
+        }
+    }
+
+    fn commit_metadata(
+        &self,
+        runtime: &Arc<Runtime>,
+        store: &Arc<dyn ObjectStore>,
+        path: &Path,
+        metadata: &VolumeMetadata,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            Self::Local { .. } => runtime.block_on(put_json_create(store, path, metadata)),
+            Self::Object { _lease } => runtime
+                .block_on(_lease.state.commit_metadata(metadata.clone()))
+                .map_err(|error| {
+                    format!("block volume lease lost while publishing metadata: {error}").into()
+                }),
+        }
+    }
 }
 
 struct LocalLease {
@@ -537,13 +561,19 @@ struct ObjectLeaseState {
     store: Arc<dyn ObjectStore>,
     path: Path,
     owner: String,
-    version: tokio::sync::Mutex<UpdateVersion>,
+    record: tokio::sync::Mutex<ObjectLeaseRecord>,
+}
+
+struct ObjectLeaseRecord {
+    version: UpdateVersion,
+    metadata: Option<VolumeMetadata>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct LeaseDocument {
     owner: String,
     released: bool,
+    metadata: Option<VolumeMetadata>,
 }
 
 impl ObjectLease {
@@ -554,17 +584,18 @@ impl ObjectLease {
         volume: String,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let owner = bson::oid::ObjectId::new().to_hex();
-        let payload = serde_json::to_vec(&LeaseDocument {
-            owner: owner.clone(),
-            released: false,
-        })?;
-        let version = match store.get(&path).await {
+        let (version, metadata) = match store.get(&path).await {
             Err(slatedb::object_store::Error::NotFound { .. }) => {
+                let payload = serde_json::to_vec(&LeaseDocument {
+                    owner: owner.clone(),
+                    released: false,
+                    metadata: None,
+                })?;
                 match store
-                    .put_opts(&path, payload.clone().into(), PutMode::Create.into())
+                    .put_opts(&path, payload.into(), PutMode::Create.into())
                     .await
                 {
-                    Ok(result) => UpdateVersion::from(result),
+                    Ok(result) => (UpdateVersion::from(result), None),
                     Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
                         return Err(format!("block volume {volume} is already leased").into());
                     }
@@ -584,11 +615,17 @@ impl ObjectLease {
                     e_tag: meta.e_tag,
                     version: meta.version,
                 };
+                let metadata = existing.metadata;
+                let payload = serde_json::to_vec(&LeaseDocument {
+                    owner: owner.clone(),
+                    released: false,
+                    metadata: metadata.clone(),
+                })?;
                 match store
-                    .put_opts(&path, payload.clone().into(), PutMode::Update(prior).into())
+                    .put_opts(&path, payload.into(), PutMode::Update(prior).into())
                     .await
                 {
-                    Ok(result) => UpdateVersion::from(result),
+                    Ok(result) => (UpdateVersion::from(result), metadata),
                     Err(slatedb::object_store::Error::Precondition { .. }) => {
                         return Err(format!("block volume {volume} is already leased").into());
                     }
@@ -601,7 +638,7 @@ impl ObjectLease {
             store,
             path,
             owner,
-            version: tokio::sync::Mutex::new(version),
+            record: tokio::sync::Mutex::new(ObjectLeaseRecord { version, metadata }),
         });
         let (stop, mut stopped) = watch::channel(false);
         let renewal_state = state.clone();
@@ -649,33 +686,68 @@ fn lease_is_expired(last_modified_ms: i64, server_now_ms: i64) -> bool {
 }
 
 impl ObjectLeaseState {
+    async fn metadata(&self) -> Result<Option<VolumeMetadata>, Box<dyn std::error::Error>> {
+        Ok(self.record.lock().await.metadata.clone())
+    }
+
     async fn renew(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut record = self.record.lock().await;
         let payload = serde_json::to_vec(&LeaseDocument {
             owner: self.owner.clone(),
             released: false,
+            metadata: record.metadata.clone(),
         })?;
-        let mut version = self.version.lock().await;
         let result = self
             .store
             .put_opts(
                 &self.path,
                 payload.into(),
-                PutMode::Update(version.clone()).into(),
+                PutMode::Update(record.version.clone()).into(),
             )
             .await?;
-        *version = UpdateVersion::from(result);
+        record.version = UpdateVersion::from(result);
+        Ok(())
+    }
+
+    async fn commit_metadata(
+        &self,
+        metadata: VolumeMetadata,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut record = self.record.lock().await;
+        let payload = serde_json::to_vec(&LeaseDocument {
+            owner: self.owner.clone(),
+            released: false,
+            metadata: Some(metadata.clone()),
+        })?;
+        let result = self
+            .store
+            .put_opts(
+                &self.path,
+                payload.into(),
+                PutMode::Update(record.version.clone()).into(),
+            )
+            .await?;
+        record.version = UpdateVersion::from(result);
+        record.metadata = Some(metadata);
         Ok(())
     }
 
     async fn release(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut record = self.record.lock().await;
         let payload = serde_json::to_vec(&LeaseDocument {
             owner: self.owner.clone(),
             released: true,
+            metadata: record.metadata.clone(),
         })?;
-        let version = self.version.lock().await.clone();
-        self.store
-            .put_opts(&self.path, payload.into(), PutMode::Update(version).into())
+        let result = self
+            .store
+            .put_opts(
+                &self.path,
+                payload.into(),
+                PutMode::Update(record.version.clone()).into(),
+            )
             .await?;
+        record.version = UpdateVersion::from(result);
         Ok(())
     }
 }
@@ -818,7 +890,7 @@ impl CowBlockStore for SlateDbBlockStore {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct VolumeMetadata {
     version: u32,
@@ -871,26 +943,12 @@ impl VolumeMetadata {
     }
 }
 
-struct VersionedJson<T> {
-    value: T,
-    version: UpdateVersion,
-}
-
-async fn read_versioned_json<T: for<'de> Deserialize<'de>>(
+async fn read_json<T: for<'de> Deserialize<'de>>(
     store: &Arc<dyn ObjectStore>,
     path: &Path,
-) -> Result<Option<VersionedJson<T>>, Box<dyn std::error::Error>> {
+) -> Result<Option<T>, Box<dyn std::error::Error>> {
     match store.get(path).await {
-        Ok(result) => {
-            let version = UpdateVersion {
-                e_tag: result.meta.e_tag.clone(),
-                version: result.meta.version.clone(),
-            };
-            Ok(Some(VersionedJson {
-                value: serde_json::from_slice(&result.bytes().await?)?,
-                version,
-            }))
-        }
+        Ok(result) => Ok(Some(serde_json::from_slice(&result.bytes().await?)?)),
         Err(slatedb::object_store::Error::NotFound { .. }) => Ok(None),
         Err(error) => Err(error.into()),
     }
@@ -919,22 +977,6 @@ async fn put_json_create<T: Serialize>(
             path,
             serde_json::to_vec(value)?.into(),
             PutMode::Create.into(),
-        )
-        .await?;
-    Ok(())
-}
-
-async fn put_json_update<T: Serialize>(
-    store: &Arc<dyn ObjectStore>,
-    path: &Path,
-    value: &T,
-    version: UpdateVersion,
-) -> Result<(), Box<dyn std::error::Error>> {
-    store
-        .put_opts(
-            path,
-            serde_json::to_vec(value)?.into(),
-            PutMode::Update(version).into(),
         )
         .await?;
     Ok(())
@@ -1008,13 +1050,15 @@ mod tests {
     use std::sync::Arc;
 
     use slatedb::Db;
-    use slatedb::object_store::ObjectStore;
     use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::path::Path as ObjectPath;
+    use slatedb::object_store::{ObjectStore, ObjectStoreExt};
+    use slatedb::object_store::{PutMode, UpdateVersion};
     use tokio::runtime::Runtime;
 
     use super::{
-        BlobBlockVolume, ObjectLease, VolumeMetadata, clone_db_generation, lease_is_expired,
+        BlobBlockVolume, LeaseDocument, ObjectLease, VolumeMetadata, clone_db_generation,
+        lease_is_expired,
     };
 
     const TEST_SIZE: u64 = 64 * 1024 * 1024;
@@ -1106,6 +1150,55 @@ mod tests {
 
         let reacquired = acquire().expect("reacquire released object lease");
         drop(reacquired);
+    }
+
+    #[test]
+    fn lost_object_lease_cannot_publish_volume_metadata() {
+        let runtime = Arc::new(Runtime::new().expect("create object lease test runtime"));
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let path = ObjectPath::from("volumes/workspace/lease.json");
+        let first = runtime
+            .block_on(ObjectLease::acquire(
+                runtime.clone(),
+                store.clone(),
+                path.clone(),
+                "workspace".to_string(),
+            ))
+            .expect("acquire object lease");
+
+        runtime.block_on(async {
+            let current = store.get(&path).await.expect("read current lease");
+            let version = UpdateVersion {
+                e_tag: current.meta.e_tag,
+                version: current.meta.version,
+            };
+            store
+                .put_opts(
+                    &path,
+                    serde_json::to_vec(&LeaseDocument {
+                        owner: "replacement".to_string(),
+                        released: false,
+                        metadata: None,
+                    })
+                    .expect("serialize replacement lease")
+                    .into(),
+                    PutMode::Update(version).into(),
+                )
+                .await
+                .expect("replace lease owner");
+
+            first
+                .state
+                .commit_metadata(VolumeMetadata::new(TEST_SIZE))
+                .await
+                .expect_err("lost lease must not publish metadata");
+            let current = store.get(&path).await.expect("read replacement lease");
+            let document: LeaseDocument =
+                serde_json::from_slice(&current.bytes().await.expect("read lease bytes"))
+                    .expect("deserialize lease");
+            assert!(document.metadata.is_none());
+        });
+        drop(first);
     }
 
     #[test]
