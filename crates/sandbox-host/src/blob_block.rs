@@ -34,6 +34,7 @@ const LEASE_RENEW_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const LEASE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const LEASE_RENEW_DEADLINE: Duration = Duration::from_secs(25);
 const LEASE_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+const BLOCK_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct BlobBlockVolume {
     store: Arc<SlateDbBlockStore>,
@@ -836,7 +837,12 @@ impl SlateDbBlockStore {
 
     fn close(&self) -> io::Result<()> {
         let db = self.db.clone();
-        self.wait_for(async move { db.close().await.map_err(io::Error::other) })
+        self.runtime.block_on(async move {
+            tokio::time::timeout(BLOCK_CLOSE_TIMEOUT, db.close())
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "blob block close timed out"))?
+                .map_err(io::Error::other)
+        })
     }
 }
 
@@ -1106,8 +1112,8 @@ mod tests {
     use tokio::runtime::Runtime;
 
     use super::{
-        BlobBlockVolume, LeaseDocument, ObjectLease, VolumeMetadata, clone_db_generation,
-        lease_is_expired,
+        BlobBlockVolume, LeaseDocument, ObjectLease, SlateDbBlockStore, VolumeMetadata,
+        clone_db_generation, lease_is_expired,
     };
 
     const TEST_SIZE: u64 = 64 * 1024 * 1024;
@@ -1296,6 +1302,30 @@ mod tests {
         let started_at = Instant::now();
         drop(lease);
         assert!(started_at.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn block_store_close_times_out_when_object_storage_is_stuck() {
+        let runtime = Arc::new(Runtime::new().expect("create block store test runtime"));
+        let throttled = Arc::new(ThrottledStore::new(
+            InMemory::new(),
+            ThrottleConfig::default(),
+        ));
+        let db = runtime
+            .block_on(Db::open(
+                ObjectPath::from("volumes/workspace/data/current"),
+                throttled.clone(),
+            ))
+            .expect("open block store database");
+        let store = SlateDbBlockStore::new(runtime, db, TEST_SIZE);
+        throttled.config_mut(|config| {
+            config.wait_put_per_call = Duration::from_secs(30);
+        });
+
+        let started_at = Instant::now();
+        let error = store.close().expect_err("stuck close must time out");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started_at.elapsed() < Duration::from_secs(3));
     }
 
     #[test]
