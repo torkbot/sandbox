@@ -5,8 +5,7 @@ use std::future::Future;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use bson::Document;
@@ -28,32 +27,109 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 const BLOCK_SIZE: u64 = 64 * 1024;
-const LEASE_DURATION: Duration = Duration::from_secs(30);
-const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(10);
-const LEASE_RENEW_RETRY_INTERVAL: Duration = Duration::from_secs(1);
-const LEASE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-const LEASE_RENEW_DEADLINE: Duration = Duration::from_secs(25);
+pub(crate) const LEASE_DURATION: Duration = Duration::from_secs(30);
+pub(crate) const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(10);
+pub(crate) const LEASE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const LEASE_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const BLOCK_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Debug)]
+pub struct BlobBlockFailure {
+    pub code: &'static str,
+    pub message: String,
+    pub retry_after_ms: Option<u64>,
+}
+
+impl BlobBlockFailure {
+    fn new(code: &'static str, error: impl fmt::Display) -> Self {
+        Self {
+            code,
+            message: error.to_string(),
+            retry_after_ms: None,
+        }
+    }
+
+    fn locked(volume: &str, retry_after_ms: Option<u64>) -> Self {
+        Self {
+            code: "volume-locked",
+            message: format!("block volume {volume} is already leased"),
+            retry_after_ms,
+        }
+    }
+
+    fn lease_provider_error(error: impl fmt::Display) -> Self {
+        Self {
+            code: "lease-provider-error",
+            message: format!("blob block lease state is uncertain: {error}"),
+            retry_after_ms: Some(LEASE_DURATION.as_millis() as u64),
+        }
+    }
+
+    fn lease_store_failure(error: slatedb::object_store::Error) -> Self {
+        let (code, message) = match &error {
+            slatedb::object_store::Error::Precondition { .. } => (
+                "lease-lost",
+                format!("blob block lease ownership was lost: {error}"),
+            ),
+            slatedb::object_store::Error::PermissionDenied { .. }
+            | slatedb::object_store::Error::Unauthenticated { .. } => (
+                "lease-authentication-failed",
+                format!("blob block lease authentication failed: {error}"),
+            ),
+            _ => (
+                "lease-provider-error",
+                format!("blob block lease state is uncertain: {error}"),
+            ),
+        };
+        Self {
+            code,
+            message,
+            retry_after_ms: Some(LEASE_DURATION.as_millis() as u64),
+        }
+    }
+}
+
+fn provider_failure(error: slatedb::object_store::Error) -> BlobBlockFailure {
+    let code = match &error {
+        slatedb::object_store::Error::PermissionDenied { .. }
+        | slatedb::object_store::Error::Unauthenticated { .. } => "authentication-failed",
+        _ => "provider-error",
+    };
+    BlobBlockFailure::new(code, error)
+}
+
+impl fmt::Display for BlobBlockFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for BlobBlockFailure {}
 
 pub struct BlobBlockVolume {
     store: Arc<SlateDbBlockStore>,
     _lease: VolumeLease,
     size: u64,
+    closed: bool,
 }
 
 impl BlobBlockVolume {
-    pub fn acquire(document: Document) -> Result<Self, Box<dyn std::error::Error>> {
-        let request: AcquireRequest = bson::deserialize_from_document(document)?;
-        request.validate()?;
+    pub fn acquire(document: Document) -> Result<Self, BlobBlockFailure> {
+        let request: AcquireRequest = bson::deserialize_from_document(document)
+            .map_err(|error| BlobBlockFailure::new("invalid-request", error))?;
+        request
+            .validate()
+            .map_err(|error| BlobBlockFailure::new("invalid-request", error))?;
         let size_bytes = request.size_bytes();
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(4)
                 .enable_all()
-                .build()?,
+                .build()
+                .map_err(|error| BlobBlockFailure::new("storage-error", error))?,
         );
-        let provider = ProviderStore::build(&request.provider)?;
+        let provider = ProviderStore::build(&request.provider)
+            .map_err(|error| BlobBlockFailure::new("provider-error", error))?;
         let volume_root = Path::from(format!("volumes/{}", request.volume));
         let lease = match provider.local_root.as_ref() {
             Some(root) => VolumeLease::Local {
@@ -84,13 +160,17 @@ impl BlobBlockVolume {
                     .clone()
                     .join("data")
                     .join(next.generation.as_str());
-                runtime.block_on(clone_db_generation(
-                    provider.store.clone(),
-                    source_path,
-                    next_path.clone(),
-                ))?;
+                runtime
+                    .block_on(clone_db_generation(
+                        provider.store.clone(),
+                        source_path,
+                        next_path.clone(),
+                    ))
+                    .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
                 lease.revalidate()?;
-                let db = runtime.block_on(Db::open(next_path, provider.store.clone()))?;
+                let db = runtime
+                    .block_on(Db::open(next_path, provider.store.clone()))
+                    .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
                 lease.revalidate()?;
                 if let Err(error) =
                     lease.commit_metadata(&runtime, &provider.store, &metadata_path, &next)
@@ -98,34 +178,35 @@ impl BlobBlockVolume {
                     let _ = runtime.block_on(db.close());
                     return Err(error);
                 }
-                if let Err(error) = lease.revalidate() {
-                    let _ = runtime.block_on(db.close());
-                    return Err(error);
-                }
                 db
             } else {
-                runtime.block_on(Db::open(
-                    volume_root
-                        .clone()
-                        .join("data")
-                        .join(current.generation.as_str()),
-                    provider.store.clone(),
-                ))?
+                runtime
+                    .block_on(Db::open(
+                        volume_root
+                            .clone()
+                            .join("data")
+                            .join(current.generation.as_str()),
+                        provider.store.clone(),
+                    ))
+                    .map_err(|error| BlobBlockFailure::new("storage-error", error))?
             }
         } else {
             let metadata = VolumeMetadata::new(size_bytes);
             // ponytail: interrupted provisioning or handoff can leave an unreachable generation;
             // add provider garbage collection when volume deletion is introduced.
-            let db = runtime.block_on(Db::open(
-                volume_root.join("data").join(metadata.generation.as_str()),
-                provider.store.clone(),
-            ))?;
+            let db = runtime
+                .block_on(Db::open(
+                    volume_root.join("data").join(metadata.generation.as_str()),
+                    provider.store.clone(),
+                ))
+                .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
             let store = Arc::new(SlateDbBlockStore::new(
                 runtime.clone(),
                 db.clone(),
                 size_bytes,
             ));
-            format_empty_ext4(store, size_bytes, metadata.fs_uuid)?;
+            format_empty_ext4(store, size_bytes, metadata.fs_uuid)
+                .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
             if let Err(error) =
                 lease.commit_metadata(&runtime, &provider.store, &metadata_path, &metadata)
             {
@@ -134,11 +215,16 @@ impl BlobBlockVolume {
             }
             db
         };
+        if let Err(error) = lease.revalidate() {
+            let _ = runtime.block_on(db.close());
+            return Err(error);
+        }
         let store = Arc::new(SlateDbBlockStore::new(runtime, db, size_bytes));
         Ok(Self {
             store,
             _lease: lease,
             size: size_bytes,
+            closed: false,
         })
     }
 
@@ -148,11 +234,31 @@ impl BlobBlockVolume {
             size: self.size,
         }
     }
+
+    pub fn take_failure_receiver(&mut self) -> Option<mpsc::Receiver<BlobBlockFailure>> {
+        self._lease.take_failure_receiver()
+    }
+
+    pub fn failed(&self) -> bool {
+        self._lease.failed()
+    }
+
+    pub fn close(&mut self) -> Result<(), BlobBlockFailure> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        if let Err(error) = self.store.close() {
+            self._lease.close(false)?;
+            return Err(BlobBlockFailure::new("storage-error", error));
+        }
+        self._lease.close(true)
+    }
 }
 
 impl Drop for BlobBlockVolume {
     fn drop(&mut self) {
-        let _ = self.store.close();
+        let _ = self.close();
     }
 }
 
@@ -470,16 +576,14 @@ impl VolumeLease {
         matches!(self, Self::Object { .. })
     }
 
-    fn revalidate(&self) -> Result<(), Box<dyn std::error::Error>> {
+    fn revalidate(&self) -> Result<(), BlobBlockFailure> {
         match self {
             Self::Local { .. } => Ok(()),
             Self::Object { _lease } => {
-                _lease
-                    .runtime
-                    .block_on(_lease.state.renew())
-                    .map_err(|error| {
-                        format!("block volume lease lost during acquisition: {error}").into()
-                    })
+                if let Some(failure) = _lease.state.failure() {
+                    return Err(failure);
+                }
+                _lease.runtime.block_on(_lease.state.renew())
             }
         }
     }
@@ -489,9 +593,11 @@ impl VolumeLease {
         runtime: &Arc<Runtime>,
         store: &Arc<dyn ObjectStore>,
         path: &Path,
-    ) -> Result<Option<VolumeMetadata>, Box<dyn std::error::Error>> {
+    ) -> Result<Option<VolumeMetadata>, BlobBlockFailure> {
         match self {
-            Self::Local { .. } => runtime.block_on(read_json(store, path)),
+            Self::Local { .. } => runtime
+                .block_on(read_json(store, path))
+                .map_err(|error| BlobBlockFailure::new("storage-error", error)),
             Self::Object { _lease } => runtime.block_on(_lease.state.metadata()),
         }
     }
@@ -502,14 +608,35 @@ impl VolumeLease {
         store: &Arc<dyn ObjectStore>,
         path: &Path,
         metadata: &VolumeMetadata,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), BlobBlockFailure> {
         match self {
-            Self::Local { .. } => runtime.block_on(put_json_create(store, path, metadata)),
-            Self::Object { _lease } => runtime
-                .block_on(_lease.state.commit_metadata(metadata.clone()))
-                .map_err(|error| {
-                    format!("block volume lease lost while publishing metadata: {error}").into()
-                }),
+            Self::Local { .. } => runtime
+                .block_on(put_json_create(store, path, metadata))
+                .map_err(|error| BlobBlockFailure::new("storage-error", error)),
+            Self::Object { _lease } => {
+                runtime.block_on(_lease.state.commit_metadata(metadata.clone()))
+            }
+        }
+    }
+
+    fn take_failure_receiver(&mut self) -> Option<mpsc::Receiver<BlobBlockFailure>> {
+        match self {
+            Self::Local { .. } => None,
+            Self::Object { _lease } => _lease.failure_rx.take(),
+        }
+    }
+
+    fn failed(&self) -> bool {
+        match self {
+            Self::Local { .. } => false,
+            Self::Object { _lease } => _lease.state.failure().is_some(),
+        }
+    }
+
+    fn close(&mut self, release: bool) -> Result<(), BlobBlockFailure> {
+        match self {
+            Self::Local { .. } => Ok(()),
+            Self::Object { _lease } => _lease.close(release),
         }
     }
 }
@@ -523,28 +650,30 @@ impl LocalLease {
         root: &FsPath,
         prefix: Option<&str>,
         volume: &str,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, BlobBlockFailure> {
         let mut path = root.to_path_buf();
         if let Some(prefix) = prefix {
             path.push(prefix);
         }
         path.push("volumes");
         path.push(volume);
-        fs::create_dir_all(&path)?;
+        fs::create_dir_all(&path)
+            .map_err(|error| BlobBlockFailure::new("provider-error", error))?;
         path.push("lease.lock");
         let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
-            .open(path)?;
+            .open(path)
+            .map_err(|error| BlobBlockFailure::new("provider-error", error))?;
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if result != 0 {
             let error = io::Error::last_os_error();
             if matches!(error.raw_os_error(), Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN)
             {
-                return Err(format!("block volume {volume} is already leased").into());
+                return Err(BlobBlockFailure::locked(volume, None));
             }
-            return Err(error.into());
+            return Err(BlobBlockFailure::new("provider-error", error));
         }
         Ok(Self { file })
     }
@@ -561,6 +690,8 @@ struct ObjectLease {
     state: Arc<ObjectLeaseState>,
     stop: watch::Sender<bool>,
     task: Option<JoinHandle<()>>,
+    failure_rx: Option<mpsc::Receiver<BlobBlockFailure>>,
+    closed: bool,
 }
 
 struct ObjectLeaseState {
@@ -568,7 +699,7 @@ struct ObjectLeaseState {
     path: Path,
     owner: String,
     record: tokio::sync::Mutex<ObjectLeaseRecord>,
-    ownership_lost: AtomicBool,
+    failure: Mutex<Option<BlobBlockFailure>>,
 }
 
 struct ObjectLeaseRecord {
@@ -589,7 +720,7 @@ impl ObjectLease {
         store: Arc<dyn ObjectStore>,
         path: Path,
         volume: String,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, BlobBlockFailure> {
         let owner = bson::oid::ObjectId::new().to_hex();
         let (version, metadata) = match store.get(&path).await {
             Err(slatedb::object_store::Error::NotFound { .. }) => {
@@ -597,25 +728,36 @@ impl ObjectLease {
                     owner: owner.clone(),
                     released: false,
                     metadata: None,
-                })?;
+                })
+                .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
                 match store
                     .put_opts(&path, payload.into(), PutMode::Create.into())
                     .await
                 {
                     Ok(result) => (UpdateVersion::from(result), None),
                     Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
-                        return Err(format!("block volume {volume} is already leased").into());
+                        return Err(BlobBlockFailure::locked(&volume, None));
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => return Err(provider_failure(error)),
                 }
             }
             Ok(result) => {
                 let meta = result.meta.clone();
-                let existing: LeaseDocument = serde_json::from_slice(&result.bytes().await?)?;
+                let bytes = result.bytes().await.map_err(provider_failure)?;
+                let existing: LeaseDocument = serde_json::from_slice(&bytes)
+                    .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
                 if !existing.released {
-                    let server_now = object_store_now_millis(&store, &path).await?;
+                    let server_now = object_store_now_millis(&store, &path)
+                        .await
+                        .map_err(provider_failure)?;
                     if !lease_is_expired(meta.last_modified.timestamp_millis(), server_now) {
-                        return Err(format!("block volume {volume} is already leased").into());
+                        return Err(BlobBlockFailure::locked(
+                            &volume,
+                            Some(lease_retry_after_ms(
+                                meta.last_modified.timestamp_millis(),
+                                server_now,
+                            )),
+                        ));
                     }
                 }
                 let prior = UpdateVersion {
@@ -627,59 +769,44 @@ impl ObjectLease {
                     owner: owner.clone(),
                     released: false,
                     metadata: metadata.clone(),
-                })?;
+                })
+                .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
                 match store
                     .put_opts(&path, payload.into(), PutMode::Update(prior).into())
                     .await
                 {
                     Ok(result) => (UpdateVersion::from(result), metadata),
                     Err(slatedb::object_store::Error::Precondition { .. }) => {
-                        return Err(format!("block volume {volume} is already leased").into());
+                        return Err(BlobBlockFailure::locked(&volume, None));
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => return Err(provider_failure(error)),
                 }
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(provider_failure(error)),
         };
         let state = Arc::new(ObjectLeaseState {
             store,
             path,
             owner,
             record: tokio::sync::Mutex::new(ObjectLeaseRecord { version, metadata }),
-            ownership_lost: AtomicBool::new(false),
+            failure: Mutex::new(None),
         });
         let (stop, mut stopped) = watch::channel(false);
+        let (failure_tx, failure_rx) = mpsc::sync_channel(1);
         let renewal_state = state.clone();
         let task = runtime.spawn(async move {
-            let mut last_renewed = tokio::time::Instant::now();
-            let mut next_renewal = LEASE_RENEW_INTERVAL;
             loop {
                 tokio::select! {
-                    _ = tokio::time::sleep(next_renewal) => {
-                        match tokio::time::timeout(LEASE_REQUEST_TIMEOUT, renewal_state.renew()).await {
-                            Ok(Ok(())) => {
-                                last_renewed = tokio::time::Instant::now();
-                                next_renewal = LEASE_RENEW_INTERVAL;
-                            }
-                            result => {
-                                let error = match result {
-                                    Ok(Err(error)) => error.to_string(),
-                                    Err(_) => "request timed out".to_string(),
-                                    Ok(Ok(())) => unreachable!(),
-                                };
-                                if renewal_state.ownership_lost.load(Ordering::Relaxed) {
-                                    eprintln!("sandbox-host: blob block lease ownership was lost: {error}");
-                                    std::process::exit(1);
-                                }
-                                if last_renewed.elapsed() >= LEASE_RENEW_DEADLINE {
-                                    eprintln!("sandbox-host: blob block lease could not be renewed before its safety deadline: {error}");
-                                    std::process::exit(1);
-                                }
-                                eprintln!("sandbox-host: blob block lease renewal failed; retrying: {error}");
-                                next_renewal = LEASE_RENEW_RETRY_INTERVAL;
-                            }
+                    _ = tokio::time::sleep(LEASE_RENEW_INTERVAL) => {
+                        let failure = match tokio::time::timeout(LEASE_REQUEST_TIMEOUT, renewal_state.renew()).await {
+                            Ok(Ok(())) => continue,
+                            Ok(Err(error)) => error,
+                            Err(_) => BlobBlockFailure::lease_provider_error("renewal request timed out"),
+                        };
+                        *renewal_state.failure.lock().expect("lease failure lock poisoned") = Some(failure.clone());
+                        let _ = failure_tx.send(failure);
+                        return;
                         }
-                    }
                     changed = stopped.changed() => {
                         if changed.is_err() || *stopped.borrow() {
                             return;
@@ -693,14 +820,46 @@ impl ObjectLease {
             state,
             stop,
             task: Some(task),
+            failure_rx: Some(failure_rx),
+            closed: false,
         })
+    }
+
+    fn close(&mut self, release: bool) -> Result<(), BlobBlockFailure> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        let _ = self.stop.send(true);
+        if let Some(mut task) = self.task.take() {
+            self.runtime.block_on(async {
+                if tokio::time::timeout(LEASE_CLOSE_TIMEOUT, &mut task)
+                    .await
+                    .is_err()
+                {
+                    task.abort();
+                    let _ = task.await;
+                }
+            });
+        }
+        if let Some(failure) = self.state.failure() {
+            return Err(failure);
+        }
+        if !release {
+            return Ok(());
+        }
+        self.runtime
+            .block_on(async {
+                tokio::time::timeout(LEASE_CLOSE_TIMEOUT, self.state.release()).await
+            })
+            .map_err(|_| BlobBlockFailure::lease_provider_error("release request timed out"))?
     }
 }
 
 async fn object_store_now_millis(
     store: &Arc<dyn ObjectStore>,
     lease_path: &Path,
-) -> Result<i64, Box<dyn std::error::Error>> {
+) -> Result<i64, slatedb::object_store::Error> {
     let probe_path = Path::from(format!("{lease_path}.clock"));
     store.put(&probe_path, Vec::<u8>::new().into()).await?;
     Ok(store
@@ -714,12 +873,24 @@ fn lease_is_expired(last_modified_ms: i64, server_now_ms: i64) -> bool {
     server_now_ms.saturating_sub(last_modified_ms) >= LEASE_DURATION.as_millis() as i64
 }
 
+fn lease_retry_after_ms(last_modified_ms: i64, server_now_ms: i64) -> u64 {
+    let age_ms = server_now_ms.saturating_sub(last_modified_ms).max(0) as u64;
+    (LEASE_DURATION.as_millis() as u64).saturating_sub(age_ms)
+}
+
 impl ObjectLeaseState {
-    async fn metadata(&self) -> Result<Option<VolumeMetadata>, Box<dyn std::error::Error>> {
+    fn failure(&self) -> Option<BlobBlockFailure> {
+        self.failure
+            .lock()
+            .expect("lease failure lock poisoned")
+            .clone()
+    }
+
+    async fn metadata(&self) -> Result<Option<VolumeMetadata>, BlobBlockFailure> {
         Ok(self.record.lock().await.metadata.clone())
     }
 
-    async fn renew(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn renew(&self) -> Result<(), BlobBlockFailure> {
         let mut record = self.record.lock().await;
         let metadata = record.metadata.clone();
         self.update_document(&mut record, false, metadata).await
@@ -730,52 +901,27 @@ impl ObjectLeaseState {
         record: &mut ObjectLeaseRecord,
         released: bool,
         metadata: Option<VolumeMetadata>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), BlobBlockFailure> {
         let payload = serde_json::to_vec(&LeaseDocument {
             owner: self.owner.clone(),
             released,
             metadata,
-        })?;
-        let result = match self
+        })
+        .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
+        let result = self
             .store
             .put_opts(
                 &self.path,
-                payload.clone().into(),
+                payload.into(),
                 PutMode::Update(record.version.clone()).into(),
             )
             .await
-        {
-            Ok(result) => result,
-            Err(slatedb::object_store::Error::Precondition { .. }) => {
-                let current = self.store.get(&self.path).await?;
-                let current_meta = current.meta.clone();
-                let document: LeaseDocument = serde_json::from_slice(&current.bytes().await?)?;
-                if document.released || document.owner != self.owner {
-                    self.ownership_lost.store(true, Ordering::Relaxed);
-                    return Err("blob block lease ownership was lost".into());
-                }
-                record.version = UpdateVersion {
-                    e_tag: current_meta.e_tag,
-                    version: current_meta.version,
-                };
-                self.store
-                    .put_opts(
-                        &self.path,
-                        payload.into(),
-                        PutMode::Update(record.version.clone()).into(),
-                    )
-                    .await?
-            }
-            Err(error) => return Err(error.into()),
-        };
+            .map_err(BlobBlockFailure::lease_store_failure)?;
         record.version = UpdateVersion::from(result);
         Ok(())
     }
 
-    async fn commit_metadata(
-        &self,
-        metadata: VolumeMetadata,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn commit_metadata(&self, metadata: VolumeMetadata) -> Result<(), BlobBlockFailure> {
         let mut record = self.record.lock().await;
         self.update_document(&mut record, false, Some(metadata.clone()))
             .await?;
@@ -783,7 +929,7 @@ impl ObjectLeaseState {
         Ok(())
     }
 
-    async fn release(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn release(&self) -> Result<(), BlobBlockFailure> {
         let mut record = self.record.lock().await;
         let metadata = record.metadata.clone();
         self.update_document(&mut record, true, metadata).await
@@ -792,21 +938,7 @@ impl ObjectLeaseState {
 
 impl Drop for ObjectLease {
     fn drop(&mut self) {
-        let _ = self.stop.send(true);
-        if let Some(mut task) = self.task.take() {
-            self.runtime.block_on(async {
-                if tokio::time::timeout(LEASE_CLOSE_TIMEOUT, &mut task)
-                    .await
-                    .is_err()
-                {
-                    task.abort();
-                    let _ = task.await;
-                }
-            });
-        }
-        let _ = self.runtime.block_on(async {
-            tokio::time::timeout(LEASE_CLOSE_TIMEOUT, self.state.release()).await
-        });
+        let _ = self.close(true);
     }
 }
 
@@ -976,21 +1108,29 @@ impl VolumeMetadata {
         }
     }
 
-    fn validate(&self, requested_size: u64) -> Result<(), Box<dyn std::error::Error>> {
+    fn validate(&self, requested_size: u64) -> Result<(), BlobBlockFailure> {
         if self.version != 1 {
-            return Err(format!("unsupported blob block volume version: {}", self.version).into());
+            return Err(BlobBlockFailure::new(
+                "storage-error",
+                format!("unsupported blob block volume version: {}", self.version),
+            ));
         }
         if self.size_bytes != requested_size {
-            return Err(format!(
-                "blob block volume size mismatch: stored {}, requested {}",
-                self.size_bytes, requested_size
-            )
-            .into());
+            return Err(BlobBlockFailure::new(
+                "volume-mismatch",
+                format!(
+                    "blob block volume size mismatch: stored {}, requested {}",
+                    self.size_bytes, requested_size
+                ),
+            ));
         }
         if self.generation.len() != 24
             || !self.generation.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
-            return Err("invalid blob block volume generation".into());
+            return Err(BlobBlockFailure::new(
+                "storage-error",
+                "invalid blob block volume generation",
+            ));
         }
         Ok(())
     }
@@ -1107,13 +1247,14 @@ mod tests {
     use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::path::Path as ObjectPath;
     use slatedb::object_store::throttle::{ThrottleConfig, ThrottledStore};
-    use slatedb::object_store::{ObjectStore, ObjectStoreExt};
+    use slatedb::object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt};
     use slatedb::object_store::{PutMode, UpdateVersion};
     use tokio::runtime::Runtime;
 
     use super::{
-        BlobBlockVolume, LeaseDocument, ObjectLease, SlateDbBlockStore, VolumeMetadata,
-        clone_db_generation, lease_is_expired,
+        BlobBlockFailure, BlobBlockVolume, LeaseDocument, ObjectLease, SlateDbBlockStore,
+        VolumeMetadata, clone_db_generation, lease_is_expired, lease_retry_after_ms,
+        provider_failure,
     };
 
     const TEST_SIZE: u64 = 64 * 1024 * 1024;
@@ -1182,7 +1323,7 @@ mod tests {
     }
 
     #[test]
-    fn object_lease_uses_conditional_writes_for_exclusion_and_release() {
+    fn object_lease_fails_closed_after_an_ambiguous_write_version() {
         let runtime = Arc::new(Runtime::new().expect("create object lease test runtime"));
         let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
         let path = ObjectPath::from("volumes/workspace/lease.json");
@@ -1215,8 +1356,11 @@ mod tests {
         });
         drop(first);
 
-        let reacquired = acquire().expect("reacquire released object lease");
-        drop(reacquired);
+        let blocked = acquire()
+            .err()
+            .expect("ambiguous release must fall back to lease expiry");
+        assert_eq!(blocked.code, "volume-locked");
+        assert!(blocked.retry_after_ms.is_some_and(|delay| delay > 0));
     }
 
     #[test]
@@ -1254,11 +1398,13 @@ mod tests {
                 .await
                 .expect("replace lease owner");
 
-            first
+            let failure = first
                 .state
                 .commit_metadata(VolumeMetadata::new(TEST_SIZE))
                 .await
                 .expect_err("lost lease must not publish metadata");
+            assert_eq!(failure.code, "lease-lost");
+            assert_eq!(failure.retry_after_ms, Some(30_000));
             let current = store.get(&path).await.expect("read replacement lease");
             let document: LeaseDocument =
                 serde_json::from_slice(&current.bytes().await.expect("read lease bytes"))
@@ -1333,6 +1479,22 @@ mod tests {
         assert!(!lease_is_expired(1_000, 30_999));
         assert!(lease_is_expired(1_000, 31_000));
         assert!(!lease_is_expired(31_000, 1_000));
+        assert_eq!(lease_retry_after_ms(1_000, 6_000), 25_000);
+        assert_eq!(lease_retry_after_ms(1_000, 31_000), 0);
+    }
+
+    #[test]
+    fn provider_authentication_failures_are_distinct() {
+        let error = || ObjectStoreError::Unauthenticated {
+            path: "volumes/workspace/lease.json".to_string(),
+            source: Box::new(std::io::Error::other("bad credentials")),
+        };
+        let failure = provider_failure(error());
+        assert_eq!(failure.code, "authentication-failed");
+        assert_eq!(failure.retry_after_ms, None);
+        let failure = BlobBlockFailure::lease_store_failure(error());
+        assert_eq!(failure.code, "lease-authentication-failed");
+        assert_eq!(failure.retry_after_ms, Some(30_000));
     }
 
     #[test]

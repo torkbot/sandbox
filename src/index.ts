@@ -15,7 +15,12 @@ import { open } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { HostControlTransport } from "./control.ts";
 import { GuestFetch } from "./guest-fetch.ts";
-import { HostProcessSandboxVm } from "./host-process.ts";
+import {
+  HostProcessSandboxVm,
+  SandboxBlockDeviceError,
+  type SandboxBlockDeviceClosed,
+  type SandboxBlockDeviceErrorCode,
+} from "./host-process.ts";
 import { createMemoryFileSystem } from "./memory-fs.ts";
 import {
   isSandboxPosixFileSystem,
@@ -63,6 +68,12 @@ export type SandboxFileStat = {
   readonly mediaType: string | null;
   readonly modifiedAtMs: number | null;
   readonly writable?: boolean;
+};
+
+export {
+  SandboxBlockDeviceError,
+  type SandboxBlockDeviceClosed,
+  type SandboxBlockDeviceErrorCode,
 };
 
 export type SandboxDirectoryEntry = {
@@ -246,8 +257,8 @@ export type SandboxReadWriteHostDirectorySource = {
 export type SandboxHostDirectorySource = SandboxReadOnlyHostDirectorySource | SandboxReadWriteHostDirectorySource;
 
 export interface SandboxBlockDeviceLifecycle {
-  /** Resolves after the native host process has closed. */
-  readonly closed: Promise<void>;
+  /** Resolves with the reason after the device has closed. */
+  readonly closed: Promise<SandboxBlockDeviceClosed>;
   /** Closes the device and releases its host-side resources. */
   close(): Promise<void>;
 }
@@ -331,8 +342,14 @@ async function acquireBlobBlockDevice(
   validateBlobBlockAcquireOptions(options);
   const host = await HostProcessSandboxVm.acquireBlobBlock(options);
   const lifecycle: SandboxBlockDeviceLifecycle = {
-    closed: host.closed,
-    close: () => host.close(),
+    closed: host.blockDeviceClosed,
+    close: async () => {
+      await host.close();
+      const closure = await host.blockDeviceClosed;
+      if (closure.reason === "failed") {
+        throw closure.error;
+      }
+    },
   };
   const device: SandboxBlockDevice = {
     kind: "block-device",

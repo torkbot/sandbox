@@ -714,8 +714,23 @@ try {
 returns the mountable handle. If another writer owns the volume, acquisition
 rejects and no VM is started. Closing the sandbox closes the native host and
 releases the lease; call the lifecycle's `close()` yourself when an acquired
-device is never booted. `closed` resolves whenever that host closes, whether
-closure was requested or unexpected.
+device is never booted. `closed` resolves to `{ reason: "closed" }` after a
+clean close, or `{ reason: "failed", error }` after the host has failed closed.
+`close()` rejects with that same error when clean storage shutdown and lease
+release cannot be confirmed.
+
+Acquisition and lifecycle failures are `SandboxBlockDeviceError` instances.
+Their stable `code` is `volume-locked`, `volume-mismatch`, `provider-error`,
+`authentication-failed`, `lease-lost`, `lease-authentication-failed`,
+`lease-provider-error`, `storage-error`, or `host-error`.
+`retryAfterMs` is present only when Sandbox can provide a safe minimum delay:
+the remaining provider-timestamped lease for a locked remote volume, or 30
+seconds after a failed renewal or release. Sandbox does not retry lease
+operations. `lease-lost`, `lease-authentication-failed`, and
+`lease-provider-error` preserve the runtime cause while carrying the same
+fail-closed lease semantics. Any failed renewal immediately stops the host; a
+later writer uses a new storage generation, so the stopped writer cannot affect
+it.
 
 Blob-backed devices currently use ext4, are writable, are single-use, and are
 limited to one per sandbox. Their mount path cannot be nested beneath another
@@ -735,6 +750,9 @@ are:
 
 Every provider accepts an optional relative object `prefix`. Static bearer
 tokens are not refreshed by Sandbox.
+
+Writes are durable after a successful filesystem flush or clean device close.
+An abnormal close may lose writes that the guest had not flushed.
 
 ### `fs.memory(options)`
 

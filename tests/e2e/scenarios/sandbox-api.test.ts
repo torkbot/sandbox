@@ -11,6 +11,7 @@ import {
   fs,
   network,
   rootfs,
+  SandboxBlockDeviceError,
   type SandboxBlockStore,
   type SandboxEnvironmentFact,
   type RootfsImageConfig,
@@ -677,14 +678,22 @@ test("blob block acquisition provisions, leases, and reopens a mounted disk", as
     sizeBytes: 64n * 1024n * 1024n,
   };
 
+  const unusedDisk = await block.blob.acquire(acquisition);
+  const unusedLifecycle = unusedDisk.getLifecycle?.();
+  assert.ok(unusedLifecycle);
+  await unusedLifecycle.close();
+  assert.deepEqual(await unusedLifecycle.closed, { reason: "closed" });
+
   const firstDisk = await block.blob.acquire(acquisition);
   const firstLifecycle = firstDisk.getLifecycle?.();
   assert.ok(firstLifecycle);
   try {
-    await assert.rejects(
-      block.blob.acquire(acquisition),
-      /block volume workspace is already leased/,
-    );
+    await assert.rejects(block.blob.acquire(acquisition), (error) => {
+      assert.ok(error instanceof SandboxBlockDeviceError);
+      assert.equal(error.code, "volume-locked");
+      assert.match(error.message, /block volume workspace is already leased/);
+      return true;
+    });
 
     const first = await defineSandbox({
       rootfs: testRootfs,
@@ -705,7 +714,7 @@ test("blob block acquisition provisions, leases, and reopens a mounted disk", as
     } finally {
       await first.close();
     }
-    await firstLifecycle.closed;
+    assert.deepEqual(await firstLifecycle.closed, { reason: "closed" });
   } finally {
     await firstLifecycle.close();
   }
@@ -726,7 +735,7 @@ test("blob block acquisition provisions, leases, and reopens a mounted disk", as
     } finally {
       await second.close();
     }
-    await secondLifecycle.closed;
+    assert.deepEqual(await secondLifecycle.closed, { reason: "closed" });
   } finally {
     await secondLifecycle.close();
   }
