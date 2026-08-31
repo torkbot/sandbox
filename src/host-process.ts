@@ -62,6 +62,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
   #stdinError: Error | null = null;
   #configured = false;
   #spawnSent = false;
+  #holdsBlobBlockLease = false;
   #resolveClosed!: () => void;
 
   private constructor(
@@ -154,6 +155,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
             : "sandbox-host blob block acquisition failed",
         );
       }
+      vm.#holdsBlobBlockLease = true;
       return vm;
     } catch (error) {
       await vm.close();
@@ -309,13 +311,16 @@ export class HostProcessSandboxVm implements HostControlChannel {
       ? Promise.resolve()
       : once(this.#child, "exit").then(() => undefined);
 
-    this.#child.stdin.end();
-    await Promise.race([
-      exited,
-      delay(500),
-    ]);
-
     try {
+      this.#child.stdin.end();
+      if (this.#holdsBlobBlockLease) {
+        await exited;
+        return;
+      }
+      await Promise.race([
+        exited,
+        delay(500),
+      ]);
       if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
         return;
       }
