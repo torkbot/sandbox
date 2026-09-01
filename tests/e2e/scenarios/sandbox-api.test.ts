@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmod, lstat, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -769,6 +770,77 @@ test("sandbox owns an attached blob block device lifecycle", async (t) => {
   };
   await assert.rejects(failed.close(), assertHostFailure);
   await assert.rejects(failed.close(), assertHostFailure);
+});
+
+test("blob block mounts create absent guest directories without changing the rootfs", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const objectStore = await mkdtemp(join(tmpdir(), "sandbox-blob-mount-point-"));
+  t.after(async () => {
+    await rm(objectStore, { recursive: true, force: true });
+  });
+  const acquisition = {
+    provider: { kind: "local" as const, path: objectStore },
+    volume: "agent-state",
+    sizeBytes: 64n * 1024n * 1024n,
+  };
+
+  const firstDisk = await block.blob.acquire(acquisition);
+  const first = await defineSandbox({ rootfs: testRootfs }).boot({
+    mounts: { "/agent-state": firstDisk },
+  });
+  try {
+    const write = await first.exec("/bin/sh", [
+      "-lc",
+      "printf '%s' persisted > /agent-state/value && sync",
+    ]);
+    assert.equal(write.exitCode, 0, write.stderr);
+  } finally {
+    await first.close();
+  }
+
+  await using rootfsOnly = await defineSandbox({ rootfs: testRootfs }).boot();
+  const absent = await rootfsOnly.exec("/bin/sh", ["-lc", "test ! -e /agent-state"]);
+  assert.equal(absent.exitCode, 0, absent.stderr);
+
+  const secondDisk = await block.blob.acquire(acquisition);
+  await using second = await defineSandbox({ rootfs: testRootfs }).boot({
+    mounts: { "/agent-state": secondDisk },
+  });
+  const read = await second.exec("/bin/cat", ["/agent-state/value"]);
+  assert.equal(read.exitCode, 0, read.stderr);
+  assert.equal(read.stdout, "persisted");
+});
+
+test("blob block boot reports mount preparation failures and releases the lease", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const objectStore = await mkdtemp(join(tmpdir(), "sandbox-blob-mount-error-"));
+  t.after(async () => {
+    await rm(objectStore, { recursive: true, force: true });
+  });
+  const acquisition = {
+    provider: { kind: "local" as const, path: objectStore },
+    volume: "agent-state",
+    sizeBytes: 64n * 1024n * 1024n,
+  };
+
+  const disk = await block.blob.acquire(acquisition);
+  await assert.rejects(
+    defineSandbox({ rootfs: testRootfs }).boot({
+      mounts: { "/etc/hostname": disk },
+    }),
+    /guest mount point is not a directory: \/etc\/hostname/,
+  );
+
+  const reacquired = await block.blob.acquire(acquisition);
+  await reacquired.getLifecycle?.().close();
 });
 
 test("timed out blob block acquisition terminates a stuck host", async (t) => {
@@ -1701,7 +1773,7 @@ test("missing writable mount directories are created before mounting virtual fil
   assert.equal(result.stdout, "mounted\n");
 });
 
-test("top-level read-only rootfs mount directories fail with actionable init output", async (t) => {
+test("top-level read-only rootfs mount directories are synthetic", async (t) => {
   const testRootfs = await testRootfsForVmTest(t);
   if (testRootfs === undefined) {
     return;
@@ -1712,19 +1784,73 @@ test("top-level read-only rootfs mount directories fail with actionable init out
       "/note.txt": "mounted\n",
     },
   });
-  await assert.rejects(
-    defineSandbox({
-      rootfs: testRootfs,
-    }).boot({
-      mounts: {
-        "/missing-mount": fs.virtual(missingFs),
-      },
-    }),
-    /virtual filesystem mount point parent is on durable rootfs: \/missing-mount/,
-  );
+  await using mounted = await defineSandbox({ rootfs: testRootfs }).boot({
+    mounts: { "/missing-mount": fs.virtual(missingFs) },
+  });
+  const read = await mounted.exec("/bin/cat", ["/missing-mount/note.txt"]);
+  assert.equal(read.exitCode, 0, read.stderr);
+  assert.equal(read.stdout, "mounted\n");
+
+  await mounted.close();
+  await using rootfsOnly = await defineSandbox({ rootfs: testRootfs }).boot();
+  const absent = await rootfsOnly.exec("/bin/sh", ["-lc", "test ! -e /missing-mount"]);
+  assert.equal(absent.exitCode, 0, absent.stderr);
 });
 
-test("missing COW rootfs mount directories do not persist synthetic rootfs paths", async (t) => {
+test("read-only rootfs mount directories follow guest-absolute symlinks", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const overlay = memoryBlockStore();
+  await using builder = await defineSandbox({
+    rootfs: rootfs.cow({ base: testRootfs, writable: overlay }),
+  }).boot();
+  const prepare = await builder.exec("/bin/sh", [
+    "-lc",
+    "mkdir -p /srv/data && ln -s /srv/data /data && sync",
+  ]);
+  assert.equal(prepare.exitCode, 0, prepare.stderr);
+  await builder.close();
+
+  const image = await rootfs.flatten({
+    format: "qcow2",
+    source: rootfs.compose({ base: testRootfs, overlay }),
+    dest: memoryBlockStore(),
+  });
+  const imageDir = await mkdtemp(join(tmpdir(), "sandbox-symlink-rootfs-"));
+  t.after(async () => {
+    await rm(imageDir, { recursive: true, force: true });
+  });
+  const imagePath = join(imageDir, "rootfs.qcow2");
+  const imageFile = await open(imagePath, "w");
+  const imageHash = createHash("sha256");
+  try {
+    for await (const chunk of rootfs.bytes(image)) {
+      imageHash.update(chunk);
+      await imageFile.write(chunk);
+    }
+  } finally {
+    await imageFile.close();
+  }
+  const customRootfs: RootfsImageConfig = {
+    ...testRootfs,
+    path: imagePath,
+    digest: `sha256:${imageHash.digest("hex")}`,
+    sizeBytes: image.sizeBytes,
+  };
+  const mountedFs = fs.memory({ files: { "/note.txt": "mounted\n" } });
+  await using sandbox = await defineSandbox({ rootfs: customRootfs }).boot({
+    mounts: { "/data/cache": fs.virtual(mountedFs) },
+  });
+
+  const read = await sandbox.exec("/bin/cat", ["/data/cache/note.txt"]);
+  assert.equal(read.exitCode, 0, read.stderr);
+  assert.equal(read.stdout, "mounted\n");
+});
+
+test("missing COW rootfs mount directories become machine state", async (t) => {
   const testRootfs = await testRootfsForVmTest(t);
   if (testRootfs === undefined) {
     return;
@@ -1744,17 +1870,16 @@ test("missing COW rootfs mount directories do not persist synthetic rootfs paths
     }),
   });
 
-  await assert.rejects(
-    sandboxDefinition.boot({
-      mounts: {
-        "/opt/cache": fs.virtual(missingFs),
-      },
-    }),
-    /virtual filesystem mount point parent is on durable rootfs: \/opt\/cache/,
-  );
+  const mounted = await sandboxDefinition.boot({
+    mounts: { "/opt/cache": fs.virtual(missingFs) },
+  });
+  const read = await mounted.exec("/bin/cat", ["/opt/cache/note.txt"]);
+  assert.equal(read.exitCode, 0, read.stderr);
+  assert.equal(read.stdout, "mounted\n");
+  await mounted.close();
 
   await using sandbox = await sandboxDefinition.boot();
-  const result = await sandbox.exec("/bin/sh", ["-lc", "test ! -e /opt/cache"]);
+  const result = await sandbox.exec("/bin/sh", ["-lc", "test -d /opt/cache"]);
 
   assert.equal(result.exitCode, 0, result.stderr);
 });
@@ -1812,7 +1937,7 @@ test("invalid rootfs mount targets fail with actionable init output", async (t) 
         "/etc/passwd": fs.virtual(mountedFs),
       },
     }),
-    /virtual filesystem mount point is not a directory: \/etc\/passwd/,
+    /guest mount point is not a directory: \/etc\/passwd/,
   );
 });
 

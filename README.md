@@ -680,9 +680,10 @@ retain them for delayed persistence.
 ### `block.blob.acquire(options)`
 
 Acquires a single-writer logical disk backed by object storage. There is no
-separate create operation: acquiring an absent volume atomically provisions a
-sparse ext4 filesystem, while acquiring an existing volume requires the same
-explicit `sizeBytes`.
+separate create operation: acquiring an absent volume reserves it without
+writing disk blocks, and Sandbox provisions its sparse ext4 filesystem when it
+is first attached. Acquiring a provisioned volume requires the same explicit
+`sizeBytes`.
 
 ```ts
 const disk = await block.blob.acquire({
@@ -704,6 +705,9 @@ await using vm = await sandbox.boot({
 });
 await vm.exec("sh", ["-lc", "printf '%s' ready > state.txt"]);
 ```
+
+Mount paths do not need to exist in the rootfs. Sandbox creates them while
+booting; a read-only rootfs remains unchanged.
 
 `acquire()` obtains and starts renewing the exclusive writer lease before it
 returns the mountable handle. If another writer owns the volume, acquisition

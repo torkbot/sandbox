@@ -329,8 +329,7 @@ export const block = {
   blob: {
     /**
      * Acquires an exclusive writer lease and returns a mountable device.
-     * An absent volume is provisioned as a sparse ext4 filesystem before
-     * this promise resolves.
+     * An absent volume is provisioned lazily when first attached.
      */
     acquire: acquireBlobBlockDevice,
   },

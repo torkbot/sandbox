@@ -32,7 +32,7 @@ RUN apk add --no-cache \
   && tar -xzf "$tmp/gh.tar.gz" -C "$tmp" \
   && install -m 0755 "$tmp/gh_2.83.0_linux_${gh_arch}/bin/gh" /usr/local/bin/gh \
   && rm -rf "$tmp" \
-  && mkdir -p /dev /proc /run /sandbox /sys /tmp /usr/lib/sandbox /workspace \
+  && mkdir -p /dev /proc /run /sandbox /sys /tmp /usr/lib/sandbox \
   && chmod 1777 /tmp \
   && printf '%s\n' \
     '#!/bin/sh' \

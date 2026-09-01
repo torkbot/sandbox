@@ -57,6 +57,7 @@ test("checked-in image manifests stay minimal and immutable", async () => {
     const dockerfile = await readFile(new URL(`../../images/${definition.id}/Dockerfile`, import.meta.url), "utf8");
     assert.match(dockerfile, /^ARG SOURCE_IMAGE$/m);
     assert.match(dockerfile, /^FROM \$\{SOURCE_IMAGE\}$/m);
+    assert.doesNotMatch(dockerfile, /\/workspace/);
     if (definition.id.startsWith("debian-") || definition.id.startsWith("ubuntu-")) {
       assert.match(dockerfile, /--no-install-recommends --no-install-suggests/);
       assert.match(dockerfile, /path-exclude=\/usr\/share\/doc\/\*/);

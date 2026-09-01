@@ -107,7 +107,13 @@ impl fmt::Display for BlobBlockFailure {
 impl std::error::Error for BlobBlockFailure {}
 
 pub struct BlobBlockVolume {
-    store: Arc<SlateDbBlockStore>,
+    runtime: Arc<Runtime>,
+    provider: Arc<dyn ObjectStore>,
+    volume_root: Path,
+    metadata_path: Path,
+    metadata: VolumeMetadata,
+    provisioned: bool,
+    store: Option<Arc<SlateDbBlockStore>>,
     _lease: VolumeLease,
     size: u64,
     closed: bool,
@@ -148,91 +154,100 @@ impl BlobBlockVolume {
         let metadata_path = volume_root.clone().join("metadata.json");
         let metadata = lease.metadata(&runtime, &provider.store, &metadata_path)?;
         lease.revalidate()?;
-        let db = if let Some(current) = metadata {
-            current.validate(size_bytes)?;
-            if lease.requires_isolated_generation() {
-                let next = current.next_generation();
-                let source_path = volume_root
-                    .clone()
-                    .join("data")
-                    .join(current.generation.as_str());
-                let next_path = volume_root
-                    .clone()
-                    .join("data")
-                    .join(next.generation.as_str());
-                runtime
-                    .block_on(clone_db_generation(
-                        provider.store.clone(),
-                        source_path,
-                        next_path.clone(),
-                    ))
-                    .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
-                lease.revalidate()?;
-                let db = runtime
-                    .block_on(Db::open(next_path, provider.store.clone()))
-                    .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
-                lease.revalidate()?;
-                if let Err(error) =
-                    lease.commit_metadata(&runtime, &provider.store, &metadata_path, &next)
-                {
-                    let _ = runtime.block_on(db.close());
-                    return Err(error);
-                }
-                db
-            } else {
-                runtime
-                    .block_on(Db::open(
-                        volume_root
-                            .clone()
-                            .join("data")
-                            .join(current.generation.as_str()),
-                        provider.store.clone(),
-                    ))
-                    .map_err(|error| BlobBlockFailure::new("storage-error", error))?
+        let (metadata, provisioned) = match metadata {
+            Some(metadata) => {
+                metadata.validate(size_bytes)?;
+                (metadata, true)
             }
-        } else {
-            let metadata = VolumeMetadata::new(size_bytes);
-            // ponytail: interrupted provisioning or handoff can leave an unreachable generation;
-            // add provider garbage collection when volume deletion is introduced.
-            let db = runtime
-                .block_on(Db::open(
-                    volume_root.join("data").join(metadata.generation.as_str()),
-                    provider.store.clone(),
-                ))
-                .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
-            let store = Arc::new(SlateDbBlockStore::new(
-                runtime.clone(),
-                db.clone(),
-                size_bytes,
-            ));
-            format_empty_ext4(store, size_bytes, metadata.fs_uuid)
-                .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
-            if let Err(error) =
-                lease.commit_metadata(&runtime, &provider.store, &metadata_path, &metadata)
-            {
-                let _ = runtime.block_on(db.close());
-                return Err(error);
-            }
-            db
+            None => (VolumeMetadata::new(size_bytes), false),
         };
-        if let Err(error) = lease.revalidate() {
-            let _ = runtime.block_on(db.close());
-            return Err(error);
-        }
-        let store = Arc::new(SlateDbBlockStore::new(runtime, db, size_bytes));
         Ok(Self {
-            store,
+            runtime,
+            provider: provider.store,
+            volume_root,
+            metadata_path,
+            metadata,
+            provisioned,
+            store: None,
             _lease: lease,
             size: size_bytes,
             closed: false,
         })
     }
 
-    pub fn service(&self) -> BlockDeviceService {
-        BlockDeviceService {
-            storage: self.store.clone(),
-            size: self.size,
+    pub fn service(&mut self) -> Result<BlockDeviceService, BlobBlockFailure> {
+        if self.store.is_none() {
+            let active_metadata = if self.provisioned && self._lease.requires_isolated_generation()
+            {
+                let next = self.metadata.next_generation();
+                self.runtime
+                    .block_on(clone_db_generation(
+                        self.provider.clone(),
+                        self.volume_root
+                            .clone()
+                            .join("data")
+                            .join(self.metadata.generation.as_str()),
+                        self.volume_root
+                            .clone()
+                            .join("data")
+                            .join(next.generation.as_str()),
+                    ))
+                    .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
+                self._lease.revalidate()?;
+                next
+            } else {
+                self.metadata.clone()
+            };
+            let db = self
+                .runtime
+                .block_on(Db::open(
+                    self.volume_root
+                        .clone()
+                        .join("data")
+                        .join(active_metadata.generation.as_str()),
+                    self.provider.clone(),
+                ))
+                .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
+            let store = Arc::new(SlateDbBlockStore::new(
+                self.runtime.clone(),
+                db.clone(),
+                self.size,
+            ));
+            if !self.provisioned {
+                if let Err(error) =
+                    format_empty_ext4(store.clone(), self.size, active_metadata.fs_uuid)
+                {
+                    let _ = self.runtime.block_on(db.close());
+                    return Err(BlobBlockFailure::new("storage-error", error));
+                }
+            }
+            if !self.provisioned || active_metadata.generation != self.metadata.generation {
+                if let Err(error) = self._lease.commit_metadata(
+                    &self.runtime,
+                    &self.provider,
+                    &self.metadata_path,
+                    &active_metadata,
+                ) {
+                    let _ = self.runtime.block_on(db.close());
+                    return Err(error);
+                }
+                self.metadata = active_metadata;
+                self.provisioned = true;
+            }
+            if let Err(error) = self._lease.revalidate() {
+                let _ = self.runtime.block_on(db.close());
+                return Err(error);
+            }
+            self.store = Some(store);
         }
+        Ok(BlockDeviceService {
+            storage: self
+                .store
+                .as_ref()
+                .expect("block store initialized")
+                .clone(),
+            size: self.size,
+        })
     }
 
     pub fn take_failure_receiver(&mut self) -> Option<mpsc::Receiver<BlobBlockFailure>> {
@@ -248,7 +263,9 @@ impl BlobBlockVolume {
             return Ok(());
         }
         self.closed = true;
-        if let Err(error) = self.store.close() {
+        if let Some(store) = self.store.as_ref()
+            && let Err(error) = store.close()
+        {
             self._lease.close(false)?;
             return Err(BlobBlockFailure::new("storage-error", error));
         }
@@ -579,12 +596,7 @@ impl VolumeLease {
     fn revalidate(&self) -> Result<(), BlobBlockFailure> {
         match self {
             Self::Local { .. } => Ok(()),
-            Self::Object { _lease } => {
-                if let Some(failure) = _lease.state.failure() {
-                    return Err(failure);
-                }
-                _lease.runtime.block_on(_lease.state.renew())
-            }
+            Self::Object { _lease } => _lease.state.failure().map_or(Ok(()), Err),
         }
     }
 
@@ -722,26 +734,19 @@ impl ObjectLease {
         volume: String,
     ) -> Result<Self, BlobBlockFailure> {
         let owner = bson::oid::ObjectId::new().to_hex();
-        let (version, metadata) = match store.get(&path).await {
-            Err(slatedb::object_store::Error::NotFound { .. }) => {
-                let payload = serde_json::to_vec(&LeaseDocument {
-                    owner: owner.clone(),
-                    released: false,
-                    metadata: None,
-                })
-                .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
-                match store
-                    .put_opts(&path, payload.into(), PutMode::Create.into())
-                    .await
-                {
-                    Ok(result) => (UpdateVersion::from(result), None),
-                    Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
-                        return Err(BlobBlockFailure::locked(&volume, None));
-                    }
-                    Err(error) => return Err(provider_failure(error)),
-                }
-            }
-            Ok(result) => {
+        let payload = serde_json::to_vec(&LeaseDocument {
+            owner: owner.clone(),
+            released: false,
+            metadata: None,
+        })
+        .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
+        let created = store
+            .put_opts(&path, payload.into(), PutMode::Create.into())
+            .await;
+        let (version, metadata) = match created {
+            Ok(result) => (UpdateVersion::from(result), None),
+            Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
+                let result = store.get(&path).await.map_err(provider_failure)?;
                 let meta = result.meta.clone();
                 let bytes = result.bytes().await.map_err(provider_failure)?;
                 let existing: LeaseDocument = serde_json::from_slice(&bytes)
@@ -771,10 +776,10 @@ impl ObjectLease {
                     metadata: metadata.clone(),
                 })
                 .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
-                match store
+                let result = store
                     .put_opts(&path, payload.into(), PutMode::Update(prior).into())
-                    .await
-                {
+                    .await;
+                match result {
                     Ok(result) => (UpdateVersion::from(result), metadata),
                     Err(slatedb::object_store::Error::Precondition { .. }) => {
                         return Err(BlobBlockFailure::locked(&volume, None));
@@ -1253,7 +1258,7 @@ mod tests {
 
     use super::{
         BlobBlockFailure, BlobBlockVolume, LeaseDocument, ObjectLease, SlateDbBlockStore,
-        VolumeMetadata, clone_db_generation, lease_is_expired, lease_retry_after_ms,
+        VolumeLease, VolumeMetadata, clone_db_generation, lease_is_expired, lease_retry_after_ms,
         provider_failure,
     };
 
@@ -1293,11 +1298,11 @@ mod tests {
             }
         };
 
-        let first = BlobBlockVolume::acquire(request(TEST_SIZE)).expect("acquire new volume");
-        let allocated = allocated_bytes(&directory.0);
+        let mut first = BlobBlockVolume::acquire(request(TEST_SIZE)).expect("acquire new volume");
+        let acquired_bytes = allocated_bytes(&directory.0);
         assert!(
-            allocated < TEST_SIZE / 2,
-            "sparse filesystem used {allocated} bytes for a {TEST_SIZE}-byte volume"
+            acquired_bytes < 4096,
+            "acquisition materialized {acquired_bytes} bytes before attachment"
         );
         let competing = BlobBlockVolume::acquire(request(TEST_SIZE))
             .err()
@@ -1305,6 +1310,13 @@ mod tests {
         assert_eq!(
             competing.to_string(),
             "block volume workspace is already leased"
+        );
+
+        first.service().expect("provision attached volume");
+        let provisioned_bytes = allocated_bytes(&directory.0);
+        assert!(
+            provisioned_bytes < TEST_SIZE / 2,
+            "sparse filesystem used {provisioned_bytes} bytes for a {TEST_SIZE}-byte volume"
         );
 
         drop(first);
@@ -1364,6 +1376,31 @@ mod tests {
     }
 
     #[test]
+    fn new_object_lease_uses_only_the_conditional_create() {
+        let runtime = Arc::new(Runtime::new().expect("create object lease test runtime"));
+        let throttled = Arc::new(ThrottledStore::new(
+            InMemory::new(),
+            ThrottleConfig {
+                wait_get_per_call: Duration::from_millis(500),
+                ..ThrottleConfig::default()
+            },
+        ));
+        let store = throttled.clone() as Arc<dyn ObjectStore>;
+        let started_at = Instant::now();
+        let lease = runtime
+            .block_on(ObjectLease::acquire(
+                runtime.clone(),
+                store,
+                ObjectPath::from("volumes/workspace/lease.json"),
+                "workspace".to_string(),
+            ))
+            .expect("acquire new object lease");
+
+        assert!(started_at.elapsed() < Duration::from_millis(100));
+        drop(lease);
+    }
+
+    #[test]
     fn lost_object_lease_cannot_publish_volume_metadata() {
         let runtime = Arc::new(Runtime::new().expect("create object lease test runtime"));
         let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
@@ -1412,6 +1449,42 @@ mod tests {
             assert!(document.metadata.is_none());
         });
         drop(first);
+    }
+
+    #[test]
+    fn lease_revalidation_does_not_wait_for_object_storage() {
+        let runtime = Arc::new(Runtime::new().expect("create object lease test runtime"));
+        let throttled = Arc::new(ThrottledStore::new(
+            InMemory::new(),
+            ThrottleConfig::default(),
+        ));
+        let store = throttled.clone() as Arc<dyn ObjectStore>;
+        let path = ObjectPath::from("volumes/workspace/lease.json");
+        let mut lease = runtime
+            .block_on(ObjectLease::acquire(
+                runtime.clone(),
+                store,
+                path,
+                "workspace".to_string(),
+            ))
+            .expect("acquire object lease");
+        lease.stop.send(true).expect("stop renewal task");
+        runtime
+            .block_on(lease.task.take().expect("renewal task"))
+            .expect("join renewal task");
+        throttled.config_mut(|config| {
+            config.wait_put_per_call = Duration::from_millis(500);
+        });
+
+        let lease = VolumeLease::Object { _lease: lease };
+        let started_at = Instant::now();
+        lease.revalidate().expect("revalidate held lease");
+
+        assert!(started_at.elapsed() < Duration::from_millis(100));
+        throttled.config_mut(|config| {
+            config.wait_put_per_call = Duration::ZERO;
+        });
+        drop(lease);
     }
 
     #[test]
@@ -1498,7 +1571,7 @@ mod tests {
     }
 
     #[test]
-    fn provisioning_attempts_use_isolated_generations() {
+    fn provisioning_attempts_use_distinct_unpublished_generations() {
         let first = VolumeMetadata::new(TEST_SIZE);
         let second = VolumeMetadata::new(TEST_SIZE);
 

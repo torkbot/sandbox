@@ -17,6 +17,9 @@ pub enum ControlFrame {
         root_readonly: bool,
         init_name: String,
     },
+    InitFailed {
+        message: String,
+    },
     GuestExec {
         id: String,
         argv: Vec<String>,
@@ -244,6 +247,10 @@ impl ControlFrame {
                 "type": "init.ready",
                 "rootReadonly": *root_readonly,
                 "initName": init_name,
+            },
+            Self::InitFailed { message } => bson::doc! {
+                "type": "init.failed",
+                "message": message,
             },
             Self::GuestExec {
                 id,
@@ -589,6 +596,12 @@ impl ControlFrame {
                 init_name: document
                     .get_str("initName")
                     .map_err(|_| ControlFrameError::new("init.ready missing initName"))?
+                    .to_string(),
+            }),
+            "init.failed" => Ok(Self::InitFailed {
+                message: document
+                    .get_str("message")
+                    .map_err(|_| ControlFrameError::new("init.failed missing message"))?
                     .to_string(),
             }),
             "guest.exec" => Ok(Self::GuestExec {
@@ -1689,6 +1702,16 @@ mod tests {
         let packet = frame.encode_packet().unwrap();
         let frame_len = u32::from_le_bytes(packet[0..4].try_into().unwrap()) as usize;
         assert_eq!(packet.len(), 4 + frame_len);
+        assert_eq!(ControlFrame::decode_packet(&packet).unwrap(), frame);
+    }
+
+    #[test]
+    fn init_failed_packet_round_trips() {
+        let frame = ControlFrame::InitFailed {
+            message: "mount /workspace: invalid argument".to_string(),
+        };
+        let packet = frame.encode_packet().unwrap();
+
         assert_eq!(ControlFrame::decode_packet(&packet).unwrap(), frame);
     }
 

@@ -1,7 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
-import { appendFileSync, closeSync, mkdtempSync, openSync, readSync, rmSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { appendFileSync } from "node:fs";
 import { Binary, BSON } from "bson";
 import { hostBinaryPath, macosHostSigningError } from "./artifacts.ts";
 import type { HostControlChannel } from "./control.ts";
@@ -83,8 +82,6 @@ export class HostProcessSandboxVm implements HostControlChannel {
   #requestHeaderHooks = new Map<string, RegisteredHttpRequestHeadersHook>();
   #networkConnectionHook?: RegisteredNetworkConnectionHook;
   readonly #httpMiddlewareByFlow = new Map<string, HttpRequestMiddleware | undefined>();
-  readonly #consoleOutputPath?: string;
-  readonly #consoleOutputCleanupPath?: string;
   #buffer = new Uint8Array();
   #stderr = "";
   #closed = false;
@@ -98,11 +95,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
   #blockDeviceClosure?: SandboxBlockDeviceClosed;
   #resolveBlockDeviceClosed!: (closure: SandboxBlockDeviceClosed) => void;
 
-  private constructor(
-    child: ChildProcessWithoutNullStreams,
-    consoleOutputPath?: string,
-    consoleOutputCleanupPath?: string,
-  ) {
+  private constructor(child: ChildProcessWithoutNullStreams) {
     this.#child = child;
     this.packets = this.#packets;
     this.closed = new Promise((resolve) => {
@@ -111,8 +104,6 @@ export class HostProcessSandboxVm implements HostControlChannel {
     this.blockDeviceClosed = new Promise((resolve) => {
       this.#resolveBlockDeviceClosed = resolve;
     });
-    this.#consoleOutputPath = consoleOutputPath;
-    this.#consoleOutputCleanupPath = consoleOutputCleanupPath;
     child.stdout.on("data", (chunk: Buffer) => {
       this.#receive(chunk);
     });
@@ -134,7 +125,6 @@ export class HostProcessSandboxVm implements HostControlChannel {
     child.on("exit", (code, signal) => {
       this.#resolveClosed();
       if (this.#closed) {
-        this.#cleanupConsoleOutput();
         return;
       }
 
@@ -143,9 +133,8 @@ export class HostProcessSandboxVm implements HostControlChannel {
           ? `sandbox-host exited with ${code ?? "unknown status"}`
           : `sandbox-host exited from signal ${signal}`;
       this.#exitError = new Error(
-        hostExitMessage(exitText, this.#stderr, this.#consoleOutputPath),
+        hostExitMessage(exitText, this.#stderr),
       );
-      this.#cleanupConsoleOutput();
       this.#packets.close(this.#exitError);
       this.#packetActivity.close(this.#exitError);
       this.#launchReady.close(this.#exitError);
@@ -218,19 +207,11 @@ export class HostProcessSandboxVm implements HostControlChannel {
     const hostPath = hostBinaryPath();
     let vm: HostProcessSandboxVm | undefined;
     try {
-      const consoleOutput = launchConsoleOutput();
       const child = spawn(hostPath, ["--stdio"], {
         stdio: ["pipe", "pipe", "pipe"],
-        env: {
-          ...process.env,
-          ...(consoleOutput === undefined ? {} : { SANDBOX_CONSOLE_OUTPUT: consoleOutput.path }),
-        },
+        env: process.env,
       });
-      vm = new HostProcessSandboxVm(
-        child,
-        consoleOutput?.path,
-        consoleOutput?.cleanupPath,
-      );
+      vm = new HostProcessSandboxVm(child);
       await Promise.race([
         once(child, "spawn"),
         once(child, "error").then(([error]) => {
@@ -357,30 +338,26 @@ export class HostProcessSandboxVm implements HostControlChannel {
       ? Promise.resolve()
       : once(this.#child, "exit").then(() => undefined);
 
-    try {
-      this.#child.stdin.end();
-      await Promise.race([
-        exited,
-        delay(this.#mayHoldBlobBlockLease ? BLOB_BLOCK_CLOSE_GRACE_MS : 500),
-      ]);
-      if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
-        return;
-      }
+    this.#child.stdin.end();
+    await Promise.race([
+      exited,
+      delay(this.#mayHoldBlobBlockLease ? BLOB_BLOCK_CLOSE_GRACE_MS : 500),
+    ]);
+    if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
+      return;
+    }
 
-      this.#child.kill("SIGTERM");
+    this.#child.kill("SIGTERM");
+    await Promise.race([
+      exited,
+      delay(500),
+    ]);
+    if (this.#child.exitCode === null && this.#child.signalCode === null) {
+      this.#child.kill("SIGKILL");
       await Promise.race([
         exited,
-        delay(500),
+        delay(1_000),
       ]);
-      if (this.#child.exitCode === null && this.#child.signalCode === null) {
-        this.#child.kill("SIGKILL");
-        await Promise.race([
-          exited,
-          delay(1_000),
-        ]);
-      }
-    } finally {
-      this.#cleanupConsoleOutput();
     }
   }
 
@@ -473,16 +450,6 @@ export class HostProcessSandboxVm implements HostControlChannel {
     return result.value;
   }
 
-  #cleanupConsoleOutput(): void {
-    if (this.#consoleOutputCleanupPath === undefined) {
-      return;
-    }
-    try {
-      rmSync(this.#consoleOutputCleanupPath, { recursive: true, force: true });
-    } catch {
-    }
-  }
-
   #writeToHost(packet: Uint8Array): void {
     this.#assertOpen();
     this.#writeOpenPacket(packet);
@@ -549,6 +516,14 @@ export class HostProcessSandboxVm implements HostControlChannel {
     }
 
     const type = document.type;
+    if (type === "init.failed") {
+      this.#launchReady.close(new Error(
+        typeof document.message === "string"
+          ? `sandbox init failed: ${document.message}`
+          : "sandbox init failed",
+      ));
+      return true;
+    }
     if (type === "host.block.closed") {
       this.#handleBlockDeviceClosed(document);
       return true;
@@ -1278,57 +1253,12 @@ function launchTimeoutMs(): number {
   return parsed;
 }
 
-function launchConsoleOutput(): { readonly path: string; readonly cleanupPath?: string } | undefined {
-  const configured = process.env.SANDBOX_CONSOLE_OUTPUT;
-  if (configured === undefined) {
-    return undefined;
-  }
-  try {
-    if (statSync(configured).isDirectory()) {
-      const outputPath = mkdtempSync(join(configured, "sandbox-console-"));
-      return { path: join(outputPath, "console.log") };
-    }
-  } catch {
-    // Non-existent configured paths are treated as explicit output files.
-  }
-  return { path: configured };
-}
-
-function hostExitMessage(exitText: string, stderr: string, consoleOutputPath: string | undefined): string {
+function hostExitMessage(exitText: string, stderr: string): string {
   const parts = [exitText];
   if (stderr.length > 0) {
     parts.push(stderr);
   }
-
-  const consoleOutput = consoleOutputPath === undefined ? "" : readConsoleTail(consoleOutputPath);
-  if (consoleOutput.length > 0) {
-    parts.push(`guest console output:\n${consoleOutput}`);
-  }
   return parts.join("\n");
-}
-
-function readConsoleTail(path: string): string {
-  const maxBytes = 8_000;
-  let fd: number | undefined;
-  try {
-    const stat = statSync(path);
-    const offset = Math.max(0, stat.size - maxBytes);
-    const size = stat.size - offset;
-    if (size <= 0) return "";
-    const buffer = Buffer.alloc(size);
-    fd = openSync(path, "r");
-    readSync(fd, buffer, 0, size, offset);
-    return buffer.toString("utf8").trimEnd();
-  } catch {
-    return "";
-  } finally {
-    if (fd !== undefined) {
-      try {
-        closeSync(fd);
-      } catch {
-      }
-    }
-  }
 }
 
 function encodeXattrNameList(names: readonly string[]): Uint8Array {
