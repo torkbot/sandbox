@@ -105,7 +105,9 @@ fn run_stage0() -> Result<(), InitError> {
     use std::os::unix::process::CommandExt;
 
     mount_kernel_filesystems()?;
-    mount_real_root()?;
+    let root_readonly = configured_root_readonly()?;
+    let mount_paths = configured_mount_paths()?;
+    mount_real_root(root_readonly, &mount_paths)?;
     move_mount("/proc", "/newroot/proc")?;
     move_mount("/sys", "/newroot/sys")?;
     move_mount("/dev", "/newroot/dev")?;
@@ -129,15 +131,19 @@ fn run_stage0() -> Result<(), InitError> {
 }
 
 #[cfg(target_os = "linux")]
-fn mount_real_root() -> Result<(), InitError> {
+fn mount_real_root(readonly: bool, mount_paths: &[String]) -> Result<(), InitError> {
     use std::ffi::CString;
 
-    std::fs::create_dir_all("/newroot")
-        .map_err(|error| InitError(format!("create /newroot: {error}")))?;
+    let target_path = if readonly && !mount_paths.is_empty() {
+        "/newroot-lower"
+    } else {
+        "/newroot"
+    };
+    std::fs::create_dir_all(target_path)
+        .map_err(|error| InitError(format!("create {target_path}: {error}")))?;
     let source = CString::new("/dev/vda").unwrap();
-    let target = CString::new("/newroot").unwrap();
+    let target = CString::new(target_path).unwrap();
     let fstype = CString::new("ext4").unwrap();
-    let readonly = configured_root_readonly()?;
     let flags = if readonly { libc::MS_RDONLY } else { 0 };
     let result = unsafe {
         libc::mount(
@@ -151,6 +157,9 @@ fn mount_real_root() -> Result<(), InitError> {
     if result < 0 {
         return Err(InitError::last_os("mount root block device"));
     }
+    if target_path != "/newroot" {
+        prepare_readonly_root_mount_points(mount_paths)?;
+    }
     for mount_point in [
         "/newroot/dev",
         "/newroot/proc",
@@ -163,6 +172,73 @@ fn mount_real_root() -> Result<(), InitError> {
                 "rootfs image must contain mount point {mount_point}"
             )));
         }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn configured_mount_paths() -> Result<Vec<String>, InitError> {
+    let mut paths = virtual_fs_mounts(
+        std::env::args().skip(1),
+        std::env::var("SANDBOX_VIRTIOFS_MOUNTS").ok(),
+    )?
+    .into_iter()
+    .map(|mount| mount.path)
+    .collect::<Vec<_>>();
+    if let Some(path) = configured_block_mount(
+        std::env::args().skip(1),
+        std::env::var("SANDBOX_BLOCK_MOUNT").ok(),
+    )? {
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_readonly_root_mount_points(mount_paths: &[String]) -> Result<(), InitError> {
+    mount_fs("tmpfs", "/newroot-overlay", "tmpfs", 0)?;
+    std::fs::create_dir_all("/newroot-overlay/upper")
+        .map_err(|error| InitError(format!("create read-only root overlay upper: {error}")))?;
+    std::fs::create_dir_all("/newroot-overlay/work")
+        .map_err(|error| InitError(format!("create read-only root overlay work: {error}")))?;
+    std::fs::create_dir_all("/newroot")
+        .map_err(|error| InitError(format!("create /newroot: {error}")))?;
+    mount_fs_with_data(
+        "overlay",
+        "/newroot",
+        "overlay",
+        0,
+        "lowerdir=/newroot-lower,upperdir=/newroot-overlay/upper,workdir=/newroot-overlay/work",
+    )?;
+    for path in mount_paths {
+        let target = std::path::Path::new("/newroot").join(path.trim_start_matches('/'));
+        if !target.exists() {
+            std::fs::create_dir_all(&target).map_err(|error| {
+                InitError(format!(
+                    "create guest mount point {}: {error}",
+                    target.display()
+                ))
+            })?;
+        }
+    }
+    remount_readonly("/newroot")
+}
+
+#[cfg(target_os = "linux")]
+fn remount_readonly(target: &str) -> Result<(), InitError> {
+    let target = std::ffi::CString::new(target)
+        .map_err(|_| InitError("remount target contains nul".to_string()))?;
+    let result = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            target.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REMOUNT | libc::MS_RDONLY,
+            std::ptr::null(),
+        )
+    };
+    if result < 0 {
+        return Err(InitError::last_os("remount synthetic root read-only"));
     }
     Ok(())
 }
@@ -766,6 +842,40 @@ fn mount_fs(
 }
 
 #[cfg(target_os = "linux")]
+fn mount_fs_with_data(
+    source: &str,
+    target: &str,
+    fstype: &str,
+    flags: libc::c_ulong,
+    data: &str,
+) -> Result<(), InitError> {
+    use std::ffi::CString;
+
+    std::fs::create_dir_all(target)
+        .map_err(|error| InitError(format!("create mount point {target}: {error}")))?;
+    let source = CString::new(source)
+        .map_err(|_| InitError(format!("mount source contains nul: {source}")))?;
+    let target_cstr = CString::new(target)
+        .map_err(|_| InitError(format!("mount target contains nul: {target}")))?;
+    let fstype = CString::new(fstype)
+        .map_err(|_| InitError(format!("mount fstype contains nul: {fstype}")))?;
+    let data = CString::new(data).map_err(|_| InitError("mount data contains nul".to_string()))?;
+    let result = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target_cstr.as_ptr(),
+            fstype.as_ptr(),
+            flags,
+            data.as_ptr().cast(),
+        )
+    };
+    if result < 0 {
+        return Err(InitError::last_os(&format!("mount {target}")));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn mount_fs_with_allowed_errors(
     source: &str,
     target: &str,
@@ -833,7 +943,7 @@ fn mount_internal_http_ca(
     let Some(mount) = mounts.iter().find(|mount| is_internal_http_ca_mount(mount)) else {
         return Ok(());
     };
-    ensure_mount_point(&mount.path, mounted_virtual_paths)?;
+    ensure_mount_point(&mount.path)?;
     mount_virtiofs(&mount.tag, &mount.path, mount.readonly)?;
     mounted_virtual_paths.push(std::path::PathBuf::from(&mount.path));
     Ok(())
@@ -848,7 +958,7 @@ fn mount_virtual_filesystems_before_http_ca(
         if is_internal_http_ca_mount(mount) || hides_internal_http_ca_mount(&mount.path) {
             continue;
         }
-        ensure_mount_point(&mount.path, mounted_virtual_paths)?;
+        ensure_mount_point(&mount.path)?;
         mount_virtiofs(&mount.tag, &mount.path, mount.readonly)?;
         mounted_virtual_paths.push(std::path::PathBuf::from(&mount.path));
     }
@@ -864,7 +974,7 @@ fn mount_virtual_filesystems_after_http_ca(
         if is_internal_http_ca_mount(mount) || !hides_internal_http_ca_mount(&mount.path) {
             continue;
         }
-        ensure_mount_point(&mount.path, mounted_virtual_paths)?;
+        ensure_mount_point(&mount.path)?;
         mount_virtiofs(&mount.tag, &mount.path, mount.readonly)?;
         mounted_virtual_paths.push(std::path::PathBuf::from(&mount.path));
     }
@@ -925,24 +1035,29 @@ fn mount_configured_block(
     mounted_paths: &mut Vec<std::path::PathBuf>,
     after_http_ca: bool,
 ) -> Result<(), InitError> {
-    let encoded = args
-        .filter_map(|arg| arg.strip_prefix("--block-mount=").map(str::to_string))
-        .next()
-        .or(env_mount)
-        .filter(|value| !value.is_empty());
-    let Some(path) = encoded
-        .map(|value| decode_mount_field(&value))
-        .transpose()?
-    else {
+    let Some(path) = configured_block_mount(args, env_mount)? else {
         return Ok(());
     };
     if block_mount_after_http_ca(&path) != after_http_ca {
         return Ok(());
     }
-    ensure_mount_point(&path, mounted_paths)?;
+    ensure_mount_point(&path)?;
     mount_block_device(&path)?;
     mounted_paths.push(std::path::PathBuf::from(path));
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn configured_block_mount(
+    args: impl Iterator<Item = String>,
+    env_mount: Option<String>,
+) -> Result<Option<String>, InitError> {
+    let encoded = args
+        .filter_map(|arg| arg.strip_prefix("--block-mount=").map(str::to_string))
+        .next()
+        .or(env_mount)
+        .filter(|value| !value.is_empty());
+    encoded.map(|value| decode_mount_field(&value)).transpose()
 }
 
 fn block_mount_after_http_ca(path: &str) -> bool {
@@ -998,10 +1113,7 @@ fn parse_virtual_fs_mount(mount: &str) -> Result<VirtualFsMount, InitError> {
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_mount_point(
-    path: &str,
-    mounted_virtual_paths: &[std::path::PathBuf],
-) -> Result<(), InitError> {
+fn ensure_mount_point(path: &str) -> Result<(), InitError> {
     use std::path::Path;
 
     if Path::new(path).is_dir() {
@@ -1009,83 +1121,21 @@ fn ensure_mount_point(
     }
     if Path::new(path).exists() {
         return Err(InitError(format!(
-            "virtual filesystem mount point is not a directory: {path}"
+            "guest mount point is not a directory: {path}"
         )));
     }
-    ensure_mount_point_parent_is_ephemeral(path, mounted_virtual_paths)?;
 
-    std::fs::create_dir_all(path).map_err(|error| {
-        InitError(format!(
-            "create virtual filesystem mount point {path}: {error}"
-        ))
-    })?;
+    std::fs::create_dir_all(path)
+        .map_err(|error| InitError(format!("create guest mount point {path}: {error}")))?;
 
     if !Path::new(path).is_dir() {
         return Err(InitError(format!(
-            "virtual filesystem mount point is not a directory: {path}"
+            "guest mount point is not a directory: {path}"
         )));
     }
 
     Ok(())
 }
-
-#[cfg(target_os = "linux")]
-fn ensure_mount_point_parent_is_ephemeral(
-    path: &str,
-    mounted_virtual_paths: &[std::path::PathBuf],
-) -> Result<(), InitError> {
-    let parent = nearest_existing_ancestor(path)?;
-    if parent.starts_with("/run") || parent.starts_with("/tmp") || parent.starts_with("/dev/shm") {
-        return Ok(());
-    }
-    if mounted_virtual_paths
-        .iter()
-        .any(|mounted_path| parent.starts_with(mounted_path))
-    {
-        return Ok(());
-    }
-
-    let fs_type = filesystem_type(&parent)?;
-    if fs_type == TMPFS_MAGIC {
-        return Ok(());
-    }
-    Err(InitError(format!(
-        "virtual filesystem mount point parent is on durable rootfs: {path}"
-    )))
-}
-
-#[cfg(target_os = "linux")]
-fn nearest_existing_ancestor(path: &str) -> Result<std::path::PathBuf, InitError> {
-    let mut candidate = std::path::PathBuf::from(path);
-    while !candidate.exists() {
-        if !candidate.pop() {
-            return Err(InitError(format!(
-                "virtual filesystem mount point has no existing ancestor: {path}"
-            )));
-        }
-    }
-    Ok(candidate)
-}
-
-#[cfg(target_os = "linux")]
-fn filesystem_type(path: &std::path::Path) -> Result<i128, InitError> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| InitError(format!("statfs path contains nul: {}", path.display())))?;
-    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    let result = unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) };
-    if result < 0 {
-        return Err(InitError::last_os(
-            "stat virtual filesystem mount point parent",
-        ));
-    }
-    Ok(unsafe { stat.assume_init().f_type as i128 })
-}
-
-#[cfg(target_os = "linux")]
-const TMPFS_MAGIC: i128 = 0x0102_1994;
 
 #[cfg(target_os = "linux")]
 fn mount_virtiofs(tag: &str, path: &str, readonly: bool) -> Result<(), InitError> {

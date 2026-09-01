@@ -111,7 +111,6 @@ await mkdir(resolve(outDir, "sandbox"), { recursive: true });
 await mkdir(resolve(outDir, "sys"), { recursive: true });
 await mkdir(resolve(outDir, "tmp"), { recursive: true, mode: 0o1777 });
 await chmod(resolve(outDir, "tmp"), 0o1777);
-await mkdir(resolve(outDir, "workspace"), { recursive: true });
 await writeFile(
   resolve(outDir, rootfsEnvironmentFactsManifestFile),
   `${JSON.stringify(rootfsEnvironmentFactsManifest, null, 2)}\n`,

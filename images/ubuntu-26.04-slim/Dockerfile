@@ -11,7 +11,7 @@ RUN printf '%s\n' \
     > /etc/dpkg/dpkg.cfg.d/01_sandbox_rootfs_excludes \
   && apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --no-install-suggests ca-certificates \
-  && mkdir -p /dev /proc /run /sandbox /sys /tmp /usr/lib/sandbox /workspace \
+  && mkdir -p /dev /proc /run /sandbox /sys /tmp /usr/lib/sandbox \
   && chmod 1777 /tmp \
   && printf '%s\n' \
     '#!/bin/sh' \

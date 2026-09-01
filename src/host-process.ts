@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
 import { appendFileSync, closeSync, mkdtempSync, openSync, readSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { Binary, BSON } from "bson";
 import { hostBinaryPath, macosHostSigningError } from "./artifacts.ts";
 import type { HostControlChannel } from "./control.ts";
@@ -1281,7 +1282,8 @@ function launchTimeoutMs(): number {
 function launchConsoleOutput(): { readonly path: string; readonly cleanupPath?: string } | undefined {
   const configured = process.env.SANDBOX_CONSOLE_OUTPUT;
   if (configured === undefined) {
-    return undefined;
+    const outputPath = mkdtempSync(join(tmpdir(), "sandbox-console-"));
+    return { path: join(outputPath, "console.log"), cleanupPath: outputPath };
   }
   try {
     if (statSync(configured).isDirectory()) {

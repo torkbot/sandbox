@@ -2,7 +2,7 @@ ARG SOURCE_IMAGE
 FROM ${SOURCE_IMAGE}
 
 RUN apk add --no-cache ca-certificates \
-  && mkdir -p /dev /proc /run /sandbox /sys /tmp /usr/lib/sandbox /workspace \
+  && mkdir -p /dev /proc /run /sandbox /sys /tmp /usr/lib/sandbox \
   && chmod 1777 /tmp \
   && printf '%s\n' \
     '#!/bin/sh' \

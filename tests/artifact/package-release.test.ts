@@ -304,6 +304,7 @@ test("default rootfs includes agent utility packages", async () => {
       new RegExp(`mkdir\\(resolve\\(outDir, "${mountPoint}"\\)`),
     );
   }
+  assert.doesNotMatch(buildRootfsScript, /mkdir\(resolve\(outDir, "workspace"\)/);
 });
 
 test("default rootfs facts are tied to rootfs build inputs", async () => {

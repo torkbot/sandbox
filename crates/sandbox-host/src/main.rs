@@ -290,8 +290,9 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
                 sandbox::config::RootfsStorageSpec::PersistentQcow2Overlay { .. } => None,
             }),
         block_device: blob_volume
-            .as_ref()
-            .map(blob_block::BlobBlockVolume::service),
+            .as_mut()
+            .map(blob_block::BlobBlockVolume::service)
+            .transpose()?,
     };
     let mut vm = sandbox::runtime::KrunVm::create_with_services(&spec, virtual_fs, services)?;
     vm.start()?;
