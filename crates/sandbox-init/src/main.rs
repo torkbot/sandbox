@@ -121,7 +121,8 @@ fn run_stage0() -> Result<(), InitError> {
     mount_kernel_filesystems()?;
     let root_readonly = configured_root_readonly()?;
     let mount_paths = configured_mount_paths()?;
-    mount_real_root(root_readonly, &mount_paths)?;
+    let synthetic_root = root_readonly && !mount_paths.is_empty();
+    mount_real_root(root_readonly, synthetic_root)?;
     move_mount("/proc", "/newroot/proc")?;
     move_mount("/sys", "/newroot/sys")?;
     move_mount("/dev", "/newroot/dev")?;
@@ -132,6 +133,10 @@ fn run_stage0() -> Result<(), InitError> {
         .map_err(|error| InitError(format!("copy stage1 init to {stage1_path}: {error}")))?;
     set_file_mode(stage1_path, 0o755)?;
     move_new_root()?;
+    if synthetic_root {
+        prepare_guest_mount_points(&mount_paths)?;
+        remount_readonly("/")?;
+    }
     let args = stage1_args();
     let error = std::process::Command::new("/dev/shm/sandbox-init")
         .args(args)
@@ -145,10 +150,10 @@ fn run_stage0() -> Result<(), InitError> {
 }
 
 #[cfg(target_os = "linux")]
-fn mount_real_root(readonly: bool, mount_paths: &[String]) -> Result<(), InitError> {
+fn mount_real_root(readonly: bool, synthetic_root: bool) -> Result<(), InitError> {
     use std::ffi::CString;
 
-    let target_path = if readonly && !mount_paths.is_empty() {
+    let target_path = if synthetic_root {
         "/newroot-lower"
     } else {
         "/newroot"
@@ -172,7 +177,7 @@ fn mount_real_root(readonly: bool, mount_paths: &[String]) -> Result<(), InitErr
         return Err(InitError::last_os("mount root block device"));
     }
     if target_path != "/newroot" {
-        prepare_readonly_root_mount_points(mount_paths)?;
+        mount_readonly_root_overlay()?;
     }
     for mount_point in [
         "/newroot/dev",
@@ -209,7 +214,7 @@ fn configured_mount_paths() -> Result<Vec<String>, InitError> {
 }
 
 #[cfg(target_os = "linux")]
-fn prepare_readonly_root_mount_points(mount_paths: &[String]) -> Result<(), InitError> {
+fn mount_readonly_root_overlay() -> Result<(), InitError> {
     mount_fs("tmpfs", "/newroot-overlay", "tmpfs", 0)?;
     std::fs::create_dir_all("/newroot-overlay/upper")
         .map_err(|error| InitError(format!("create read-only root overlay upper: {error}")))?;
@@ -224,8 +229,13 @@ fn prepare_readonly_root_mount_points(mount_paths: &[String]) -> Result<(), Init
         0,
         "lowerdir=/newroot-lower,upperdir=/newroot-overlay/upper,workdir=/newroot-overlay/work",
     )?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_guest_mount_points(mount_paths: &[String]) -> Result<(), InitError> {
     for path in mount_paths {
-        let target = std::path::Path::new("/newroot").join(path.trim_start_matches('/'));
+        let target = std::path::Path::new(path);
         if !target.exists() {
             std::fs::create_dir_all(&target).map_err(|error| {
                 InitError(format!(
@@ -235,7 +245,7 @@ fn prepare_readonly_root_mount_points(mount_paths: &[String]) -> Result<(), Init
             })?;
         }
     }
-    remount_readonly("/newroot")
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

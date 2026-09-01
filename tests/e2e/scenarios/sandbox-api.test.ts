@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmod, lstat, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -1794,6 +1795,59 @@ test("top-level read-only rootfs mount directories are synthetic", async (t) => 
   await using rootfsOnly = await defineSandbox({ rootfs: testRootfs }).boot();
   const absent = await rootfsOnly.exec("/bin/sh", ["-lc", "test ! -e /missing-mount"]);
   assert.equal(absent.exitCode, 0, absent.stderr);
+});
+
+test("read-only rootfs mount directories follow guest-absolute symlinks", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const overlay = memoryBlockStore();
+  await using builder = await defineSandbox({
+    rootfs: rootfs.cow({ base: testRootfs, writable: overlay }),
+  }).boot();
+  const prepare = await builder.exec("/bin/sh", [
+    "-lc",
+    "mkdir -p /srv/data && ln -s /srv/data /data && sync",
+  ]);
+  assert.equal(prepare.exitCode, 0, prepare.stderr);
+  await builder.close();
+
+  const image = await rootfs.flatten({
+    format: "qcow2",
+    source: rootfs.compose({ base: testRootfs, overlay }),
+    dest: memoryBlockStore(),
+  });
+  const imageDir = await mkdtemp(join(tmpdir(), "sandbox-symlink-rootfs-"));
+  t.after(async () => {
+    await rm(imageDir, { recursive: true, force: true });
+  });
+  const imagePath = join(imageDir, "rootfs.qcow2");
+  const imageFile = await open(imagePath, "w");
+  const imageHash = createHash("sha256");
+  try {
+    for await (const chunk of rootfs.bytes(image)) {
+      imageHash.update(chunk);
+      await imageFile.write(chunk);
+    }
+  } finally {
+    await imageFile.close();
+  }
+  const customRootfs: RootfsImageConfig = {
+    ...testRootfs,
+    path: imagePath,
+    digest: `sha256:${imageHash.digest("hex")}`,
+    sizeBytes: image.sizeBytes,
+  };
+  const mountedFs = fs.memory({ files: { "/note.txt": "mounted\n" } });
+  await using sandbox = await defineSandbox({ rootfs: customRootfs }).boot({
+    mounts: { "/data/cache": fs.virtual(mountedFs) },
+  });
+
+  const read = await sandbox.exec("/bin/cat", ["/data/cache/note.txt"]);
+  assert.equal(read.exitCode, 0, read.stderr);
+  assert.equal(read.stdout, "mounted\n");
 });
 
 test("missing COW rootfs mount directories become machine state", async (t) => {
