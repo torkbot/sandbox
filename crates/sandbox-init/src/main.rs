@@ -22,9 +22,23 @@ const GUEST_FS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 fn main() {
     if let Err(error) = run() {
+        report_init_failure(&error);
         eprintln!("sandbox-init failed: {error}");
         std::process::exit(1);
     }
+}
+
+fn report_init_failure(error: &InitError) {
+    let Ok(mut control) = connect_control() else {
+        return;
+    };
+    let Ok(packet) = (ControlFrame::InitFailed {
+        message: error.to_string(),
+    })
+    .encode_packet() else {
+        return;
+    };
+    let _ = control.write_all(&packet);
 }
 
 fn run() -> Result<(), InitError> {
@@ -1496,6 +1510,7 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
                 connections.send(&id, ConnectionControl::Close);
             }
             ControlFrame::InitReady { .. }
+            | ControlFrame::InitFailed { .. }
             | ControlFrame::GuestExecComplete { .. }
             | ControlFrame::GuestFsResponse { .. }
             | ControlFrame::GuestSpawnStarted { .. }
