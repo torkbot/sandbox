@@ -876,6 +876,42 @@ test("failed declarative blob mount boot releases its lease", async (t) => {
   assert.equal(result.exitCode, 0, result.stderr);
 });
 
+test("failed second blob acquisition releases the acquired overlay", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const objectStore = await mkdtemp(join(tmpdir(), "sandbox-blob-partial-acquire-"));
+  t.after(async () => {
+    await rm(objectStore, { recursive: true, force: true });
+  });
+  const provider = { kind: "local" as const, path: objectStore };
+  const wrongRole = storage.blob.overlay({ provider, volume: "wrong-role" });
+  const seed = await defineSandbox({
+    rootfs: rootfs.cow({ base: testRootfs, writable: wrongRole }),
+  }).boot();
+  await seed.close();
+
+  const overlay = storage.blob.overlay({ provider, volume: "agent-overlay" });
+  const invalidDisk = storage.blob.block({
+    provider,
+    volume: "wrong-role",
+    sizeBytes: 64n * 1024n * 1024n,
+  });
+  const sandbox = defineSandbox({
+    rootfs: rootfs.cow({ base: testRootfs, writable: overlay }),
+  });
+  await assert.rejects(
+    sandbox.boot({ mounts: { "/workspace": invalidDisk } }),
+    /blob volume role mismatch/,
+  );
+
+  await using retry = await sandbox.boot();
+  const result = await retry.exec("/bin/true");
+  assert.equal(result.exitCode, 0, result.stderr);
+});
+
 test("blob store opening failures preserve their public error code", async (t) => {
   const testRootfs = await testRootfsForVmTest(t);
   if (testRootfs === undefined) {

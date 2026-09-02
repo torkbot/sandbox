@@ -6,9 +6,8 @@ use std::io::{self, ErrorKind, Read};
 use std::mem::MaybeUninit;
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -29,17 +28,17 @@ use sandbox::network_service::{
 };
 use sandbox::rootfs_image::{Qcow2FlattenOptions, flatten_rootfs_to_qcow2};
 use sandbox::runtime::{
-    ControlSocket, HostDirectoryFsDevice, HostDirectoryIdentityMapping, HostDirectoryMaskFsDevice,
-    HostServices, StartStatusObserver, VirtioFsDevice, VirtualFsDevice,
+    HostDirectoryFsDevice, HostDirectoryIdentityMapping, HostDirectoryMaskFsDevice, HostServices,
+    VirtioFsDevice, VirtualFsDevice,
 };
 
 mod blob_block;
 mod host_vfs;
+mod session;
 
 use host_vfs::{HostIoBridge, NodeVirtualFs, StaticFileVirtualFs};
 
 const USAGE: &str = "usage: sandbox-host --capabilities | --stdio | --flatten-qcow2";
-const BLOB_BLOCK_FAILURE_EXIT_GRACE: Duration = Duration::from_secs(5);
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
@@ -168,300 +167,52 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
     let blob_block_config = blob_block_config();
     let mut stdin = io::stdin().lock();
     let spawn_document = read_document_packet(&mut stdin)?;
-    let (mut root_blob_volume, mut blob_volume) =
-        acquire_blob_resources(&blob_block_config, &spawn_document, &bridge)?;
     drop(stdin);
 
-    let run_result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        let spec = sandbox::MicroVmSpec::build(parse_spawn(spawn_document)?)?;
-        #[cfg(target_os = "macos")]
-        validate_writable_xattr_backing(&spec)?;
-        let (bridge_tx, bridge_rx) = mpsc::channel::<Result<(), String>>();
-        monitor_blob_block_failure(
-            root_blob_volume
-                .as_mut()
-                .and_then(blob_block::BlobBlockVolume::take_failure_receiver),
-            bridge.clone(),
-            bridge_tx.clone(),
-        );
-        monitor_blob_block_failure(
-            blob_volume
-                .as_mut()
-                .and_then(blob_block::BlobBlockVolume::take_failure_receiver),
-            bridge.clone(),
-            bridge_tx.clone(),
-        );
-        let guest_writer_slot: Arc<(Mutex<Option<ControlSocket>>, Condvar)> =
-            Arc::new((Mutex::new(None), Condvar::new()));
-        let start_status_slot: Arc<Mutex<Option<StartStatusObserver>>> = Arc::new(Mutex::new(None));
-        let launch_ready = Arc::new(AtomicBool::new(false));
-        let host_stdin_closed = Arc::new(AtomicBool::new(false));
-
-        let stdin_bridge = bridge.clone();
-        let stdin_tx = bridge_tx.clone();
-        let stdin_guest_writer = guest_writer_slot.clone();
-        let stdin_start_status = start_status_slot.clone();
-        let stdin_launch_ready = launch_ready.clone();
-        let stdin_host_stdin_closed = host_stdin_closed.clone();
-        thread::spawn(move || {
-            let mut stdin = io::stdin().lock();
-            loop {
-                let (packet, document) = match read_packet(&mut stdin) {
-                    Ok(value) => value,
-                    Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
-                        stdin_host_stdin_closed.store(true, Ordering::SeqCst);
-                        let start_status =
-                            stdin_start_status
-                                .lock()
-                                .unwrap()
-                                .clone()
-                                .and_then(|status| {
-                                    status
-                                        .get()
-                                        .map(|result| result.map_err(|error| error.to_string()))
-                                });
-                        let result = host_stdin_closed_result(
-                            start_status,
-                            stdin_launch_ready.load(Ordering::SeqCst),
-                        );
-                        let _ = stdin_tx.send(result);
-                        return;
-                    }
-                    Err(error) => {
-                        let _ = stdin_tx.send(Err(format!("read host control packet: {error}")));
-                        return;
-                    }
-                };
-                if stdin_bridge.route_response(document) {
-                    continue;
-                }
-
-                let (writer_lock, writer_ready) = &*stdin_guest_writer;
-                let mut writer = writer_lock.lock().unwrap();
-                while writer.is_none() {
-                    writer = writer_ready.wait(writer).unwrap();
-                }
-                if let Err(error) = writer.as_mut().unwrap().write_packet(&packet) {
-                    let _ = stdin_tx.send(Err(format!("write guest control packet: {error}")));
-                    return;
-                }
-            }
-        });
-
-        let virtual_fs = virtio_fs_devices(&spec, bridge.clone());
-        let services = HostServices {
-            http: http_intercept_runtime(&spec, bridge.clone())?,
-            network_policy: network_policy_runtime(&spec, bridge.clone()),
-            root_storage: match root_blob_volume.as_mut() {
-                Some(volume) => Some(report_blob_block_result(&bridge, volume.cow_store())?),
-                None => spec
-                    .rootfs
-                    .storage
-                    .as_ref()
-                    .and_then(|storage| match storage {
-                        sandbox::config::RootfsStorageSpec::CowBlockStore {
-                            block_size, ..
-                        } => Some(Arc::new(NodeCowBlockStore::new(
-                            bridge.clone(),
-                            *block_size,
-                            "host.block",
-                        )) as Arc<dyn CowBlockStore>),
-                        sandbox::config::RootfsStorageSpec::EphemeralCow { .. } => None,
-                        sandbox::config::RootfsStorageSpec::PersistentQcow2Overlay { .. } => None,
-                    }),
-            },
-            block_device: blob_volume
-                .as_mut()
-                .map(|volume| report_blob_block_result(&bridge, volume.service()))
-                .transpose()?,
-        };
-        let mut vm = sandbox::runtime::KrunVm::create_with_services(&spec, virtual_fs, services)?;
-        vm.start()?;
-
-        {
-            let (writer_lock, writer_ready) = &*guest_writer_slot;
-            *writer_lock.lock().unwrap() = Some(vm.control_socket().try_clone()?);
-            writer_ready.notify_all();
-        }
-        let mut guest_reader = vm.control_socket().try_clone()?;
-
-        let start_status = vm.start_status_observer();
-        *start_status_slot.lock().unwrap() = Some(start_status.clone());
-        let status_tx = bridge_tx.clone();
-        let status_launch_ready = launch_ready.clone();
-        let status_host_stdin_closed = host_stdin_closed.clone();
-        thread::spawn(move || {
-            let result = start_status.wait().map_err(|error| error.to_string());
-            if status_host_stdin_closed.load(Ordering::SeqCst) {
-                return;
-            }
-            let _ = status_tx.send(vm_exited_before_host_stdin_result(
-                result,
-                status_launch_ready.load(Ordering::SeqCst),
-            ));
-        });
-
-        let guest_tx = bridge_tx.clone();
-        let guest_launch_ready = launch_ready.clone();
-        let guest_bridge = bridge.clone();
-        thread::spawn(move || {
-            loop {
-                let packet = match guest_reader.read_packet() {
-                    Ok(packet) => packet,
-                    Err(error) => {
-                        let _ = guest_tx.send(Err(format!("read guest control packet: {error}")));
-                        return;
-                    }
-                };
-                if is_init_ready_packet(&packet) {
-                    guest_launch_ready.store(true, Ordering::SeqCst);
-                }
-                if let Err(error) = guest_bridge.write_raw_packet(&packet) {
-                    let _ = guest_tx.send(Err(format!("write host control packet: {error}")));
-                    return;
-                }
-            }
-        });
-
-        let result = match bridge_rx.recv() {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => {
-                if let Some(result) = vm.start_status() {
-                    result?;
-                }
-                Err(error.into())
-            }
-            Err(error) => Err(format!("control bridge stopped: {error}").into()),
-        };
-        drop(vm);
-        result
-    })();
-
-    let root_close_result = root_blob_volume
-        .as_mut()
-        .map(blob_block::BlobBlockVolume::close);
-    let block_close_result = blob_volume.as_mut().map(blob_block::BlobBlockVolume::close);
-    let close_failure = root_close_result
-        .into_iter()
-        .chain(block_close_result)
-        .find_map(Result::err);
-    if let Some(failure) = close_failure.as_ref() {
-        report_blob_block_failure(&bridge, failure);
-    }
-    run_result?;
-    if let Some(failure) = close_failure {
-        return Err(Box::new(failure));
-    }
-    Ok(())
-}
-
-fn acquire_blob_resources(
-    config: &blob_block::BlobBlockConfig,
-    spawn_document: &Document,
-    bridge: &HostIoBridge,
-) -> Result<
-    (
-        Option<blob_block::BlobBlockVolume>,
-        Option<blob_block::BlobBlockVolume>,
-    ),
-    Box<dyn std::error::Error>,
-> {
-    let resources = spawn_document.get_document("blobResources").ok();
-    let root = resources
-        .and_then(|resources| resources.get_document("rootOverlay").ok())
-        .cloned()
-        .map(|document| blob_block::BlobBlockVolume::acquire(config, document))
-        .transpose();
-    let block = match root {
-        Ok(root) => resources
-            .and_then(|resources| resources.get_document("blockDevice").ok())
-            .cloned()
-            .map(|document| blob_block::BlobBlockVolume::acquire(config, document))
-            .transpose()
-            .map(|block| (root, block)),
-        Err(error) => Err(error),
-    };
-    block.map_err(|error| {
-        report_blob_block_failure(bridge, &error);
-        Box::new(error) as Box<dyn std::error::Error>
-    })
-}
-
-fn blob_block_failure_document(failure: &blob_block::BlobBlockFailure) -> Document {
-    let mut document = doc! { "type": "host.resources.failure" };
-    document.insert("code", failure.code);
-    document.insert("error", failure.message.clone());
-    if let Some(retry_after_ms) = failure.retry_after_ms {
-        document.insert("retryAfterMs", retry_after_ms as i64);
-    }
-    document
-}
-
-fn report_blob_block_failure(bridge: &HostIoBridge, failure: &blob_block::BlobBlockFailure) {
-    let notification = blob_block_failure_document(failure);
-    if let Ok(packet) = encode_document_packet(&notification) {
-        let _ = bridge.write_raw_packet(&packet);
-    }
-}
-
-fn report_blob_block_result<T>(
-    bridge: &HostIoBridge,
-    result: Result<T, blob_block::BlobBlockFailure>,
-) -> Result<T, blob_block::BlobBlockFailure> {
-    result.inspect_err(|failure| report_blob_block_failure(bridge, failure))
-}
-
-fn monitor_blob_block_failure(
-    failures: Option<mpsc::Receiver<blob_block::BlobBlockFailure>>,
-    bridge: Arc<HostIoBridge>,
-    failure_tx: mpsc::Sender<Result<(), String>>,
-) {
-    let Some(failures) = failures else {
-        return;
-    };
-    thread::spawn(move || {
-        let Ok(failure) = failures.recv() else {
-            return;
-        };
-        report_blob_block_failure(&bridge, &failure);
-        let _ = failure_tx.send(Err(failure.message));
-        thread::sleep(BLOB_BLOCK_FAILURE_EXIT_GRACE);
-        std::process::exit(1);
-    });
-}
-
-fn host_stdin_closed_result(
-    start_status: Option<Result<(), String>>,
-    launch_ready: bool,
-) -> Result<(), String> {
-    match start_status {
-        Some(Ok(())) if launch_ready => Ok(()),
-        Some(Ok(())) => Err("host stdin closed after VM exited before init.ready".to_string()),
-        Some(Err(error)) => Err(format!("VM exited after host stdin closed: {error}")),
-        None if launch_ready => Ok(()),
-        None => Err("host stdin closed before VM launch completed".to_string()),
-    }
-}
-
-fn vm_exited_before_host_stdin_result(
-    start_status: Result<(), String>,
-    launch_ready: bool,
-) -> Result<(), String> {
-    match start_status {
-        Ok(()) if launch_ready => Err("VM exited before host stdin closed".to_string()),
-        Ok(()) => Err("VM exited before init.ready".to_string()),
-        Err(error) => Err(error),
-    }
-}
-
-fn is_init_ready_packet(packet: &[u8]) -> bool {
-    if packet.len() < 4 {
-        return false;
-    }
-    let Ok(document) = Document::from_reader(&packet[4..]) else {
-        return false;
-    };
-    matches!(document.get_str("type"), Ok("init.ready"))
+    let spec = sandbox::MicroVmSpec::build(parse_spawn(&spawn_document)?)?;
+    #[cfg(target_os = "macos")]
+    validate_writable_xattr_backing(&spec)?;
+    session::with_blob_resources(
+        &blob_block_config,
+        &spawn_document,
+        bridge.clone(),
+        |resources| {
+            let session = session::StdioSession::begin(bridge.clone(), resources);
+            let virtual_fs = virtio_fs_devices(&spec, bridge.clone());
+            let services = HostServices {
+                http: http_intercept_runtime(&spec, bridge.clone())?,
+                network_policy: network_policy_runtime(&spec, bridge.clone()),
+                root_storage: match resources.root_store()? {
+                    Some(store) => Some(store),
+                    None => spec
+                        .rootfs
+                        .storage
+                        .as_ref()
+                        .and_then(|storage| match storage {
+                            sandbox::config::RootfsStorageSpec::CowBlockStore {
+                                block_size,
+                                ..
+                            } => Some(Arc::new(NodeCowBlockStore::new(
+                                bridge.clone(),
+                                *block_size,
+                                "host.block",
+                            )) as Arc<dyn CowBlockStore>),
+                            sandbox::config::RootfsStorageSpec::EphemeralCow { .. } => None,
+                            sandbox::config::RootfsStorageSpec::PersistentQcow2Overlay {
+                                ..
+                            } => None,
+                        }),
+                },
+                block_device: resources.block_service()?,
+            };
+            let mut vm =
+                sandbox::runtime::KrunVm::create_with_services(&spec, virtual_fs, services)?;
+            vm.start()?;
+            let result = session.run(&vm);
+            drop(vm);
+            result
+        },
+    )
 }
 
 fn network_policy_runtime(
@@ -1113,7 +864,7 @@ fn macos_volume_root(path: &CStr) -> io::Result<CString> {
     Ok(unsafe { CStr::from_ptr(volume.f_mntonname.as_ptr()) }.to_owned())
 }
 
-fn parse_spawn(document: Document) -> Result<MicroVmSpecInput, Box<dyn std::error::Error>> {
+fn parse_spawn(document: &Document) -> Result<MicroVmSpecInput, Box<dyn std::error::Error>> {
     let frame_type = document.get_str("type")?;
     if frame_type != "host.spawn" {
         return Err(format!("expected host.spawn, got {frame_type}").into());
@@ -1396,36 +1147,6 @@ fn optional_bool(document: &Document, key: &str) -> Option<bool> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn blob_block_failure_forces_exit_before_lease_expiry() {
-        let config = blob_block_config();
-        assert!(
-            config.lease_renew_interval
-                + config.lease_request_timeout
-                + BLOB_BLOCK_FAILURE_EXIT_GRACE
-                < config.lease_duration
-        );
-    }
-
-    #[test]
-    fn blob_block_failure_packet_preserves_close_error_details() {
-        let failure = blob_block::BlobBlockFailure {
-            code: "lease-provider-error",
-            message: "blob block lease state is uncertain: release request timed out".to_string(),
-            retry_after_ms: Some(30_000),
-        };
-
-        assert_eq!(
-            blob_block_failure_document(&failure),
-            doc! {
-                "type": "host.resources.failure",
-                "code": "lease-provider-error",
-                "error": "blob block lease state is uncertain: release request timed out",
-                "retryAfterMs": 30_000i64,
-            },
-        );
-    }
-
     #[cfg(target_os = "macos")]
     #[test]
     fn volume_root_resolution_accepts_subdirectories() {
@@ -1433,51 +1154,5 @@ mod tests {
         let volume_root = macos_volume_root(&path).unwrap();
 
         assert!(volume_root.to_bytes().starts_with(b"/"));
-    }
-
-    #[test]
-    fn host_stdin_close_after_ready_is_normal_shutdown() {
-        assert_eq!(host_stdin_closed_result(Some(Ok(())), true), Ok(()));
-    }
-
-    #[test]
-    fn host_stdin_close_after_ready_before_vm_exit_is_normal_shutdown() {
-        assert_eq!(host_stdin_closed_result(None, true), Ok(()));
-    }
-
-    #[test]
-    fn host_stdin_close_before_ready_reports_launch_failure() {
-        assert_eq!(
-            host_stdin_closed_result(Some(Ok(())), false),
-            Err("host stdin closed after VM exited before init.ready".to_string()),
-        );
-    }
-
-    #[test]
-    fn vm_exit_before_ready_reports_launch_failure() {
-        assert_eq!(
-            vm_exited_before_host_stdin_result(Ok(()), false),
-            Err("VM exited before init.ready".to_string()),
-        );
-    }
-
-    #[test]
-    fn vm_exit_after_ready_without_host_close_reports_unexpected_exit() {
-        assert_eq!(
-            vm_exited_before_host_stdin_result(Ok(()), true),
-            Err("VM exited before host stdin closed".to_string()),
-        );
-    }
-
-    #[test]
-    fn init_ready_packet_is_detected() {
-        let packet = encode_document_packet(&doc! {
-            "type": "init.ready",
-            "rootReadonly": true,
-            "initName": "sandbox-init",
-        })
-        .unwrap();
-
-        assert!(is_init_ready_packet(&packet));
     }
 }

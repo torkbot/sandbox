@@ -92,8 +92,6 @@ export class HostProcessSandboxVm implements HostControlChannel {
   #closed = false;
   #exitError: Error | null = null;
   #stdinError: Error | null = null;
-  #configured = false;
-  #spawnSent = false;
   #blobResourceCount = 0;
   #blobFailure: SandboxBlobStorageError | null = null;
   #closePromise?: Promise<void>;
@@ -142,21 +140,6 @@ export class HostProcessSandboxVm implements HostControlChannel {
     requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook> = new Map(),
     networkConnectionHook?: RegisteredNetworkConnectionHook,
   ): Promise<HostProcessSandboxVm> {
-    const vm = await HostProcessSandboxVm.#start();
-    try {
-      return await vm.attach(
-        options,
-        hostOptions,
-        requestHeaderHooks,
-        networkConnectionHook,
-      );
-    } catch (error) {
-      await cleanupAfterFailure(error, () => vm.#beginClose(FAILED_LAUNCH_CLOSE_GRACE_MS));
-      throw error;
-    }
-  }
-
-  static async #start(): Promise<HostProcessSandboxVm> {
     const hostPath = hostBinaryPath();
     let vm: HostProcessSandboxVm | undefined;
     try {
@@ -171,34 +154,37 @@ export class HostProcessSandboxVm implements HostControlChannel {
           throw error;
         }),
       ]);
+      vm.#requestHeaderHooks = requestHeaderHooks;
+      vm.#networkConnectionHook = networkConnectionHook;
+      if (options.rootfs.storage?.kind === "cow-block-store") {
+        vm.#blockStores.set("host.block", {
+          blockStore: options.rootfs.storage.blockStore,
+          context: options.rootfs.storage.context,
+        });
+      }
+      for (const mount of options.mounts ?? []) {
+        if (mount.kind === "virtual-fs") {
+          vm.#hostFs.set(mount.path, mount.fileSystem);
+        }
+      }
+      const blobResources = declarativeBlobResources(options);
+      vm.#blobResourceCount = Number(blobResources.rootOverlay !== undefined)
+        + Number(blobResources.blockDevice !== undefined);
+      vm.#writeToHost(encodeHostSpawn(hostOptions, blobResources));
+      await vm.#waitForLaunch();
       return vm;
     } catch (error) {
-      await cleanupAfterFailure(error, async () => vm?.close());
+      await cleanupAfterFailure(error, async () => {
+        if (vm !== undefined) {
+          await vm.#beginClose(FAILED_LAUNCH_CLOSE_GRACE_MS);
+        }
+      });
       const signingError = macosHostSigningError(hostPath);
       if (signingError !== null) {
         throw signingError;
       }
       throw error;
     }
-  }
-
-  async attach(
-    options: InternalSandboxOptions,
-    hostOptions: HostSpawnSandboxOptions,
-    requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook> = new Map(),
-    networkConnectionHook?: RegisteredNetworkConnectionHook,
-  ): Promise<HostProcessSandboxVm> {
-    if (this.#spawnSent) {
-      throw new Error("sandbox block device has already been attached");
-    }
-    this.#configure(options, requestHeaderHooks, networkConnectionHook);
-    this.#spawnSent = true;
-    const blobResources = declarativeBlobResources(options);
-    this.#blobResourceCount = Number(blobResources.rootOverlay !== undefined)
-      + Number(blobResources.blockDevice !== undefined);
-    this.#writeToHost(encodeHostSpawn(hostOptions, blobResources));
-    await this.#waitForLaunch();
-    return this;
   }
 
   static async flattenQcow2(input: {
@@ -364,30 +350,6 @@ export class HostProcessSandboxVm implements HostControlChannel {
     }
     if (this.#exitError !== null) {
       throw this.#exitError;
-    }
-  }
-
-  #configure(
-    options: InternalSandboxOptions,
-    requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook>,
-    networkConnectionHook?: RegisteredNetworkConnectionHook,
-  ): void {
-    if (this.#configured) {
-      throw new Error("sandbox-host process is already configured");
-    }
-    this.#configured = true;
-    this.#requestHeaderHooks = requestHeaderHooks;
-    this.#networkConnectionHook = networkConnectionHook;
-    if (options.rootfs.storage?.kind === "cow-block-store") {
-      this.#blockStores.set("host.block", {
-        blockStore: options.rootfs.storage.blockStore,
-        context: options.rootfs.storage.context,
-      });
-    }
-    for (const mount of options.mounts ?? []) {
-      if (mount.kind === "virtual-fs") {
-        this.#hostFs.set(mount.path, mount.fileSystem);
-      }
     }
   }
 
