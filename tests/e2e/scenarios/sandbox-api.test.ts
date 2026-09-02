@@ -969,6 +969,7 @@ test("timed out declarative blob boot terminates a stuck host", async (t) => {
   const priorTimeout = process.env.SANDBOX_LAUNCH_TIMEOUT_MS;
   process.env.SANDBOX_LAUNCH_TIMEOUT_MS = "100";
   const startedAt = performance.now();
+  let cleanupError: unknown;
   try {
     await assert.rejects(
       defineSandbox({ rootfs: testRootfs }).boot({
@@ -990,7 +991,12 @@ test("timed out declarative blob boot terminates a stuck host", async (t) => {
           }),
         },
       }),
-      /sandbox-host did not produce a launch acknowledgement within 100ms/,
+      (error) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /sandbox-host did not produce a launch acknowledgement within 100ms/);
+        cleanupError = error.cause;
+        return true;
+      },
     );
   } finally {
     if (priorTimeout === undefined) {
@@ -999,7 +1005,10 @@ test("timed out declarative blob boot terminates a stuck host", async (t) => {
       process.env.SANDBOX_LAUNCH_TIMEOUT_MS = priorTimeout;
     }
   }
-  assert.ok(performance.now() - startedAt < 4_000);
+  assert.ok(performance.now() - startedAt < 8_000);
+  assert.ok(cleanupError instanceof SandboxBlobStorageError);
+  assert.equal(cleanupError.code, "lease-provider-error");
+  assert.match(cleanupError.message, /acquisition request timed out/);
 });
 
 test("timed out second blob acquisition releases the acquired overlay", async (t) => {

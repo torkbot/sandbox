@@ -91,7 +91,6 @@ export class HostProcessSandboxVm implements HostControlChannel {
   #exitError: Error | null = null;
   #stdinError: Error | null = null;
   #blobResourceCount = 0;
-  #blobResourcesAcquired = false;
   #blobFailure: SandboxBlobStorageError | null = null;
   #closePromise?: Promise<void>;
 
@@ -298,7 +297,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
   }
 
   #closeGraceMs(fallback: number): number {
-    return this.#blobResourcesAcquired
+    return this.#blobResourceCount > 0
       ? this.#blobResourceCount * BLOB_BLOCK_CLOSE_GRACE_MS
       : fallback;
   }
@@ -448,10 +447,6 @@ export class HostProcessSandboxVm implements HostControlChannel {
     }
 
     const type = document.type;
-    if (type === "host.resources.acquired") {
-      this.#blobResourcesAcquired = true;
-      return true;
-    }
     if (type === "host.resources.failure") {
       this.#blobFailure = new SandboxBlobStorageError(
         parseBlobStorageErrorCode(document.code),

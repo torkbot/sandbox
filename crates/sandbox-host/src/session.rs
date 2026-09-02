@@ -30,9 +30,6 @@ impl BlobResources {
             .cloned()
             .map(|document| BlobBlockVolume::acquire(config, document))
             .transpose()?;
-        if root.is_some() {
-            report_blob_resources_acquired(&bridge);
-        }
         let block = match resources
             .and_then(|resources| resources.get_document("blockDevice").ok())
             .cloned()
@@ -48,9 +45,6 @@ impl BlobResources {
                 return Err(error);
             }
         };
-        if root.is_none() && block.is_some() {
-            report_blob_resources_acquired(&bridge);
-        }
         Ok(Self {
             bridge,
             root,
@@ -118,14 +112,6 @@ pub fn with_blob_resources<T>(
     let value = result?;
     close_result.map_err(|failure| Box::new(failure) as Box<dyn std::error::Error>)?;
     Ok(value)
-}
-
-fn report_blob_resources_acquired(bridge: &HostIoBridge) {
-    if let Ok(packet) = crate::encode_document_packet(&doc! {
-        "type": "host.resources.acquired",
-    }) {
-        let _ = bridge.write_raw_packet(&packet);
-    }
 }
 
 enum SessionEvent {
