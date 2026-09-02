@@ -340,12 +340,16 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
         .as_mut()
         .map(blob_block::BlobBlockVolume::close);
     let block_close_result = blob_volume.as_mut().map(blob_block::BlobBlockVolume::close);
-    run_result?;
-    if let Some(result) = root_close_result {
-        result?;
+    let close_failure = root_close_result
+        .into_iter()
+        .chain(block_close_result)
+        .find_map(Result::err);
+    if let Some(failure) = close_failure.as_ref() {
+        report_blob_block_failure(&bridge, failure);
     }
-    if let Some(result) = block_close_result {
-        result?;
+    run_result?;
+    if let Some(failure) = close_failure {
+        return Err(Box::new(failure));
     }
     Ok(())
 }
@@ -377,20 +381,25 @@ fn acquire_blob_resources(
         Err(error) => Err(error),
     };
     block.map_err(|error| {
-        let mut notification = doc! { "type": "host.resources.failure" };
-        append_blob_block_failure(&mut notification, &error);
-        if let Ok(packet) = encode_document_packet(&notification) {
-            let _ = bridge.write_raw_packet(&packet);
-        }
+        report_blob_block_failure(bridge, &error);
         Box::new(error) as Box<dyn std::error::Error>
     })
 }
 
-fn append_blob_block_failure(document: &mut Document, failure: &blob_block::BlobBlockFailure) {
+fn blob_block_failure_document(failure: &blob_block::BlobBlockFailure) -> Document {
+    let mut document = doc! { "type": "host.resources.failure" };
     document.insert("code", failure.code);
     document.insert("error", failure.message.clone());
     if let Some(retry_after_ms) = failure.retry_after_ms {
         document.insert("retryAfterMs", retry_after_ms as i64);
+    }
+    document
+}
+
+fn report_blob_block_failure(bridge: &HostIoBridge, failure: &blob_block::BlobBlockFailure) {
+    let notification = blob_block_failure_document(failure);
+    if let Ok(packet) = encode_document_packet(&notification) {
+        let _ = bridge.write_raw_packet(&packet);
     }
 }
 
@@ -406,11 +415,7 @@ fn monitor_blob_block_failure(
         let Ok(failure) = failures.recv() else {
             return;
         };
-        let mut notification = doc! { "type": "host.resources.failure" };
-        append_blob_block_failure(&mut notification, &failure);
-        if let Ok(packet) = encode_document_packet(&notification) {
-            let _ = bridge.write_raw_packet(&packet);
-        }
+        report_blob_block_failure(&bridge, &failure);
         let _ = failure_tx.send(Err(failure.message));
         thread::sleep(BLOB_BLOCK_FAILURE_EXIT_GRACE);
         std::process::exit(1);
@@ -1391,6 +1396,25 @@ mod tests {
                 + config.lease_request_timeout
                 + BLOB_BLOCK_FAILURE_EXIT_GRACE
                 < config.lease_duration
+        );
+    }
+
+    #[test]
+    fn blob_block_failure_packet_preserves_close_error_details() {
+        let failure = blob_block::BlobBlockFailure {
+            code: "lease-provider-error",
+            message: "blob block lease state is uncertain: release request timed out".to_string(),
+            retry_after_ms: Some(30_000),
+        };
+
+        assert_eq!(
+            blob_block_failure_document(&failure),
+            doc! {
+                "type": "host.resources.failure",
+                "code": "lease-provider-error",
+                "error": "blob block lease state is uncertain: release request timed out",
+                "retryAfterMs": 30_000i64,
+            },
         );
     }
 
