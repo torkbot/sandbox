@@ -798,22 +798,13 @@ impl ObjectLease {
             metadata: None,
         })
         .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
-        let get_store = store.clone();
-        let get_path = path.clone();
-        let existing = tokio::spawn(async move { get_store.get(&get_path).await });
         let created = store
             .put_opts(&path, payload.into(), PutMode::Create.into())
             .await;
         let (version, metadata) = match created {
-            Ok(result) => {
-                existing.abort();
-                (UpdateVersion::from(result), None)
-            }
+            Ok(result) => (UpdateVersion::from(result), None),
             Err(object_store::Error::AlreadyExists { .. }) => {
-                let result = existing
-                    .await
-                    .map_err(|error| BlobBlockFailure::new("storage-error", error))?
-                    .map_err(provider_failure)?;
+                let result = store.get(&path).await.map_err(provider_failure)?;
                 let meta = result.meta.clone();
                 let bytes = result.bytes().await.map_err(provider_failure)?;
                 let existing: LeaseDocument = serde_json::from_slice(&bytes)
@@ -859,10 +850,7 @@ impl ObjectLease {
                     Err(error) => return Err(provider_failure(error)),
                 }
             }
-            Err(error) => {
-                existing.abort();
-                return Err(provider_failure(error));
-            }
+            Err(error) => return Err(provider_failure(error)),
         };
         let state = Arc::new(ObjectLeaseState {
             store,
@@ -1956,6 +1944,35 @@ mod tests {
 
         assert!(started_at.elapsed() < Duration::from_millis(100));
         drop(lease);
+    }
+
+    #[test]
+    fn concurrent_first_acquisition_reports_the_loser_as_locked() {
+        let runtime = Arc::new(Runtime::new().expect("create object lease test runtime"));
+        let store = Arc::new(ThrottledStore::new(
+            InMemory::new(),
+            ThrottleConfig {
+                wait_put_per_call: Duration::from_millis(100),
+                ..ThrottleConfig::default()
+            },
+        )) as Arc<dyn ObjectStore>;
+        let acquire = || {
+            ObjectLease::acquire(
+                runtime.clone(),
+                store.clone(),
+                ObjectPath::from("volumes/workspace/lease.json"),
+                "workspace".to_string(),
+                config(),
+            )
+        };
+
+        let (first, second) = runtime.block_on(async { tokio::join!(acquire(), acquire()) });
+        let (winner, loser) = match (first, second) {
+            (Ok(winner), Err(loser)) | (Err(loser), Ok(winner)) => (winner, loser),
+            _ => panic!("one concurrent acquisition must win and one must fail"),
+        };
+        assert_eq!(loser.code, "volume-locked");
+        drop(winner);
     }
 
     #[test]
