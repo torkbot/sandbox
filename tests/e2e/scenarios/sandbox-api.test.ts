@@ -1002,6 +1002,78 @@ test("timed out declarative blob boot terminates a stuck host", async (t) => {
   assert.ok(performance.now() - startedAt < 4_000);
 });
 
+test("timed out second blob acquisition releases the acquired overlay", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const objectStore = await mkdtemp(join(tmpdir(), "sandbox-blob-partial-timeout-"));
+  t.after(async () => {
+    await rm(objectStore, { recursive: true, force: true });
+  });
+  const server = createServer(() => {});
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  const address = server.address();
+  assert.ok(address !== null && typeof address !== "string");
+  const overlay = storage.blob.overlay({
+    provider: { kind: "local", path: objectStore },
+    volume: "agent-overlay",
+  });
+  const sandbox = defineSandbox({
+    rootfs: rootfs.cow({ base: testRootfs, writable: overlay }),
+  });
+  const priorTimeout = process.env.SANDBOX_LAUNCH_TIMEOUT_MS;
+  process.env.SANDBOX_LAUNCH_TIMEOUT_MS = "2000";
+  let cleanupError: unknown;
+  try {
+    await assert.rejects(
+      sandbox.boot({
+        mounts: {
+          "/workspace": storage.blob.block({
+            provider: {
+              kind: "s3",
+              bucket: "agent-disks",
+              region: "us-east-1",
+              endpoint: `http://127.0.0.1:${address.port}`,
+              auth: {
+                kind: "access-key",
+                accessKeyId: "test",
+                secretAccessKey: "test",
+              },
+            },
+            volume: "stuck-acquisition",
+            sizeBytes: 64n * 1024n * 1024n,
+          }),
+        },
+      }),
+      (error) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /sandbox-host did not produce a launch acknowledgement within 2000ms/);
+        cleanupError = error.cause;
+        return true;
+      },
+    );
+  } finally {
+    if (priorTimeout === undefined) {
+      delete process.env.SANDBOX_LAUNCH_TIMEOUT_MS;
+    } else {
+      process.env.SANDBOX_LAUNCH_TIMEOUT_MS = priorTimeout;
+    }
+  }
+  assert.ok(cleanupError instanceof SandboxBlobStorageError);
+  assert.equal(cleanupError.code, "lease-provider-error");
+  assert.match(cleanupError.message, /acquisition request timed out/);
+
+  await using retry = await sandbox.boot();
+  const result = await retry.exec("/bin/true");
+  assert.equal(result.exitCode, 0, result.stderr);
+});
+
 test("running sandbox exposes a remote-friendly guest filesystem API", async (t) => {
   const testRootfs = await testRootfsForVmTest(t);
   if (testRootfs === undefined) {

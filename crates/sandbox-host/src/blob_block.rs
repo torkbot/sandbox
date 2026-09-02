@@ -176,13 +176,28 @@ impl BlobBlockVolume {
             Some(root) => VolumeLease::Local {
                 _guard: LocalLease::acquire(root, request.provider.prefix(), &request.volume)?,
             },
-            None => VolumeLease::Object(runtime.block_on(ObjectLease::acquire(
-                runtime.clone(),
-                provider.store.clone(),
-                volume_root.clone().join("lease.json"),
-                request.volume.clone(),
-                config.clone(),
-            ))?),
+            None => VolumeLease::Object(
+                runtime
+                    .block_on(async {
+                        tokio::time::timeout(
+                            config.lease_request_timeout,
+                            ObjectLease::acquire(
+                                runtime.clone(),
+                                provider.store.clone(),
+                                volume_root.clone().join("lease.json"),
+                                request.volume.clone(),
+                                config.clone(),
+                            ),
+                        )
+                        .await
+                    })
+                    .map_err(|_| {
+                        BlobBlockFailure::lease_provider_error(
+                            "acquisition request timed out",
+                            config.lease_duration,
+                        )
+                    })??,
+            ),
         };
 
         let metadata_path = volume_root.clone().join("metadata.json");
