@@ -246,8 +246,17 @@ impl BlobBlockVolume {
                     &self.provider,
                     &generation_root.clone().join("manifest.json"),
                 ))
-                .map_err(|error| BlobBlockFailure::new("storage-error", error))?
-                .unwrap_or_default();
+                .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
+            let manifest = match manifest {
+                Some(manifest) => manifest,
+                None if self.provisioned => {
+                    return Err(BlobBlockFailure::new(
+                        "storage-error",
+                        "missing blob block manifest for provisioned volume",
+                    ));
+                }
+                None => BlockManifest::default(),
+            };
             manifest
                 .validate(self.size, self.config.pack_bytes)
                 .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
@@ -1026,7 +1035,7 @@ impl Drop for ObjectLease {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BlockLocation {
     object: String,
@@ -1158,6 +1167,7 @@ struct StagingState {
 
 struct PendingUpload {
     receiver: oneshot::Receiver<io::Result<Vec<(u64, u64, BlockLocation)>>>,
+    bytes: u64,
 }
 
 impl PackedObjectBlockStore {
@@ -1237,7 +1247,7 @@ impl PackedObjectBlockStore {
             let _ = sender
                 .send(upload_blocks(provider, object_root, upload_permits, config, blocks).await);
         });
-        staging.pending.push(PendingUpload { receiver });
+        staging.pending.push(PendingUpload { receiver, bytes });
     }
 
     fn flush_dirty(&self, timeout: Option<Duration>) -> io::Result<()> {
@@ -1337,6 +1347,7 @@ impl PackedObjectBlockStore {
                 None => cache.remove(*index),
             }
         }
+        drop(cache);
         let mut staging = self
             .staging
             .lock()
@@ -1500,7 +1511,7 @@ impl CowBlockStore for PackedObjectBlockStore {
                             entries
                                 .into_iter()
                                 .zip(bytes)
-                                .map(|((index, _), bytes)| (index, bytes.to_vec()))
+                                .map(|((index, location), bytes)| (index, location, bytes.to_vec()))
                                 .collect::<Vec<_>>(),
                         )
                     }
@@ -1509,11 +1520,32 @@ impl CowBlockStore for PackedObjectBlockStore {
                 .try_collect::<Vec<_>>()
                 .await
             })?;
+            let staging = self
+                .staging
+                .lock()
+                .expect("blob block staging lock poisoned");
             let mut cache = self.cache.lock().expect("blob block cache lock poisoned");
+            let manifest = self
+                .manifest
+                .lock()
+                .expect("blob block manifest lock poisoned");
             for entries in fetched {
-                for (index, data) in entries {
-                    cache.insert(index, data.clone());
-                    blocks.insert(index, data);
+                for (index, location, data) in entries {
+                    if let Some(block) = staging.dirty.get(&index) {
+                        match &block.data {
+                            Some(data) => {
+                                blocks.insert(index, data.clone());
+                            }
+                            None => {
+                                blocks.remove(&index);
+                            }
+                        }
+                    } else if let Some(data) = cache.blocks.get(&index) {
+                        blocks.insert(index, data.clone());
+                    } else if manifest.blocks.get(&index) == Some(&location) {
+                        cache.insert(index, data.clone());
+                        blocks.insert(index, data);
+                    }
                 }
             }
         }
@@ -1551,9 +1583,21 @@ impl CowBlockStore for PackedObjectBlockStore {
             };
             staging.dirty.insert(index, block);
         }
-        let should_flush = staging.dirty.len() as u64 * BLOCK_SIZE >= self.config.max_dirty_bytes;
         drop(staging);
         self.schedule_uploads(false);
+        let should_flush = {
+            let staging = self
+                .staging
+                .lock()
+                .expect("blob block staging lock poisoned");
+            let dirty_bytes = (staging.dirty.len() as u64).saturating_mul(BLOCK_SIZE);
+            let pending_bytes = staging
+                .pending
+                .iter()
+                .fold(0_u64, |bytes, pending| bytes.saturating_add(pending.bytes));
+            dirty_bytes >= self.config.max_dirty_bytes
+                || pending_bytes >= self.config.max_dirty_bytes
+        };
         drop(flushing);
         if should_flush {
             self.flush_dirty(None)
@@ -1807,6 +1851,7 @@ mod tests {
         );
 
         first.service().expect("provision attached volume");
+        let generation = first.metadata.generation.clone();
         let provisioned_bytes = allocated_bytes(&directory.0);
         assert!(
             provisioned_bytes < TEST_SIZE / 2,
@@ -1817,6 +1862,22 @@ mod tests {
         let reopened =
             BlobBlockVolume::acquire(&config, request(TEST_SIZE)).expect("reopen volume");
         drop(reopened);
+        fs::remove_file(
+            directory
+                .0
+                .join("volumes/workspace/data")
+                .join(generation)
+                .join("manifest.json"),
+        )
+        .expect("remove provisioned manifest");
+        let mut damaged =
+            BlobBlockVolume::acquire(&config, request(TEST_SIZE)).expect("acquire damaged volume");
+        let error = damaged
+            .service()
+            .err()
+            .expect("provisioned volume without a manifest must fail");
+        assert!(error.to_string().contains("missing blob block manifest"));
+        drop(damaged);
         let mismatch = BlobBlockVolume::acquire(&config, request(TEST_SIZE * 2))
             .err()
             .expect("size mismatch must fail");
@@ -2118,6 +2179,106 @@ mod tests {
         assert_eq!(
             reopened.read_blocks(7, 1).expect("read latest block"),
             vec![(7, vec![43; 4096])]
+        );
+    }
+
+    #[test]
+    fn completed_write_cannot_be_overwritten_by_a_stale_read_cache() {
+        let runtime = Arc::new(Runtime::new().expect("create block store test runtime"));
+        let throttled = Arc::new(ThrottledStore::new(
+            InMemory::new(),
+            ThrottleConfig::default(),
+        ));
+        let object_store = throttled.clone() as Arc<dyn ObjectStore>;
+        let path = ObjectPath::from("volumes/workspace/data/current");
+        let object_root = ObjectPath::from("volumes/workspace/objects");
+        let seed = PackedObjectBlockStore::new(
+            runtime.clone(),
+            object_store.clone(),
+            path.clone(),
+            object_root.clone(),
+            BlockManifest::default(),
+            TEST_SIZE,
+            config(),
+        );
+        seed.write_blocks(vec![(7, vec![41; 4096])])
+            .expect("write original block");
+        seed.flush().expect("flush original block");
+        let manifest = runtime
+            .block_on(super::read_manifest(
+                &object_store,
+                &path.clone().join("manifest.json"),
+            ))
+            .expect("read manifest")
+            .expect("committed manifest");
+        let store = Arc::new(PackedObjectBlockStore::new(
+            runtime,
+            object_store,
+            path,
+            object_root,
+            manifest,
+            TEST_SIZE,
+            config(),
+        ));
+        throttled.config_mut(|config| {
+            config.wait_get_per_call = Duration::from_millis(250);
+        });
+        let reader = {
+            let store = store.clone();
+            std::thread::spawn(move || store.read_blocks(7, 1).expect("read overlapping block"))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        store
+            .write_blocks(vec![(7, vec![42; 4096])])
+            .expect("write replacement block");
+        store.flush().expect("flush replacement block");
+        reader.join().expect("join overlapping read");
+        throttled.config_mut(|config| {
+            config.wait_get_per_call = Duration::ZERO;
+        });
+
+        assert_eq!(
+            store.read_blocks(7, 1).expect("read completed write"),
+            vec![(7, vec![42; 4096])]
+        );
+    }
+
+    #[test]
+    fn repeated_overwrites_apply_upload_backpressure() {
+        let runtime = Arc::new(Runtime::new().expect("create block store test runtime"));
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let path = ObjectPath::from("volumes/workspace/data/current");
+        let mut block_config = config();
+        block_config.background_upload_bytes = super::BLOCK_SIZE;
+        block_config.max_dirty_bytes = 4 * super::BLOCK_SIZE;
+        let store = PackedObjectBlockStore::new(
+            runtime.clone(),
+            object_store.clone(),
+            path.clone(),
+            ObjectPath::from("volumes/workspace/objects"),
+            BlockManifest::default(),
+            TEST_SIZE,
+            block_config,
+        );
+
+        for value in 1..=4 {
+            store
+                .write_blocks(vec![(7, vec![value; 4096])])
+                .expect("overwrite block");
+        }
+
+        assert!(
+            runtime
+                .block_on(super::read_manifest(
+                    &object_store,
+                    &path.join("manifest.json"),
+                ))
+                .expect("read manifest after backpressure")
+                .is_some()
+        );
+        assert_eq!(
+            store.read_blocks(7, 1).expect("read latest overwrite"),
+            vec![(7, vec![4; 4096])]
         );
     }
 
