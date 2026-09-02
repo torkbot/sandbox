@@ -302,7 +302,7 @@ jobs:
 
       - name: Build package artifacts
         if: steps.package-cache.outputs.cache-hit != 'true'
-        run: npm run build
+        run: npm run build:host && npm run build:ts
 
       - name: Run artifact tests
         run: npm run test:artifact

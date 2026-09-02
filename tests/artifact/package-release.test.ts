@@ -156,6 +156,20 @@ test("release workflow packages main-built platform artifacts before publishing"
   assert.match(platformJob, /submodules: recursive/);
 });
 
+test("e2e package cache misses reuse restored kernel and init fixtures", async () => {
+  const workflow = await readFile(
+    new URL("../../.github/workflows/ci.yml", import.meta.url),
+    "utf8",
+  );
+  const packageBuildStep = workflow.slice(
+    workflow.indexOf("      - name: Build package artifacts"),
+    workflow.indexOf("      - name: Run artifact tests"),
+  );
+
+  assert.match(packageBuildStep, /run: npm run build:host && npm run build:ts/);
+  assert.doesNotMatch(packageBuildStep, /run: npm run build\s/);
+});
+
 test("local release scripts package platform artifacts without rebuilding rootfs images", async () => {
   const packageJson = JSON.parse(
     await readFile(new URL("../../package.json", import.meta.url), "utf8"),
