@@ -85,14 +85,14 @@ test("non-blob host failures remain generic lifecycle errors", async (t) => {
 
   const sandbox = await defineSandbox({ rootfs: testRootfs }).boot();
   const diagnostics = (sandbox as {
-    readonly diagnostics?: { terminateHostForTest(): Promise<void> };
+    readonly diagnostics?: { hostPid(): number };
   }).diagnostics;
   assert.ok(diagnostics);
-  await diagnostics.terminateHostForTest();
+  process.kill(diagnostics.hostPid(), "SIGSTOP");
   await assert.rejects(sandbox.close(), (error) => {
     assert.ok(error instanceof Error);
     assert.ok(!(error instanceof SandboxBlobStorageError));
-    assert.match(error.message, /sandbox-host exited/);
+    assert.match(error.message, /sandbox-host did not close/);
     return true;
   });
 });

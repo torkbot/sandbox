@@ -34,7 +34,17 @@ import type {
 } from "./index.ts";
 
 const DEFAULT_LAUNCH_TIMEOUT_MS = 60_000;
+const FAILED_LAUNCH_CLOSE_GRACE_MS = 2_000;
 const BLOB_BLOCK_CLOSE_GRACE_MS = 35_000;
+
+type HostExit = {
+  readonly code: number | null;
+  readonly signal: NodeJS.Signals | null;
+};
+
+type HostShutdownOutcome =
+  | { readonly kind: "exit"; readonly exit: HostExit; readonly expected: boolean }
+  | { readonly kind: "forced" };
 
 export type SandboxBlobStorageErrorCode =
   | "volume-locked"
@@ -65,6 +75,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
   readonly closed: Promise<void>;
 
   readonly #child: ChildProcessWithoutNullStreams;
+  readonly #exit: Promise<HostExit>;
   readonly #packets = new AsyncQueue<Uint8Array>();
   readonly #packetActivity = new AsyncSignal();
   readonly #launchReady = new AsyncSignal("sandbox-host launch acknowledgement closed");
@@ -85,14 +96,26 @@ export class HostProcessSandboxVm implements HostControlChannel {
   #spawnSent = false;
   #blobResourceCount = 0;
   #blobFailure: SandboxBlobStorageError | null = null;
-  #resolveClosed!: () => void;
+  #closePromise?: Promise<void>;
 
   private constructor(child: ChildProcessWithoutNullStreams) {
     this.#child = child;
     this.packets = this.#packets;
-    this.closed = new Promise((resolve) => {
-      this.#resolveClosed = resolve;
+    this.#exit = new Promise((resolve) => {
+      child.on("close", (code, signal) => {
+        const exit = { code, signal };
+        resolve(exit);
+        if (this.#closed) {
+          return;
+        }
+
+        this.#exitError = this.#shutdownError({ kind: "exit", exit, expected: false });
+        this.#packets.close(this.#exitError);
+        this.#packetActivity.close(this.#exitError);
+        this.#launchReady.close(this.#exitError);
+      });
     });
+    this.closed = this.#exit.then(() => undefined);
     child.stdout.on("data", (chunk: Buffer) => {
       this.#receive(chunk);
     });
@@ -111,21 +134,6 @@ export class HostProcessSandboxVm implements HostControlChannel {
         this.#exitError = new Error(`sandbox-host stdin failed: ${error.message}`);
       }
     });
-    child.on("close", (code, signal) => {
-      this.#resolveClosed();
-      if (this.#closed) {
-        return;
-      }
-
-      const exitText =
-        signal === null
-          ? `sandbox-host exited with ${code ?? "unknown status"}`
-          : `sandbox-host exited from signal ${signal}`;
-      this.#exitError = this.#blobFailure ?? new Error(hostExitMessage(exitText, this.#stderr));
-      this.#packets.close(this.#exitError);
-      this.#packetActivity.close(this.#exitError);
-      this.#launchReady.close(this.#exitError);
-    });
   }
 
   static async spawn(
@@ -143,7 +151,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
         networkConnectionHook,
       );
     } catch (error) {
-      await cleanupAfterFailure(error, () => vm.#closeFailedResourceAcquisition());
+      await cleanupAfterFailure(error, () => vm.#beginClose(FAILED_LAUNCH_CLOSE_GRACE_MS));
       throw error;
     }
   }
@@ -274,84 +282,77 @@ export class HostProcessSandboxVm implements HostControlChannel {
     return this.#child.pid;
   }
 
-  async close(): Promise<void> {
-    if (this.#closed) {
-      return;
-    }
+  close(): Promise<void> {
+    return this.#beginClose(this.#blobResourceCount * BLOB_BLOCK_CLOSE_GRACE_MS || 500);
+  }
 
+  #beginClose(graceMs: number): Promise<void> {
+    return this.#closePromise ??= this.#shutdown(graceMs);
+  }
+
+  async #shutdown(graceMs: number): Promise<void> {
     this.#closed = true;
     this.#packets.close();
     this.#packetActivity.close();
-    const closed = this.closed;
 
     this.#child.stdin.end();
-    await Promise.race([
-      closed,
-      unrefDelay(this.#blobResourceCount * BLOB_BLOCK_CLOSE_GRACE_MS || 500),
-    ]);
-    if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
-      if (this.#child.exitCode !== 0) {
-        const error = hostExitMessage(
-          `sandbox-host exited with ${this.#child.exitCode ?? "unknown status"}`,
-          this.#stderr,
-        );
-        throw this.#blobFailure ?? (this.#blobResourceCount > 0
-          ? new SandboxBlobStorageError("host-error", error)
-          : new Error(error));
-      }
-      return;
+    const exit = await this.#waitForExit(graceMs);
+    const outcome: HostShutdownOutcome = exit === undefined
+      ? { kind: "forced" }
+      : { kind: "exit", exit, expected: true };
+    if (exit === undefined) {
+      await this.#terminateHost();
     }
 
-    this.#child.kill("SIGTERM");
-    await Promise.race([
-      closed,
-      unrefDelay(500),
-    ]);
-    if (this.#child.exitCode === null && this.#child.signalCode === null) {
-      this.#child.kill("SIGKILL");
-      await Promise.race([
-        closed,
-        unrefDelay(1_000),
-      ]);
-    }
-    throw new SandboxBlobStorageError(
-      "storage-error",
-      "sandbox-host did not close its blob storage before the shutdown grace period; it was terminated",
-    );
-  }
-
-  async #closeFailedResourceAcquisition(): Promise<void> {
-    const closing = this.close();
-    await Promise.race([closing, unrefDelay(2_000)]);
-    if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
-      return;
-    }
-    this.#child.kill("SIGTERM");
-    await Promise.race([closing, unrefDelay(500)]);
-    if (this.#child.exitCode === null && this.#child.signalCode === null) {
-      this.#child.kill("SIGKILL");
-      await Promise.race([closing, unrefDelay(1_000)]);
+    const error = this.#shutdownError(outcome);
+    if (error !== null) {
+      throw error;
     }
   }
 
+  async #waitForExit(timeoutMs: number): Promise<HostExit | undefined> {
+    return Promise.race([
+      this.#exit,
+      unrefDelay(timeoutMs).then(() => undefined),
+    ]);
+  }
+
+  async #terminateHost(): Promise<void> {
+    this.#child.kill("SIGTERM");
+    if (await this.#waitForExit(500) !== undefined) {
+      return;
+    }
+    this.#child.kill("SIGKILL");
+    await this.#waitForExit(1_000);
+  }
 
   async terminateHostForTest(): Promise<void> {
-    if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
-      return;
+    await this.#terminateHost();
+  }
+
+  #shutdownError(outcome: HostShutdownOutcome): Error | null {
+    if (this.#blobFailure !== null) {
+      return this.#blobFailure;
+    }
+    if (outcome.kind === "forced") {
+      return this.#blobResourceCount > 0
+        ? new SandboxBlobStorageError(
+          "storage-error",
+          "sandbox-host did not close its blob storage before the shutdown grace period; it was terminated",
+        )
+        : new Error("sandbox-host did not close before the shutdown grace period; it was terminated");
+    }
+    if (outcome.expected && outcome.exit.code === 0) {
+      return null;
     }
 
-    const closed = this.closed;
-    this.#child.kill("SIGTERM");
-    await Promise.race([
-      closed,
-      unrefDelay(1_000),
-    ]);
-    if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
-      return;
-    }
-
-    this.#child.kill("SIGKILL");
-    await closed;
+    const exitText = outcome.exit.signal === null
+      ? `sandbox-host exited with ${outcome.exit.code ?? "unknown status"}`
+      : `sandbox-host exited from signal ${outcome.exit.signal}`;
+    const message = hostExitMessage(exitText, this.#stderr);
+    return this.#blobResourceCount > 0
+      ? new SandboxBlobStorageError("host-error", message)
+      : new Error(message);
   }
 
   #assertOpen(): void {
