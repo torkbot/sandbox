@@ -148,13 +148,29 @@ fn run_stdio() -> ExitCode {
     }
 }
 
+fn blob_block_config() -> blob_block::BlobBlockConfig {
+    blob_block::BlobBlockConfig {
+        pack_bytes: 4 * 1024 * 1024,
+        background_upload_bytes: 1024 * 1024,
+        max_dirty_bytes: 64 * 1024 * 1024,
+        max_cached_bytes: 64 * 1024 * 1024,
+        object_concurrency: 16,
+        lease_duration: Duration::from_secs(30),
+        lease_renew_interval: Duration::from_secs(10),
+        lease_request_timeout: Duration::from_secs(5),
+        lease_close_timeout: Duration::from_secs(2),
+        block_close_timeout: Duration::from_secs(30),
+    }
+}
+
 fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
     let bridge = HostIoBridge::new();
+    let blob_block_config = blob_block_config();
     let mut stdin = io::stdin().lock();
     let first_document = read_document_packet(&mut stdin)?;
     let (spawn_document, mut blob_volume) =
         if matches!(first_document.get_str("type"), Ok("host.block.acquire")) {
-            match blob_block::BlobBlockVolume::acquire(first_document) {
+            match blob_block::BlobBlockVolume::acquire(&blob_block_config, first_document) {
                 Ok(volume) => {
                     bridge.write_raw_packet(&encode_document_packet(&doc! {
                         "type": "host.block.acquire.result",
@@ -1366,11 +1382,12 @@ mod tests {
 
     #[test]
     fn blob_block_failure_forces_exit_before_lease_expiry() {
+        let config = blob_block_config();
         assert!(
-            blob_block::LEASE_RENEW_INTERVAL
-                + blob_block::LEASE_REQUEST_TIMEOUT
+            config.lease_renew_interval
+                + config.lease_request_timeout
                 + BLOB_BLOCK_FAILURE_EXIT_GRACE
-                < blob_block::LEASE_DURATION
+                < config.lease_duration
         );
     }
 

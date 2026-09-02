@@ -12,5 +12,5 @@ libc = "0.2"
 sandbox = { path = "../sandbox" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-slatedb = { version = "0.15", default-features = false, features = ["aws", "azure", "gcp", "moka"] }
+object_store = { version = "0.14", features = ["aws", "azure", "gcp"] }
 tokio = { version = "1.52", features = ["rt-multi-thread", "sync", "time"] }

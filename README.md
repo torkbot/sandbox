@@ -754,6 +754,11 @@ tokens are not refreshed by Sandbox.
 Writes are durable after a successful filesystem flush or clean device close.
 An abnormal close may lose writes that the guest had not flushed.
 
+The packed-object layout does not read volumes created by the earlier SlateDB
+backend; use a new volume or provider prefix when upgrading those disks.
+Automatic garbage collection is not yet provided, so failed or superseded
+uploads may leave unreachable objects in the provider.
+
 ### `fs.memory(options)`
 
 Used in: [Run one command](#1-run-one-command-in-a-clean-vm),
