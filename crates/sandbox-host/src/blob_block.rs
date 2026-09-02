@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
@@ -9,29 +9,62 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use bson::Document;
+use futures_util::stream::{self, StreamExt, TryStreamExt};
+use object_store::aws::AmazonS3Builder;
+use object_store::azure::MicrosoftAzureBuilder;
+use object_store::client::SpawnedReqwestConnector;
+use object_store::gcp::GoogleCloudStorageBuilder;
+use object_store::local::LocalFileSystem;
+use object_store::path::Path;
+use object_store::prefix::PrefixStore;
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, UpdateVersion};
 use sandbox::block_storage::{CowBlockStore, format_empty_ext4};
 use sandbox::runtime::BlockDeviceService;
 use serde::{Deserialize, Serialize};
-use slatedb::admin::{AdminBuilder, CloneSourceSpec};
-use slatedb::config::WriteOptions;
-use slatedb::object_store::aws::AmazonS3Builder;
-use slatedb::object_store::azure::MicrosoftAzureBuilder;
-use slatedb::object_store::gcp::GoogleCloudStorageBuilder;
-use slatedb::object_store::local::LocalFileSystem;
-use slatedb::object_store::path::Path;
-use slatedb::object_store::prefix::PrefixStore;
-use slatedb::object_store::{ObjectStore, ObjectStoreExt, PutMode, UpdateVersion};
-use slatedb::{Db, WriteBatch};
 use tokio::runtime::Runtime;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, oneshot, watch};
 use tokio::task::JoinHandle;
 
-const BLOCK_SIZE: u64 = 64 * 1024;
-pub(crate) const LEASE_DURATION: Duration = Duration::from_secs(30);
-pub(crate) const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(10);
-pub(crate) const LEASE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-const LEASE_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
-const BLOCK_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+const BLOCK_SIZE: u64 = 4 * 1024;
+
+#[derive(Clone, Debug)]
+pub(crate) struct BlobBlockConfig {
+    pub pack_bytes: usize,
+    pub background_upload_bytes: u64,
+    pub max_dirty_bytes: u64,
+    pub max_cached_bytes: u64,
+    pub object_concurrency: usize,
+    pub lease_duration: Duration,
+    pub lease_renew_interval: Duration,
+    pub lease_request_timeout: Duration,
+    pub lease_close_timeout: Duration,
+    pub block_close_timeout: Duration,
+}
+
+impl BlobBlockConfig {
+    fn validate(&self) -> Result<(), BlobBlockFailure> {
+        if self.pack_bytes < BLOCK_SIZE as usize
+            || self.pack_bytes > u32::MAX as usize
+            || !self.pack_bytes.is_multiple_of(BLOCK_SIZE as usize)
+            || self.background_upload_bytes < BLOCK_SIZE
+            || self.max_dirty_bytes < BLOCK_SIZE
+            || self.background_upload_bytes > self.max_dirty_bytes
+            || self.max_cached_bytes < BLOCK_SIZE
+            || self.object_concurrency == 0
+            || self.lease_duration.is_zero()
+            || self.lease_renew_interval.is_zero()
+            || self.lease_renew_interval + self.lease_request_timeout >= self.lease_duration
+            || self.lease_close_timeout.is_zero()
+            || self.block_close_timeout.is_zero()
+        {
+            return Err(BlobBlockFailure::new(
+                "storage-error",
+                "invalid blob block host configuration",
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct BlobBlockFailure {
@@ -57,22 +90,22 @@ impl BlobBlockFailure {
         }
     }
 
-    fn lease_provider_error(error: impl fmt::Display) -> Self {
+    fn lease_provider_error(error: impl fmt::Display, lease_duration: Duration) -> Self {
         Self {
             code: "lease-provider-error",
             message: format!("blob block lease state is uncertain: {error}"),
-            retry_after_ms: Some(LEASE_DURATION.as_millis() as u64),
+            retry_after_ms: Some(lease_duration.as_millis() as u64),
         }
     }
 
-    fn lease_store_failure(error: slatedb::object_store::Error) -> Self {
+    fn lease_store_failure(error: object_store::Error, lease_duration: Duration) -> Self {
         let (code, message) = match &error {
-            slatedb::object_store::Error::Precondition { .. } => (
+            object_store::Error::Precondition { .. } => (
                 "lease-lost",
                 format!("blob block lease ownership was lost: {error}"),
             ),
-            slatedb::object_store::Error::PermissionDenied { .. }
-            | slatedb::object_store::Error::Unauthenticated { .. } => (
+            object_store::Error::PermissionDenied { .. }
+            | object_store::Error::Unauthenticated { .. } => (
                 "lease-authentication-failed",
                 format!("blob block lease authentication failed: {error}"),
             ),
@@ -84,15 +117,15 @@ impl BlobBlockFailure {
         Self {
             code,
             message,
-            retry_after_ms: Some(LEASE_DURATION.as_millis() as u64),
+            retry_after_ms: Some(lease_duration.as_millis() as u64),
         }
     }
 }
 
-fn provider_failure(error: slatedb::object_store::Error) -> BlobBlockFailure {
+fn provider_failure(error: object_store::Error) -> BlobBlockFailure {
     let code = match &error {
-        slatedb::object_store::Error::PermissionDenied { .. }
-        | slatedb::object_store::Error::Unauthenticated { .. } => "authentication-failed",
+        object_store::Error::PermissionDenied { .. }
+        | object_store::Error::Unauthenticated { .. } => "authentication-failed",
         _ => "provider-error",
     };
     BlobBlockFailure::new(code, error)
@@ -113,14 +146,16 @@ pub struct BlobBlockVolume {
     metadata_path: Path,
     metadata: VolumeMetadata,
     provisioned: bool,
-    store: Option<Arc<SlateDbBlockStore>>,
+    store: Option<Arc<PackedObjectBlockStore>>,
     _lease: VolumeLease,
     size: u64,
     closed: bool,
+    config: BlobBlockConfig,
 }
 
 impl BlobBlockVolume {
-    pub fn acquire(document: Document) -> Result<Self, BlobBlockFailure> {
+    pub fn acquire(config: &BlobBlockConfig, document: Document) -> Result<Self, BlobBlockFailure> {
+        config.validate()?;
         let request: AcquireRequest = bson::deserialize_from_document(document)
             .map_err(|error| BlobBlockFailure::new("invalid-request", error))?;
         request
@@ -134,7 +169,7 @@ impl BlobBlockVolume {
                 .build()
                 .map_err(|error| BlobBlockFailure::new("storage-error", error))?,
         );
-        let provider = ProviderStore::build(&request.provider)
+        let provider = ProviderStore::build(&request.provider, &runtime)
             .map_err(|error| BlobBlockFailure::new("provider-error", error))?;
         let volume_root = Path::from(format!("volumes/{}", request.volume));
         let lease = match provider.local_root.as_ref() {
@@ -147,6 +182,7 @@ impl BlobBlockVolume {
                     provider.store.clone(),
                     volume_root.clone().join("lease.json"),
                     request.volume.clone(),
+                    config.clone(),
                 ))?,
             },
         };
@@ -172,6 +208,7 @@ impl BlobBlockVolume {
             _lease: lease,
             size: size_bytes,
             closed: false,
+            config: config.clone(),
         })
     }
 
@@ -181,7 +218,7 @@ impl BlobBlockVolume {
             {
                 let next = self.metadata.next_generation();
                 self.runtime
-                    .block_on(clone_db_generation(
+                    .block_on(clone_manifest_generation(
                         self.provider.clone(),
                         self.volume_root
                             .clone()
@@ -198,26 +235,44 @@ impl BlobBlockVolume {
             } else {
                 self.metadata.clone()
             };
-            let db = self
+            let generation_root = self
+                .volume_root
+                .clone()
+                .join("data")
+                .join(active_metadata.generation.as_str());
+            let manifest = self
                 .runtime
-                .block_on(Db::open(
-                    self.volume_root
-                        .clone()
-                        .join("data")
-                        .join(active_metadata.generation.as_str()),
-                    self.provider.clone(),
+                .block_on(read_manifest(
+                    &self.provider,
+                    &generation_root.clone().join("manifest.json"),
                 ))
                 .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
-            let store = Arc::new(SlateDbBlockStore::new(
+            let manifest = match manifest {
+                Some(manifest) => manifest,
+                None if self.provisioned => {
+                    return Err(BlobBlockFailure::new(
+                        "storage-error",
+                        "missing blob block manifest for provisioned volume",
+                    ));
+                }
+                None => BlockManifest::default(),
+            };
+            manifest
+                .validate(self.size, self.config.pack_bytes)
+                .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
+            let store = Arc::new(PackedObjectBlockStore::new(
                 self.runtime.clone(),
-                db.clone(),
+                self.provider.clone(),
+                generation_root,
+                self.volume_root.clone().join("objects"),
+                manifest,
                 self.size,
+                self.config.clone(),
             ));
             if !self.provisioned {
                 if let Err(error) =
                     format_empty_ext4(store.clone(), self.size, active_metadata.fs_uuid)
                 {
-                    let _ = self.runtime.block_on(db.close());
                     return Err(BlobBlockFailure::new("storage-error", error));
                 }
             }
@@ -228,14 +283,12 @@ impl BlobBlockVolume {
                     &self.metadata_path,
                     &active_metadata,
                 ) {
-                    let _ = self.runtime.block_on(db.close());
                     return Err(error);
                 }
                 self.metadata = active_metadata;
                 self.provisioned = true;
             }
             if let Err(error) = self._lease.revalidate() {
-                let _ = self.runtime.block_on(db.close());
                 return Err(error);
             }
             self.store = Some(store);
@@ -489,7 +542,7 @@ struct ProviderStore {
 }
 
 impl ProviderStore {
-    fn build(provider: &Provider) -> Result<Self, Box<dyn std::error::Error>> {
+    fn build(provider: &Provider, runtime: &Runtime) -> Result<Self, Box<dyn std::error::Error>> {
         let (store, local_root): (Arc<dyn ObjectStore>, Option<PathBuf>) = match provider {
             Provider::Local { path, .. } => (
                 Arc::new(LocalFileSystem::new_with_prefix(path)?),
@@ -519,7 +572,8 @@ impl ProviderStore {
                     }
                 }
                 .with_bucket_name(bucket)
-                .with_region(region);
+                .with_region(region)
+                .with_http_connector(SpawnedReqwestConnector::new(runtime.handle().clone()));
                 if let Some(endpoint) = endpoint {
                     builder = builder
                         .with_endpoint(endpoint)
@@ -537,7 +591,8 @@ impl ProviderStore {
                         GoogleCloudStorageBuilder::new().with_bearer_token(token)
                     }
                 }
-                .with_bucket_name(bucket);
+                .with_bucket_name(bucket)
+                .with_http_connector(SpawnedReqwestConnector::new(runtime.handle().clone()));
                 (Arc::new(builder.build()?), None)
             }
             Provider::Azure {
@@ -566,7 +621,8 @@ impl ProviderStore {
                     ),
                 }
                 .with_account(account)
-                .with_container_name(container);
+                .with_container_name(container)
+                .with_http_connector(SpawnedReqwestConnector::new(runtime.handle().clone()));
                 if let Some(endpoint) = endpoint {
                     builder = builder
                         .with_endpoint(endpoint.clone())
@@ -712,6 +768,7 @@ struct ObjectLeaseState {
     owner: String,
     record: tokio::sync::Mutex<ObjectLeaseRecord>,
     failure: Mutex<Option<BlobBlockFailure>>,
+    config: BlobBlockConfig,
 }
 
 struct ObjectLeaseRecord {
@@ -732,6 +789,7 @@ impl ObjectLease {
         store: Arc<dyn ObjectStore>,
         path: Path,
         volume: String,
+        config: BlobBlockConfig,
     ) -> Result<Self, BlobBlockFailure> {
         let owner = bson::oid::ObjectId::new().to_hex();
         let payload = serde_json::to_vec(&LeaseDocument {
@@ -745,7 +803,7 @@ impl ObjectLease {
             .await;
         let (version, metadata) = match created {
             Ok(result) => (UpdateVersion::from(result), None),
-            Err(slatedb::object_store::Error::AlreadyExists { .. }) => {
+            Err(object_store::Error::AlreadyExists { .. }) => {
                 let result = store.get(&path).await.map_err(provider_failure)?;
                 let meta = result.meta.clone();
                 let bytes = result.bytes().await.map_err(provider_failure)?;
@@ -755,12 +813,17 @@ impl ObjectLease {
                     let server_now = object_store_now_millis(&store, &path)
                         .await
                         .map_err(provider_failure)?;
-                    if !lease_is_expired(meta.last_modified.timestamp_millis(), server_now) {
+                    if !lease_is_expired(
+                        meta.last_modified.timestamp_millis(),
+                        server_now,
+                        config.lease_duration,
+                    ) {
                         return Err(BlobBlockFailure::locked(
                             &volume,
                             Some(lease_retry_after_ms(
                                 meta.last_modified.timestamp_millis(),
                                 server_now,
+                                config.lease_duration,
                             )),
                         ));
                     }
@@ -781,7 +844,7 @@ impl ObjectLease {
                     .await;
                 match result {
                     Ok(result) => (UpdateVersion::from(result), metadata),
-                    Err(slatedb::object_store::Error::Precondition { .. }) => {
+                    Err(object_store::Error::Precondition { .. }) => {
                         return Err(BlobBlockFailure::locked(&volume, None));
                     }
                     Err(error) => return Err(provider_failure(error)),
@@ -795,6 +858,7 @@ impl ObjectLease {
             owner,
             record: tokio::sync::Mutex::new(ObjectLeaseRecord { version, metadata }),
             failure: Mutex::new(None),
+            config: config.clone(),
         });
         let (stop, mut stopped) = watch::channel(false);
         let (failure_tx, failure_rx) = mpsc::sync_channel(1);
@@ -802,11 +866,11 @@ impl ObjectLease {
         let task = runtime.spawn(async move {
             loop {
                 tokio::select! {
-                    _ = tokio::time::sleep(LEASE_RENEW_INTERVAL) => {
-                        let failure = match tokio::time::timeout(LEASE_REQUEST_TIMEOUT, renewal_state.renew()).await {
+                    _ = tokio::time::sleep(config.lease_renew_interval) => {
+                        let failure = match tokio::time::timeout(config.lease_request_timeout, renewal_state.renew()).await {
                             Ok(Ok(())) => continue,
                             Ok(Err(error)) => error,
-                            Err(_) => BlobBlockFailure::lease_provider_error("renewal request timed out"),
+                            Err(_) => BlobBlockFailure::lease_provider_error("renewal request timed out", config.lease_duration),
                         };
                         *renewal_state.failure.lock().expect("lease failure lock poisoned") = Some(failure.clone());
                         let _ = failure_tx.send(failure);
@@ -838,7 +902,7 @@ impl ObjectLease {
         let _ = self.stop.send(true);
         if let Some(mut task) = self.task.take() {
             self.runtime.block_on(async {
-                if tokio::time::timeout(LEASE_CLOSE_TIMEOUT, &mut task)
+                if tokio::time::timeout(self.state.config.lease_close_timeout, &mut task)
                     .await
                     .is_err()
                 {
@@ -855,16 +919,22 @@ impl ObjectLease {
         }
         self.runtime
             .block_on(async {
-                tokio::time::timeout(LEASE_CLOSE_TIMEOUT, self.state.release()).await
+                tokio::time::timeout(self.state.config.lease_close_timeout, self.state.release())
+                    .await
             })
-            .map_err(|_| BlobBlockFailure::lease_provider_error("release request timed out"))?
+            .map_err(|_| {
+                BlobBlockFailure::lease_provider_error(
+                    "release request timed out",
+                    self.state.config.lease_duration,
+                )
+            })?
     }
 }
 
 async fn object_store_now_millis(
     store: &Arc<dyn ObjectStore>,
     lease_path: &Path,
-) -> Result<i64, slatedb::object_store::Error> {
+) -> Result<i64, object_store::Error> {
     let probe_path = Path::from(format!("{lease_path}.clock"));
     store.put(&probe_path, Vec::<u8>::new().into()).await?;
     Ok(store
@@ -874,13 +944,17 @@ async fn object_store_now_millis(
         .timestamp_millis())
 }
 
-fn lease_is_expired(last_modified_ms: i64, server_now_ms: i64) -> bool {
-    server_now_ms.saturating_sub(last_modified_ms) >= LEASE_DURATION.as_millis() as i64
+fn lease_is_expired(last_modified_ms: i64, server_now_ms: i64, lease_duration: Duration) -> bool {
+    server_now_ms.saturating_sub(last_modified_ms) >= lease_duration.as_millis() as i64
 }
 
-fn lease_retry_after_ms(last_modified_ms: i64, server_now_ms: i64) -> u64 {
+fn lease_retry_after_ms(
+    last_modified_ms: i64,
+    server_now_ms: i64,
+    lease_duration: Duration,
+) -> u64 {
     let age_ms = server_now_ms.saturating_sub(last_modified_ms).max(0) as u64;
-    (LEASE_DURATION.as_millis() as u64).saturating_sub(age_ms)
+    (lease_duration.as_millis() as u64).saturating_sub(age_ms)
 }
 
 impl ObjectLeaseState {
@@ -921,7 +995,9 @@ impl ObjectLeaseState {
                 PutMode::Update(record.version.clone()).into(),
             )
             .await
-            .map_err(BlobBlockFailure::lease_store_failure)?;
+            .map_err(|error| {
+                BlobBlockFailure::lease_store_failure(error, self.config.lease_duration)
+            })?;
         record.version = UpdateVersion::from(result);
         Ok(())
     }
@@ -947,15 +1023,165 @@ impl Drop for ObjectLease {
     }
 }
 
-struct SlateDbBlockStore {
-    runtime: Arc<Runtime>,
-    db: Db,
-    size: u64,
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BlockLocation {
+    object: String,
+    offset: u32,
+    len: u32,
 }
 
-impl SlateDbBlockStore {
-    fn new(runtime: Arc<Runtime>, db: Db, size: u64) -> Self {
-        Self { runtime, db, size }
+#[derive(Clone, Serialize, Deserialize)]
+struct BlockManifest {
+    #[serde(default = "manifest_version")]
+    version: u32,
+    #[serde(default)]
+    blocks: HashMap<u64, BlockLocation>,
+}
+
+impl Default for BlockManifest {
+    fn default() -> Self {
+        Self {
+            version: manifest_version(),
+            blocks: HashMap::new(),
+        }
+    }
+}
+
+fn manifest_version() -> u32 {
+    1
+}
+
+impl BlockManifest {
+    fn validate(&self, size: u64, pack_bytes: usize) -> io::Result<()> {
+        if self.version != manifest_version() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported blob block manifest version: {}", self.version),
+            ));
+        }
+        let block_count = size.div_ceil(BLOCK_SIZE);
+        for (index, location) in &self.blocks {
+            let end = u64::from(location.offset)
+                .checked_add(u64::from(location.len))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "block range overflow")
+                })?;
+            if *index >= block_count
+                || location.len == 0
+                || u64::from(location.len) > BLOCK_SIZE
+                || end > pack_bytes as u64
+                || location.object.len() != 24
+                || !location.object.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid blob block manifest entry",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+struct BlockCache {
+    blocks: HashMap<u64, Vec<u8>>,
+    order: VecDeque<u64>,
+    bytes: u64,
+    max_bytes: u64,
+}
+
+impl BlockCache {
+    fn new(max_bytes: u64) -> Self {
+        Self {
+            blocks: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+            max_bytes,
+        }
+    }
+
+    fn insert(&mut self, index: u64, data: Vec<u8>) {
+        if let Some(previous) = self.blocks.insert(index, data.clone()) {
+            self.bytes = self.bytes.saturating_sub(previous.len() as u64);
+            self.order.retain(|cached| *cached != index);
+        }
+        self.bytes += data.len() as u64;
+        self.order.push_back(index);
+        while self.bytes > self.max_bytes {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(removed) = self.blocks.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(removed.len() as u64);
+            }
+        }
+    }
+
+    fn remove(&mut self, index: u64) {
+        if let Some(removed) = self.blocks.remove(&index) {
+            self.bytes = self.bytes.saturating_sub(removed.len() as u64);
+        }
+        self.order.retain(|cached| *cached != index);
+    }
+}
+
+struct PackedObjectBlockStore {
+    runtime: Arc<Runtime>,
+    provider: Arc<dyn ObjectStore>,
+    generation_root: Path,
+    object_root: Path,
+    manifest: Mutex<BlockManifest>,
+    staging: Mutex<StagingState>,
+    cache: Mutex<BlockCache>,
+    flushing: Mutex<()>,
+    upload_permits: Arc<Semaphore>,
+    size: u64,
+    config: BlobBlockConfig,
+}
+
+#[derive(Clone)]
+struct DirtyBlock {
+    sequence: u64,
+    data: Option<Vec<u8>>,
+}
+
+#[derive(Default)]
+struct StagingState {
+    next_sequence: u64,
+    dirty: HashMap<u64, DirtyBlock>,
+    scheduled: HashMap<u64, u64>,
+    pending: Vec<PendingUpload>,
+}
+
+struct PendingUpload {
+    receiver: oneshot::Receiver<io::Result<Vec<(u64, u64, BlockLocation)>>>,
+    bytes: u64,
+}
+
+impl PackedObjectBlockStore {
+    fn new(
+        runtime: Arc<Runtime>,
+        provider: Arc<dyn ObjectStore>,
+        generation_root: Path,
+        object_root: Path,
+        manifest: BlockManifest,
+        size: u64,
+        config: BlobBlockConfig,
+    ) -> Self {
+        Self {
+            runtime,
+            provider,
+            generation_root,
+            object_root,
+            manifest: Mutex::new(manifest),
+            staging: Mutex::new(StagingState::default()),
+            cache: Mutex::new(BlockCache::new(config.max_cached_bytes)),
+            flushing: Mutex::new(()),
+            upload_permits: Arc::new(Semaphore::new(config.object_concurrency)),
+            size,
+            config,
+        }
     }
 
     fn wait_for<T, F>(&self, future: F) -> io::Result<T>
@@ -973,110 +1199,414 @@ impl SlateDbBlockStore {
     }
 
     fn close(&self) -> io::Result<()> {
-        let db = self.db.clone();
-        self.runtime.block_on(async move {
-            tokio::time::timeout(BLOCK_CLOSE_TIMEOUT, db.close())
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "blob block close timed out"))?
-                .map_err(io::Error::other)
-        })
+        self.flush_dirty(Some(self.config.block_close_timeout))
+    }
+
+    fn schedule_uploads(&self, force: bool) {
+        let mut staging = self
+            .staging
+            .lock()
+            .expect("blob block staging lock poisoned");
+        let blocks = staging
+            .dirty
+            .iter()
+            .filter_map(|(index, block)| {
+                block.data.as_ref().and_then(|data| {
+                    (staging.scheduled.get(index) != Some(&block.sequence))
+                        .then(|| (*index, block.sequence, data.clone()))
+                })
+            })
+            .collect::<Vec<_>>();
+        let bytes = blocks
+            .iter()
+            .map(|(_, _, data)| data.len() as u64)
+            .sum::<u64>();
+        if blocks.is_empty() || (!force && bytes < self.config.background_upload_bytes) {
+            return;
+        }
+        for (index, sequence, _) in &blocks {
+            staging.scheduled.insert(*index, *sequence);
+        }
+        let provider = self.provider.clone();
+        let object_root = self.object_root.clone();
+        let config = self.config.clone();
+        let upload_permits = self.upload_permits.clone();
+        let (sender, receiver) = oneshot::channel();
+        self.runtime.spawn(async move {
+            let _ = sender
+                .send(upload_blocks(provider, object_root, upload_permits, config, blocks).await);
+        });
+        staging.pending.push(PendingUpload { receiver, bytes });
+    }
+
+    fn flush_dirty(&self, timeout: Option<Duration>) -> io::Result<()> {
+        let _flushing = self
+            .flushing
+            .lock()
+            .expect("blob block flush lock poisoned");
+        self.schedule_uploads(true);
+        let (dirty, pending) = {
+            let mut staging = self
+                .staging
+                .lock()
+                .expect("blob block staging lock poisoned");
+            (staging.dirty.clone(), std::mem::take(&mut staging.pending))
+        };
+        if dirty.is_empty() {
+            return Ok(());
+        }
+        let provider = self.provider.clone();
+        let generation_root = self.generation_root.clone();
+        let mut manifest = self
+            .manifest
+            .lock()
+            .expect("blob block manifest lock poisoned")
+            .clone();
+        let flushed = dirty.clone();
+        let result = self.wait_for(async move {
+            let operation = async {
+                let mut uploaded = HashSet::new();
+                for pending in pending {
+                    for (index, sequence, location) in pending
+                        .receiver
+                        .await
+                        .map_err(|_| io::Error::other("blob block background upload stopped"))??
+                    {
+                        if dirty
+                            .get(&index)
+                            .is_some_and(|block| block.sequence == sequence)
+                        {
+                            manifest.blocks.insert(index, location);
+                            uploaded.insert(index);
+                        }
+                    }
+                }
+                for (index, block) in &dirty {
+                    match &block.data {
+                        Some(_) if !uploaded.contains(index) => {
+                            return Err(io::Error::other(
+                                "blob block sync is missing an uploaded block",
+                            ));
+                        }
+                        None => {
+                            manifest.blocks.remove(index);
+                        }
+                        Some(_) => {}
+                    }
+                }
+                provider
+                    .put(
+                        &generation_root.clone().join("manifest.json"),
+                        serde_json::to_vec(&manifest)
+                            .map_err(io::Error::other)?
+                            .into(),
+                    )
+                    .await
+                    .map_err(io::Error::other)?;
+                Ok(manifest)
+            };
+            match timeout {
+                Some(timeout) => tokio::time::timeout(timeout, operation)
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "blob block flush timed out")
+                    })?,
+                None => operation.await,
+            }
+        });
+        manifest = match result {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                self.staging
+                    .lock()
+                    .expect("blob block staging lock poisoned")
+                    .scheduled
+                    .clear();
+                return Err(error);
+            }
+        };
+        *self
+            .manifest
+            .lock()
+            .expect("blob block manifest lock poisoned") = manifest;
+        let mut cache = self.cache.lock().expect("blob block cache lock poisoned");
+        for (index, block) in &flushed {
+            match &block.data {
+                Some(data) => cache.insert(*index, data.clone()),
+                None => cache.remove(*index),
+            }
+        }
+        drop(cache);
+        let mut staging = self
+            .staging
+            .lock()
+            .expect("blob block staging lock poisoned");
+        staging.dirty.retain(|index, block| {
+            flushed
+                .get(index)
+                .is_none_or(|flushed| flushed.sequence != block.sequence)
+        });
+        staging.scheduled.clear();
+        Ok(())
     }
 }
 
-impl fmt::Debug for SlateDbBlockStore {
+async fn upload_blocks(
+    provider: Arc<dyn ObjectStore>,
+    object_root: Path,
+    upload_permits: Arc<Semaphore>,
+    config: BlobBlockConfig,
+    mut blocks: Vec<(u64, u64, Vec<u8>)>,
+) -> io::Result<Vec<(u64, u64, BlockLocation)>> {
+    blocks.sort_unstable_by_key(|(index, _, _)| *index);
+    let mut packs = Vec::<(String, Vec<u8>, Vec<(u64, u64, BlockLocation)>)>::new();
+    for chunk in blocks.chunks(config.pack_bytes / BLOCK_SIZE as usize) {
+        let object = bson::oid::ObjectId::new().to_hex();
+        let mut bytes = Vec::with_capacity(config.pack_bytes);
+        let mut locations = Vec::with_capacity(chunk.len());
+        for (index, sequence, data) in chunk {
+            let offset = bytes.len() as u32;
+            bytes.extend_from_slice(data);
+            locations.push((
+                *index,
+                *sequence,
+                BlockLocation {
+                    object: object.clone(),
+                    offset,
+                    len: data.len() as u32,
+                },
+            ));
+        }
+        packs.push((object, bytes, locations));
+    }
+    stream::iter(packs.into_iter().map(|(object, bytes, locations)| {
+        let provider = provider.clone();
+        let path = object_root.clone().join(object.as_str());
+        let upload_permits = upload_permits.clone();
+        async move {
+            let _permit = upload_permits
+                .acquire_owned()
+                .await
+                .map_err(|_| io::Error::other("blob block upload scheduler stopped"))?;
+            provider
+                .put_opts(&path, bytes.into(), PutMode::Create.into())
+                .await
+                .map_err(io::Error::other)?;
+            Ok::<_, io::Error>(locations)
+        }
+    }))
+    .buffer_unordered(config.object_concurrency)
+    .try_collect::<Vec<_>>()
+    .await
+    .map(|packs| packs.into_iter().flatten().collect())
+}
+
+impl fmt::Debug for PackedObjectBlockStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SlateDbBlockStore")
+        f.debug_struct("PackedObjectBlockStore")
             .field("size", &self.size)
             .finish_non_exhaustive()
     }
 }
 
-impl CowBlockStore for SlateDbBlockStore {
+impl CowBlockStore for PackedObjectBlockStore {
     fn block_size(&self) -> u64 {
         BLOCK_SIZE
     }
 
     fn list_blocks(&self) -> io::Result<HashSet<u64>> {
-        let db = self.db.clone();
-        self.wait_for(async move {
-            let mut blocks = HashSet::new();
-            let mut iter = db.scan_prefix(b"b", ..).await.map_err(io::Error::other)?;
-            while let Some(entry) = iter.next().await.map_err(io::Error::other)? {
-                if entry.key.len() != 9 || entry.key[0] != b'b' {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "invalid blob block key",
-                    ));
-                }
-                blocks.insert(u64::from_be_bytes(
-                    entry.key[1..].try_into().expect("block key length checked"),
-                ));
+        let mut blocks = self
+            .manifest
+            .lock()
+            .expect("blob block manifest lock poisoned")
+            .blocks
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+        for (index, block) in self
+            .staging
+            .lock()
+            .expect("blob block staging lock poisoned")
+            .dirty
+            .iter()
+        {
+            if block.data.is_some() {
+                blocks.insert(*index);
+            } else {
+                blocks.remove(index);
             }
-            Ok(blocks)
-        })
+        }
+        Ok(blocks)
     }
 
     fn read_blocks(&self, start: u64, count: u64) -> io::Result<Vec<(u64, Vec<u8>)>> {
         let end = start
             .checked_add(count)
             .ok_or_else(|| io::Error::other("blob block read range overflow"))?;
-        let db = self.db.clone();
-        self.wait_for(async move {
-            let mut chunks = Vec::new();
-            let mut iter = db
-                .scan(block_key(start).to_vec()..block_key(end).to_vec())
-                .await
-                .map_err(io::Error::other)?;
-            while let Some(entry) = iter.next().await.map_err(io::Error::other)? {
-                if entry.key.len() != 9 || entry.key[0] != b'b' {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "invalid blob block key",
-                    ));
+        if end > self.size.div_ceil(BLOCK_SIZE) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "blob block read exceeds volume size",
+            ));
+        }
+        loop {
+            let mut blocks = HashMap::new();
+            let mut reads = HashMap::<String, Vec<(u64, BlockLocation)>>::new();
+            {
+                let staging = self
+                    .staging
+                    .lock()
+                    .expect("blob block staging lock poisoned");
+                let cached = self.cache.lock().expect("blob block cache lock poisoned");
+                let manifest = self
+                    .manifest
+                    .lock()
+                    .expect("blob block manifest lock poisoned");
+                for index in start..end {
+                    if let Some(block) = staging.dirty.get(&index) {
+                        if let Some(data) = &block.data {
+                            blocks.insert(index, data.clone());
+                        }
+                    } else if let Some(data) = cached.blocks.get(&index) {
+                        blocks.insert(index, data.clone());
+                    } else if let Some(location) = manifest.blocks.get(&index) {
+                        reads
+                            .entry(location.object.clone())
+                            .or_default()
+                            .push((index, location.clone()));
+                    }
                 }
-                let index = u64::from_be_bytes(
-                    entry.key[1..].try_into().expect("block key length checked"),
-                );
-                chunks.push((index, entry.value.to_vec()));
             }
-            Ok(chunks)
-        })
+            let mut superseded = false;
+            if !reads.is_empty() {
+                let provider = self.provider.clone();
+                let object_root = self.object_root.clone();
+                let object_concurrency = self.config.object_concurrency;
+                let fetched = self.wait_for(async move {
+                    stream::iter(reads.into_iter().map(|(object, entries)| {
+                        let provider = provider.clone();
+                        let path = object_root.clone().join(object.as_str());
+                        async move {
+                            let ranges = entries
+                                .iter()
+                                .map(|(_, location)| {
+                                    u64::from(location.offset)
+                                        ..u64::from(location.offset) + u64::from(location.len)
+                                })
+                                .collect::<Vec<_>>();
+                            let bytes = provider
+                                .get_ranges(&path, &ranges)
+                                .await
+                                .map_err(io::Error::other)?;
+                            Ok::<_, io::Error>(
+                                entries
+                                    .into_iter()
+                                    .zip(bytes)
+                                    .map(|((index, location), bytes)| {
+                                        (index, location, bytes.to_vec())
+                                    })
+                                    .collect::<Vec<_>>(),
+                            )
+                        }
+                    }))
+                    .buffer_unordered(object_concurrency)
+                    .try_collect::<Vec<_>>()
+                    .await
+                })?;
+                let staging = self
+                    .staging
+                    .lock()
+                    .expect("blob block staging lock poisoned");
+                let mut cache = self.cache.lock().expect("blob block cache lock poisoned");
+                let manifest = self
+                    .manifest
+                    .lock()
+                    .expect("blob block manifest lock poisoned");
+                for entries in fetched {
+                    for (index, location, data) in entries {
+                        if let Some(block) = staging.dirty.get(&index) {
+                            match &block.data {
+                                Some(data) => {
+                                    blocks.insert(index, data.clone());
+                                }
+                                None => {
+                                    blocks.remove(&index);
+                                }
+                            }
+                        } else if let Some(data) = cache.blocks.get(&index) {
+                            blocks.insert(index, data.clone());
+                        } else if manifest.blocks.get(&index) == Some(&location) {
+                            cache.insert(index, data.clone());
+                            blocks.insert(index, data);
+                        } else {
+                            superseded = true;
+                        }
+                    }
+                }
+            }
+            if superseded {
+                continue;
+            }
+            let mut blocks = blocks.into_iter().collect::<Vec<_>>();
+            blocks.sort_unstable_by_key(|(index, _)| *index);
+            return Ok(blocks);
+        }
     }
 
     fn write_blocks(&self, chunks: Vec<(u64, Vec<u8>)>) -> io::Result<()> {
-        let mut batch = WriteBatch::new();
-        for (index, data) in chunks {
-            if data.len() > BLOCK_SIZE as usize {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "blob block exceeds block size",
-                ));
-            }
-            let key = block_key(index);
-            if data.iter().all(|byte| *byte == 0) {
-                batch.delete(key);
-            } else {
-                batch.put(key, data);
-            }
+        let block_count = self.size.div_ceil(BLOCK_SIZE);
+        if chunks.iter().any(|(index, data)| {
+            *index >= block_count || data.is_empty() || data.len() > BLOCK_SIZE as usize
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid blob block write",
+            ));
         }
-        let db = self.db.clone();
-        self.wait_for(async move {
-            db.write_with_options(
-                batch,
-                &WriteOptions {
-                    await_durable: false,
-                    ..WriteOptions::default()
-                },
-            )
-            .await
-            .map_err(io::Error::other)?;
+        let flushing = self
+            .flushing
+            .lock()
+            .expect("blob block flush lock poisoned");
+        let mut staging = self
+            .staging
+            .lock()
+            .expect("blob block staging lock poisoned");
+        for (index, data) in chunks {
+            staging.next_sequence = staging
+                .next_sequence
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("blob block write sequence overflow"))?;
+            let block = DirtyBlock {
+                sequence: staging.next_sequence,
+                data: (!data.iter().all(|byte| *byte == 0)).then_some(data),
+            };
+            staging.dirty.insert(index, block);
+        }
+        drop(staging);
+        self.schedule_uploads(false);
+        let should_flush = {
+            let staging = self
+                .staging
+                .lock()
+                .expect("blob block staging lock poisoned");
+            let dirty_bytes = (staging.dirty.len() as u64).saturating_mul(BLOCK_SIZE);
+            let pending_bytes = staging
+                .pending
+                .iter()
+                .fold(0_u64, |bytes, pending| bytes.saturating_add(pending.bytes));
+            dirty_bytes >= self.config.max_dirty_bytes
+                || pending_bytes >= self.config.max_dirty_bytes
+        };
+        drop(flushing);
+        if should_flush {
+            self.flush_dirty(None)
+        } else {
             Ok(())
-        })
+        }
     }
 
     fn flush(&self) -> io::Result<()> {
-        let db = self.db.clone();
-        self.wait_for(async move { db.flush().await.map_err(io::Error::other) })
+        self.flush_dirty(None)
     }
 }
 
@@ -1147,21 +1677,29 @@ async fn read_json<T: for<'de> Deserialize<'de>>(
 ) -> Result<Option<T>, Box<dyn std::error::Error>> {
     match store.get(path).await {
         Ok(result) => Ok(Some(serde_json::from_slice(&result.bytes().await?)?)),
-        Err(slatedb::object_store::Error::NotFound { .. }) => Ok(None),
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
 
-async fn clone_db_generation(
+async fn read_manifest(
+    store: &Arc<dyn ObjectStore>,
+    path: &Path,
+) -> Result<Option<BlockManifest>, Box<dyn std::error::Error>> {
+    read_json(store, path).await
+}
+
+async fn clone_manifest_generation(
     store: Arc<dyn ObjectStore>,
     source_path: Path,
     target_path: Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    AdminBuilder::new(target_path, store)
-        .build()
-        .create_clone_builder_from_source(CloneSourceSpec::new(source_path))
-        .build()
-        .await?;
+    let source = source_path.join("manifest.json");
+    let target = target_path.join("manifest.json");
+    let manifest = read_manifest(&store, &source)
+        .await?
+        .ok_or_else(|| format!("missing blob block manifest at {source}"))?;
+    put_json_create(&store, &target, &manifest).await?;
     Ok(())
 }
 
@@ -1178,13 +1716,6 @@ async fn put_json_create<T: Serialize>(
         )
         .await?;
     Ok(())
-}
-
-fn block_key(index: u64) -> [u8; 9] {
-    let mut key = [0; 9];
-    key[0] = b'b';
-    key[1..].copy_from_slice(&index.to_be_bytes());
-    key
 }
 
 fn validate_volume(volume: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -1248,21 +1779,37 @@ mod tests {
 
     use std::sync::Arc;
 
-    use slatedb::Db;
-    use slatedb::object_store::memory::InMemory;
-    use slatedb::object_store::path::Path as ObjectPath;
-    use slatedb::object_store::throttle::{ThrottleConfig, ThrottledStore};
-    use slatedb::object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt};
-    use slatedb::object_store::{PutMode, UpdateVersion};
+    use object_store::memory::InMemory;
+    use object_store::path::Path as ObjectPath;
+    use object_store::throttle::{ThrottleConfig, ThrottledStore};
+    use object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt};
+    use object_store::{PutMode, UpdateVersion};
+    use sandbox::block_storage::CowBlockStore;
     use tokio::runtime::Runtime;
 
     use super::{
-        BlobBlockFailure, BlobBlockVolume, LeaseDocument, ObjectLease, SlateDbBlockStore,
-        VolumeLease, VolumeMetadata, clone_db_generation, lease_is_expired, lease_retry_after_ms,
-        provider_failure,
+        BlobBlockConfig, BlobBlockFailure, BlobBlockVolume, BlockCache, BlockManifest,
+        LeaseDocument, ObjectLease, PackedObjectBlockStore, VolumeLease, VolumeMetadata,
+        clone_manifest_generation, lease_is_expired, lease_retry_after_ms, provider_failure,
     };
 
     const TEST_SIZE: u64 = 64 * 1024 * 1024;
+
+    fn config() -> BlobBlockConfig {
+        crate::blob_block_config()
+    }
+
+    #[test]
+    fn removed_cache_entries_do_not_evict_reinserted_blocks() {
+        let mut cache = BlockCache::new(2);
+        cache.insert(1, vec![1]);
+        cache.remove(1);
+        cache.insert(1, vec![2]);
+        cache.insert(2, vec![3]);
+
+        assert_eq!(cache.blocks.get(&1), Some(&vec![2]));
+        assert_eq!(cache.blocks.get(&2), Some(&vec![3]));
+    }
 
     struct TestDirectory(PathBuf);
 
@@ -1298,13 +1845,15 @@ mod tests {
             }
         };
 
-        let mut first = BlobBlockVolume::acquire(request(TEST_SIZE)).expect("acquire new volume");
+        let config = config();
+        let mut first =
+            BlobBlockVolume::acquire(&config, request(TEST_SIZE)).expect("acquire new volume");
         let acquired_bytes = allocated_bytes(&directory.0);
         assert!(
             acquired_bytes < 4096,
             "acquisition materialized {acquired_bytes} bytes before attachment"
         );
-        let competing = BlobBlockVolume::acquire(request(TEST_SIZE))
+        let competing = BlobBlockVolume::acquire(&config, request(TEST_SIZE))
             .err()
             .expect("competing acquire must fail");
         assert_eq!(
@@ -1313,6 +1862,7 @@ mod tests {
         );
 
         first.service().expect("provision attached volume");
+        let generation = first.metadata.generation.clone();
         let provisioned_bytes = allocated_bytes(&directory.0);
         assert!(
             provisioned_bytes < TEST_SIZE / 2,
@@ -1320,9 +1870,26 @@ mod tests {
         );
 
         drop(first);
-        let reopened = BlobBlockVolume::acquire(request(TEST_SIZE)).expect("reopen volume");
+        let reopened =
+            BlobBlockVolume::acquire(&config, request(TEST_SIZE)).expect("reopen volume");
         drop(reopened);
-        let mismatch = BlobBlockVolume::acquire(request(TEST_SIZE * 2))
+        fs::remove_file(
+            directory
+                .0
+                .join("volumes/workspace/data")
+                .join(generation)
+                .join("manifest.json"),
+        )
+        .expect("remove provisioned manifest");
+        let mut damaged =
+            BlobBlockVolume::acquire(&config, request(TEST_SIZE)).expect("acquire damaged volume");
+        let error = damaged
+            .service()
+            .err()
+            .expect("provisioned volume without a manifest must fail");
+        assert!(error.to_string().contains("missing blob block manifest"));
+        drop(damaged);
+        let mismatch = BlobBlockVolume::acquire(&config, request(TEST_SIZE * 2))
             .err()
             .expect("size mismatch must fail");
         assert_eq!(
@@ -1345,6 +1912,7 @@ mod tests {
                 store.clone(),
                 path.clone(),
                 "workspace".to_string(),
+                config(),
             ))
         };
 
@@ -1393,11 +1961,41 @@ mod tests {
                 store,
                 ObjectPath::from("volumes/workspace/lease.json"),
                 "workspace".to_string(),
+                config(),
             ))
             .expect("acquire new object lease");
 
         assert!(started_at.elapsed() < Duration::from_millis(100));
         drop(lease);
+    }
+
+    #[test]
+    fn concurrent_first_acquisition_reports_the_loser_as_locked() {
+        let runtime = Arc::new(Runtime::new().expect("create object lease test runtime"));
+        let store = Arc::new(ThrottledStore::new(
+            InMemory::new(),
+            ThrottleConfig {
+                wait_put_per_call: Duration::from_millis(100),
+                ..ThrottleConfig::default()
+            },
+        )) as Arc<dyn ObjectStore>;
+        let acquire = || {
+            ObjectLease::acquire(
+                runtime.clone(),
+                store.clone(),
+                ObjectPath::from("volumes/workspace/lease.json"),
+                "workspace".to_string(),
+                config(),
+            )
+        };
+
+        let (first, second) = runtime.block_on(async { tokio::join!(acquire(), acquire()) });
+        let (winner, loser) = match (first, second) {
+            (Ok(winner), Err(loser)) | (Err(loser), Ok(winner)) => (winner, loser),
+            _ => panic!("one concurrent acquisition must win and one must fail"),
+        };
+        assert_eq!(loser.code, "volume-locked");
+        drop(winner);
     }
 
     #[test]
@@ -1411,6 +2009,7 @@ mod tests {
                 store.clone(),
                 path.clone(),
                 "workspace".to_string(),
+                config(),
             ))
             .expect("acquire object lease");
 
@@ -1466,6 +2065,7 @@ mod tests {
                 store,
                 path,
                 "workspace".to_string(),
+                config(),
             ))
             .expect("acquire object lease");
         lease.stop.send(true).expect("stop renewal task");
@@ -1502,6 +2102,7 @@ mod tests {
                 store,
                 path,
                 "workspace".to_string(),
+                config(),
             ))
             .expect("acquire object lease");
         lease.stop.send(true).expect("stop normal renewal task");
@@ -1530,13 +2131,21 @@ mod tests {
             InMemory::new(),
             ThrottleConfig::default(),
         ));
-        let db = runtime
-            .block_on(Db::open(
-                ObjectPath::from("volumes/workspace/data/current"),
-                throttled.clone(),
-            ))
-            .expect("open block store database");
-        let store = SlateDbBlockStore::new(runtime, db, TEST_SIZE);
+        let mut config = config();
+        config.block_close_timeout = Duration::from_millis(100);
+        let generation_root = ObjectPath::from("volumes/workspace/data/current");
+        let store = PackedObjectBlockStore::new(
+            runtime.clone(),
+            throttled.clone(),
+            generation_root.clone(),
+            ObjectPath::from("volumes/workspace/objects"),
+            BlockManifest::default(),
+            TEST_SIZE,
+            config,
+        );
+        store
+            .write_blocks(vec![(7, vec![42; 4096])])
+            .expect("buffer block");
         throttled.config_mut(|config| {
             config.wait_put_per_call = Duration::from_secs(30);
         });
@@ -1544,16 +2153,285 @@ mod tests {
         let started_at = Instant::now();
         let error = store.close().expect_err("stuck close must time out");
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-        assert!(started_at.elapsed() < Duration::from_secs(3));
+        assert!(started_at.elapsed() < Duration::from_secs(1));
+        let object_store = throttled as Arc<dyn ObjectStore>;
+        assert!(
+            runtime
+                .block_on(super::read_manifest(
+                    &object_store,
+                    &generation_root.join("manifest.json"),
+                ))
+                .expect("read manifest after failed close")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn background_upload_does_not_publish_a_superseded_block() {
+        let runtime = Arc::new(Runtime::new().expect("create block store test runtime"));
+        let throttled = Arc::new(ThrottledStore::new(
+            InMemory::new(),
+            ThrottleConfig {
+                wait_put_per_call: Duration::from_millis(200),
+                ..ThrottleConfig::default()
+            },
+        ));
+        let object_store = throttled as Arc<dyn ObjectStore>;
+        let path = ObjectPath::from("volumes/workspace/data/current");
+        let mut block_config = config();
+        block_config.background_upload_bytes = super::BLOCK_SIZE;
+        let store = PackedObjectBlockStore::new(
+            runtime.clone(),
+            object_store.clone(),
+            path.clone(),
+            ObjectPath::from("volumes/workspace/objects"),
+            BlockManifest::default(),
+            TEST_SIZE,
+            block_config.clone(),
+        );
+
+        let write_started = Instant::now();
+        store
+            .write_blocks(vec![(7, vec![42; 4096])])
+            .expect("stage background upload");
+        assert!(write_started.elapsed() < Duration::from_millis(100));
+        store
+            .write_blocks(vec![(7, vec![43; 4096])])
+            .expect("supersede background upload");
+        store.flush().expect("flush latest block");
+
+        let manifest = runtime
+            .block_on(super::read_manifest(
+                &object_store,
+                &path.clone().join("manifest.json"),
+            ))
+            .expect("read manifest")
+            .expect("committed manifest");
+        let reopened = PackedObjectBlockStore::new(
+            runtime,
+            object_store,
+            path,
+            ObjectPath::from("volumes/workspace/objects"),
+            manifest,
+            TEST_SIZE,
+            block_config,
+        );
+        assert_eq!(
+            reopened.read_blocks(7, 1).expect("read latest block"),
+            vec![(7, vec![43; 4096])]
+        );
+    }
+
+    #[test]
+    fn completed_write_cannot_be_overwritten_by_a_stale_read_cache() {
+        let runtime = Arc::new(Runtime::new().expect("create block store test runtime"));
+        let throttled = Arc::new(ThrottledStore::new(
+            InMemory::new(),
+            ThrottleConfig::default(),
+        ));
+        let object_store = throttled.clone() as Arc<dyn ObjectStore>;
+        let path = ObjectPath::from("volumes/workspace/data/current");
+        let object_root = ObjectPath::from("volumes/workspace/objects");
+        let seed = PackedObjectBlockStore::new(
+            runtime.clone(),
+            object_store.clone(),
+            path.clone(),
+            object_root.clone(),
+            BlockManifest::default(),
+            TEST_SIZE,
+            config(),
+        );
+        seed.write_blocks(vec![(7, vec![41; 4096]), (8, vec![80; 4096])])
+            .expect("write original block");
+        seed.flush().expect("flush original block");
+        let manifest = runtime
+            .block_on(super::read_manifest(
+                &object_store,
+                &path.clone().join("manifest.json"),
+            ))
+            .expect("read manifest")
+            .expect("committed manifest");
+        let mut block_config = config();
+        block_config.max_cached_bytes = super::BLOCK_SIZE;
+        let store = Arc::new(PackedObjectBlockStore::new(
+            runtime,
+            object_store,
+            path,
+            object_root,
+            manifest,
+            TEST_SIZE,
+            block_config,
+        ));
+        throttled.config_mut(|config| {
+            config.wait_get_per_call = Duration::from_millis(250);
+        });
+        let reader = {
+            let store = store.clone();
+            std::thread::spawn(move || store.read_blocks(7, 1).expect("read overlapping block"))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        store
+            .write_blocks(vec![(7, vec![42; 4096])])
+            .expect("write replacement block");
+        store.flush().expect("flush replacement block");
+        throttled.config_mut(|config| {
+            config.wait_get_per_call = Duration::ZERO;
+        });
+        assert_eq!(
+            store.read_blocks(8, 1).expect("evict replacement block"),
+            vec![(8, vec![80; 4096])]
+        );
+        assert_eq!(
+            reader.join().expect("join overlapping read"),
+            vec![(7, vec![42; 4096])]
+        );
+
+        assert_eq!(
+            store.read_blocks(7, 1).expect("read completed write"),
+            vec![(7, vec![42; 4096])]
+        );
+    }
+
+    #[test]
+    fn repeated_overwrites_apply_upload_backpressure() {
+        let runtime = Arc::new(Runtime::new().expect("create block store test runtime"));
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let path = ObjectPath::from("volumes/workspace/data/current");
+        let mut block_config = config();
+        block_config.background_upload_bytes = super::BLOCK_SIZE;
+        block_config.max_dirty_bytes = 4 * super::BLOCK_SIZE;
+        let store = PackedObjectBlockStore::new(
+            runtime.clone(),
+            object_store.clone(),
+            path.clone(),
+            ObjectPath::from("volumes/workspace/objects"),
+            BlockManifest::default(),
+            TEST_SIZE,
+            block_config,
+        );
+
+        for value in 1..=4 {
+            store
+                .write_blocks(vec![(7, vec![value; 4096])])
+                .expect("overwrite block");
+        }
+
+        assert!(
+            runtime
+                .block_on(super::read_manifest(
+                    &object_store,
+                    &path.join("manifest.json"),
+                ))
+                .expect("read manifest after backpressure")
+                .is_some()
+        );
+        assert_eq!(
+            store.read_blocks(7, 1).expect("read latest overwrite"),
+            vec![(7, vec![4; 4096])]
+        );
+    }
+
+    #[test]
+    fn block_store_buffers_writes_until_flush() {
+        let runtime = Arc::new(Runtime::new().expect("create block store test runtime"));
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let path = ObjectPath::from("volumes/workspace/data/current");
+        let manifest_path = path.clone().join("manifest.json");
+        let store = PackedObjectBlockStore::new(
+            runtime.clone(),
+            object_store.clone(),
+            path.clone(),
+            ObjectPath::from("volumes/workspace/objects"),
+            BlockManifest::default(),
+            TEST_SIZE,
+            config(),
+        );
+        store
+            .write_blocks(vec![(7, vec![42; 4096])])
+            .expect("buffer block");
+
+        assert!(
+            runtime
+                .block_on(super::read_manifest(&object_store, &manifest_path))
+                .expect("read manifest")
+                .is_none()
+        );
+        assert_eq!(
+            store.read_blocks(7, 1).expect("read buffered block"),
+            vec![(7, vec![42; 4096])]
+        );
+
+        store.flush().expect("flush block");
+        let manifest = runtime
+            .block_on(super::read_manifest(&object_store, &manifest_path))
+            .expect("read flushed manifest")
+            .expect("flushed manifest");
+        assert!(manifest.blocks.contains_key(&7));
+
+        store
+            .write_blocks(vec![(7, vec![0; 4096])])
+            .expect("buffer block deletion");
+        assert!(
+            store
+                .read_blocks(7, 1)
+                .expect("read deleted block")
+                .is_empty()
+        );
+        assert!(
+            !store
+                .list_blocks()
+                .expect("list buffered blocks")
+                .contains(&7)
+        );
+        assert!(
+            runtime
+                .block_on(super::read_manifest(&object_store, &manifest_path))
+                .expect("read manifest before deletion flush")
+                .expect("durable manifest")
+                .blocks
+                .contains_key(&7)
+        );
+        store.flush().expect("flush block deletion");
+        assert!(
+            !runtime
+                .block_on(super::read_manifest(&object_store, &manifest_path))
+                .expect("read manifest after deletion flush")
+                .expect("durable manifest")
+                .blocks
+                .contains_key(&7)
+        );
+
+        store
+            .write_blocks(vec![(8, vec![24; 4096])])
+            .expect("buffer block before close");
+        store.close().expect("close block store");
+        let manifest = runtime
+            .block_on(super::read_manifest(&object_store, &manifest_path))
+            .expect("read close-flushed manifest")
+            .expect("close-flushed manifest");
+        let reopened = PackedObjectBlockStore::new(
+            runtime,
+            object_store,
+            path,
+            ObjectPath::from("volumes/workspace/objects"),
+            manifest,
+            TEST_SIZE,
+            config(),
+        );
+        assert_eq!(
+            reopened.read_blocks(8, 1).expect("read reopened block"),
+            vec![(8, vec![24; 4096])]
+        );
     }
 
     #[test]
     fn lease_expiry_uses_provider_timestamps() {
-        assert!(!lease_is_expired(1_000, 30_999));
-        assert!(lease_is_expired(1_000, 31_000));
-        assert!(!lease_is_expired(31_000, 1_000));
-        assert_eq!(lease_retry_after_ms(1_000, 6_000), 25_000);
-        assert_eq!(lease_retry_after_ms(1_000, 31_000), 0);
+        let duration = Duration::from_secs(30);
+        assert!(!lease_is_expired(1_000, 30_999, duration));
+        assert!(lease_is_expired(1_000, 31_000, duration));
+        assert!(!lease_is_expired(31_000, 1_000, duration));
+        assert_eq!(lease_retry_after_ms(1_000, 6_000, duration), 25_000);
+        assert_eq!(lease_retry_after_ms(1_000, 31_000, duration), 0);
     }
 
     #[test]
@@ -1565,7 +2443,7 @@ mod tests {
         let failure = provider_failure(error());
         assert_eq!(failure.code, "authentication-failed");
         assert_eq!(failure.retry_after_ms, None);
-        let failure = BlobBlockFailure::lease_store_failure(error());
+        let failure = BlobBlockFailure::lease_store_failure(error(), Duration::from_secs(30));
         assert_eq!(failure.code, "lease-authentication-failed");
         assert_eq!(failure.retry_after_ms, Some(30_000));
     }
@@ -1584,45 +2462,79 @@ mod tests {
 
     #[test]
     fn handed_off_generations_do_not_fence_each_other() {
-        let runtime = Runtime::new().expect("create SlateDB generation test runtime");
-        runtime.block_on(async {
-            let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
-            let source_path = ObjectPath::from("volumes/workspace/data/source");
-            let source = Db::open(source_path.clone(), store.clone())
-                .await
-                .expect("open source generation");
-            source
-                .put(b"before", b"first")
-                .await
-                .expect("write source value");
-            source.close().await.expect("close source generation");
+        let runtime = Arc::new(Runtime::new().expect("create generation test runtime"));
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let object_root = ObjectPath::from("volumes/workspace/objects");
+        let source_path = ObjectPath::from("volumes/workspace/data/source");
+        let source = PackedObjectBlockStore::new(
+            runtime.clone(),
+            store.clone(),
+            source_path.clone(),
+            object_root.clone(),
+            BlockManifest::default(),
+            TEST_SIZE,
+            config(),
+        );
+        source
+            .write_blocks(vec![(1, vec![1; 4096])])
+            .expect("write source block");
+        source.flush().expect("flush source generation");
 
-            let active_path = ObjectPath::from("volumes/workspace/data/active");
-            clone_db_generation(store.clone(), source_path.clone(), active_path.clone())
-                .await
-                .expect("clone active generation");
-            let active = Db::open(active_path, store.clone())
-                .await
-                .expect("open active generation");
-
-            let stale_path = ObjectPath::from("volumes/workspace/data/stale");
-            clone_db_generation(store.clone(), source_path, stale_path.clone())
-                .await
-                .expect("clone stale generation");
-            let stale = Db::open(stale_path, store)
-                .await
-                .expect("open stale generation");
-            stale
-                .put(b"after", b"stale")
-                .await
-                .expect("stale generation remains isolated");
-            active
-                .put(b"after", b"replacement")
-                .await
-                .expect("active generation remains writable");
-            active.close().await.expect("close active generation");
-            stale.close().await.expect("close stale generation");
-        });
+        let active_path = ObjectPath::from("volumes/workspace/data/active");
+        let stale_path = ObjectPath::from("volumes/workspace/data/stale");
+        runtime
+            .block_on(clone_manifest_generation(
+                store.clone(),
+                source_path.clone(),
+                active_path.clone(),
+            ))
+            .expect("clone active manifest");
+        runtime
+            .block_on(clone_manifest_generation(
+                store.clone(),
+                source_path,
+                stale_path.clone(),
+            ))
+            .expect("clone stale manifest");
+        let manifest = |path: &ObjectPath| {
+            runtime
+                .block_on(super::read_manifest(
+                    &store,
+                    &path.clone().join("manifest.json"),
+                ))
+                .expect("read generation manifest")
+                .expect("generation manifest")
+        };
+        let active_manifest = manifest(&active_path);
+        let stale_manifest = manifest(&stale_path);
+        let active = PackedObjectBlockStore::new(
+            runtime.clone(),
+            store.clone(),
+            active_path.clone(),
+            object_root.clone(),
+            active_manifest,
+            TEST_SIZE,
+            config(),
+        );
+        let stale = PackedObjectBlockStore::new(
+            runtime,
+            store,
+            stale_path.clone(),
+            object_root,
+            stale_manifest,
+            TEST_SIZE,
+            config(),
+        );
+        stale
+            .write_blocks(vec![(2, vec![2; 4096])])
+            .and_then(|_| stale.flush())
+            .expect("write stale generation");
+        active
+            .write_blocks(vec![(2, vec![3; 4096])])
+            .and_then(|_| active.flush())
+            .expect("write active generation");
+        assert_eq!(stale.read_blocks(2, 1).unwrap()[0].1, vec![2; 4096]);
+        assert_eq!(active.read_blocks(2, 1).unwrap()[0].1, vec![3; 4096]);
     }
 
     fn allocated_bytes(path: &Path) -> u64 {

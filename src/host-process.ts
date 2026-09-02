@@ -35,7 +35,7 @@ import type {
 
 const DEFAULT_LAUNCH_TIMEOUT_MS = 60_000;
 const FAILED_ACQUISITION_CLOSE_GRACE_MS = 2_000;
-const BLOB_BLOCK_CLOSE_GRACE_MS = 5_000;
+const BLOB_BLOCK_CLOSE_GRACE_MS = 35_000;
 
 export type SandboxBlockDeviceErrorCode =
   | "volume-locked"

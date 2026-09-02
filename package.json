@@ -21,6 +21,7 @@
     "images:validate": "node ./scripts/image-manifest.ts validate",
     "images:publish-local": "node ./scripts/publish-image-packages-local.ts",
     "artifacts:link-current": "node ./scripts/prepare-npm-packages.ts --version ${SANDBOX_RELEASE_VERSION:-0.0.0-dev} --platform --current --install",
+    "benchmark:blob-disk": "node ./scripts/benchmark-blob-disk.ts",
     "benchmark:e2e:lifecycle": "node ./scripts/benchmark-e2e-lifecycle.ts",
     "check:rust": "cargo check --workspace",
     "test:disk": "node ./scripts/test-disk.ts",
