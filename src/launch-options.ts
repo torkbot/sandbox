@@ -97,6 +97,7 @@ export interface InternalSandboxOptions {
           readonly blockSize: number;
           readonly maxDirtyBytes: number;
           readonly blob: Omit<HostBlobBlockOptions, "sizeBytes">;
+          readonly baseIdentity: string;
         }
       | {
           readonly kind: "ephemeral-cow";

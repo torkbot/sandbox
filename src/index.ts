@@ -2236,7 +2236,13 @@ function lowerCowRootfs(
       path: base.path,
       readonly: false,
       format: "qcow2",
-      storage: { kind: "blob-cow", blockSize: 4096, maxDirtyBytes, blob },
+      storage: {
+        kind: "blob-cow",
+        blockSize: 4096,
+        maxDirtyBytes,
+        blob,
+        baseIdentity: rootfsImageIdentity(base),
+      },
     };
   }
   return {

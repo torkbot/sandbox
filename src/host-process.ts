@@ -136,7 +136,6 @@ export class HostProcessSandboxVm implements HostControlChannel {
   ): Promise<HostProcessSandboxVm> {
     const vm = await HostProcessSandboxVm.#start();
     try {
-      await vm.#acquireDeclarativeBlobResources(options);
       return await vm.attach(
         options,
         hostOptions,
@@ -154,33 +153,6 @@ export class HostProcessSandboxVm implements HostControlChannel {
       throw error;
     }
   }
-
-  async #acquireDeclarativeBlobResources(options: InternalSandboxOptions): Promise<void> {
-    const rootOverlay = options.rootfs.storage?.kind === "blob-cow"
-      ? options.rootfs.storage.blob
-      : undefined;
-    const blockDevice = options.mounts
-      ?.find((mount) => mount.kind === "block-device")?.blob;
-    if (rootOverlay === undefined && blockDevice === undefined) {
-      return;
-    }
-    const response = this.#nextPacket();
-    this.#blobResourceCount = Number(rootOverlay !== undefined) + Number(blockDevice !== undefined);
-    this.#writeToHost(encodeHostBlobResources({ rootOverlay, blockDevice }));
-    const packet = await response;
-    const document = BSON.deserialize(packet.slice(4)) as Record<string, unknown>;
-    if (document.type !== "host.resources.acquire.result") {
-      throw new Error("sandbox-host returned an invalid blob resource acquisition response");
-    }
-    if (document.ok !== true) {
-      throw new SandboxBlobStorageError(
-        parseBlobStorageErrorCode(document.code),
-        typeof document.error === "string" ? document.error : "sandbox-host blob resource acquisition failed",
-        parseRetryAfterMs(document.retryAfterMs),
-      );
-    }
-  }
-
 
   static async #start(): Promise<HostProcessSandboxVm> {
     const hostPath = hostBinaryPath();
@@ -219,7 +191,10 @@ export class HostProcessSandboxVm implements HostControlChannel {
     }
     this.#configure(options, requestHeaderHooks, networkConnectionHook);
     this.#spawnSent = true;
-    this.#writeToHost(encodeHostSpawn(hostOptions));
+    const blobResources = declarativeBlobResources(options);
+    this.#blobResourceCount = Number(blobResources.rootOverlay !== undefined)
+      + Number(blobResources.blockDevice !== undefined);
+    this.#writeToHost(encodeHostSpawn(hostOptions, blobResources));
     await this.#waitForLaunch();
     return this;
   }
@@ -418,23 +393,6 @@ export class HostProcessSandboxVm implements HostControlChannel {
         this.#hostFs.set(mount.path, mount.fileSystem);
       }
     }
-  }
-
-  async #nextPacket(): Promise<Uint8Array> {
-    const next = this.#packets[Symbol.asyncIterator]().next();
-    const result = await Promise.race([
-      next,
-      once(this.#child, "close").then(() => {
-        throw this.#exitError ?? new Error("sandbox-host exited before responding");
-      }),
-      unrefDelay(launchTimeoutMs()).then(() => {
-        throw new Error("sandbox-host did not respond before the launch timeout");
-      }),
-    ]);
-    if (result.value === undefined) {
-      throw new Error("sandbox-host closed before responding");
-    }
-    return result.value;
   }
 
   #writeToHost(packet: Uint8Array): void {
@@ -1695,7 +1653,10 @@ class AsyncSignal {
   }
 }
 
-function encodeHostSpawn(options: HostSpawnSandboxOptions): Uint8Array {
+function encodeHostSpawn(
+  options: HostSpawnSandboxOptions,
+  blobResources: DeclarativeBlobResources,
+): Uint8Array {
   const rootfsStorage = options.rootfs.storage === undefined
     ? undefined
     : options.rootfs.storage.kind === "persistent-qcow2-overlay"
@@ -1723,6 +1684,9 @@ function encodeHostSpawn(options: HostSpawnSandboxOptions): Uint8Array {
     rootfsReadonly: options.rootfs.readonly,
     rootfsFormat: options.rootfs.format,
     rootfsStorage,
+    ...(blobResources.rootOverlay === undefined && blobResources.blockDevice === undefined
+      ? {}
+      : { blobResources }),
     mounts: options.mounts ?? [],
     networkOutbound: options.network?.outbound,
     networkHttp: options.network?.http === undefined ? undefined : options.network.http,
@@ -1730,19 +1694,39 @@ function encodeHostSpawn(options: HostSpawnSandboxOptions): Uint8Array {
   });
 }
 
-function encodeHostBlobResources(options: {
-  readonly rootOverlay?: Omit<HostBlobBlockOptions, "sizeBytes">;
-  readonly blockDevice?: HostBlobBlockOptions;
-}): Uint8Array {
-  return encodePacket({
-    type: "host.resources.acquire",
-    ...(options.rootOverlay === undefined ? {} : {
-      rootOverlay: { ...options.rootOverlay, sizeBytes: "18446744073709547520" },
-    }),
-    ...(options.blockDevice === undefined ? {} : {
-      blockDevice: { ...options.blockDevice, sizeBytes: options.blockDevice.sizeBytes.toString() },
-    }),
-  });
+type DeclarativeBlobResources = {
+  readonly rootOverlay?: {
+    readonly provider: HostBlobBlockOptions["provider"];
+    readonly volume: string;
+    readonly sizeBytes: string;
+    readonly role: { readonly kind: "rootfs-cow-overlay"; readonly baseIdentity: string };
+  };
+  readonly blockDevice?: {
+    readonly provider: HostBlobBlockOptions["provider"];
+    readonly volume: string;
+    readonly sizeBytes: string;
+    readonly role: { readonly kind: "guest-block-device" };
+  };
+};
+
+function declarativeBlobResources(options: InternalSandboxOptions): DeclarativeBlobResources {
+  const rootStorage = options.rootfs.storage;
+  const rootOverlay = rootStorage?.kind === "blob-cow"
+    ? {
+      ...rootStorage.blob,
+      sizeBytes: "18446744073709547520",
+      role: { kind: "rootfs-cow-overlay" as const, baseIdentity: rootStorage.baseIdentity },
+    }
+    : undefined;
+  const block = options.mounts?.find((mount) => mount.kind === "block-device")?.blob;
+  const blockDevice = block === undefined
+    ? undefined
+    : {
+      ...block,
+      sizeBytes: block.sizeBytes.toString(),
+      role: { kind: "guest-block-device" as const },
+    };
+  return { rootOverlay, blockDevice };
 }
 
 function parseBlobStorageErrorCode(value: unknown): SandboxBlobStorageErrorCode {

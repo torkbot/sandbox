@@ -699,6 +699,83 @@ test("declarative blob storage persists an agent overlay and mounted workspace",
   assert.equal(read.stdout, "machineworkspace");
 });
 
+test("blob overlays reject a different rootfs base before boot", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const objectStore = await mkdtemp(join(tmpdir(), "sandbox-blob-overlay-base-"));
+  t.after(async () => {
+    await rm(objectStore, { recursive: true, force: true });
+  });
+  const overlay = storage.blob.overlay({
+    provider: { kind: "local", path: objectStore },
+    volume: "agent-overlay",
+  });
+  const first = await defineSandbox({
+    rootfs: rootfs.cow({ base: testRootfs, writable: overlay }),
+  }).boot();
+  await first.close();
+
+  const differentBase = {
+    ...testRootfs,
+    digest: `sha256:${"0".repeat(64)}` as `sha256:${string}`,
+  };
+  await assert.rejects(
+    defineSandbox({
+      rootfs: rootfs.cow({ base: differentBase, writable: overlay }),
+    }).boot(),
+    /blob rootfs overlay base identity mismatch/,
+  );
+});
+
+test("blob volumes reject being reused across overlay and disk roles", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const objectStore = await mkdtemp(join(tmpdir(), "sandbox-blob-volume-role-"));
+  t.after(async () => {
+    await rm(objectStore, { recursive: true, force: true });
+  });
+  const provider = { kind: "local" as const, path: objectStore };
+  const disk = storage.blob.block({
+    provider,
+    volume: "workspace-first",
+    sizeBytes: 64n * 1024n * 1024n,
+  });
+  const firstDisk = await defineSandbox({ rootfs: testRootfs }).boot({
+    mounts: { "/workspace": disk },
+  });
+  await firstDisk.close();
+  const diskThenOverlay = storage.blob.overlay({ provider, volume: "workspace-first" });
+  await assert.rejects(
+    defineSandbox({
+      rootfs: rootfs.cow({ base: testRootfs, writable: diskThenOverlay }),
+    }).boot(),
+    /blob volume role mismatch: stored guest-block-device, requested rootfs-cow-overlay/,
+  );
+
+  const overlay = storage.blob.overlay({ provider, volume: "overlay-first" });
+  const firstOverlay = await defineSandbox({
+    rootfs: rootfs.cow({ base: testRootfs, writable: overlay }),
+  }).boot();
+  await firstOverlay.close();
+  const overlayThenDisk = storage.blob.block({
+    provider,
+    volume: "overlay-first",
+    sizeBytes: 64n * 1024n * 1024n,
+  });
+  await assert.rejects(
+    defineSandbox({ rootfs: testRootfs }).boot({
+      mounts: { "/workspace": overlayThenDisk },
+    }),
+    /blob volume role mismatch: stored rootfs-cow-overlay, requested guest-block-device/,
+  );
+});
+
 test("failed declarative blob mount boot releases its lease", async (t) => {
   const testRootfs = await testRootfsForVmTest(t);
   if (testRootfs === undefined) {
@@ -766,7 +843,7 @@ test("timed out declarative blob boot terminates a stuck host", async (t) => {
           }),
         },
       }),
-      /sandbox-host did not respond before the launch timeout/,
+      /sandbox-host did not produce a launch acknowledgement within 100ms/,
     );
   } finally {
     if (priorTimeout === undefined) {

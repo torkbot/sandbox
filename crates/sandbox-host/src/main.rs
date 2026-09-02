@@ -167,50 +167,9 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
     let bridge = HostIoBridge::new();
     let blob_block_config = blob_block_config();
     let mut stdin = io::stdin().lock();
-    let first_document = read_document_packet(&mut stdin)?;
-    let (spawn_document, mut root_blob_volume, mut blob_volume) =
-        if matches!(first_document.get_str("type"), Ok("host.resources.acquire")) {
-            let mut root_document = first_document.get_document("rootOverlay").ok().cloned();
-            let mut block_document = first_document.get_document("blockDevice").ok().cloned();
-            if let Some(document) = root_document.as_mut() {
-                document.insert("type", "host.block.acquire");
-            }
-            if let Some(document) = block_document.as_mut() {
-                document.insert("type", "host.block.acquire");
-            }
-            let root = root_document
-                .map(|document| blob_block::BlobBlockVolume::acquire(&blob_block_config, document))
-                .transpose();
-            let block = match root {
-                Ok(root) => block_document
-                    .map(|document| {
-                        blob_block::BlobBlockVolume::acquire(&blob_block_config, document)
-                    })
-                    .transpose()
-                    .map(|block| (root, block)),
-                Err(error) => Err(error),
-            };
-            match block {
-                Ok((root, block)) => {
-                    bridge.write_raw_packet(&encode_document_packet(&doc! {
-                        "type": "host.resources.acquire.result", "ok": true,
-                    })?)?;
-                    match read_document_packet(&mut stdin) {
-                        Ok(spawn_document) => (spawn_document, root, block),
-                        Err(error) => return Err(Box::new(error)),
-                    }
-                }
-                Err(error) => {
-                    let mut response =
-                        doc! { "type": "host.resources.acquire.result", "ok": false };
-                    append_blob_block_failure(&mut response, &error);
-                    bridge.write_raw_packet(&encode_document_packet(&response)?)?;
-                    return Err(Box::new(error));
-                }
-            }
-        } else {
-            (first_document, None, None)
-        };
+    let spawn_document = read_document_packet(&mut stdin)?;
+    let (mut root_blob_volume, mut blob_volume) =
+        acquire_blob_resources(&blob_block_config, &spawn_document, &bridge)?;
     drop(stdin);
 
     let spec = sandbox::MicroVmSpec::build(parse_spawn(spawn_document)?)?;
@@ -389,6 +348,42 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
         result?;
     }
     Ok(())
+}
+
+fn acquire_blob_resources(
+    config: &blob_block::BlobBlockConfig,
+    spawn_document: &Document,
+    bridge: &HostIoBridge,
+) -> Result<
+    (
+        Option<blob_block::BlobBlockVolume>,
+        Option<blob_block::BlobBlockVolume>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let resources = spawn_document.get_document("blobResources").ok();
+    let root = resources
+        .and_then(|resources| resources.get_document("rootOverlay").ok())
+        .cloned()
+        .map(|document| blob_block::BlobBlockVolume::acquire(config, document))
+        .transpose();
+    let block = match root {
+        Ok(root) => resources
+            .and_then(|resources| resources.get_document("blockDevice").ok())
+            .cloned()
+            .map(|document| blob_block::BlobBlockVolume::acquire(config, document))
+            .transpose()
+            .map(|block| (root, block)),
+        Err(error) => Err(error),
+    };
+    block.map_err(|error| {
+        let mut notification = doc! { "type": "host.resources.failure" };
+        append_blob_block_failure(&mut notification, &error);
+        if let Ok(packet) = encode_document_packet(&notification) {
+            let _ = bridge.write_raw_packet(&packet);
+        }
+        Box::new(error) as Box<dyn std::error::Error>
+    })
 }
 
 fn append_blob_block_failure(document: &mut Document, failure: &blob_block::BlobBlockFailure) {

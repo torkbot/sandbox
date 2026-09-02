@@ -192,10 +192,10 @@ impl BlobBlockVolume {
         lease.revalidate()?;
         let (metadata, provisioned) = match metadata {
             Some(metadata) => {
-                metadata.validate(size_bytes)?;
+                metadata.validate(&request)?;
                 (metadata, true)
             }
-            None => (VolumeMetadata::new(size_bytes), false),
+            None => (VolumeMetadata::new(size_bytes, request.role.clone()), false),
         };
         Ok(Self {
             runtime,
@@ -213,7 +213,7 @@ impl BlobBlockVolume {
     }
 
     pub fn service(&mut self) -> Result<BlockDeviceService, BlobBlockFailure> {
-        let store = self.open_store(true)?;
+        let store = self.open_store()?;
         Ok(BlockDeviceService {
             storage: store,
             size: self.size,
@@ -221,13 +221,10 @@ impl BlobBlockVolume {
     }
 
     pub fn cow_store(&mut self) -> Result<Arc<dyn CowBlockStore>, BlobBlockFailure> {
-        Ok(self.open_store(false)?)
+        Ok(self.open_store()?)
     }
 
-    fn open_store(
-        &mut self,
-        format_ext4: bool,
-    ) -> Result<Arc<PackedObjectBlockStore>, BlobBlockFailure> {
+    fn open_store(&mut self) -> Result<Arc<PackedObjectBlockStore>, BlobBlockFailure> {
         if self.store.is_none() {
             let active_metadata = if self.provisioned && self._lease.requires_isolated_generation()
             {
@@ -284,7 +281,7 @@ impl BlobBlockVolume {
                 self.size,
                 self.config.clone(),
             ));
-            if format_ext4 && !self.provisioned {
+            if matches!(self.metadata.role, VolumeRole::GuestBlockDevice) && !self.provisioned {
                 if let Err(error) =
                     format_empty_ext4(store.clone(), self.size, active_metadata.fs_uuid)
                 {
@@ -343,18 +340,14 @@ impl Drop for BlobBlockVolume {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AcquireRequest {
-    #[serde(rename = "type")]
-    frame_type: String,
     provider: Provider,
     volume: String,
     size_bytes: String,
+    role: VolumeRole,
 }
 
 impl AcquireRequest {
     fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.frame_type != "host.block.acquire" {
-            return Err(format!("expected host.block.acquire, got {}", self.frame_type).into());
-        }
         validate_volume(&self.volume)?;
         self.provider.validate()?;
         let size = self.size_bytes.parse::<u64>()?;
@@ -369,6 +362,16 @@ impl AcquireRequest {
             .parse()
             .expect("validated block size must parse")
     }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+enum VolumeRole {
+    RootfsCowOverlay {
+        #[serde(rename = "baseIdentity")]
+        base_identity: String,
+    },
+    GuestBlockDevice,
 }
 
 #[derive(Deserialize)]
@@ -1616,20 +1619,22 @@ impl CowBlockStore for PackedObjectBlockStore {
 struct VolumeMetadata {
     version: u32,
     size_bytes: u64,
+    role: VolumeRole,
     fs_uuid: [u8; 16],
     generation: String,
 }
 
 impl VolumeMetadata {
-    fn new(size_bytes: u64) -> Self {
+    fn new(size_bytes: u64, role: VolumeRole) -> Self {
         let first = bson::oid::ObjectId::new().bytes();
         let second = bson::oid::ObjectId::new().bytes();
         let mut fs_uuid = [0; 16];
         fs_uuid[..12].copy_from_slice(&first);
         fs_uuid[12..].copy_from_slice(&second[..4]);
         Self {
-            version: 1,
+            version: 2,
             size_bytes,
+            role,
             fs_uuid,
             generation: bson::oid::ObjectId::new().to_hex(),
         }
@@ -1639,24 +1644,53 @@ impl VolumeMetadata {
         Self {
             version: self.version,
             size_bytes: self.size_bytes,
+            role: self.role.clone(),
             fs_uuid: self.fs_uuid,
             generation: bson::oid::ObjectId::new().to_hex(),
         }
     }
 
-    fn validate(&self, requested_size: u64) -> Result<(), BlobBlockFailure> {
-        if self.version != 1 {
+    fn validate(&self, request: &AcquireRequest) -> Result<(), BlobBlockFailure> {
+        if self.version != 2 {
             return Err(BlobBlockFailure::new(
                 "storage-error",
                 format!("unsupported blob block volume version: {}", self.version),
             ));
         }
-        if self.size_bytes != requested_size {
+        match (&self.role, &request.role) {
+            (
+                VolumeRole::RootfsCowOverlay {
+                    base_identity: stored,
+                },
+                VolumeRole::RootfsCowOverlay {
+                    base_identity: requested,
+                },
+            ) if stored != requested => {
+                return Err(BlobBlockFailure::new(
+                    "volume-mismatch",
+                    "blob rootfs overlay base identity mismatch",
+                ));
+            }
+            (VolumeRole::GuestBlockDevice, VolumeRole::GuestBlockDevice)
+            | (VolumeRole::RootfsCowOverlay { .. }, VolumeRole::RootfsCowOverlay { .. }) => {}
+            (stored, requested) => {
+                return Err(BlobBlockFailure::new(
+                    "volume-mismatch",
+                    format!(
+                        "blob volume role mismatch: stored {}, requested {}",
+                        volume_role_name(stored),
+                        volume_role_name(requested)
+                    ),
+                ));
+            }
+        }
+        if self.size_bytes != request.size_bytes() {
             return Err(BlobBlockFailure::new(
                 "volume-mismatch",
                 format!(
                     "blob block volume size mismatch: stored {}, requested {}",
-                    self.size_bytes, requested_size
+                    self.size_bytes,
+                    request.size_bytes()
                 ),
             ));
         }
@@ -1669,6 +1703,13 @@ impl VolumeMetadata {
             ));
         }
         Ok(())
+    }
+}
+
+fn volume_role_name(role: &VolumeRole) -> &'static str {
+    match role {
+        VolumeRole::RootfsCowOverlay { .. } => "rootfs-cow-overlay",
+        VolumeRole::GuestBlockDevice => "guest-block-device",
     }
 }
 
@@ -1789,9 +1830,10 @@ mod tests {
     use tokio::runtime::Runtime;
 
     use super::{
-        BlobBlockConfig, BlobBlockFailure, BlobBlockVolume, BlockCache, BlockManifest,
-        LeaseDocument, ObjectLease, PackedObjectBlockStore, VolumeLease, VolumeMetadata,
-        clone_manifest_generation, lease_is_expired, lease_retry_after_ms, provider_failure,
+        AcquireRequest, BlobBlockConfig, BlobBlockFailure, BlobBlockVolume, BlockCache,
+        BlockManifest, LeaseDocument, ObjectLease, PackedObjectBlockStore, Provider, VolumeLease,
+        VolumeMetadata, VolumeRole, clone_manifest_generation, lease_is_expired,
+        lease_retry_after_ms, provider_failure,
     };
 
     const TEST_SIZE: u64 = 64 * 1024 * 1024;
@@ -1836,13 +1878,13 @@ mod tests {
         let directory = TestDirectory::new();
         let request = |size: u64| {
             doc! {
-                "type": "host.block.acquire",
                 "provider": {
                     "kind": "local",
                     "path": directory.0.to_string_lossy().to_string(),
                 },
                 "volume": "workspace",
                 "sizeBytes": size.to_string(),
+                "role": { "kind": "guest-block-device" },
             }
         };
 
@@ -2037,7 +2079,7 @@ mod tests {
 
             let failure = first
                 .state
-                .commit_metadata(VolumeMetadata::new(TEST_SIZE))
+                .commit_metadata(VolumeMetadata::new(TEST_SIZE, VolumeRole::GuestBlockDevice))
                 .await
                 .expect_err("lost lease must not publish metadata");
             assert_eq!(failure.code, "lease-lost");
@@ -2451,14 +2493,21 @@ mod tests {
 
     #[test]
     fn provisioning_attempts_use_distinct_unpublished_generations() {
-        let first = VolumeMetadata::new(TEST_SIZE);
-        let second = VolumeMetadata::new(TEST_SIZE);
+        let first = VolumeMetadata::new(TEST_SIZE, VolumeRole::GuestBlockDevice);
+        let second = VolumeMetadata::new(TEST_SIZE, VolumeRole::GuestBlockDevice);
 
         assert_ne!(first.generation, second.generation);
-        first.validate(TEST_SIZE).expect("validate first metadata");
-        second
-            .validate(TEST_SIZE)
-            .expect("validate second metadata");
+        let request = AcquireRequest {
+            provider: Provider::Local {
+                path: "/tmp/blob-block".to_string(),
+                prefix: None,
+            },
+            volume: "workspace".to_string(),
+            size_bytes: TEST_SIZE.to_string(),
+            role: VolumeRole::GuestBlockDevice,
+        };
+        first.validate(&request).expect("validate first metadata");
+        second.validate(&request).expect("validate second metadata");
     }
 
     #[test]
