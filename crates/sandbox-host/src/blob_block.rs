@@ -224,7 +224,10 @@ impl BlobBlockVolume {
         Ok(self.open_store(false)?)
     }
 
-    fn open_store(&mut self, format_ext4: bool) -> Result<Arc<PackedObjectBlockStore>, BlobBlockFailure> {
+    fn open_store(
+        &mut self,
+        format_ext4: bool,
+    ) -> Result<Arc<PackedObjectBlockStore>, BlobBlockFailure> {
         if self.store.is_none() {
             let active_metadata = if self.provisioned && self._lease.requires_isolated_generation()
             {
@@ -305,7 +308,11 @@ impl BlobBlockVolume {
             }
             self.store = Some(store);
         }
-        Ok(self.store.as_ref().expect("block store initialized").clone())
+        Ok(self
+            .store
+            .as_ref()
+            .expect("block store initialized")
+            .clone())
     }
 
     pub fn take_failure_receiver(&mut self) -> Option<mpsc::Receiver<BlobBlockFailure>> {

@@ -83,7 +83,8 @@ export class HostProcessSandboxVm implements HostControlChannel {
   #stdinError: Error | null = null;
   #configured = false;
   #spawnSent = false;
-  #mayHoldBlobBlockLease = false;
+  #blobResourceCount = 0;
+  #blobFailure: SandboxBlobStorageError | null = null;
   #resolveClosed!: () => void;
 
   private constructor(child: ChildProcessWithoutNullStreams) {
@@ -120,9 +121,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
         signal === null
           ? `sandbox-host exited with ${code ?? "unknown status"}`
           : `sandbox-host exited from signal ${signal}`;
-      this.#exitError = new Error(
-        hostExitMessage(exitText, this.#stderr),
-      );
+      this.#exitError = this.#blobFailure ?? new Error(hostExitMessage(exitText, this.#stderr));
       this.#packets.close(this.#exitError);
       this.#packetActivity.close(this.#exitError);
       this.#launchReady.close(this.#exitError);
@@ -166,7 +165,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
       return;
     }
     const response = this.#nextPacket();
-    this.#mayHoldBlobBlockLease = true;
+    this.#blobResourceCount = Number(rootOverlay !== undefined) + Number(blockDevice !== undefined);
     this.#writeToHost(encodeHostBlobResources({ rootOverlay, blockDevice }));
     const packet = await response;
     const document = BSON.deserialize(packet.slice(4)) as Record<string, unknown>;
@@ -321,11 +320,11 @@ export class HostProcessSandboxVm implements HostControlChannel {
     this.#child.stdin.end();
     await Promise.race([
       exited,
-      delay(this.#mayHoldBlobBlockLease ? BLOB_BLOCK_CLOSE_GRACE_MS : 500),
+      delay(this.#blobResourceCount * BLOB_BLOCK_CLOSE_GRACE_MS || 500),
     ]);
     if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
       if (this.#child.exitCode !== 0) {
-        throw new SandboxBlobStorageError("host-error", hostExitMessage(
+        throw this.#blobFailure ?? new SandboxBlobStorageError("host-error", hostExitMessage(
           `sandbox-host exited with ${this.#child.exitCode ?? "unknown status"}`,
           this.#stderr,
         ));
@@ -345,6 +344,10 @@ export class HostProcessSandboxVm implements HostControlChannel {
         delay(1_000),
       ]);
     }
+    throw new SandboxBlobStorageError(
+      "storage-error",
+      "sandbox-host did not close its blob storage before the shutdown grace period; it was terminated",
+    );
   }
 
   async #closeFailedResourceAcquisition(): Promise<void> {
@@ -500,6 +503,14 @@ export class HostProcessSandboxVm implements HostControlChannel {
     }
 
     const type = document.type;
+    if (type === "host.resources.failure") {
+      this.#blobFailure = new SandboxBlobStorageError(
+        parseBlobStorageErrorCode(document.code),
+        typeof document.error === "string" ? document.error : "sandbox-host blob storage failed",
+        parseRetryAfterMs(document.retryAfterMs),
+      );
+      return true;
+    }
     if (type === "init.failed") {
       this.#launchReady.close(new Error(
         typeof document.message === "string"

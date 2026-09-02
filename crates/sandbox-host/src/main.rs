@@ -183,7 +183,9 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
                 .transpose();
             let block = match root {
                 Ok(root) => block_document
-                    .map(|document| blob_block::BlobBlockVolume::acquire(&blob_block_config, document))
+                    .map(|document| {
+                        blob_block::BlobBlockVolume::acquire(&blob_block_config, document)
+                    })
                     .transpose()
                     .map(|block| (root, block)),
                 Err(error) => Err(error),
@@ -199,7 +201,8 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(error) => {
-                    let mut response = doc! { "type": "host.resources.acquire.result", "ok": false };
+                    let mut response =
+                        doc! { "type": "host.resources.acquire.result", "ok": false };
                     append_blob_block_failure(&mut response, &error);
                     bridge.write_raw_packet(&encode_document_packet(&response)?)?;
                     return Err(Box::new(error));
@@ -214,20 +217,20 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
     validate_writable_xattr_backing(&spec)?;
     let (bridge_tx, bridge_rx) = mpsc::channel::<Result<(), String>>();
-    if let Some(failures) = blob_volume
-        .as_mut()
-        .and_then(blob_block::BlobBlockVolume::take_failure_receiver)
-    {
-        let failure_tx = bridge_tx.clone();
-        thread::spawn(move || {
-            let Ok(failure) = failures.recv() else {
-                return;
-            };
-            let _ = failure_tx.send(Err(failure.message));
-            thread::sleep(BLOB_BLOCK_FAILURE_EXIT_GRACE);
-            std::process::exit(1);
-        });
-    }
+    monitor_blob_block_failure(
+        root_blob_volume
+            .as_mut()
+            .and_then(blob_block::BlobBlockVolume::take_failure_receiver),
+        bridge.clone(),
+        bridge_tx.clone(),
+    );
+    monitor_blob_block_failure(
+        blob_volume
+            .as_mut()
+            .and_then(blob_block::BlobBlockVolume::take_failure_receiver),
+        bridge.clone(),
+        bridge_tx.clone(),
+    );
     let guest_writer_slot: Arc<(Mutex<Option<ControlSocket>>, Condvar)> =
         Arc::new((Mutex::new(None), Condvar::new()));
     let start_status_slot: Arc<Mutex<Option<StartStatusObserver>>> = Arc::new(Mutex::new(None));
@@ -289,11 +292,7 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
     let services = HostServices {
         http: http_intercept_runtime(&spec, bridge.clone())?,
         network_policy: network_policy_runtime(&spec, bridge.clone()),
-        root_storage: match spec
-            .rootfs
-            .storage
-            .as_ref()
-        {
+        root_storage: match spec.rootfs.storage.as_ref() {
             Some(sandbox::config::RootfsStorageSpec::BlobCow { .. }) => root_blob_volume
                 .as_mut()
                 .ok_or_else(|| io::Error::other("blob root storage missing"))
@@ -378,7 +377,9 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
     };
     drop(vm);
 
-    let root_close_result = root_blob_volume.as_mut().map(blob_block::BlobBlockVolume::close);
+    let root_close_result = root_blob_volume
+        .as_mut()
+        .map(blob_block::BlobBlockVolume::close);
     let block_close_result = blob_volume.as_mut().map(blob_block::BlobBlockVolume::close);
     run_result?;
     if let Some(result) = root_close_result {
@@ -396,6 +397,29 @@ fn append_blob_block_failure(document: &mut Document, failure: &blob_block::Blob
     if let Some(retry_after_ms) = failure.retry_after_ms {
         document.insert("retryAfterMs", retry_after_ms as i64);
     }
+}
+
+fn monitor_blob_block_failure(
+    failures: Option<mpsc::Receiver<blob_block::BlobBlockFailure>>,
+    bridge: Arc<HostIoBridge>,
+    failure_tx: mpsc::Sender<Result<(), String>>,
+) {
+    let Some(failures) = failures else {
+        return;
+    };
+    thread::spawn(move || {
+        let Ok(failure) = failures.recv() else {
+            return;
+        };
+        let mut notification = doc! { "type": "host.resources.failure" };
+        append_blob_block_failure(&mut notification, &failure);
+        if let Ok(packet) = encode_document_packet(&notification) {
+            let _ = bridge.write_raw_packet(&packet);
+        }
+        let _ = failure_tx.send(Err(failure.message));
+        thread::sleep(BLOB_BLOCK_FAILURE_EXIT_GRACE);
+        std::process::exit(1);
+    });
 }
 
 fn host_stdin_closed_result(
