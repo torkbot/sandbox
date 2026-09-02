@@ -172,167 +172,170 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
         acquire_blob_resources(&blob_block_config, &spawn_document, &bridge)?;
     drop(stdin);
 
-    let spec = sandbox::MicroVmSpec::build(parse_spawn(spawn_document)?)?;
-    #[cfg(target_os = "macos")]
-    validate_writable_xattr_backing(&spec)?;
-    let (bridge_tx, bridge_rx) = mpsc::channel::<Result<(), String>>();
-    monitor_blob_block_failure(
-        root_blob_volume
-            .as_mut()
-            .and_then(blob_block::BlobBlockVolume::take_failure_receiver),
-        bridge.clone(),
-        bridge_tx.clone(),
-    );
-    monitor_blob_block_failure(
-        blob_volume
-            .as_mut()
-            .and_then(blob_block::BlobBlockVolume::take_failure_receiver),
-        bridge.clone(),
-        bridge_tx.clone(),
-    );
-    let guest_writer_slot: Arc<(Mutex<Option<ControlSocket>>, Condvar)> =
-        Arc::new((Mutex::new(None), Condvar::new()));
-    let start_status_slot: Arc<Mutex<Option<StartStatusObserver>>> = Arc::new(Mutex::new(None));
-    let launch_ready = Arc::new(AtomicBool::new(false));
-    let host_stdin_closed = Arc::new(AtomicBool::new(false));
+    let run_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let spec = sandbox::MicroVmSpec::build(parse_spawn(spawn_document)?)?;
+        #[cfg(target_os = "macos")]
+        validate_writable_xattr_backing(&spec)?;
+        let (bridge_tx, bridge_rx) = mpsc::channel::<Result<(), String>>();
+        monitor_blob_block_failure(
+            root_blob_volume
+                .as_mut()
+                .and_then(blob_block::BlobBlockVolume::take_failure_receiver),
+            bridge.clone(),
+            bridge_tx.clone(),
+        );
+        monitor_blob_block_failure(
+            blob_volume
+                .as_mut()
+                .and_then(blob_block::BlobBlockVolume::take_failure_receiver),
+            bridge.clone(),
+            bridge_tx.clone(),
+        );
+        let guest_writer_slot: Arc<(Mutex<Option<ControlSocket>>, Condvar)> =
+            Arc::new((Mutex::new(None), Condvar::new()));
+        let start_status_slot: Arc<Mutex<Option<StartStatusObserver>>> = Arc::new(Mutex::new(None));
+        let launch_ready = Arc::new(AtomicBool::new(false));
+        let host_stdin_closed = Arc::new(AtomicBool::new(false));
 
-    let stdin_bridge = bridge.clone();
-    let stdin_tx = bridge_tx.clone();
-    let stdin_guest_writer = guest_writer_slot.clone();
-    let stdin_start_status = start_status_slot.clone();
-    let stdin_launch_ready = launch_ready.clone();
-    let stdin_host_stdin_closed = host_stdin_closed.clone();
-    thread::spawn(move || {
-        let mut stdin = io::stdin().lock();
-        loop {
-            let (packet, document) = match read_packet(&mut stdin) {
-                Ok(value) => value,
-                Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
-                    stdin_host_stdin_closed.store(true, Ordering::SeqCst);
-                    let start_status =
-                        stdin_start_status
-                            .lock()
-                            .unwrap()
-                            .clone()
-                            .and_then(|status| {
-                                status
-                                    .get()
-                                    .map(|result| result.map_err(|error| error.to_string()))
-                            });
-                    let result = host_stdin_closed_result(
-                        start_status,
-                        stdin_launch_ready.load(Ordering::SeqCst),
-                    );
-                    let _ = stdin_tx.send(result);
+        let stdin_bridge = bridge.clone();
+        let stdin_tx = bridge_tx.clone();
+        let stdin_guest_writer = guest_writer_slot.clone();
+        let stdin_start_status = start_status_slot.clone();
+        let stdin_launch_ready = launch_ready.clone();
+        let stdin_host_stdin_closed = host_stdin_closed.clone();
+        thread::spawn(move || {
+            let mut stdin = io::stdin().lock();
+            loop {
+                let (packet, document) = match read_packet(&mut stdin) {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+                        stdin_host_stdin_closed.store(true, Ordering::SeqCst);
+                        let start_status =
+                            stdin_start_status
+                                .lock()
+                                .unwrap()
+                                .clone()
+                                .and_then(|status| {
+                                    status
+                                        .get()
+                                        .map(|result| result.map_err(|error| error.to_string()))
+                                });
+                        let result = host_stdin_closed_result(
+                            start_status,
+                            stdin_launch_ready.load(Ordering::SeqCst),
+                        );
+                        let _ = stdin_tx.send(result);
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = stdin_tx.send(Err(format!("read host control packet: {error}")));
+                        return;
+                    }
+                };
+                if stdin_bridge.route_response(document) {
+                    continue;
+                }
+
+                let (writer_lock, writer_ready) = &*stdin_guest_writer;
+                let mut writer = writer_lock.lock().unwrap();
+                while writer.is_none() {
+                    writer = writer_ready.wait(writer).unwrap();
+                }
+                if let Err(error) = writer.as_mut().unwrap().write_packet(&packet) {
+                    let _ = stdin_tx.send(Err(format!("write guest control packet: {error}")));
                     return;
                 }
-                Err(error) => {
-                    let _ = stdin_tx.send(Err(format!("read host control packet: {error}")));
-                    return;
-                }
-            };
-            if stdin_bridge.route_response(document) {
-                continue;
             }
+        });
 
-            let (writer_lock, writer_ready) = &*stdin_guest_writer;
-            let mut writer = writer_lock.lock().unwrap();
-            while writer.is_none() {
-                writer = writer_ready.wait(writer).unwrap();
-            }
-            if let Err(error) = writer.as_mut().unwrap().write_packet(&packet) {
-                let _ = stdin_tx.send(Err(format!("write guest control packet: {error}")));
-                return;
-            }
-        }
-    });
-
-    let virtual_fs = virtio_fs_devices(&spec, bridge.clone());
-    let services = HostServices {
-        http: http_intercept_runtime(&spec, bridge.clone())?,
-        network_policy: network_policy_runtime(&spec, bridge.clone()),
-        root_storage: match root_blob_volume.as_mut() {
-            Some(volume) => Some(report_blob_block_result(&bridge, volume.cow_store())?),
-            None => spec
-                .rootfs
-                .storage
-                .as_ref()
-                .and_then(|storage| match storage {
-                    sandbox::config::RootfsStorageSpec::CowBlockStore { block_size, .. } => {
-                        Some(Arc::new(NodeCowBlockStore::new(
+        let virtual_fs = virtio_fs_devices(&spec, bridge.clone());
+        let services = HostServices {
+            http: http_intercept_runtime(&spec, bridge.clone())?,
+            network_policy: network_policy_runtime(&spec, bridge.clone()),
+            root_storage: match root_blob_volume.as_mut() {
+                Some(volume) => Some(report_blob_block_result(&bridge, volume.cow_store())?),
+                None => spec
+                    .rootfs
+                    .storage
+                    .as_ref()
+                    .and_then(|storage| match storage {
+                        sandbox::config::RootfsStorageSpec::CowBlockStore {
+                            block_size, ..
+                        } => Some(Arc::new(NodeCowBlockStore::new(
                             bridge.clone(),
                             *block_size,
                             "host.block",
-                        )) as Arc<dyn CowBlockStore>)
-                    }
-                    sandbox::config::RootfsStorageSpec::EphemeralCow { .. } => None,
-                    sandbox::config::RootfsStorageSpec::PersistentQcow2Overlay { .. } => None,
-                }),
-        },
-        block_device: blob_volume
-            .as_mut()
-            .map(|volume| report_blob_block_result(&bridge, volume.service()))
-            .transpose()?,
-    };
-    let mut vm = sandbox::runtime::KrunVm::create_with_services(&spec, virtual_fs, services)?;
-    vm.start()?;
+                        )) as Arc<dyn CowBlockStore>),
+                        sandbox::config::RootfsStorageSpec::EphemeralCow { .. } => None,
+                        sandbox::config::RootfsStorageSpec::PersistentQcow2Overlay { .. } => None,
+                    }),
+            },
+            block_device: blob_volume
+                .as_mut()
+                .map(|volume| report_blob_block_result(&bridge, volume.service()))
+                .transpose()?,
+        };
+        let mut vm = sandbox::runtime::KrunVm::create_with_services(&spec, virtual_fs, services)?;
+        vm.start()?;
 
-    {
-        let (writer_lock, writer_ready) = &*guest_writer_slot;
-        *writer_lock.lock().unwrap() = Some(vm.control_socket().try_clone()?);
-        writer_ready.notify_all();
-    }
-    let mut guest_reader = vm.control_socket().try_clone()?;
-
-    let start_status = vm.start_status_observer();
-    *start_status_slot.lock().unwrap() = Some(start_status.clone());
-    let status_tx = bridge_tx.clone();
-    let status_launch_ready = launch_ready.clone();
-    let status_host_stdin_closed = host_stdin_closed.clone();
-    thread::spawn(move || {
-        let result = start_status.wait().map_err(|error| error.to_string());
-        if status_host_stdin_closed.load(Ordering::SeqCst) {
-            return;
+        {
+            let (writer_lock, writer_ready) = &*guest_writer_slot;
+            *writer_lock.lock().unwrap() = Some(vm.control_socket().try_clone()?);
+            writer_ready.notify_all();
         }
-        let _ = status_tx.send(vm_exited_before_host_stdin_result(
-            result,
-            status_launch_ready.load(Ordering::SeqCst),
-        ));
-    });
+        let mut guest_reader = vm.control_socket().try_clone()?;
 
-    let guest_tx = bridge_tx.clone();
-    let guest_launch_ready = launch_ready.clone();
-    let guest_bridge = bridge.clone();
-    thread::spawn(move || {
-        loop {
-            let packet = match guest_reader.read_packet() {
-                Ok(packet) => packet,
-                Err(error) => {
-                    let _ = guest_tx.send(Err(format!("read guest control packet: {error}")));
-                    return;
-                }
-            };
-            if is_init_ready_packet(&packet) {
-                guest_launch_ready.store(true, Ordering::SeqCst);
-            }
-            if let Err(error) = guest_bridge.write_raw_packet(&packet) {
-                let _ = guest_tx.send(Err(format!("write host control packet: {error}")));
+        let start_status = vm.start_status_observer();
+        *start_status_slot.lock().unwrap() = Some(start_status.clone());
+        let status_tx = bridge_tx.clone();
+        let status_launch_ready = launch_ready.clone();
+        let status_host_stdin_closed = host_stdin_closed.clone();
+        thread::spawn(move || {
+            let result = start_status.wait().map_err(|error| error.to_string());
+            if status_host_stdin_closed.load(Ordering::SeqCst) {
                 return;
             }
-        }
-    });
+            let _ = status_tx.send(vm_exited_before_host_stdin_result(
+                result,
+                status_launch_ready.load(Ordering::SeqCst),
+            ));
+        });
 
-    let run_result: Result<(), Box<dyn std::error::Error>> = match bridge_rx.recv() {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => {
-            if let Some(result) = vm.start_status() {
-                result?;
+        let guest_tx = bridge_tx.clone();
+        let guest_launch_ready = launch_ready.clone();
+        let guest_bridge = bridge.clone();
+        thread::spawn(move || {
+            loop {
+                let packet = match guest_reader.read_packet() {
+                    Ok(packet) => packet,
+                    Err(error) => {
+                        let _ = guest_tx.send(Err(format!("read guest control packet: {error}")));
+                        return;
+                    }
+                };
+                if is_init_ready_packet(&packet) {
+                    guest_launch_ready.store(true, Ordering::SeqCst);
+                }
+                if let Err(error) = guest_bridge.write_raw_packet(&packet) {
+                    let _ = guest_tx.send(Err(format!("write host control packet: {error}")));
+                    return;
+                }
             }
-            Err(error.into())
-        }
-        Err(error) => Err(format!("control bridge stopped: {error}").into()),
-    };
-    drop(vm);
+        });
+
+        let result = match bridge_rx.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                if let Some(result) = vm.start_status() {
+                    result?;
+                }
+                Err(error.into())
+            }
+            Err(error) => Err(format!("control bridge stopped: {error}").into()),
+        };
+        drop(vm);
+        result
+    })();
 
     let root_close_result = root_blob_volume
         .as_mut()
