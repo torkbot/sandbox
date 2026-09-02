@@ -1448,98 +1448,108 @@ impl CowBlockStore for PackedObjectBlockStore {
                 "blob block read exceeds volume size",
             ));
         }
-        let mut blocks = HashMap::new();
-        let mut reads = HashMap::<String, Vec<(u64, BlockLocation)>>::new();
-        {
-            let staging = self
-                .staging
-                .lock()
-                .expect("blob block staging lock poisoned");
-            let cached = self.cache.lock().expect("blob block cache lock poisoned");
-            let manifest = self
-                .manifest
-                .lock()
-                .expect("blob block manifest lock poisoned");
-            for index in start..end {
-                if let Some(block) = staging.dirty.get(&index) {
-                    if let Some(data) = &block.data {
-                        blocks.insert(index, data.clone());
-                    }
-                } else if let Some(data) = cached.blocks.get(&index) {
-                    blocks.insert(index, data.clone());
-                } else if let Some(location) = manifest.blocks.get(&index) {
-                    reads
-                        .entry(location.object.clone())
-                        .or_default()
-                        .push((index, location.clone()));
-                }
-            }
-        }
-        if !reads.is_empty() {
-            let provider = self.provider.clone();
-            let object_root = self.object_root.clone();
-            let object_concurrency = self.config.object_concurrency;
-            let fetched = self.wait_for(async move {
-                stream::iter(reads.into_iter().map(|(object, entries)| {
-                    let provider = provider.clone();
-                    let path = object_root.clone().join(object.as_str());
-                    async move {
-                        let ranges = entries
-                            .iter()
-                            .map(|(_, location)| {
-                                u64::from(location.offset)
-                                    ..u64::from(location.offset) + u64::from(location.len)
-                            })
-                            .collect::<Vec<_>>();
-                        let bytes = provider
-                            .get_ranges(&path, &ranges)
-                            .await
-                            .map_err(io::Error::other)?;
-                        Ok::<_, io::Error>(
-                            entries
-                                .into_iter()
-                                .zip(bytes)
-                                .map(|((index, location), bytes)| (index, location, bytes.to_vec()))
-                                .collect::<Vec<_>>(),
-                        )
-                    }
-                }))
-                .buffer_unordered(object_concurrency)
-                .try_collect::<Vec<_>>()
-                .await
-            })?;
-            let staging = self
-                .staging
-                .lock()
-                .expect("blob block staging lock poisoned");
-            let mut cache = self.cache.lock().expect("blob block cache lock poisoned");
-            let manifest = self
-                .manifest
-                .lock()
-                .expect("blob block manifest lock poisoned");
-            for entries in fetched {
-                for (index, location, data) in entries {
+        loop {
+            let mut blocks = HashMap::new();
+            let mut reads = HashMap::<String, Vec<(u64, BlockLocation)>>::new();
+            {
+                let staging = self
+                    .staging
+                    .lock()
+                    .expect("blob block staging lock poisoned");
+                let cached = self.cache.lock().expect("blob block cache lock poisoned");
+                let manifest = self
+                    .manifest
+                    .lock()
+                    .expect("blob block manifest lock poisoned");
+                for index in start..end {
                     if let Some(block) = staging.dirty.get(&index) {
-                        match &block.data {
-                            Some(data) => {
-                                blocks.insert(index, data.clone());
-                            }
-                            None => {
-                                blocks.remove(&index);
-                            }
+                        if let Some(data) = &block.data {
+                            blocks.insert(index, data.clone());
                         }
-                    } else if let Some(data) = cache.blocks.get(&index) {
+                    } else if let Some(data) = cached.blocks.get(&index) {
                         blocks.insert(index, data.clone());
-                    } else if manifest.blocks.get(&index) == Some(&location) {
-                        cache.insert(index, data.clone());
-                        blocks.insert(index, data);
+                    } else if let Some(location) = manifest.blocks.get(&index) {
+                        reads
+                            .entry(location.object.clone())
+                            .or_default()
+                            .push((index, location.clone()));
                     }
                 }
             }
+            let mut superseded = false;
+            if !reads.is_empty() {
+                let provider = self.provider.clone();
+                let object_root = self.object_root.clone();
+                let object_concurrency = self.config.object_concurrency;
+                let fetched = self.wait_for(async move {
+                    stream::iter(reads.into_iter().map(|(object, entries)| {
+                        let provider = provider.clone();
+                        let path = object_root.clone().join(object.as_str());
+                        async move {
+                            let ranges = entries
+                                .iter()
+                                .map(|(_, location)| {
+                                    u64::from(location.offset)
+                                        ..u64::from(location.offset) + u64::from(location.len)
+                                })
+                                .collect::<Vec<_>>();
+                            let bytes = provider
+                                .get_ranges(&path, &ranges)
+                                .await
+                                .map_err(io::Error::other)?;
+                            Ok::<_, io::Error>(
+                                entries
+                                    .into_iter()
+                                    .zip(bytes)
+                                    .map(|((index, location), bytes)| {
+                                        (index, location, bytes.to_vec())
+                                    })
+                                    .collect::<Vec<_>>(),
+                            )
+                        }
+                    }))
+                    .buffer_unordered(object_concurrency)
+                    .try_collect::<Vec<_>>()
+                    .await
+                })?;
+                let staging = self
+                    .staging
+                    .lock()
+                    .expect("blob block staging lock poisoned");
+                let mut cache = self.cache.lock().expect("blob block cache lock poisoned");
+                let manifest = self
+                    .manifest
+                    .lock()
+                    .expect("blob block manifest lock poisoned");
+                for entries in fetched {
+                    for (index, location, data) in entries {
+                        if let Some(block) = staging.dirty.get(&index) {
+                            match &block.data {
+                                Some(data) => {
+                                    blocks.insert(index, data.clone());
+                                }
+                                None => {
+                                    blocks.remove(&index);
+                                }
+                            }
+                        } else if let Some(data) = cache.blocks.get(&index) {
+                            blocks.insert(index, data.clone());
+                        } else if manifest.blocks.get(&index) == Some(&location) {
+                            cache.insert(index, data.clone());
+                            blocks.insert(index, data);
+                        } else {
+                            superseded = true;
+                        }
+                    }
+                }
+            }
+            if superseded {
+                continue;
+            }
+            let mut blocks = blocks.into_iter().collect::<Vec<_>>();
+            blocks.sort_unstable_by_key(|(index, _)| *index);
+            return Ok(blocks);
         }
-        let mut blocks = blocks.into_iter().collect::<Vec<_>>();
-        blocks.sort_unstable_by_key(|(index, _)| *index);
-        Ok(blocks)
     }
 
     fn write_blocks(&self, chunks: Vec<(u64, Vec<u8>)>) -> io::Result<()> {
@@ -2218,7 +2228,7 @@ mod tests {
             TEST_SIZE,
             config(),
         );
-        seed.write_blocks(vec![(7, vec![41; 4096])])
+        seed.write_blocks(vec![(7, vec![41; 4096]), (8, vec![80; 4096])])
             .expect("write original block");
         seed.flush().expect("flush original block");
         let manifest = runtime
@@ -2228,6 +2238,8 @@ mod tests {
             ))
             .expect("read manifest")
             .expect("committed manifest");
+        let mut block_config = config();
+        block_config.max_cached_bytes = super::BLOCK_SIZE;
         let store = Arc::new(PackedObjectBlockStore::new(
             runtime,
             object_store,
@@ -2235,7 +2247,7 @@ mod tests {
             object_root,
             manifest,
             TEST_SIZE,
-            config(),
+            block_config,
         ));
         throttled.config_mut(|config| {
             config.wait_get_per_call = Duration::from_millis(250);
@@ -2249,10 +2261,17 @@ mod tests {
             .write_blocks(vec![(7, vec![42; 4096])])
             .expect("write replacement block");
         store.flush().expect("flush replacement block");
-        reader.join().expect("join overlapping read");
         throttled.config_mut(|config| {
             config.wait_get_per_call = Duration::ZERO;
         });
+        assert_eq!(
+            store.read_blocks(8, 1).expect("evict replacement block"),
+            vec![(8, vec![80; 4096])]
+        );
+        assert_eq!(
+            reader.join().expect("join overlapping read"),
+            vec![(7, vec![42; 4096])]
+        );
 
         assert_eq!(
             store.read_blocks(7, 1).expect("read completed write"),
