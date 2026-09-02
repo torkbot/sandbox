@@ -40,7 +40,7 @@ impl BlobResources {
             Err(error) => {
                 let mut root = root;
                 if let Some(Err(close_failure)) = root.as_mut().map(BlobBlockVolume::close) {
-                    report_blob_failure(&bridge, &close_failure);
+                    return Err(close_failure);
                 }
                 return Err(error);
             }

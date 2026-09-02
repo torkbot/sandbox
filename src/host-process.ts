@@ -4,7 +4,7 @@ import { appendFileSync } from "node:fs";
 import { Binary, BSON } from "bson";
 import { hostBinaryPath, macosHostSigningError } from "./artifacts.ts";
 import type { HostControlChannel } from "./control.ts";
-import type { HostBlobBlockOptions, HostSpawnSandboxOptions } from "./spawn-options.ts";
+import type { HostBlobVolumeOptions, HostSpawnSandboxOptions } from "./spawn-options.ts";
 import { isSandboxWritableFileSystem } from "./vfs.ts";
 import type {
   SandboxFileSystem,
@@ -72,20 +72,18 @@ export class SandboxBlobStorageError extends Error {
 export class HostProcessSandboxVm implements HostControlChannel {
   readonly hasControlSocket = true;
   readonly packets: AsyncIterable<Uint8Array>;
-  readonly closed: Promise<void>;
 
   readonly #child: ChildProcessWithoutNullStreams;
   readonly #exit: Promise<HostExit>;
   readonly #packets = new AsyncQueue<Uint8Array>();
-  readonly #packetActivity = new AsyncSignal();
-  readonly #launchReady = new AsyncSignal("sandbox-host launch acknowledgement closed");
-  readonly #hostFs = new Map<string, SandboxFileSystem>();
-  readonly #blockStores = new Map<string, {
+  readonly #launchReady = Promise.withResolvers<void>();
+  readonly #hostFs: ReadonlyMap<string, SandboxFileSystem>;
+  readonly #blockStores: ReadonlyMap<string, {
     readonly blockStore: SandboxBlockStore;
     readonly context: SandboxBlockStoreContext;
-  }>();
-  #requestHeaderHooks = new Map<string, RegisteredHttpRequestHeadersHook>();
-  #networkConnectionHook?: RegisteredNetworkConnectionHook;
+  }>;
+  readonly #requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook>;
+  readonly #networkConnectionHook?: RegisteredNetworkConnectionHook;
   readonly #httpMiddlewareByFlow = new Map<string, HttpRequestMiddleware | undefined>();
   #buffer = new Uint8Array();
   #stderr = "";
@@ -97,9 +95,23 @@ export class HostProcessSandboxVm implements HostControlChannel {
   #blobFailure: SandboxBlobStorageError | null = null;
   #closePromise?: Promise<void>;
 
-  private constructor(child: ChildProcessWithoutNullStreams) {
+  private constructor(
+    child: ChildProcessWithoutNullStreams,
+    hostFs: ReadonlyMap<string, SandboxFileSystem>,
+    blockStores: ReadonlyMap<string, {
+      readonly blockStore: SandboxBlockStore;
+      readonly context: SandboxBlockStoreContext;
+    }>,
+    requestHeaderHooks: Map<string, RegisteredHttpRequestHeadersHook>,
+    networkConnectionHook: RegisteredNetworkConnectionHook | undefined,
+  ) {
     this.#child = child;
+    this.#hostFs = hostFs;
+    this.#blockStores = blockStores;
+    this.#requestHeaderHooks = requestHeaderHooks;
+    this.#networkConnectionHook = networkConnectionHook;
     this.packets = this.#packets;
+    void this.#launchReady.promise.catch(() => undefined);
     this.#exit = new Promise((resolve) => {
       child.on("close", (code, signal) => {
         const exit = { code, signal };
@@ -110,11 +122,9 @@ export class HostProcessSandboxVm implements HostControlChannel {
 
         this.#exitError = this.#shutdownError({ kind: "exit", exit, expected: false });
         this.#packets.close(this.#exitError);
-        this.#packetActivity.close(this.#exitError);
-        this.#launchReady.close(this.#exitError);
+        this.#launchReady.reject(this.#exitError);
       });
     });
-    this.closed = this.#exit.then(() => undefined);
     child.stdout.on("data", (chunk: Buffer) => {
       this.#receive(chunk);
     });
@@ -144,30 +154,39 @@ export class HostProcessSandboxVm implements HostControlChannel {
     const hostPath = hostBinaryPath();
     let vm: HostProcessSandboxVm | undefined;
     try {
-      const child = spawn(hostPath, ["--stdio"], {
-        stdio: ["pipe", "pipe", "pipe"],
-        env: process.env,
-      });
-      vm = new HostProcessSandboxVm(child);
-      await Promise.race([
-        once(child, "spawn"),
-        once(child, "error").then(([error]) => {
-          throw error;
-        }),
-      ]);
-      vm.#requestHeaderHooks = requestHeaderHooks;
-      vm.#networkConnectionHook = networkConnectionHook;
+      const hostFs = new Map<string, SandboxFileSystem>();
+      const blockStores = new Map<string, {
+        readonly blockStore: SandboxBlockStore;
+        readonly context: SandboxBlockStoreContext;
+      }>();
       if (options.rootfs.storage?.kind === "cow-block-store") {
-        vm.#blockStores.set("host.block", {
+        blockStores.set("host.block", {
           blockStore: options.rootfs.storage.blockStore,
           context: options.rootfs.storage.context,
         });
       }
       for (const mount of options.mounts ?? []) {
         if (mount.kind === "virtual-fs") {
-          vm.#hostFs.set(mount.path, mount.fileSystem);
+          hostFs.set(mount.path, mount.fileSystem);
         }
       }
+      const child = spawn(hostPath, ["--stdio"], {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: process.env,
+      });
+      vm = new HostProcessSandboxVm(
+        child,
+        hostFs,
+        blockStores,
+        requestHeaderHooks,
+        networkConnectionHook,
+      );
+      await Promise.race([
+        once(child, "spawn"),
+        once(child, "error").then(([error]) => {
+          throw error;
+        }),
+      ]);
       const blobResources = declarativeBlobResources(options);
       vm.#blobResourceCount = Number(blobResources.rootOverlay !== undefined)
         + Number(blobResources.blockDevice !== undefined);
@@ -203,15 +222,20 @@ export class HostProcessSandboxVm implements HostControlChannel {
     });
     const host = new HostProcessSandboxVm(
       child,
+      new Map(),
+      new Map([
+        ["host.block.source", {
+          blockStore: input.overlay,
+          context: input.overlayContext,
+        }],
+        ["host.block.dest", {
+          blockStore: input.dest,
+          context: input.destContext,
+        }],
+      ]),
+      new Map(),
+      undefined,
     );
-    host.#blockStores.set("host.block.source", {
-      blockStore: input.overlay,
-      context: input.overlayContext,
-    });
-    host.#blockStores.set("host.block.dest", {
-      blockStore: input.dest,
-      context: input.destContext,
-    });
     try {
       await Promise.race([
         once(child, "spawn"),
@@ -286,7 +310,6 @@ export class HostProcessSandboxVm implements HostControlChannel {
   async #shutdown(graceMs: number): Promise<void> {
     this.#closed = true;
     this.#packets.close();
-    this.#packetActivity.close();
 
     this.#child.stdin.end();
     const exit = await this.#waitForExit(graceMs);
@@ -407,10 +430,9 @@ export class HostProcessSandboxVm implements HostControlChannel {
 
       const packet = this.#buffer.slice(0, packetLength);
       this.#buffer = this.#buffer.slice(packetLength);
-      this.#packetActivity.notify();
       if (!this.#routeHostPacket(packet)) {
         if (isInitReadyPacket(packet)) {
-          this.#launchReady.notify();
+          this.#launchReady.resolve();
         }
         this.#packets.push(packet);
       }
@@ -436,11 +458,11 @@ export class HostProcessSandboxVm implements HostControlChannel {
         typeof document.error === "string" ? document.error : "sandbox-host blob storage failed",
         parseRetryAfterMs(document.retryAfterMs),
       );
-      this.#launchReady.close(this.#blobFailure);
+      this.#launchReady.reject(this.#blobFailure);
       return true;
     }
     if (type === "init.failed") {
-      this.#launchReady.close(new Error(
+      this.#launchReady.reject(new Error(
         typeof document.message === "string"
           ? `sandbox init failed: ${document.message}`
           : "sandbox init failed",
@@ -1122,10 +1144,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
   async #waitForLaunch(): Promise<void> {
     const timeoutMs = launchTimeoutMs();
     await Promise.race([
-      this.#launchReady.wait(),
-      this.closed.then(() => {
-        throw this.#exitError ?? new Error("sandbox-host exited before VM launch completed");
-      }),
+      this.#launchReady.promise,
       unrefDelay(timeoutMs).then(() => {
         throw new Error(`sandbox-host did not produce a launch acknowledgement within ${timeoutMs}ms`);
       }),
@@ -1564,61 +1583,6 @@ class AsyncQueue<T> implements AsyncIterable<T> {
   }
 }
 
-class AsyncSignal {
-  readonly #waiters: Array<{
-    resolve(): void;
-    reject(error: unknown): void;
-  }> = [];
-  readonly #closedMessage: string;
-  #signaled = false;
-  #closed = false;
-  #error: unknown;
-
-  constructor(closedMessage = "sandbox-host packet activity closed") {
-    this.#closedMessage = closedMessage;
-  }
-
-  notify(): void {
-    if (this.#closed) {
-      return;
-    }
-    this.#signaled = true;
-    for (const waiter of this.#waiters.splice(0)) {
-      waiter.resolve();
-    }
-  }
-
-  close(error?: unknown): void {
-    if (this.#closed) {
-      return;
-    }
-    this.#closed = true;
-    this.#error = error;
-    for (const waiter of this.#waiters.splice(0)) {
-      if (error === undefined) {
-        waiter.resolve();
-      } else {
-        waiter.reject(error);
-      }
-    }
-  }
-
-  async wait(): Promise<void> {
-    if (this.#signaled) {
-      return;
-    }
-    if (this.#closed) {
-      if (this.#error !== undefined) {
-        throw this.#error;
-      }
-      throw new Error(this.#closedMessage);
-    }
-    return await new Promise<void>((resolve, reject) => {
-      this.#waiters.push({ resolve, reject });
-    });
-  }
-}
-
 function encodeHostSpawn(
   options: HostSpawnSandboxOptions,
   blobResources: DeclarativeBlobResources,
@@ -1664,13 +1628,13 @@ function encodeHostSpawn(
 
 type DeclarativeBlobResources = {
   readonly rootOverlay?: {
-    readonly provider: HostBlobBlockOptions["provider"];
+    readonly provider: HostBlobVolumeOptions["provider"];
     readonly volume: string;
     readonly sizeBytes: string;
     readonly role: { readonly kind: "rootfs-cow-overlay"; readonly baseIdentity: string };
   };
   readonly blockDevice?: {
-    readonly provider: HostBlobBlockOptions["provider"];
+    readonly provider: HostBlobVolumeOptions["provider"];
     readonly volume: string;
     readonly sizeBytes: string;
     readonly role: { readonly kind: "guest-block-device" };

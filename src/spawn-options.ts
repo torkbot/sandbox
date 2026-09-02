@@ -25,7 +25,7 @@ export type HostSpawnMount =
       };
     };
 
-export type HostBlobBlockProvider =
+export type HostBlobStorageProvider =
   | {
       readonly kind: "local";
       readonly path: string;
@@ -73,8 +73,8 @@ export type HostBlobBlockProvider =
           };
     };
 
-export type HostBlobBlockOptions = {
-  readonly provider: HostBlobBlockProvider;
+export type HostBlobVolumeOptions = {
+  readonly provider: HostBlobStorageProvider;
   readonly volume: string;
   readonly sizeBytes: bigint;
 };

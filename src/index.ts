@@ -26,8 +26,8 @@ import {
   isSandboxWritableFileSystem,
 } from "./vfs.ts";
 import type {
-  HostBlobBlockOptions,
-  HostBlobBlockProvider,
+  HostBlobStorageProvider,
+  HostBlobVolumeOptions,
   HostSpawnMount,
   HostSpawnSandboxOptions,
 } from "./spawn-options.ts";
@@ -251,7 +251,7 @@ export type SandboxReadWriteHostDirectorySource = {
 
 export type SandboxHostDirectorySource = SandboxReadOnlyHostDirectorySource | SandboxReadWriteHostDirectorySource;
 
-export type SandboxBlobBlockProvider = HostBlobBlockProvider;
+export type SandboxBlobStorageProvider = HostBlobStorageProvider;
 
 /** A declarative, object-backed writable rootfs overlay. */
 export interface SandboxBlobOverlay {
@@ -263,8 +263,8 @@ export interface SandboxBlobBlockDevice {
   readonly kind: "blob-block-device";
 }
 
-export type SandboxBlobOverlayOptions = Omit<HostBlobBlockOptions, "sizeBytes">;
-export type SandboxBlobBlockOptions = HostBlobBlockOptions;
+export type SandboxBlobOverlayOptions = Omit<HostBlobVolumeOptions, "sizeBytes">;
+export type SandboxBlobBlockOptions = HostBlobVolumeOptions;
 
 export type SandboxMountSource = SandboxFileSystemSource | SandboxHostDirectorySource | SandboxBlobBlockDevice;
 
@@ -337,17 +337,7 @@ export const storage = {
 } as const;
 
 function validateBlobBlockOptions(options: SandboxBlobBlockOptions): void {
-  if (options === null || typeof options !== "object") {
-    throw new Error("invalid blob block declaration: options are required");
-  }
-  if (
-    typeof options.volume !== "string"
-    || options.volume.length === 0
-    || options.volume.length > 128
-    || !/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(options.volume)
-  ) {
-    throw new Error("invalid blob block declaration: volume must be 1-128 letters, digits, '.', '_', or '-'");
-  }
+  validateBlobVolumeOptions(options, "block");
   if (
     typeof options.sizeBytes !== "bigint"
     || options.sizeBytes < 8n * 1024n * 1024n
@@ -356,12 +346,18 @@ function validateBlobBlockOptions(options: SandboxBlobBlockOptions): void {
   ) {
     throw new Error("invalid blob block declaration: sizeBytes must be a 4096-byte multiple between 8 MiB and u64::MAX");
   }
-  validateBlobBlockProvider(options.provider);
 }
 
 function validateBlobOverlayOptions(options: SandboxBlobOverlayOptions): void {
+  validateBlobVolumeOptions(options, "overlay");
+}
+
+function validateBlobVolumeOptions(
+  options: SandboxBlobOverlayOptions,
+  role: "block" | "overlay",
+): void {
   if (options === null || typeof options !== "object") {
-    throw new Error("invalid blob overlay declaration: options are required");
+    throw new Error(`invalid blob ${role} declaration: options are required`);
   }
   if (
     typeof options.volume !== "string"
@@ -369,12 +365,12 @@ function validateBlobOverlayOptions(options: SandboxBlobOverlayOptions): void {
     || options.volume.length > 128
     || !/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(options.volume)
   ) {
-    throw new Error("invalid blob overlay declaration: volume must be 1-128 letters, digits, '.', '_', or '-'");
+    throw new Error(`invalid blob ${role} declaration: volume must be 1-128 letters, digits, '.', '_', or '-'`);
   }
-  validateBlobBlockProvider(options.provider);
+  validateBlobProvider(options.provider);
 }
 
-function validateBlobBlockProvider(provider: SandboxBlobBlockProvider): void {
+function validateBlobProvider(provider: SandboxBlobStorageProvider): void {
   if (provider === null || typeof provider !== "object") {
     throw new Error("invalid blob storage declaration: provider is required");
   }
@@ -439,7 +435,7 @@ function validateBlobEndpoint(endpoint: string | undefined): void {
   }
 }
 
-function validateS3Auth(auth: Extract<SandboxBlobBlockProvider, { kind: "s3" }>["auth"]): void {
+function validateS3Auth(auth: Extract<SandboxBlobStorageProvider, { kind: "s3" }>["auth"]): void {
   if (auth === null || typeof auth !== "object") {
     throw new Error("invalid blob storage declaration: provider.auth is required");
   }
@@ -456,7 +452,7 @@ function validateS3Auth(auth: Extract<SandboxBlobBlockProvider, { kind: "s3" }>[
   }
 }
 
-function validateGcsAuth(auth: Extract<SandboxBlobBlockProvider, { kind: "gcs" }>["auth"]): void {
+function validateGcsAuth(auth: Extract<SandboxBlobStorageProvider, { kind: "gcs" }>["auth"]): void {
   if (auth === null || typeof auth !== "object") {
     throw new Error("invalid blob storage declaration: provider.auth is required");
   }
@@ -474,7 +470,7 @@ function validateGcsAuth(auth: Extract<SandboxBlobBlockProvider, { kind: "gcs" }
   }
 }
 
-function validateAzureAuth(auth: Extract<SandboxBlobBlockProvider, { kind: "azure" }>["auth"]): void {
+function validateAzureAuth(auth: Extract<SandboxBlobStorageProvider, { kind: "azure" }>["auth"]): void {
   if (auth === null || typeof auth !== "object") {
     throw new Error("invalid blob storage declaration: provider.auth is required");
   }
@@ -1622,14 +1618,14 @@ class HostBackedSandboxVm implements SandboxVm {
     } catch (error) {
       closeError ??= error;
     }
-    let lifecycleError: unknown;
+    let hostError: unknown;
     try {
       await this.#hostVm.close();
     } catch (error) {
-      lifecycleError = error;
+      hostError = error;
     }
-    if (lifecycleError !== undefined) {
-      throw lifecycleError;
+    if (hostError !== undefined) {
+      throw hostError;
     }
     if (closeError !== undefined) {
       throw closeError;

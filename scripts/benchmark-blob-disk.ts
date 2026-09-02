@@ -11,7 +11,7 @@ import {
   network,
   rootfs,
   storage,
-  type SandboxBlobBlockProvider,
+  type SandboxBlobStorageProvider,
 } from "../src/index.ts";
 import { ensureLocalSandboxHost } from "./support/local-host-artifact.ts";
 import { loadLocalImageArtifact } from "./support/local-image-artifact.ts";
@@ -19,7 +19,7 @@ import { loadLocalImageArtifact } from "./support/local-image-artifact.ts";
 type Suite = "micro" | "workload" | "all";
 
 type Config = {
-  readonly provider: SandboxBlobBlockProvider;
+  readonly provider: SandboxBlobStorageProvider;
   readonly providerLabel: string;
   readonly volume: string;
   readonly sizeMiB: number;

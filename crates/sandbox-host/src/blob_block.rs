@@ -147,7 +147,7 @@ pub struct BlobBlockVolume {
     metadata: VolumeMetadata,
     provisioned: bool,
     store: Option<Arc<PackedObjectBlockStore>>,
-    _lease: VolumeLease,
+    lease: VolumeLease,
     size: u64,
     closed: bool,
     config: BlobBlockConfig,
@@ -172,30 +172,36 @@ impl BlobBlockVolume {
         let provider = ProviderStore::build(&request.provider, &runtime)
             .map_err(|error| BlobBlockFailure::new("provider-error", error))?;
         let volume_root = Path::from(format!("volumes/{}", request.volume));
-        let lease = match provider.local_root.as_ref() {
+        let mut lease = match provider.local_root.as_ref() {
             Some(root) => VolumeLease::Local {
-                _lease: LocalLease::acquire(root, request.provider.prefix(), &request.volume)?,
+                _guard: LocalLease::acquire(root, request.provider.prefix(), &request.volume)?,
             },
-            None => VolumeLease::Object {
-                _lease: runtime.block_on(ObjectLease::acquire(
-                    runtime.clone(),
-                    provider.store.clone(),
-                    volume_root.clone().join("lease.json"),
-                    request.volume.clone(),
-                    config.clone(),
-                ))?,
-            },
+            None => VolumeLease::Object(runtime.block_on(ObjectLease::acquire(
+                runtime.clone(),
+                provider.store.clone(),
+                volume_root.clone().join("lease.json"),
+                request.volume.clone(),
+                config.clone(),
+            ))?),
         };
 
         let metadata_path = volume_root.clone().join("metadata.json");
-        let metadata = lease.metadata(&runtime, &provider.store, &metadata_path)?;
-        lease.revalidate()?;
-        let (metadata, provisioned) = match metadata {
-            Some(metadata) => {
-                metadata.validate(&request)?;
-                (metadata, true)
+        let acquisition = (|| {
+            let metadata = lease.metadata(&runtime, &provider.store, &metadata_path)?;
+            lease.revalidate()?;
+            match metadata {
+                Some(metadata) => {
+                    metadata.validate(&request)?;
+                    Ok((metadata, true))
+                }
+                None => Ok((VolumeMetadata::new(size_bytes, request.role.clone()), false)),
             }
-            None => (VolumeMetadata::new(size_bytes, request.role.clone()), false),
+        })();
+        let (metadata, provisioned) = match acquisition {
+            Ok(acquired) => acquired,
+            Err(error) => {
+                return Err(release_after_failed_acquisition(&mut lease, error));
+            }
         };
         Ok(Self {
             runtime,
@@ -205,7 +211,7 @@ impl BlobBlockVolume {
             metadata,
             provisioned,
             store: None,
-            _lease: lease,
+            lease,
             size: size_bytes,
             closed: false,
             config: config.clone(),
@@ -226,8 +232,7 @@ impl BlobBlockVolume {
 
     fn open_store(&mut self) -> Result<Arc<PackedObjectBlockStore>, BlobBlockFailure> {
         if self.store.is_none() {
-            let active_metadata = if self.provisioned && self._lease.requires_isolated_generation()
-            {
+            let active_metadata = if self.provisioned && self.lease.requires_isolated_generation() {
                 let next = self.metadata.next_generation();
                 self.runtime
                     .block_on(clone_manifest_generation(
@@ -242,7 +247,7 @@ impl BlobBlockVolume {
                             .join(next.generation.as_str()),
                     ))
                     .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
-                self._lease.revalidate()?;
+                self.lease.revalidate()?;
                 next
             } else {
                 self.metadata.clone()
@@ -300,7 +305,7 @@ impl BlobBlockVolume {
                 return Err(BlobBlockFailure::new("storage-error", error));
             }
             if !self.provisioned || active_metadata.generation != self.metadata.generation {
-                self._lease.commit_metadata(
+                self.lease.commit_metadata(
                     &self.runtime,
                     &self.provider,
                     &self.metadata_path,
@@ -309,7 +314,7 @@ impl BlobBlockVolume {
                 self.metadata = active_metadata;
                 self.provisioned = true;
             }
-            self._lease.revalidate()?;
+            self.lease.revalidate()?;
             self.store = Some(store);
         }
         Ok(self
@@ -320,7 +325,7 @@ impl BlobBlockVolume {
     }
 
     pub fn take_failure_receiver(&mut self) -> Option<mpsc::Receiver<BlobBlockFailure>> {
-        self._lease.take_failure_receiver()
+        self.lease.take_failure_receiver()
     }
 
     pub fn close(&mut self) -> Result<(), BlobBlockFailure> {
@@ -331,11 +336,18 @@ impl BlobBlockVolume {
         if let Some(store) = self.store.as_ref()
             && let Err(error) = store.close()
         {
-            self._lease.close(false)?;
+            self.lease.close(false)?;
             return Err(BlobBlockFailure::new("storage-error", error));
         }
-        self._lease.close(true)
+        self.lease.close(true)
     }
+}
+
+fn release_after_failed_acquisition(
+    lease: &mut VolumeLease,
+    acquisition_error: BlobBlockFailure,
+) -> BlobBlockFailure {
+    lease.close(true).err().unwrap_or(acquisition_error)
 }
 
 impl Drop for BlobBlockVolume {
@@ -658,8 +670,8 @@ impl ProviderStore {
 }
 
 enum VolumeLease {
-    Local { _lease: LocalLease },
-    Object { _lease: ObjectLease },
+    Local { _guard: LocalLease },
+    Object(ObjectLease),
 }
 
 impl VolumeLease {
@@ -670,7 +682,7 @@ impl VolumeLease {
     fn revalidate(&self) -> Result<(), BlobBlockFailure> {
         match self {
             Self::Local { .. } => Ok(()),
-            Self::Object { _lease } => _lease.state.failure().map_or(Ok(()), Err),
+            Self::Object(lease) => lease.state.failure().map_or(Ok(()), Err),
         }
     }
 
@@ -684,7 +696,7 @@ impl VolumeLease {
             Self::Local { .. } => runtime
                 .block_on(read_json(store, path))
                 .map_err(|error| BlobBlockFailure::new("storage-error", error)),
-            Self::Object { _lease } => runtime.block_on(_lease.state.metadata()),
+            Self::Object(lease) => runtime.block_on(lease.state.metadata()),
         }
     }
 
@@ -699,23 +711,21 @@ impl VolumeLease {
             Self::Local { .. } => runtime
                 .block_on(put_json_create(store, path, metadata))
                 .map_err(|error| BlobBlockFailure::new("storage-error", error)),
-            Self::Object { _lease } => {
-                runtime.block_on(_lease.state.commit_metadata(metadata.clone()))
-            }
+            Self::Object(lease) => runtime.block_on(lease.state.commit_metadata(metadata.clone())),
         }
     }
 
     fn take_failure_receiver(&mut self) -> Option<mpsc::Receiver<BlobBlockFailure>> {
         match self {
             Self::Local { .. } => None,
-            Self::Object { _lease } => _lease.failure_rx.take(),
+            Self::Object(lease) => lease.failure_rx.take(),
         }
     }
 
     fn close(&mut self, release: bool) -> Result<(), BlobBlockFailure> {
         match self {
             Self::Local { .. } => Ok(()),
-            Self::Object { _lease } => _lease.close(release),
+            Self::Object(lease) => lease.close(release),
         }
     }
 }
@@ -1840,7 +1850,7 @@ mod tests {
         AcquireRequest, BlobBlockConfig, BlobBlockFailure, BlobBlockVolume, BlockCache,
         BlockManifest, LeaseDocument, ObjectLease, PackedObjectBlockStore, Provider, VolumeLease,
         VolumeMetadata, VolumeRole, clone_manifest_generation, lease_is_expired,
-        lease_retry_after_ms, provider_failure,
+        lease_retry_after_ms, provider_failure, release_after_failed_acquisition,
     };
 
     const TEST_SIZE: u64 = 64 * 1024 * 1024;
@@ -1994,6 +2004,43 @@ mod tests {
     }
 
     #[test]
+    fn failed_acquisition_surfaces_lease_release_failure() {
+        let runtime = Arc::new(Runtime::new().expect("create object lease test runtime"));
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let path = ObjectPath::from("volumes/workspace/lease.json");
+        let lease = runtime
+            .block_on(ObjectLease::acquire(
+                runtime.clone(),
+                store.clone(),
+                path.clone(),
+                "workspace".to_string(),
+                config(),
+            ))
+            .expect("acquire object lease");
+
+        runtime.block_on(async {
+            let current = store.get(&path).await.expect("read current lease");
+            let version = UpdateVersion {
+                e_tag: current.meta.e_tag.clone(),
+                version: current.meta.version.clone(),
+            };
+            let payload = current.bytes().await.expect("read lease bytes");
+            store
+                .put_opts(&path, payload.into(), PutMode::Update(version).into())
+                .await
+                .expect("invalidate acquired lease version");
+        });
+
+        let mut lease = VolumeLease::Object(lease);
+        let failure = release_after_failed_acquisition(
+            &mut lease,
+            BlobBlockFailure::new("volume-mismatch", "metadata rejected"),
+        );
+        assert_eq!(failure.code, "lease-lost");
+        assert_eq!(failure.retry_after_ms, Some(30_000));
+    }
+
+    #[test]
     fn new_object_lease_uses_only_the_conditional_create() {
         let runtime = Arc::new(Runtime::new().expect("create object lease test runtime"));
         let throttled = Arc::new(ThrottledStore::new(
@@ -2126,7 +2173,7 @@ mod tests {
             config.wait_put_per_call = Duration::from_millis(500);
         });
 
-        let lease = VolumeLease::Object { _lease: lease };
+        let lease = VolumeLease::Object(lease);
         let started_at = Instant::now();
         lease.revalidate().expect("revalidate held lease");
 

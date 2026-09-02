@@ -5,7 +5,7 @@ import type {
   SandboxBlockStore,
   SandboxBlockStoreContext,
 } from "./index.ts";
-import type { HostBlobBlockOptions } from "./spawn-options.ts";
+import type { HostBlobVolumeOptions } from "./spawn-options.ts";
 
 export interface SandboxHttpRequestSelector {
   readonly origin: string;
@@ -71,7 +71,7 @@ export type InternalMount =
   | {
       readonly kind: "block-device";
       readonly path: string;
-      readonly blob: HostBlobBlockOptions;
+      readonly blob: HostBlobVolumeOptions;
     };
 
 export interface InternalSandboxOptions {
@@ -95,7 +95,7 @@ export interface InternalSandboxOptions {
           readonly kind: "blob-cow";
           readonly blockSize: number;
           readonly maxDirtyBytes: number;
-          readonly blob: Omit<HostBlobBlockOptions, "sizeBytes">;
+          readonly blob: Omit<HostBlobVolumeOptions, "sizeBytes">;
           readonly baseIdentity: string;
         }
       | {
