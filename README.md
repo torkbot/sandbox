@@ -677,26 +677,31 @@ mismatched snapshots, or migrate state.
 mutate those `Uint8Array` values after passing them to `write()`, so stores may
 retain them for delayed persistence.
 
-### `block.blob.acquire(options)`
+### `storage.blob`
 
-Acquires a single-writer logical disk backed by object storage. There is no
-separate create operation: acquiring an absent volume reserves it without
-writing disk blocks, and Sandbox provisions its sparse ext4 filesystem when it
-is first attached. Acquiring a provisioned volume requires the same explicit
-`sizeBytes`.
+Declares object-backed resources. Sandbox acquires their exclusive leases only
+while booting and owns their release when the VM closes; callers never hold a
+lease or a cleanup handle.
 
 ```ts
-const disk = await block.blob.acquire({
+const overlay = storage.blob.overlay({
   provider: {
     kind: "s3",
     bucket: "agent-disks",
     region: "us-east-1",
     auth: { kind: "environment" },
   },
+  volume: "agent-42-machine",
+});
+const disk = storage.blob.block({
+  provider: { kind: "s3", bucket: "agent-disks", region: "us-east-1", auth: { kind: "environment" } },
   volume: "agent-42-workspace",
   sizeBytes: 64n * 1024n * 1024n,
 });
 
+const sandbox = defineSandbox({
+  rootfs: rootfs.cow({ base: agentImage, writable: overlay }),
+});
 await using vm = await sandbox.boot({
   mounts: {
     "/workspace": disk,
@@ -707,19 +712,10 @@ await vm.exec("sh", ["-lc", "printf '%s' ready > state.txt"]);
 ```
 
 Mount paths do not need to exist in the rootfs. Sandbox creates them while
-booting; a read-only rootfs remains unchanged.
+booting; a read-only base remains unchanged. Overlay references store dirty
+rootfs blocks only; block references are writable sparse ext4 guest disks.
 
-`acquire()` obtains and starts renewing the exclusive writer lease before it
-returns the mountable handle. If another writer owns the volume, acquisition
-rejects and no VM is started. After `boot()` succeeds, the sandbox owns the
-device lifecycle: closing the sandbox closes the native host, waits for the
-device outcome, and releases the lease. Call the lifecycle's `close()` yourself
-only when an acquired device is never booted. `closed` resolves to
-`{ reason: "closed" }` after a clean close, or `{ reason: "failed", error }`
-after the host has failed closed. `close()` rejects with that same error when
-clean storage shutdown and lease release cannot be confirmed.
-
-Acquisition and lifecycle failures are `SandboxBlockDeviceError` instances.
+Boot and close failures are `SandboxBlobStorageError` instances.
 Their stable `code` is `volume-locked`, `volume-mismatch`, `provider-error`,
 `authentication-failed`, `lease-lost`, `lease-authentication-failed`,
 `lease-provider-error`, `storage-error`, or `host-error`.
@@ -732,7 +728,7 @@ fail-closed lease semantics. Any failed renewal immediately stops the host; a
 later writer uses a new storage generation, so the stopped writer cannot affect
 it.
 
-Blob-backed devices currently use ext4, are writable, are single-use, and are
+Blob-backed disks use ext4, are writable, and are
 limited to one per sandbox. Their mount path cannot be nested beneath another
 mount or beneath `/run/sandbox/http-ca`, though other mounts may be nested
 beneath the block device. Provider credentials remain in the native host and

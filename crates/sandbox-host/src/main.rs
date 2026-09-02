@@ -168,44 +168,45 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
     let blob_block_config = blob_block_config();
     let mut stdin = io::stdin().lock();
     let first_document = read_document_packet(&mut stdin)?;
-    let (spawn_document, mut blob_volume) =
-        if matches!(first_document.get_str("type"), Ok("host.block.acquire")) {
-            match blob_block::BlobBlockVolume::acquire(&blob_block_config, first_document) {
-                Ok(volume) => {
+    let (spawn_document, mut root_blob_volume, mut blob_volume) =
+        if matches!(first_document.get_str("type"), Ok("host.resources.acquire")) {
+            let mut root_document = first_document.get_document("rootOverlay").ok().cloned();
+            let mut block_document = first_document.get_document("blockDevice").ok().cloned();
+            if let Some(document) = root_document.as_mut() {
+                document.insert("type", "host.block.acquire");
+            }
+            if let Some(document) = block_document.as_mut() {
+                document.insert("type", "host.block.acquire");
+            }
+            let root = root_document
+                .map(|document| blob_block::BlobBlockVolume::acquire(&blob_block_config, document))
+                .transpose();
+            let block = match root {
+                Ok(root) => block_document
+                    .map(|document| blob_block::BlobBlockVolume::acquire(&blob_block_config, document))
+                    .transpose()
+                    .map(|block| (root, block)),
+                Err(error) => Err(error),
+            };
+            match block {
+                Ok((root, block)) => {
                     bridge.write_raw_packet(&encode_document_packet(&doc! {
-                        "type": "host.block.acquire.result",
-                        "ok": true,
+                        "type": "host.resources.acquire.result", "ok": true,
                     })?)?;
                     match read_document_packet(&mut stdin) {
-                        Ok(spawn_document) => (spawn_document, Some(volume)),
-                        Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
-                            let mut volume = volume;
-                            match volume.close() {
-                                Ok(()) => {
-                                    write_blob_block_closed(&bridge, None)?;
-                                    return Ok(());
-                                }
-                                Err(failure) => {
-                                    write_blob_block_closed(&bridge, Some(&failure))?;
-                                    return Err(Box::new(failure));
-                                }
-                            }
-                        }
+                        Ok(spawn_document) => (spawn_document, root, block),
                         Err(error) => return Err(Box::new(error)),
                     }
                 }
                 Err(error) => {
-                    let mut response = doc! {
-                        "type": "host.block.acquire.result",
-                        "ok": false,
-                    };
+                    let mut response = doc! { "type": "host.resources.acquire.result", "ok": false };
                     append_blob_block_failure(&mut response, &error);
                     bridge.write_raw_packet(&encode_document_packet(&response)?)?;
                     return Err(Box::new(error));
                 }
             }
         } else {
-            (first_document, None)
+            (first_document, None, None)
         };
     drop(stdin);
 
@@ -217,13 +218,11 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
         .as_mut()
         .and_then(blob_block::BlobBlockVolume::take_failure_receiver)
     {
-        let failure_bridge = bridge.clone();
         let failure_tx = bridge_tx.clone();
         thread::spawn(move || {
             let Ok(failure) = failures.recv() else {
                 return;
             };
-            let _ = write_blob_block_closed(&failure_bridge, Some(&failure));
             let _ = failure_tx.send(Err(failure.message));
             thread::sleep(BLOB_BLOCK_FAILURE_EXIT_GRACE);
             std::process::exit(1);
@@ -290,11 +289,17 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
     let services = HostServices {
         http: http_intercept_runtime(&spec, bridge.clone())?,
         network_policy: network_policy_runtime(&spec, bridge.clone()),
-        root_storage: spec
+        root_storage: match spec
             .rootfs
             .storage
             .as_ref()
-            .and_then(|storage| match storage {
+        {
+            Some(sandbox::config::RootfsStorageSpec::BlobCow { .. }) => root_blob_volume
+                .as_mut()
+                .ok_or_else(|| io::Error::other("blob root storage missing"))
+                .and_then(|volume| volume.cow_store().map_err(io::Error::other))
+                .map(Some)?,
+            Some(storage) => match storage {
                 sandbox::config::RootfsStorageSpec::CowBlockStore { block_size, .. } => {
                     Some(Arc::new(NodeCowBlockStore::new(
                         bridge.clone(),
@@ -304,7 +309,10 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 sandbox::config::RootfsStorageSpec::EphemeralCow { .. } => None,
                 sandbox::config::RootfsStorageSpec::PersistentQcow2Overlay { .. } => None,
-            }),
+                sandbox::config::RootfsStorageSpec::BlobCow { .. } => unreachable!(),
+            },
+            None => None,
+        },
         block_device: blob_volume
             .as_mut()
             .map(blob_block::BlobBlockVolume::service)
@@ -370,23 +378,13 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
     };
     drop(vm);
 
-    let lease_failure_reported = blob_volume
-        .as_ref()
-        .is_some_and(blob_block::BlobBlockVolume::failed);
-    let close_result = blob_volume.as_mut().map(blob_block::BlobBlockVolume::close);
-    if !lease_failure_reported {
-        match close_result.as_ref() {
-            Some(Err(failure)) => {
-                write_blob_block_closed(&bridge, Some(failure))?;
-            }
-            Some(Ok(())) if run_result.is_ok() => {
-                write_blob_block_closed(&bridge, None)?;
-            }
-            _ => {}
-        }
-    }
+    let root_close_result = root_blob_volume.as_mut().map(blob_block::BlobBlockVolume::close);
+    let block_close_result = blob_volume.as_mut().map(blob_block::BlobBlockVolume::close);
     run_result?;
-    if let Some(result) = close_result {
+    if let Some(result) = root_close_result {
+        result?;
+    }
+    if let Some(result) = block_close_result {
         result?;
     }
     Ok(())
@@ -398,20 +396,6 @@ fn append_blob_block_failure(document: &mut Document, failure: &blob_block::Blob
     if let Some(retry_after_ms) = failure.retry_after_ms {
         document.insert("retryAfterMs", retry_after_ms as i64);
     }
-}
-
-fn write_blob_block_closed(
-    bridge: &HostIoBridge,
-    failure: Option<&blob_block::BlobBlockFailure>,
-) -> io::Result<()> {
-    let mut document = doc! {
-        "type": "host.block.closed",
-        "reason": if failure.is_some() { "failed" } else { "closed" },
-    };
-    if let Some(failure) = failure {
-        append_blob_block_failure(&mut document, failure);
-    }
-    bridge.write_raw_packet(&encode_document_packet(&document)?)
 }
 
 fn host_stdin_closed_result(
@@ -1169,7 +1153,7 @@ fn parse_rootfs_storage(
                 base_digest: Some(document.get_str("baseDigest")?.to_string()),
             }));
         }
-        "cow-block-store" | "ephemeral-cow" => {}
+        "cow-block-store" | "ephemeral-cow" | "blob-cow" => {}
         _ => {
             return Ok(Some(RootfsStorageSpecInput {
                 kind,

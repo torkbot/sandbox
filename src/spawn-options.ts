@@ -73,7 +73,7 @@ export type HostBlobBlockProvider =
           };
     };
 
-export type HostBlobBlockAcquireOptions = {
+export type HostBlobBlockOptions = {
   readonly provider: HostBlobBlockProvider;
   readonly volume: string;
   readonly sizeBytes: bigint;
@@ -100,7 +100,7 @@ export type HostSpawnSandboxOptions = {
     readonly format: "qcow2";
     readonly storage?:
       | {
-          readonly kind: "cow-block-store" | "ephemeral-cow";
+          readonly kind: "cow-block-store" | "ephemeral-cow" | "blob-cow";
           readonly blockSize: number;
           readonly maxDirtyBytes: number;
         }

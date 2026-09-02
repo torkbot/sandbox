@@ -462,6 +462,9 @@ impl KrunContext {
                     {
                         RootfsStorageSpec::CowBlockStore {
                             max_dirty_bytes, ..
+                        }
+                        | RootfsStorageSpec::BlobCow {
+                            max_dirty_bytes, ..
                         } => {
                             let store = services.root_storage.clone().ok_or_else(|| {
                                 KrunError::new("root COW block store missing", -libc::EINVAL)

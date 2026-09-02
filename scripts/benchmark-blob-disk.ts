@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { platform } from "node:os";
@@ -7,16 +7,16 @@ import { resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 
 import {
-  block,
   defineSandbox,
   network,
   rootfs,
+  storage,
   type SandboxBlobBlockProvider,
 } from "../src/index.ts";
 import { ensureLocalSandboxHost } from "./support/local-host-artifact.ts";
 import { loadLocalImageArtifact } from "./support/local-image-artifact.ts";
 
-type Suite = "acquisition" | "micro" | "workload" | "all";
+type Suite = "micro" | "workload" | "all";
 
 type Config = {
   readonly provider: SandboxBlobBlockProvider;
@@ -63,20 +63,13 @@ await mkdir(config.output, { recursive: true });
 if (config.provider.kind === "local") {
   await mkdir(config.provider.path, { recursive: true });
 }
-if (config.suite === "acquisition") {
-  await runAcquisitionBenchmark();
-  process.exit(0);
-}
 const image = await loadLocalImageArtifact({ repoRoot, consumer: "blob disk benchmark" });
 
-const acquireStarted = performance.now();
-const disk = await block.blob.acquire({
+const disk = storage.blob.block({
   provider: config.provider,
   volume: config.volume,
   sizeBytes: BigInt(config.sizeMiB) * 1024n * 1024n,
 });
-const acquireMs = performance.now() - acquireStarted;
-
 const bootStarted = performance.now();
 const sandbox = await defineSandbox({
   rootfs: rootfs.ephemeral({
@@ -141,7 +134,7 @@ const report = {
   git: gitMetadata(hostPath),
   host: { platform: platform(), arch: process.arch, node: process.version },
   config: publicConfig(config),
-  timings: { acquireMs, bootMs, closeMs },
+  timings: { bootMs, closeMs },
   fio: fio.map(({ raw: _raw, ...result }) => result),
   fioComparisons: summarizeFio(fio),
   npm,
@@ -234,7 +227,7 @@ async function runChecked(label: string, command: string, args: readonly string[
 }
 
 function defineFioCases(input: Config): readonly FioCase[] {
-  if (input.suite === "acquisition" || input.suite === "workload") {
+  if (input.suite === "workload") {
     return [];
   }
   return [
@@ -295,8 +288,8 @@ function parseArgs(args: readonly string[]): Config {
   const providerKind = required(values, "provider");
   const volume = required(values, "volume");
   const suite = (values.get("suite") ?? "micro") as Suite;
-  if (suite !== "acquisition" && suite !== "micro" && suite !== "workload" && suite !== "all") {
-    throw new Error("--suite must be acquisition, micro, workload, or all");
+  if (suite !== "micro" && suite !== "workload" && suite !== "all") {
+    throw new Error("--suite must be micro, workload, or all");
   }
   const npmPackage = values.get("npm-package");
   if ((suite === "workload" || suite === "all") && npmPackage === undefined) {
@@ -340,60 +333,6 @@ function parseArgs(args: readonly string[]): Config {
     };
   }
   throw new Error("--provider must be local or s3");
-}
-
-async function runAcquisitionBenchmark() {
-  const observations: Array<Awaited<ReturnType<typeof acquireAndClose>>> = [];
-  for (let trial = 1; trial <= config.trials; trial += 1) {
-    const volume = `${config.volume}-a-${trial}-${randomUUID().slice(0, 8)}`;
-    if (volume.length > 128) {
-      throw new Error("--volume is too long for acquisition trial suffixes");
-    }
-    observations.push(await acquireAndClose(volume, trial, "new"));
-    observations.push(await acquireAndClose(volume, trial, "reacquire"));
-  }
-  const values = (kind: "new" | "reacquire", field: "acquireMs" | "closeMs") => observations
-    .filter((observation) => observation.kind === kind)
-    .map((observation) => observation[field]);
-  const report = {
-    schemaVersion: 1,
-    generatedAt: new Date().toISOString(),
-    git: gitMetadata(hostPath),
-    host: { platform: platform(), arch: process.arch, node: process.version },
-    config: publicConfig(config),
-    acquisition: {
-      observations,
-      summary: {
-        new: {
-          acquireMs: distribution(values("new", "acquireMs")),
-          closeMs: distribution(values("new", "closeMs")),
-        },
-        reacquire: {
-          acquireMs: distribution(values("reacquire", "acquireMs")),
-          closeMs: distribution(values("reacquire", "closeMs")),
-        },
-      },
-    },
-  };
-  await writeFile(resolve(config.output, "summary.json"), `${JSON.stringify(report, null, 2)}\n`);
-  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
-}
-
-async function acquireAndClose(volume: string, trial: number, kind: "new" | "reacquire") {
-  const acquireStarted = performance.now();
-  const device = await block.blob.acquire({
-    provider: config.provider,
-    volume,
-    sizeBytes: BigInt(config.sizeMiB) * 1024n * 1024n,
-  });
-  const acquireMs = performance.now() - acquireStarted;
-  const lifecycle = device.getLifecycle?.();
-  if (lifecycle === undefined) {
-    throw new Error("acquired blob block device did not expose lifecycle");
-  }
-  const closeStarted = performance.now();
-  await lifecycle.close();
-  return { kind, trial, acquireMs, closeMs: performance.now() - closeStarted };
 }
 
 function publicConfig(input: Config) {

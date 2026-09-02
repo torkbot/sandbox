@@ -213,6 +213,18 @@ impl BlobBlockVolume {
     }
 
     pub fn service(&mut self) -> Result<BlockDeviceService, BlobBlockFailure> {
+        let store = self.open_store(true)?;
+        Ok(BlockDeviceService {
+            storage: store,
+            size: self.size,
+        })
+    }
+
+    pub fn cow_store(&mut self) -> Result<Arc<dyn CowBlockStore>, BlobBlockFailure> {
+        Ok(self.open_store(false)?)
+    }
+
+    fn open_store(&mut self, format_ext4: bool) -> Result<Arc<PackedObjectBlockStore>, BlobBlockFailure> {
         if self.store.is_none() {
             let active_metadata = if self.provisioned && self._lease.requires_isolated_generation()
             {
@@ -269,7 +281,7 @@ impl BlobBlockVolume {
                 self.size,
                 self.config.clone(),
             ));
-            if !self.provisioned {
+            if format_ext4 && !self.provisioned {
                 if let Err(error) =
                     format_empty_ext4(store.clone(), self.size, active_metadata.fs_uuid)
                 {
@@ -293,22 +305,11 @@ impl BlobBlockVolume {
             }
             self.store = Some(store);
         }
-        Ok(BlockDeviceService {
-            storage: self
-                .store
-                .as_ref()
-                .expect("block store initialized")
-                .clone(),
-            size: self.size,
-        })
+        Ok(self.store.as_ref().expect("block store initialized").clone())
     }
 
     pub fn take_failure_receiver(&mut self) -> Option<mpsc::Receiver<BlobBlockFailure>> {
         self._lease.take_failure_receiver()
-    }
-
-    pub fn failed(&self) -> bool {
-        self._lease.failed()
     }
 
     pub fn close(&mut self) -> Result<(), BlobBlockFailure> {
@@ -691,13 +692,6 @@ impl VolumeLease {
         match self {
             Self::Local { .. } => None,
             Self::Object { _lease } => _lease.failure_rx.take(),
-        }
-    }
-
-    fn failed(&self) -> bool {
-        match self {
-            Self::Local { .. } => false,
-            Self::Object { _lease } => _lease.state.failure().is_some(),
         }
     }
 
