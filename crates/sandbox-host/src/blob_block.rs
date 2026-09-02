@@ -1122,6 +1122,7 @@ impl BlockCache {
         if let Some(removed) = self.blocks.remove(&index) {
             self.bytes = self.bytes.saturating_sub(removed.len() as u64);
         }
+        self.order.retain(|cached| *cached != index);
     }
 }
 
@@ -1787,8 +1788,8 @@ mod tests {
     use tokio::runtime::Runtime;
 
     use super::{
-        BlobBlockConfig, BlobBlockFailure, BlobBlockVolume, BlockManifest, LeaseDocument,
-        ObjectLease, PackedObjectBlockStore, VolumeLease, VolumeMetadata,
+        BlobBlockConfig, BlobBlockFailure, BlobBlockVolume, BlockCache, BlockManifest,
+        LeaseDocument, ObjectLease, PackedObjectBlockStore, VolumeLease, VolumeMetadata,
         clone_manifest_generation, lease_is_expired, lease_retry_after_ms, provider_failure,
     };
 
@@ -1796,6 +1797,18 @@ mod tests {
 
     fn config() -> BlobBlockConfig {
         crate::blob_block_config()
+    }
+
+    #[test]
+    fn removed_cache_entries_do_not_evict_reinserted_blocks() {
+        let mut cache = BlockCache::new(2);
+        cache.insert(1, vec![1]);
+        cache.remove(1);
+        cache.insert(1, vec![2]);
+        cache.insert(2, vec![3]);
+
+        assert_eq!(cache.blocks.get(&1), Some(&vec![2]));
+        assert_eq!(cache.blocks.get(&2), Some(&vec![3]));
     }
 
     struct TestDirectory(PathBuf);
