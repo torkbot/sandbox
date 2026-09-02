@@ -71,7 +71,6 @@ export type InternalMount =
   | {
       readonly kind: "block-device";
       readonly path: string;
-      readonly device: { readonly kind: "blob-block-device" };
       readonly blob: HostBlobBlockOptions;
     };
 

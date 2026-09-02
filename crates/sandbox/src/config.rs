@@ -51,10 +51,6 @@ pub enum RootfsStorageSpec {
         block_size: u64,
         max_dirty_bytes: u64,
     },
-    BlobCow {
-        block_size: u64,
-        max_dirty_bytes: u64,
-    },
     EphemeralCow {
         block_size: u64,
         max_dirty_bytes: u64,
@@ -765,13 +761,6 @@ impl RootfsStorageSpec {
             "cow-block-store" => {
                 let (block_size, max_dirty_bytes) = parse_rootfs_block_storage_limits(&input)?;
                 Self::CowBlockStore {
-                    block_size,
-                    max_dirty_bytes,
-                }
-            }
-            "blob-cow" => {
-                let (block_size, max_dirty_bytes) = parse_rootfs_block_storage_limits(&input)?;
-                Self::BlobCow {
                     block_size,
                     max_dirty_bytes,
                 }

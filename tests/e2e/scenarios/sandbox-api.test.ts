@@ -11,6 +11,7 @@ import {
   fs,
   network,
   rootfs,
+  SandboxBlobStorageError,
   storage,
   type SandboxBlockStore,
   type SandboxEnvironmentFact,
@@ -689,6 +690,12 @@ test("declarative blob storage persists an agent overlay and mounted workspace",
       "printf '%s' machine > /agent-state && printf '%s' workspace > /workspace/state && sync",
     ]);
     assert.equal(write.exitCode, 0, write.stderr);
+    await assert.rejects(sandbox.boot({ mounts: { "/workspace": workspace } }), (error) => {
+      assert.ok(error instanceof SandboxBlobStorageError);
+      assert.equal(error.code, "volume-locked");
+      assert.match(error.message, /agent-overlay is already leased/);
+      return true;
+    });
   } finally {
     await first.close();
   }
@@ -697,6 +704,37 @@ test("declarative blob storage persists an agent overlay and mounted workspace",
   const read = await second.exec("/bin/sh", ["-lc", "cat /agent-state /workspace/state"]);
   assert.equal(read.exitCode, 0, read.stderr);
   assert.equal(read.stdout, "machineworkspace");
+});
+
+test("clean blob overlay close does not keep a short-lived process alive", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const objectStore = await mkdtemp(join(tmpdir(), "sandbox-blob-close-process-"));
+  t.after(async () => {
+    await rm(objectStore, { recursive: true, force: true });
+  });
+  const moduleUrl = new URL("../../../src/index.ts", import.meta.url).href;
+  const serializedRootfs = JSON.stringify(testRootfs, (_key, value) => (
+    typeof value === "bigint" ? value.toString() : value
+  ));
+  execFileSync(process.execPath, ["--input-type=module", "--eval", `
+    const { defineSandbox, rootfs, storage } = await import(${JSON.stringify(moduleUrl)});
+    const serializedRootfs = ${serializedRootfs};
+    const base = { ...serializedRootfs, sizeBytes: BigInt(serializedRootfs.sizeBytes) };
+    const vm = await defineSandbox({
+      rootfs: rootfs.cow({
+        base,
+        writable: storage.blob.overlay({
+          provider: { kind: "local", path: ${JSON.stringify(objectStore)} },
+          volume: "agent-overlay",
+        }),
+      }),
+    }).boot();
+    await vm.close();
+  `], { timeout: 10_000 });
 });
 
 test("blob overlays reject a different rootfs base before boot", async (t) => {
@@ -726,7 +764,12 @@ test("blob overlays reject a different rootfs base before boot", async (t) => {
     defineSandbox({
       rootfs: rootfs.cow({ base: differentBase, writable: overlay }),
     }).boot(),
-    /blob rootfs overlay base identity mismatch/,
+    (error) => {
+      assert.ok(error instanceof SandboxBlobStorageError);
+      assert.equal(error.code, "volume-mismatch");
+      assert.match(error.message, /blob rootfs overlay base identity mismatch/);
+      return true;
+    },
   );
 });
 

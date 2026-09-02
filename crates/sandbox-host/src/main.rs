@@ -251,25 +251,23 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
     let services = HostServices {
         http: http_intercept_runtime(&spec, bridge.clone())?,
         network_policy: network_policy_runtime(&spec, bridge.clone()),
-        root_storage: match spec.rootfs.storage.as_ref() {
-            Some(sandbox::config::RootfsStorageSpec::BlobCow { .. }) => root_blob_volume
-                .as_mut()
-                .ok_or_else(|| io::Error::other("blob root storage missing"))
-                .and_then(|volume| volume.cow_store().map_err(io::Error::other))
-                .map(Some)?,
-            Some(storage) => match storage {
-                sandbox::config::RootfsStorageSpec::CowBlockStore { block_size, .. } => {
-                    Some(Arc::new(NodeCowBlockStore::new(
-                        bridge.clone(),
-                        *block_size,
-                        "host.block",
-                    )) as Arc<dyn CowBlockStore>)
-                }
-                sandbox::config::RootfsStorageSpec::EphemeralCow { .. } => None,
-                sandbox::config::RootfsStorageSpec::PersistentQcow2Overlay { .. } => None,
-                sandbox::config::RootfsStorageSpec::BlobCow { .. } => unreachable!(),
-            },
-            None => None,
+        root_storage: match root_blob_volume.as_mut() {
+            Some(volume) => Some(volume.cow_store().map_err(io::Error::other)?),
+            None => spec
+                .rootfs
+                .storage
+                .as_ref()
+                .and_then(|storage| match storage {
+                    sandbox::config::RootfsStorageSpec::CowBlockStore { block_size, .. } => {
+                        Some(Arc::new(NodeCowBlockStore::new(
+                            bridge.clone(),
+                            *block_size,
+                            "host.block",
+                        )) as Arc<dyn CowBlockStore>)
+                    }
+                    sandbox::config::RootfsStorageSpec::EphemeralCow { .. } => None,
+                    sandbox::config::RootfsStorageSpec::PersistentQcow2Overlay { .. } => None,
+                }),
         },
         block_device: blob_volume
             .as_mut()
@@ -1177,7 +1175,7 @@ fn parse_rootfs_storage(
                 base_digest: Some(document.get_str("baseDigest")?.to_string()),
             }));
         }
-        "cow-block-store" | "ephemeral-cow" | "blob-cow" => {}
+        "cow-block-store" | "ephemeral-cow" => {}
         _ => {
             return Ok(Some(RootfsStorageSpecInput {
                 kind,

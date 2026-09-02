@@ -338,7 +338,7 @@ export const storage = {
 
 function validateBlobBlockOptions(options: SandboxBlobBlockOptions): void {
   if (options === null || typeof options !== "object") {
-    throw new Error("invalid blob block acquisition: options are required");
+    throw new Error("invalid blob block declaration: options are required");
   }
   if (
     typeof options.volume !== "string"
@@ -346,7 +346,7 @@ function validateBlobBlockOptions(options: SandboxBlobBlockOptions): void {
     || options.volume.length > 128
     || !/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(options.volume)
   ) {
-    throw new Error("invalid blob block acquisition: volume must be 1-128 letters, digits, '.', '_', or '-'");
+    throw new Error("invalid blob block declaration: volume must be 1-128 letters, digits, '.', '_', or '-'");
   }
   if (
     typeof options.sizeBytes !== "bigint"
@@ -354,14 +354,14 @@ function validateBlobBlockOptions(options: SandboxBlobBlockOptions): void {
     || options.sizeBytes % 4096n !== 0n
     || options.sizeBytes > 18_446_744_073_709_551_615n
   ) {
-    throw new Error("invalid blob block acquisition: sizeBytes must be a 4096-byte multiple between 8 MiB and u64::MAX");
+    throw new Error("invalid blob block declaration: sizeBytes must be a 4096-byte multiple between 8 MiB and u64::MAX");
   }
   validateBlobBlockProvider(options.provider);
 }
 
 function validateBlobOverlayOptions(options: SandboxBlobOverlayOptions): void {
   if (options === null || typeof options !== "object") {
-    throw new Error("invalid blob overlay: options are required");
+    throw new Error("invalid blob overlay declaration: options are required");
   }
   if (
     typeof options.volume !== "string"
@@ -369,21 +369,21 @@ function validateBlobOverlayOptions(options: SandboxBlobOverlayOptions): void {
     || options.volume.length > 128
     || !/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(options.volume)
   ) {
-    throw new Error("invalid blob overlay: volume must be 1-128 letters, digits, '.', '_', or '-'");
+    throw new Error("invalid blob overlay declaration: volume must be 1-128 letters, digits, '.', '_', or '-'");
   }
   validateBlobBlockProvider(options.provider);
 }
 
 function validateBlobBlockProvider(provider: SandboxBlobBlockProvider): void {
   if (provider === null || typeof provider !== "object") {
-    throw new Error("invalid blob block acquisition: provider is required");
+    throw new Error("invalid blob storage declaration: provider is required");
   }
   validateBlobPrefix(provider.prefix);
   switch (provider.kind) {
     case "local":
       requireBlobString(provider.path, "provider.path");
       if (!isAbsolute(provider.path)) {
-        throw new Error("invalid blob block acquisition: provider.path must be absolute");
+        throw new Error("invalid blob storage declaration: provider.path must be absolute");
       }
       return;
     case "s3":
@@ -403,7 +403,7 @@ function validateBlobBlockProvider(provider: SandboxBlobBlockProvider): void {
       validateAzureAuth(provider.auth);
       return;
     default:
-      throw new Error("invalid blob block acquisition: unsupported provider.kind");
+      throw new Error("invalid blob storage declaration: unsupported provider.kind");
   }
 }
 
@@ -419,7 +419,7 @@ function validateBlobPrefix(prefix: string | undefined): void {
     || prefix.endsWith("/")
     || prefix.split("/").some((part) => part.length === 0 || part === "." || part === "..")
   ) {
-    throw new Error("invalid blob block acquisition: provider.prefix must be a non-empty relative object path");
+    throw new Error("invalid blob storage declaration: provider.prefix must be a non-empty relative object path");
   }
 }
 
@@ -432,22 +432,22 @@ function validateBlobEndpoint(endpoint: string | undefined): void {
   try {
     url = new URL(endpoint);
   } catch {
-    throw new Error("invalid blob block acquisition: provider.endpoint must be an HTTP(S) URL");
+    throw new Error("invalid blob storage declaration: provider.endpoint must be an HTTP(S) URL");
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error("invalid blob block acquisition: provider.endpoint must be an HTTP(S) URL");
+    throw new Error("invalid blob storage declaration: provider.endpoint must be an HTTP(S) URL");
   }
 }
 
 function validateS3Auth(auth: Extract<SandboxBlobBlockProvider, { kind: "s3" }>["auth"]): void {
   if (auth === null || typeof auth !== "object") {
-    throw new Error("invalid blob block acquisition: provider.auth is required");
+    throw new Error("invalid blob storage declaration: provider.auth is required");
   }
   if (auth.kind === "environment") {
     return;
   }
   if (auth.kind !== "access-key") {
-    throw new Error("invalid blob block acquisition: unsupported S3 auth.kind");
+    throw new Error("invalid blob storage declaration: unsupported S3 auth.kind");
   }
   requireBlobString(auth.accessKeyId, "provider.auth.accessKeyId");
   requireBlobString(auth.secretAccessKey, "provider.auth.secretAccessKey");
@@ -458,7 +458,7 @@ function validateS3Auth(auth: Extract<SandboxBlobBlockProvider, { kind: "s3" }>[
 
 function validateGcsAuth(auth: Extract<SandboxBlobBlockProvider, { kind: "gcs" }>["auth"]): void {
   if (auth === null || typeof auth !== "object") {
-    throw new Error("invalid blob block acquisition: provider.auth is required");
+    throw new Error("invalid blob storage declaration: provider.auth is required");
   }
   switch (auth.kind) {
     case "environment":
@@ -470,13 +470,13 @@ function validateGcsAuth(auth: Extract<SandboxBlobBlockProvider, { kind: "gcs" }
       requireBlobString(auth.token, "provider.auth.token");
       return;
     default:
-      throw new Error("invalid blob block acquisition: unsupported GCS auth.kind");
+      throw new Error("invalid blob storage declaration: unsupported GCS auth.kind");
   }
 }
 
 function validateAzureAuth(auth: Extract<SandboxBlobBlockProvider, { kind: "azure" }>["auth"]): void {
   if (auth === null || typeof auth !== "object") {
-    throw new Error("invalid blob block acquisition: provider.auth is required");
+    throw new Error("invalid blob storage declaration: provider.auth is required");
   }
   switch (auth.kind) {
     case "environment":
@@ -493,13 +493,13 @@ function validateAzureAuth(auth: Extract<SandboxBlobBlockProvider, { kind: "azur
       requireBlobString(auth.tenantId, "provider.auth.tenantId");
       return;
     default:
-      throw new Error("invalid blob block acquisition: unsupported Azure auth.kind");
+      throw new Error("invalid blob storage declaration: unsupported Azure auth.kind");
   }
 }
 
 function requireBlobString(value: string, field: string): void {
   if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
-    throw new Error(`invalid blob block acquisition: ${field} must be a non-empty string without NUL bytes`);
+    throw new Error(`invalid blob storage declaration: ${field} must be a non-empty string without NUL bytes`);
   }
 }
 
@@ -2001,7 +2001,6 @@ function lowerInternalMount(path: string, source: SandboxMountSource): InternalM
       return {
         kind: "block-device",
         path,
-        device: source,
         blob,
       };
     }
@@ -2745,9 +2744,6 @@ function validateSandboxBootOptions(options: SandboxBootOptions): void {
     ));
     if (parent !== undefined) {
       throw new Error(`invalid sandbox boot options: block device mount must not be nested beneath another mount: ${blockDevicePath}`);
-    }
-    if (!blobBlockDevices.has(blockDevice)) {
-      throw new Error("invalid sandbox boot options: block device must be created with storage.blob.block(...)");
     }
   }
   if (options.cwd !== undefined && !options.cwd.startsWith("/")) {

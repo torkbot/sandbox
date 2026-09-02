@@ -281,28 +281,24 @@ impl BlobBlockVolume {
                 self.size,
                 self.config.clone(),
             ));
-            if matches!(self.metadata.role, VolumeRole::GuestBlockDevice) && !self.provisioned {
-                if let Err(error) =
+            if matches!(self.metadata.role, VolumeRole::GuestBlockDevice)
+                && !self.provisioned
+                && let Err(error) =
                     format_empty_ext4(store.clone(), self.size, active_metadata.fs_uuid)
-                {
-                    return Err(BlobBlockFailure::new("storage-error", error));
-                }
+            {
+                return Err(BlobBlockFailure::new("storage-error", error));
             }
             if !self.provisioned || active_metadata.generation != self.metadata.generation {
-                if let Err(error) = self._lease.commit_metadata(
+                self._lease.commit_metadata(
                     &self.runtime,
                     &self.provider,
                     &self.metadata_path,
                     &active_metadata,
-                ) {
-                    return Err(error);
-                }
+                )?;
                 self.metadata = active_metadata;
                 self.provisioned = true;
             }
-            if let Err(error) = self._lease.revalidate() {
-                return Err(error);
-            }
+            self._lease.revalidate()?;
             self.store = Some(store);
         }
         Ok(self

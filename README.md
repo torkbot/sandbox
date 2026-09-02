@@ -714,6 +714,9 @@ await vm.exec("sh", ["-lc", "printf '%s' ready > state.txt"]);
 Mount paths do not need to exist in the rootfs. Sandbox creates them while
 booting; a read-only base remains unchanged. Overlay references store dirty
 rootfs blocks only; block references are writable sparse ext4 guest disks.
+Each volume is bound on first use to its role, and overlays are also bound to
+their base image. Reusing a volume across roles or base images fails with
+`volume-mismatch` before the VM boots.
 
 Boot and close failures are `SandboxBlobStorageError` instances.
 Their stable `code` is `volume-locked`, `volume-mismatch`, `provider-error`,
@@ -750,8 +753,10 @@ tokens are not refreshed by Sandbox.
 Writes are durable after a successful filesystem flush or clean device close.
 An abnormal close may lose writes that the guest had not flushed.
 
-The packed-object layout does not read volumes created by the earlier SlateDB
-backend; use a new volume or provider prefix when upgrading those disks.
+The role-tagged metadata is a hard format break: volumes created through the
+earlier acquisition API are intentionally not inferred or migrated. The
+packed-object layout also does not read volumes created by the earlier SlateDB
+backend. Use a new volume or provider prefix for either format.
 Automatic garbage collection is not yet provided, so failed or superseded
 uploads may leave unreachable objects in the provider.
 

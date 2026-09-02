@@ -111,7 +111,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
         this.#exitError = new Error(`sandbox-host stdin failed: ${error.message}`);
       }
     });
-    child.on("exit", (code, signal) => {
+    child.on("close", (code, signal) => {
       this.#resolveClosed();
       if (this.#closed) {
         return;
@@ -288,14 +288,12 @@ export class HostProcessSandboxVm implements HostControlChannel {
     this.#closed = true;
     this.#packets.close();
     this.#packetActivity.close();
-    const exited = this.#child.exitCode !== null || this.#child.signalCode !== null
-      ? Promise.resolve()
-      : once(this.#child, "exit").then(() => undefined);
+    const closed = this.closed;
 
     this.#child.stdin.end();
     await Promise.race([
-      exited,
-      delay(this.#blobResourceCount * BLOB_BLOCK_CLOSE_GRACE_MS || 500),
+      closed,
+      unrefDelay(this.#blobResourceCount * BLOB_BLOCK_CLOSE_GRACE_MS || 500),
     ]);
     if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
       if (this.#child.exitCode !== 0) {
@@ -309,14 +307,14 @@ export class HostProcessSandboxVm implements HostControlChannel {
 
     this.#child.kill("SIGTERM");
     await Promise.race([
-      exited,
-      delay(500),
+      closed,
+      unrefDelay(500),
     ]);
     if (this.#child.exitCode === null && this.#child.signalCode === null) {
       this.#child.kill("SIGKILL");
       await Promise.race([
-        exited,
-        delay(1_000),
+        closed,
+        unrefDelay(1_000),
       ]);
     }
     throw new SandboxBlobStorageError(
@@ -327,15 +325,15 @@ export class HostProcessSandboxVm implements HostControlChannel {
 
   async #closeFailedResourceAcquisition(): Promise<void> {
     const closing = this.close();
-    await Promise.race([closing, delay(2_000)]);
+    await Promise.race([closing, unrefDelay(2_000)]);
     if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
       return;
     }
     this.#child.kill("SIGTERM");
-    await Promise.race([closing, delay(500)]);
+    await Promise.race([closing, unrefDelay(500)]);
     if (this.#child.exitCode === null && this.#child.signalCode === null) {
       this.#child.kill("SIGKILL");
-      await Promise.race([closing, delay(1_000)]);
+      await Promise.race([closing, unrefDelay(1_000)]);
     }
   }
 
@@ -345,18 +343,18 @@ export class HostProcessSandboxVm implements HostControlChannel {
       return;
     }
 
-    const exited = once(this.#child, "exit").then(() => undefined);
+    const closed = this.closed;
     this.#child.kill("SIGTERM");
     await Promise.race([
-      exited,
-      delay(1_000),
+      closed,
+      unrefDelay(1_000),
     ]);
     if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
       return;
     }
 
     this.#child.kill("SIGKILL");
-    await exited;
+    await closed;
   }
 
   #assertOpen(): void {
@@ -467,6 +465,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
         typeof document.error === "string" ? document.error : "sandbox-host blob storage failed",
         parseRetryAfterMs(document.retryAfterMs),
       );
+      this.#launchReady.close(this.#blobFailure);
       return true;
     }
     if (type === "init.failed") {
@@ -1153,7 +1152,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
     const timeoutMs = launchTimeoutMs();
     await Promise.race([
       this.#launchReady.wait(),
-      once(this.#child, "exit").then(() => {
+      this.closed.then(() => {
         throw this.#exitError ?? new Error("sandbox-host exited before VM launch completed");
       }),
       unrefDelay(timeoutMs).then(() => {
@@ -1518,10 +1517,6 @@ function assertPosixFileSystem(
   return candidate as SandboxPosixFileSystem;
 }
 
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
-}
-
 function unrefDelay(milliseconds: number): Promise<void> {
   return new Promise((resolvePromise) => {
     const timeout = setTimeout(resolvePromise, milliseconds);
@@ -1667,7 +1662,9 @@ function encodeHostSpawn(
         baseDigest: options.rootfs.storage.baseDigest,
       }
       : {
-        kind: options.rootfs.storage.kind,
+        kind: options.rootfs.storage.kind === "blob-cow"
+          ? "cow-block-store"
+          : options.rootfs.storage.kind,
         blockSize: options.rootfs.storage.blockSize,
         maxDirtyBytes: options.rootfs.storage.maxDirtyBytes,
       };
