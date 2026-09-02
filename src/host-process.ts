@@ -291,10 +291,13 @@ export class HostProcessSandboxVm implements HostControlChannel {
     ]);
     if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
       if (this.#child.exitCode !== 0) {
-        throw this.#blobFailure ?? new SandboxBlobStorageError("host-error", hostExitMessage(
+        const error = hostExitMessage(
           `sandbox-host exited with ${this.#child.exitCode ?? "unknown status"}`,
           this.#stderr,
-        ));
+        );
+        throw this.#blobFailure ?? (this.#blobResourceCount > 0
+          ? new SandboxBlobStorageError("host-error", error)
+          : new Error(error));
       }
       return;
     }

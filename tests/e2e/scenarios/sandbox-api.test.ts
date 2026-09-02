@@ -77,6 +77,26 @@ test("new public API boots an external rootfs image and runs a process", async (
   assert.equal(result.stderr, "");
 });
 
+test("non-blob host failures remain generic lifecycle errors", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const sandbox = await defineSandbox({ rootfs: testRootfs }).boot();
+  const diagnostics = (sandbox as {
+    readonly diagnostics?: { terminateHostForTest(): Promise<void> };
+  }).diagnostics;
+  assert.ok(diagnostics);
+  await diagnostics.terminateHostForTest();
+  await assert.rejects(sandbox.close(), (error) => {
+    assert.ok(error instanceof Error);
+    assert.ok(!(error instanceof SandboxBlobStorageError));
+    assert.match(error.message, /sandbox-host exited/);
+    return true;
+  });
+});
+
 test("boot configures the default guest hostname", async (t) => {
   const testRootfs = await testRootfsForVmTest(t);
   if (testRootfs === undefined) {
