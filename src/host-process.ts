@@ -143,13 +143,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
         networkConnectionHook,
       );
     } catch (error) {
-      try {
-        await vm.#closeFailedResourceAcquisition();
-      } catch (cleanupError) {
-        if (error instanceof Error && error.cause === undefined) {
-          error.cause = cleanupError;
-        }
-      }
+      await cleanupAfterFailure(error, () => vm.#closeFailedResourceAcquisition());
       throw error;
     }
   }
@@ -171,7 +165,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
       ]);
       return vm;
     } catch (error) {
-      await vm?.close();
+      await cleanupAfterFailure(error, async () => vm?.close());
       const signingError = macosHostSigningError(hostPath);
       if (signingError !== null) {
         throw signingError;
@@ -259,7 +253,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
       await host.close();
       return output;
     } catch (error) {
-      await host.close();
+      await cleanupAfterFailure(error, () => host.close());
       const signingError = macosHostSigningError(hostPath);
       if (signingError !== null) {
         throw signingError;
@@ -1739,6 +1733,19 @@ function parseBlobStorageErrorCode(value: unknown): SandboxBlobStorageErrorCode 
       return value;
     default:
       return "host-error";
+  }
+}
+
+async function cleanupAfterFailure(
+  error: unknown,
+  cleanup: () => Promise<void> | void,
+): Promise<void> {
+  try {
+    await cleanup();
+  } catch (cleanupError) {
+    if (error instanceof Error && error.cause === undefined) {
+      error.cause = cleanupError;
+    }
   }
 }
 

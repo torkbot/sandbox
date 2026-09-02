@@ -272,6 +272,17 @@ impl BlobBlockVolume {
             manifest
                 .validate(self.size, self.config.pack_bytes)
                 .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
+            if !self.provisioned
+                && matches!(self.metadata.role, VolumeRole::RootfsCowOverlay { .. })
+            {
+                self.runtime
+                    .block_on(put_json_create(
+                        &self.provider,
+                        &generation_root.clone().join("manifest.json"),
+                        &manifest,
+                    ))
+                    .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
+            }
             let store = Arc::new(PackedObjectBlockStore::new(
                 self.runtime.clone(),
                 self.provider.clone(),

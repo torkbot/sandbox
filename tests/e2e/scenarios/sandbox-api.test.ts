@@ -751,6 +751,14 @@ test("blob overlays reject a different rootfs base before boot", async (t) => {
     provider: { kind: "local", path: objectStore },
     volume: "agent-overlay",
   });
+  await assert.rejects(
+    defineSandbox({
+      rootfs: rootfs.cow({
+        base: { ...testRootfs, path: join(objectStore, "missing.qcow2") },
+        writable: overlay,
+      }),
+    }).boot(),
+  );
   const first = await defineSandbox({
     rootfs: rootfs.cow({ base: testRootfs, writable: overlay }),
   }).boot();
