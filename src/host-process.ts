@@ -93,6 +93,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
   #exitError: Error | null = null;
   #stdinError: Error | null = null;
   #blobResourceCount = 0;
+  #blobResourcesAcquired = false;
   #blobFailure: SandboxBlobStorageError | null = null;
   #closePromise?: Promise<void>;
 
@@ -176,7 +177,7 @@ export class HostProcessSandboxVm implements HostControlChannel {
     } catch (error) {
       await cleanupAfterFailure(error, async () => {
         if (vm !== undefined) {
-          await vm.#beginClose(FAILED_LAUNCH_CLOSE_GRACE_MS);
+          await vm.#beginClose(vm.#closeGraceMs(FAILED_LAUNCH_CLOSE_GRACE_MS));
         }
       });
       const signingError = macosHostSigningError(hostPath);
@@ -269,7 +270,13 @@ export class HostProcessSandboxVm implements HostControlChannel {
   }
 
   close(): Promise<void> {
-    return this.#beginClose(this.#blobResourceCount * BLOB_BLOCK_CLOSE_GRACE_MS || 500);
+    return this.#beginClose(this.#closeGraceMs(500));
+  }
+
+  #closeGraceMs(fallback: number): number {
+    return this.#blobResourcesAcquired
+      ? this.#blobResourceCount * BLOB_BLOCK_CLOSE_GRACE_MS
+      : fallback;
   }
 
   #beginClose(graceMs: number): Promise<void> {
@@ -419,6 +426,10 @@ export class HostProcessSandboxVm implements HostControlChannel {
     }
 
     const type = document.type;
+    if (type === "host.resources.acquired") {
+      this.#blobResourcesAcquired = true;
+      return true;
+    }
     if (type === "host.resources.failure") {
       this.#blobFailure = new SandboxBlobStorageError(
         parseBlobStorageErrorCode(document.code),

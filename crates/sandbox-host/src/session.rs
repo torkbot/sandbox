@@ -83,6 +83,16 @@ impl BlobResources {
             .collect()
     }
 
+    fn report_acquired(&self) {
+        if (self.root.is_some() || self.block.is_some())
+            && let Ok(packet) = crate::encode_document_packet(&doc! {
+                "type": "host.resources.acquired",
+            })
+        {
+            let _ = self.bridge.write_raw_packet(&packet);
+        }
+    }
+
     fn close(&mut self) -> Result<(), BlobBlockFailure> {
         let root = self.root.as_mut().map(BlobBlockVolume::close);
         let block = self.block.as_mut().map(BlobBlockVolume::close);
@@ -104,6 +114,7 @@ pub fn with_blob_resources<T>(
             report_blob_failure(&bridge, &failure);
             Box::new(failure) as Box<dyn std::error::Error>
         })?;
+    resources.report_acquired();
     let result = operation(&mut resources);
     let close_result = resources.close();
     if let Err(failure) = &close_result {
