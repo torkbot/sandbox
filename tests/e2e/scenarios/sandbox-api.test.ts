@@ -1,18 +1,18 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, lstat, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import {
-  block,
   defineSandbox,
   fs,
   network,
   rootfs,
-  SandboxBlockDeviceError,
+  SandboxBlobStorageError,
+  storage,
   type SandboxBlockStore,
   type SandboxEnvironmentFact,
   type RootfsImageConfig,
@@ -75,6 +75,26 @@ test("new public API boots an external rootfs image and runs a process", async (
   );
   assert.equal(result.stdout, "ready");
   assert.equal(result.stderr, "");
+});
+
+test("non-blob host failures remain generic lifecycle errors", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const sandbox = await defineSandbox({ rootfs: testRootfs }).boot();
+  const diagnostics = (sandbox as {
+    readonly diagnostics?: { hostPid(): number };
+  }).diagnostics;
+  assert.ok(diagnostics);
+  process.kill(diagnostics.hostPid(), "SIGSTOP");
+  await assert.rejects(sandbox.close(), (error) => {
+    assert.ok(error instanceof Error);
+    assert.ok(!(error instanceof SandboxBlobStorageError));
+    assert.match(error.message, /sandbox-host did not close/);
+    return true;
+  });
 });
 
 test("boot configures the default guest hostname", async (t) => {
@@ -660,162 +680,174 @@ test("boot options provide instance-specific virtual mounts", async (t) => {
   assert.equal(result.stdout, "lane-private");
 });
 
-test("sandbox owns an attached blob block device lifecycle", async (t) => {
+test("declarative blob storage persists an agent overlay and mounted workspace", async (t) => {
   const testRootfs = await testRootfsForVmTest(t);
   if (testRootfs === undefined) {
     return;
   }
 
-  const objectStore = await mkdtemp(join(tmpdir(), "sandbox-blob-block-"));
+  const objectStore = await mkdtemp(join(tmpdir(), "sandbox-declarative-blob-"));
   t.after(async () => {
     await rm(objectStore, { recursive: true, force: true });
   });
-  const acquisition = {
-    provider: {
-      kind: "local" as const,
-      path: objectStore,
-    },
-    volume: "workspace",
-    sizeBytes: 64n * 1024n * 1024n,
-  };
-
-  const unusedDisk = await block.blob.acquire(acquisition);
-  const unusedLifecycle = unusedDisk.getLifecycle?.();
-  assert.ok(unusedLifecycle);
-  assert.equal(unusedDisk.getLifecycle?.(), unusedLifecycle);
-  await Promise.all([unusedLifecycle.close(), unusedLifecycle.close()]);
-  assert.deepEqual(await unusedLifecycle.closed, { reason: "closed" });
-
-  const firstDisk = await block.blob.acquire(acquisition);
-  await assert.rejects(block.blob.acquire(acquisition), (error) => {
-    assert.ok(error instanceof SandboxBlockDeviceError);
-    assert.equal(error.code, "volume-locked");
-    assert.match(error.message, /block volume workspace is already leased/);
-    return true;
-  });
-
-  const first = await defineSandbox({
-    rootfs: testRootfs,
-    network: network.policy((conn) => {
-      conn.accept();
+  const provider = { kind: "local" as const, path: objectStore };
+  const sandbox = defineSandbox({
+    rootfs: rootfs.cow({
+      base: testRootfs,
+      writable: storage.blob.overlay({ provider, volume: "agent-overlay" }),
     }),
-  }).boot({
-    mounts: {
-      "/run/sandbox/http-ca": firstDisk,
-    },
   });
+  const workspace = storage.blob.block({
+    provider,
+    volume: "agent-workspace",
+    sizeBytes: 64n * 1024n * 1024n,
+  });
+
+  const first = await sandbox.boot({ mounts: { "/workspace": workspace } });
   try {
     const write = await first.exec("/bin/sh", [
       "-lc",
-      "printf '%s' persisted > /run/sandbox/http-ca/state.txt && sync",
+      "printf '%s' machine > /agent-state && printf '%s' workspace > /workspace/state && sync",
     ]);
     assert.equal(write.exitCode, 0, write.stderr);
+    await assert.rejects(sandbox.boot({ mounts: { "/workspace": workspace } }), (error) => {
+      assert.ok(error instanceof SandboxBlobStorageError);
+      assert.equal(error.code, "volume-locked");
+      assert.match(error.message, /agent-overlay is already leased/);
+      return true;
+    });
   } finally {
     await first.close();
   }
 
-  const secondDisk = await block.blob.acquire(acquisition);
-  const second = await defineSandbox({ rootfs: testRootfs }).boot({
-    mounts: {
-      "/workspace": secondDisk,
-    },
-  });
-  try {
-    const read = await second.exec("/bin/cat", ["/workspace/state.txt"]);
-    assert.equal(read.exitCode, 0, read.stderr);
-    assert.equal(read.stdout, "persisted");
-  } finally {
-    await second.close();
+  await using second = await sandbox.boot({ mounts: { "/workspace": workspace } });
+  const read = await second.exec("/bin/sh", ["-lc", "cat /agent-state /workspace/state"]);
+  assert.equal(read.exitCode, 0, read.stderr);
+  assert.equal(read.stdout, "machineworkspace");
+});
+
+test("clean blob overlay close does not keep a short-lived process alive", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
   }
 
-  const failedBootAcquisition = { ...acquisition, volume: "failed-boot" };
-  const failedBootDisk = await block.blob.acquire(failedBootAcquisition);
+  const objectStore = await mkdtemp(join(tmpdir(), "sandbox-blob-close-process-"));
+  t.after(async () => {
+    await rm(objectStore, { recursive: true, force: true });
+  });
+  const moduleUrl = new URL("../../../src/index.ts", import.meta.url).href;
+  const serializedRootfs = JSON.stringify(testRootfs, (_key, value) => (
+    typeof value === "bigint" ? value.toString() : value
+  ));
+  execFileSync(process.execPath, ["--input-type=module", "--eval", `
+    const { defineSandbox, rootfs, storage } = await import(${JSON.stringify(moduleUrl)});
+    const serializedRootfs = ${serializedRootfs};
+    const base = { ...serializedRootfs, sizeBytes: BigInt(serializedRootfs.sizeBytes) };
+    const vm = await defineSandbox({
+      rootfs: rootfs.cow({
+        base,
+        writable: storage.blob.overlay({
+          provider: { kind: "local", path: ${JSON.stringify(objectStore)} },
+          volume: "agent-overlay",
+        }),
+      }),
+    }).boot();
+    await vm.close();
+  `], { timeout: 10_000 });
+});
+
+test("blob overlays reject a different rootfs base before boot", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const objectStore = await mkdtemp(join(tmpdir(), "sandbox-blob-overlay-base-"));
+  t.after(async () => {
+    await rm(objectStore, { recursive: true, force: true });
+  });
+  const overlay = storage.blob.overlay({
+    provider: { kind: "local", path: objectStore },
+    volume: "agent-overlay",
+  });
   await assert.rejects(
     defineSandbox({
-      rootfs: { ...testRootfs, path: join(objectStore, "missing.qcow2") },
-    }).boot({
-      mounts: {
-        "/workspace": failedBootDisk,
-      },
-    }),
+      rootfs: rootfs.cow({
+        base: { ...testRootfs, path: join(objectStore, "missing.qcow2") },
+        writable: overlay,
+      }),
+    }).boot(),
+  );
+  const first = await defineSandbox({
+    rootfs: rootfs.cow({ base: testRootfs, writable: overlay }),
+  }).boot();
+  await first.close();
+
+  const differentBase = {
+    ...testRootfs,
+    digest: `sha256:${"0".repeat(64)}` as `sha256:${string}`,
+  };
+  await assert.rejects(
+    defineSandbox({
+      rootfs: rootfs.cow({ base: differentBase, writable: overlay }),
+    }).boot(),
     (error) => {
-      assert.ok(error instanceof Error);
-      assert.ok(!(error instanceof SandboxBlockDeviceError));
-      assert.match(error.message, /rootfs|qcow2|No such file/i);
-      assert.ok(error.cause instanceof SandboxBlockDeviceError);
-      assert.equal(error.cause.code, "host-error");
+      assert.ok(error instanceof SandboxBlobStorageError);
+      assert.equal(error.code, "volume-mismatch");
+      assert.match(error.message, /blob rootfs overlay base identity mismatch/);
       return true;
     },
   );
-  const reacquiredAfterFailedBoot = await block.blob.acquire(failedBootAcquisition);
-  const reacquiredLifecycle = reacquiredAfterFailedBoot.getLifecycle?.();
-  assert.ok(reacquiredLifecycle);
-  await reacquiredLifecycle.close();
-
-  const failedDisk = await block.blob.acquire({ ...acquisition, volume: "failed-host" });
-  const failed = await defineSandbox({ rootfs: testRootfs }).boot({
-    mounts: {
-      "/workspace": failedDisk,
-    },
-  });
-  const diagnostics = Reflect.get(failed, "diagnostics");
-  assert.ok(diagnostics);
-  const terminateHostForTest = Reflect.get(diagnostics, "terminateHostForTest");
-  assert.equal(typeof terminateHostForTest, "function");
-  await terminateHostForTest();
-  const assertHostFailure = (error: unknown) => {
-    assert.ok(error instanceof SandboxBlockDeviceError);
-    assert.equal(error.code, "host-error");
-    return true;
-  };
-  await assert.rejects(failed.close(), assertHostFailure);
-  await assert.rejects(failed.close(), assertHostFailure);
 });
 
-test("blob block mounts create absent guest directories without changing the rootfs", async (t) => {
+test("blob volumes reject being reused across overlay and disk roles", async (t) => {
   const testRootfs = await testRootfsForVmTest(t);
   if (testRootfs === undefined) {
     return;
   }
 
-  const objectStore = await mkdtemp(join(tmpdir(), "sandbox-blob-mount-point-"));
+  const objectStore = await mkdtemp(join(tmpdir(), "sandbox-blob-volume-role-"));
   t.after(async () => {
     await rm(objectStore, { recursive: true, force: true });
   });
-  const acquisition = {
-    provider: { kind: "local" as const, path: objectStore },
-    volume: "agent-state",
+  const provider = { kind: "local" as const, path: objectStore };
+  const disk = storage.blob.block({
+    provider,
+    volume: "workspace-first",
     sizeBytes: 64n * 1024n * 1024n,
-  };
-
-  const firstDisk = await block.blob.acquire(acquisition);
-  const first = await defineSandbox({ rootfs: testRootfs }).boot({
-    mounts: { "/agent-state": firstDisk },
   });
-  try {
-    const write = await first.exec("/bin/sh", [
-      "-lc",
-      "printf '%s' persisted > /agent-state/value && sync",
-    ]);
-    assert.equal(write.exitCode, 0, write.stderr);
-  } finally {
-    await first.close();
-  }
-
-  await using rootfsOnly = await defineSandbox({ rootfs: testRootfs }).boot();
-  const absent = await rootfsOnly.exec("/bin/sh", ["-lc", "test ! -e /agent-state"]);
-  assert.equal(absent.exitCode, 0, absent.stderr);
-
-  const secondDisk = await block.blob.acquire(acquisition);
-  await using second = await defineSandbox({ rootfs: testRootfs }).boot({
-    mounts: { "/agent-state": secondDisk },
+  const firstDisk = await defineSandbox({ rootfs: testRootfs }).boot({
+    mounts: { "/workspace": disk },
   });
-  const read = await second.exec("/bin/cat", ["/agent-state/value"]);
-  assert.equal(read.exitCode, 0, read.stderr);
-  assert.equal(read.stdout, "persisted");
+  await firstDisk.close();
+  const diskThenOverlay = storage.blob.overlay({ provider, volume: "workspace-first" });
+  await assert.rejects(
+    defineSandbox({
+      rootfs: rootfs.cow({ base: testRootfs, writable: diskThenOverlay }),
+    }).boot(),
+    /blob volume role mismatch: stored guest-block-device, requested rootfs-cow-overlay/,
+  );
+
+  const overlay = storage.blob.overlay({ provider, volume: "overlay-first" });
+  const firstOverlay = await defineSandbox({
+    rootfs: rootfs.cow({ base: testRootfs, writable: overlay }),
+  }).boot();
+  await firstOverlay.close();
+  const overlayThenDisk = storage.blob.block({
+    provider,
+    volume: "overlay-first",
+    sizeBytes: 64n * 1024n * 1024n,
+  });
+  await assert.rejects(
+    defineSandbox({ rootfs: testRootfs }).boot({
+      mounts: { "/workspace": overlayThenDisk },
+    }),
+    /blob volume role mismatch: stored rootfs-cow-overlay, requested guest-block-device/,
+  );
 });
 
-test("blob block boot reports mount preparation failures and releases the lease", async (t) => {
+test("failed declarative blob mount boot releases its lease", async (t) => {
   const testRootfs = await testRootfsForVmTest(t);
   if (testRootfs === undefined) {
     return;
@@ -825,13 +857,11 @@ test("blob block boot reports mount preparation failures and releases the lease"
   t.after(async () => {
     await rm(objectStore, { recursive: true, force: true });
   });
-  const acquisition = {
+  const disk = storage.blob.block({
     provider: { kind: "local" as const, path: objectStore },
     volume: "agent-state",
     sizeBytes: 64n * 1024n * 1024n,
-  };
-
-  const disk = await block.blob.acquire(acquisition);
+  });
   await assert.rejects(
     defineSandbox({ rootfs: testRootfs }).boot({
       mounts: { "/etc/hostname": disk },
@@ -839,12 +869,92 @@ test("blob block boot reports mount preparation failures and releases the lease"
     /guest mount point is not a directory: \/etc\/hostname/,
   );
 
-  const reacquired = await block.blob.acquire(acquisition);
-  await reacquired.getLifecycle?.().close();
+  await using retry = await defineSandbox({ rootfs: testRootfs }).boot({
+    mounts: { "/workspace": disk },
+  });
+  const result = await retry.exec("/bin/sh", ["-lc", "test -d /workspace"]);
+  assert.equal(result.exitCode, 0, result.stderr);
 });
 
-test("timed out blob block acquisition terminates a stuck host", async (t) => {
-  if (!requireHostArtifact(t)) {
+test("failed second blob acquisition releases the acquired overlay", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const objectStore = await mkdtemp(join(tmpdir(), "sandbox-blob-partial-acquire-"));
+  t.after(async () => {
+    await rm(objectStore, { recursive: true, force: true });
+  });
+  const provider = { kind: "local" as const, path: objectStore };
+  const wrongRole = storage.blob.overlay({ provider, volume: "wrong-role" });
+  const seed = await defineSandbox({
+    rootfs: rootfs.cow({ base: testRootfs, writable: wrongRole }),
+  }).boot();
+  await seed.close();
+
+  const overlay = storage.blob.overlay({ provider, volume: "agent-overlay" });
+  const invalidDisk = storage.blob.block({
+    provider,
+    volume: "wrong-role",
+    sizeBytes: 64n * 1024n * 1024n,
+  });
+  const sandbox = defineSandbox({
+    rootfs: rootfs.cow({ base: testRootfs, writable: overlay }),
+  });
+  await assert.rejects(
+    sandbox.boot({ mounts: { "/workspace": invalidDisk } }),
+    /blob volume role mismatch/,
+  );
+
+  await using retry = await sandbox.boot();
+  const result = await retry.exec("/bin/true");
+  assert.equal(result.exitCode, 0, result.stderr);
+});
+
+test("blob store opening failures preserve their public error code", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const objectStore = await mkdtemp(join(tmpdir(), "sandbox-blob-open-error-"));
+  t.after(async () => {
+    await rm(objectStore, { recursive: true, force: true });
+  });
+  const disk = storage.blob.block({
+    provider: { kind: "local" as const, path: objectStore },
+    volume: "agent-state",
+    sizeBytes: 64n * 1024n * 1024n,
+  });
+  const first = await defineSandbox({ rootfs: testRootfs }).boot({
+    mounts: { "/workspace": disk },
+  });
+  await first.close();
+
+  const metadata = JSON.parse(
+    await readFile(join(objectStore, "volumes", "agent-state", "metadata.json"), "utf8"),
+  ) as { generation: string };
+  await unlink(
+    join(objectStore, "volumes", "agent-state", "data", metadata.generation, "manifest.json"),
+  );
+
+  await assert.rejects(
+    defineSandbox({ rootfs: testRootfs }).boot({
+      mounts: { "/workspace": disk },
+    }),
+    (error) => {
+      assert.ok(error instanceof SandboxBlobStorageError);
+      assert.equal(error.code, "storage-error");
+      assert.match(error.message, /missing blob block manifest for provisioned volume/);
+      return true;
+    },
+  );
+});
+
+test("timed out declarative blob boot terminates a stuck host", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
     return;
   }
 
@@ -859,24 +969,34 @@ test("timed out blob block acquisition terminates a stuck host", async (t) => {
   const priorTimeout = process.env.SANDBOX_LAUNCH_TIMEOUT_MS;
   process.env.SANDBOX_LAUNCH_TIMEOUT_MS = "100";
   const startedAt = performance.now();
+  let cleanupError: unknown;
   try {
     await assert.rejects(
-      block.blob.acquire({
-        provider: {
-          kind: "s3",
-          bucket: "agent-disks",
-          region: "us-east-1",
-          endpoint: `http://127.0.0.1:${address.port}`,
-          auth: {
-            kind: "access-key",
-            accessKeyId: "test",
-            secretAccessKey: "test",
-          },
+      defineSandbox({ rootfs: testRootfs }).boot({
+        mounts: {
+          "/workspace": storage.blob.block({
+            provider: {
+              kind: "s3",
+              bucket: "agent-disks",
+              region: "us-east-1",
+              endpoint: `http://127.0.0.1:${address.port}`,
+              auth: {
+                kind: "access-key",
+                accessKeyId: "test",
+                secretAccessKey: "test",
+              },
+            },
+            volume: "stuck-acquisition",
+            sizeBytes: 64n * 1024n * 1024n,
+          }),
         },
-        volume: "stuck-acquisition",
-        sizeBytes: 64n * 1024n * 1024n,
       }),
-      /sandbox-host did not respond before the launch timeout/,
+      (error) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /sandbox-host did not produce a launch acknowledgement within 100ms/);
+        cleanupError = error.cause;
+        return true;
+      },
     );
   } finally {
     if (priorTimeout === undefined) {
@@ -885,7 +1005,82 @@ test("timed out blob block acquisition terminates a stuck host", async (t) => {
       process.env.SANDBOX_LAUNCH_TIMEOUT_MS = priorTimeout;
     }
   }
-  assert.ok(performance.now() - startedAt < 4_000);
+  assert.ok(performance.now() - startedAt < 8_000);
+  assert.ok(cleanupError instanceof SandboxBlobStorageError);
+  assert.equal(cleanupError.code, "lease-provider-error");
+  assert.match(cleanupError.message, /acquisition request timed out/);
+});
+
+test("timed out second blob acquisition releases the acquired overlay", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const objectStore = await mkdtemp(join(tmpdir(), "sandbox-blob-partial-timeout-"));
+  t.after(async () => {
+    await rm(objectStore, { recursive: true, force: true });
+  });
+  const server = createServer(() => {});
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  const address = server.address();
+  assert.ok(address !== null && typeof address !== "string");
+  const overlay = storage.blob.overlay({
+    provider: { kind: "local", path: objectStore },
+    volume: "agent-overlay",
+  });
+  const sandbox = defineSandbox({
+    rootfs: rootfs.cow({ base: testRootfs, writable: overlay }),
+  });
+  const priorTimeout = process.env.SANDBOX_LAUNCH_TIMEOUT_MS;
+  process.env.SANDBOX_LAUNCH_TIMEOUT_MS = "2000";
+  let cleanupError: unknown;
+  try {
+    await assert.rejects(
+      sandbox.boot({
+        mounts: {
+          "/workspace": storage.blob.block({
+            provider: {
+              kind: "s3",
+              bucket: "agent-disks",
+              region: "us-east-1",
+              endpoint: `http://127.0.0.1:${address.port}`,
+              auth: {
+                kind: "access-key",
+                accessKeyId: "test",
+                secretAccessKey: "test",
+              },
+            },
+            volume: "stuck-acquisition",
+            sizeBytes: 64n * 1024n * 1024n,
+          }),
+        },
+      }),
+      (error) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /sandbox-host did not produce a launch acknowledgement within 2000ms/);
+        cleanupError = error.cause;
+        return true;
+      },
+    );
+  } finally {
+    if (priorTimeout === undefined) {
+      delete process.env.SANDBOX_LAUNCH_TIMEOUT_MS;
+    } else {
+      process.env.SANDBOX_LAUNCH_TIMEOUT_MS = priorTimeout;
+    }
+  }
+  assert.ok(cleanupError instanceof SandboxBlobStorageError);
+  assert.equal(cleanupError.code, "lease-provider-error");
+  assert.match(cleanupError.message, /acquisition request timed out/);
+
+  await using retry = await sandbox.boot();
+  const result = await retry.exec("/bin/true");
+  assert.equal(result.exitCode, 0, result.stderr);
 });
 
 test("running sandbox exposes a remote-friendly guest filesystem API", async (t) => {

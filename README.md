@@ -5,11 +5,12 @@ control of files, durable machine state, network egress, and credentials.
 
 ```ts
 import {
-  block,
   defineSandbox,
   fs,
   network,
   rootfs,
+  SandboxBlobStorageError,
+  storage,
 } from "@torkbot/sandbox";
 import { image as alpine323Agent } from "@torkbot/sandbox-image-alpine-3.23-agent";
 
@@ -19,9 +20,16 @@ const workspace = fs.memory({
   },
 });
 
-const machineState = new AgentMachineStore({
+const blobProvider = {
+  kind: "s3" as const,
   bucket: "agent-machines",
-  keyPrefix: "lanes/github-worker",
+  region: "us-east-1",
+  auth: { kind: "environment" as const },
+};
+
+const machineState = storage.blob.overlay({
+  provider: blobProvider,
+  volume: "github-worker-machine",
 });
 
 const githubTokens = new GitHubInstallationTokenService({
@@ -133,13 +141,24 @@ into the guest only for this boot.
 Give an agent a saved machine when package installs, language toolchains,
 cloned repos, and caches should survive across boots.
 
-Uses: [`rootfs.cow`](#rootfscowoptions),
+Uses: [`storage.blob`](#storageblob), [`rootfs.cow`](#rootfscowoptions),
 [`rootfs.persistent`](#rootfspersistentoptions).
 
 ```ts
-const machineState = new AgentMachineStore({
+const provider = {
+  kind: "s3" as const,
   bucket: "agent-machines",
-  keyPrefix: "lanes/github-worker",
+  region: "us-east-1",
+  auth: { kind: "environment" as const },
+};
+const machineState = storage.blob.overlay({
+  provider,
+  volume: "github-worker-machine",
+});
+const workspace = storage.blob.block({
+  provider,
+  volume: "github-worker-workspace",
+  sizeBytes: 64n * 1024n * 1024n,
 });
 
 const sandbox = defineSandbox({
@@ -148,17 +167,17 @@ const sandbox = defineSandbox({
     writable: machineState,
   }),
 });
+
+await using vm = await sandbox.boot({
+  mounts: { "/workspace": workspace },
+  cwd: "/workspace",
+});
 ```
 
-`rootfs.cow(...)` lets you plug in your own storage backend for saved machine
-changes. Sandbox handles the VM details; your application decides where the
-agent's machine state lives.
-
-This is powerful because Sandbox saves only the deltas the agent creates. Your
-store can put those deltas anywhere with a block-storage-like API: object
-storage, a database, a local cache, a tenant-scoped service, or a content
-addressed backend. Agents get durable machines without the host copying or
-owning a full VM image per agent.
+The overlay stores only the machine blocks changed by the agent. The mounted
+disk is a sparse ext4 workspace. These objects are declarations, not acquired
+resources: `boot()` acquires their exclusive leases, and closing the VM flushes
+and releases them. Give every concurrently running agent distinct volume names.
 
 For one local durable machine, save changes in a local file:
 
@@ -182,6 +201,11 @@ const sandbox = defineSandbox({
   }),
 });
 ```
+
+For custom storage systems, `rootfs.cow(...)` also accepts a
+[`SandboxBlockStore`](#sandboxblockstore). That lower-level interface is useful
+when machine deltas belong in a database, cache, tenant service, or other
+application-owned backend.
 
 ### 3. Mount Host-Controlled Workspaces
 
@@ -425,7 +449,7 @@ Uses: [`rootfs.compose`](#rootfscomposeoptions),
 ```ts
 const source = rootfs.compose({
   base: alpine323Agent,
-  overlay: machineState,
+  overlay: blockStore,
 });
 
 const image = await rootfs.flatten({
@@ -560,13 +584,25 @@ Used in: [Durable machines](#2-give-each-agent-a-durable-machine),
 ```ts
 rootfs.cow({
   base: alpine323Agent,
-  writable: blockStore,
+  writable: storage.blob.overlay({
+    provider: {
+      kind: "s3",
+      bucket: "agent-machines",
+      region: "us-east-1",
+      auth: { kind: "environment" },
+    },
+    volume: "agent-42-machine",
+  }),
   maxDirtyBytes: 64 * 1024 * 1024,
 });
 ```
 
-Creates a VM whose machine changes are saved through caller-owned storage. The
-starting image remains read-only. You can also pass a pre-composed source:
+Creates a VM whose machine changes are saved outside the base image. The
+starting image remains read-only. The built-in blob overlay is bound to this
+base image on first use, so accidentally reusing it with another image fails
+before boot.
+
+You can also use a custom `SandboxBlockStore` and pass a pre-composed source:
 
 ```ts
 const source = rootfs.compose({
@@ -577,8 +613,9 @@ const source = rootfs.compose({
 rootfs.cow({ source });
 ```
 
-Attach one writable state store to at most one running VM at a time, or enforce
-single-writer coordination in your storage layer.
+Built-in blob overlays enforce single-writer access. When supplying a custom
+block store, attach it to at most one running VM at a time or implement that
+coordination in the storage layer.
 
 ### `rootfs.persistent(options)`
 
@@ -677,26 +714,32 @@ mismatched snapshots, or migrate state.
 mutate those `Uint8Array` values after passing them to `write()`, so stores may
 retain them for delayed persistence.
 
-### `block.blob.acquire(options)`
+### `storage.blob`
 
-Acquires a single-writer logical disk backed by object storage. There is no
-separate create operation: acquiring an absent volume reserves it without
-writing disk blocks, and Sandbox provisions its sparse ext4 filesystem when it
-is first attached. Acquiring a provisioned volume requires the same explicit
-`sizeBytes`.
+Declares object-backed resources. Sandbox acquires their exclusive leases only
+while booting and owns their release when the VM closes; callers never hold a
+lease or a cleanup handle.
 
 ```ts
-const disk = await block.blob.acquire({
-  provider: {
-    kind: "s3",
-    bucket: "agent-disks",
-    region: "us-east-1",
-    auth: { kind: "environment" },
-  },
+const provider = {
+  kind: "s3" as const,
+  bucket: "agent-disks",
+  region: "us-east-1",
+  auth: { kind: "environment" as const },
+};
+const overlay = storage.blob.overlay({
+  provider,
+  volume: "agent-42-machine",
+});
+const disk = storage.blob.block({
+  provider,
   volume: "agent-42-workspace",
   sizeBytes: 64n * 1024n * 1024n,
 });
 
+const sandbox = defineSandbox({
+  rootfs: rootfs.cow({ base: alpine323Agent, writable: overlay }),
+});
 await using vm = await sandbox.boot({
   mounts: {
     "/workspace": disk,
@@ -707,19 +750,13 @@ await vm.exec("sh", ["-lc", "printf '%s' ready > state.txt"]);
 ```
 
 Mount paths do not need to exist in the rootfs. Sandbox creates them while
-booting; a read-only rootfs remains unchanged.
+booting; a read-only base remains unchanged. Overlay references store dirty
+rootfs blocks only; block references are writable sparse ext4 guest disks.
+Each volume is bound on first use to its role, and overlays are also bound to
+their base image. Reusing a volume across roles or base images fails with
+`volume-mismatch` before the VM boots.
 
-`acquire()` obtains and starts renewing the exclusive writer lease before it
-returns the mountable handle. If another writer owns the volume, acquisition
-rejects and no VM is started. After `boot()` succeeds, the sandbox owns the
-device lifecycle: closing the sandbox closes the native host, waits for the
-device outcome, and releases the lease. Call the lifecycle's `close()` yourself
-only when an acquired device is never booted. `closed` resolves to
-`{ reason: "closed" }` after a clean close, or `{ reason: "failed", error }`
-after the host has failed closed. `close()` rejects with that same error when
-clean storage shutdown and lease release cannot be confirmed.
-
-Acquisition and lifecycle failures are `SandboxBlockDeviceError` instances.
+Boot and close failures are `SandboxBlobStorageError` instances.
 Their stable `code` is `volume-locked`, `volume-mismatch`, `provider-error`,
 `authentication-failed`, `lease-lost`, `lease-authentication-failed`,
 `lease-provider-error`, `storage-error`, or `host-error`.
@@ -732,7 +769,29 @@ fail-closed lease semantics. Any failed renewal immediately stops the host; a
 later writer uses a new storage generation, so the stopped writer cannot affect
 it.
 
-Blob-backed devices currently use ext4, are writable, are single-use, and are
+Use `retryAfterMs` only when it is present. For example, a competing remote
+writer reports how long to wait before retrying safely:
+
+```ts
+import { setTimeout } from "node:timers/promises";
+
+try {
+  await using vm = await sandbox.boot();
+  await vm.exec("sh", ["-lc", "run-agent"]);
+} catch (error) {
+  if (
+    error instanceof SandboxBlobStorageError
+    && error.code === "volume-locked"
+    && error.retryAfterMs !== undefined
+  ) {
+    await setTimeout(error.retryAfterMs);
+  } else {
+    throw error;
+  }
+}
+```
+
+Blob-backed disks use ext4, are writable, and are
 limited to one per sandbox. Their mount path cannot be nested beneath another
 mount or beneath `/run/sandbox/http-ca`, though other mounts may be nested
 beneath the block device. Provider credentials remain in the native host and
@@ -754,8 +813,10 @@ tokens are not refreshed by Sandbox.
 Writes are durable after a successful filesystem flush or clean device close.
 An abnormal close may lose writes that the guest had not flushed.
 
-The packed-object layout does not read volumes created by the earlier SlateDB
-backend; use a new volume or provider prefix when upgrading those disks.
+The role-tagged metadata is a hard format break: volumes created through the
+earlier acquisition API are intentionally not inferred or migrated. The
+packed-object layout also does not read volumes created by the earlier SlateDB
+backend. Use a new volume or provider prefix for either format.
 Automatic garbage collection is not yet provided, so failed or superseded
 uploads may leave unreachable objects in the provider.
 
@@ -1141,7 +1202,8 @@ entitlements and for bounding VM lifetime.
 Machine images are read-only by default. Writable machine state is explicit:
 
 - `rootfs.ephemeral(...)` stores changes in memory for one boot,
-- `rootfs.cow(...)` stores agent-made deltas in caller-owned storage,
+- `rootfs.cow(...)` stores agent-made deltas in a declared blob overlay or a
+  caller-owned block store,
 - `rootfs.persistent(...)` stores agent-made deltas in one local state file.
 
 Host workspaces are separate mounts. `fs.virtual(...)` is host-implemented.

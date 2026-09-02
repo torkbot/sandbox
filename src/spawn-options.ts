@@ -25,7 +25,7 @@ export type HostSpawnMount =
       };
     };
 
-export type HostBlobBlockProvider =
+export type HostBlobStorageProvider =
   | {
       readonly kind: "local";
       readonly path: string;
@@ -73,8 +73,8 @@ export type HostBlobBlockProvider =
           };
     };
 
-export type HostBlobBlockAcquireOptions = {
-  readonly provider: HostBlobBlockProvider;
+export type HostBlobVolumeOptions = {
+  readonly provider: HostBlobStorageProvider;
   readonly volume: string;
   readonly sizeBytes: bigint;
 };
@@ -100,7 +100,7 @@ export type HostSpawnSandboxOptions = {
     readonly format: "qcow2";
     readonly storage?:
       | {
-          readonly kind: "cow-block-store" | "ephemeral-cow";
+          readonly kind: "cow-block-store" | "ephemeral-cow" | "blob-cow";
           readonly blockSize: number;
           readonly maxDirtyBytes: number;
         }

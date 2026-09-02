@@ -17,9 +17,8 @@ import { HostControlTransport } from "./control.ts";
 import { GuestFetch } from "./guest-fetch.ts";
 import {
   HostProcessSandboxVm,
-  SandboxBlockDeviceError,
-  type SandboxBlockDeviceClosed,
-  type SandboxBlockDeviceErrorCode,
+  SandboxBlobStorageError,
+  type SandboxBlobStorageErrorCode,
 } from "./host-process.ts";
 import { createMemoryFileSystem } from "./memory-fs.ts";
 import {
@@ -27,8 +26,8 @@ import {
   isSandboxWritableFileSystem,
 } from "./vfs.ts";
 import type {
-  HostBlobBlockAcquireOptions,
-  HostBlobBlockProvider,
+  HostBlobStorageProvider,
+  HostBlobVolumeOptions,
   HostSpawnMount,
   HostSpawnSandboxOptions,
 } from "./spawn-options.ts";
@@ -70,11 +69,7 @@ export type SandboxFileStat = {
   readonly writable?: boolean;
 };
 
-export {
-  SandboxBlockDeviceError,
-  type SandboxBlockDeviceClosed,
-  type SandboxBlockDeviceErrorCode,
-};
+export { SandboxBlobStorageError, type SandboxBlobStorageErrorCode };
 
 export type SandboxDirectoryEntry = {
   readonly name: string;
@@ -186,7 +181,7 @@ export type RootfsImageConfig = {
 export type ComposedRootfsConfig = {
   readonly kind: "composed-rootfs";
   readonly base: RootfsImageConfig;
-  readonly overlay: SandboxBlockStore;
+  readonly overlay: SandboxBlockStore | SandboxBlobOverlay;
 };
 
 export type CowRootfsConfig = {
@@ -256,24 +251,22 @@ export type SandboxReadWriteHostDirectorySource = {
 
 export type SandboxHostDirectorySource = SandboxReadOnlyHostDirectorySource | SandboxReadWriteHostDirectorySource;
 
-export interface SandboxBlockDeviceLifecycle {
-  /** Resolves with the reason after the device has closed. */
-  readonly closed: Promise<SandboxBlockDeviceClosed>;
-  /** Idempotently closes the device and releases its host-side resources. */
-  close(): Promise<void>;
+export type SandboxBlobStorageProvider = HostBlobStorageProvider;
+
+/** A declarative, object-backed writable rootfs overlay. */
+export interface SandboxBlobOverlay {
+  readonly kind: "blob-overlay";
 }
 
-export interface SandboxBlockDevice {
-  readonly kind: "block-device";
-  /** Returns shared lifecycle controls for Sandbox to own while attached. */
-  getLifecycle?(): SandboxBlockDeviceLifecycle;
+/** A declarative, object-backed guest block device. */
+export interface SandboxBlobBlockDevice {
+  readonly kind: "blob-block-device";
 }
 
-export type SandboxBlobBlockProvider = HostBlobBlockProvider;
+export type SandboxBlobOverlayOptions = Omit<HostBlobVolumeOptions, "sizeBytes">;
+export type SandboxBlobBlockOptions = HostBlobVolumeOptions;
 
-export type SandboxBlobBlockAcquireOptions = HostBlobBlockAcquireOptions;
-
-export type SandboxMountSource = SandboxFileSystemSource | SandboxHostDirectorySource | SandboxBlockDevice;
+export type SandboxMountSource = SandboxFileSystemSource | SandboxHostDirectorySource | SandboxBlobBlockDevice;
 
 type HostDirectorySourceForValidation = {
   readonly kind: "host-directory";
@@ -322,49 +315,49 @@ const rootfsImageStorage = new WeakMap<Qcow2RootfsImage, {
   readonly blockStore: SandboxBlockStore;
   readonly context: SandboxBlockStoreContext;
 }>();
-const blockDeviceHosts = new WeakMap<SandboxBlockDevice, HostProcessSandboxVm>();
+const blobOverlays = new WeakMap<SandboxBlobOverlay, SandboxBlobOverlayOptions>();
+const blobBlockDevices = new WeakMap<SandboxBlobBlockDevice, SandboxBlobBlockOptions>();
 
-/** Native block devices backed by blob/object storage. */
-export const block = {
+/** Object storage declarations resolved and owned by Sandbox during boot. */
+export const storage = {
   blob: {
-    /**
-     * Acquires an exclusive writer lease and returns a mountable device.
-     * An absent volume is provisioned lazily when first attached.
-     */
-    acquire: acquireBlobBlockDevice,
+    overlay(options: SandboxBlobOverlayOptions): SandboxBlobOverlay {
+      validateBlobOverlayOptions(options);
+      const overlay: SandboxBlobOverlay = Object.freeze({ kind: "blob-overlay" });
+      blobOverlays.set(overlay, options);
+      return overlay;
+    },
+    block(options: SandboxBlobBlockOptions): SandboxBlobBlockDevice {
+      validateBlobBlockOptions(options);
+      const device: SandboxBlobBlockDevice = Object.freeze({ kind: "blob-block-device" });
+      blobBlockDevices.set(device, options);
+      return device;
+    },
   },
 } as const;
 
-async function acquireBlobBlockDevice(
-  options: SandboxBlobBlockAcquireOptions,
-): Promise<SandboxBlockDevice> {
-  validateBlobBlockAcquireOptions(options);
-  const host = await HostProcessSandboxVm.acquireBlobBlock(options);
-  let closePromise: Promise<void> | undefined;
-  const lifecycle: SandboxBlockDeviceLifecycle = Object.freeze({
-    closed: host.blockDeviceClosed,
-    close: () => {
-      closePromise ??= (async () => {
-        await host.close();
-        const closure = await host.blockDeviceClosed;
-        if (closure.reason === "failed") {
-          throw closure.error;
-        }
-      })();
-      return closePromise;
-    },
-  });
-  const device: SandboxBlockDevice = {
-    kind: "block-device",
-    getLifecycle: () => lifecycle,
-  };
-  blockDeviceHosts.set(device, host);
-  return Object.freeze(device);
+function validateBlobBlockOptions(options: SandboxBlobBlockOptions): void {
+  validateBlobVolumeOptions(options, "block");
+  if (
+    typeof options.sizeBytes !== "bigint"
+    || options.sizeBytes < 8n * 1024n * 1024n
+    || options.sizeBytes % 4096n !== 0n
+    || options.sizeBytes > 18_446_744_073_709_551_615n
+  ) {
+    throw new Error("invalid blob block declaration: sizeBytes must be a 4096-byte multiple between 8 MiB and u64::MAX");
+  }
 }
 
-function validateBlobBlockAcquireOptions(options: SandboxBlobBlockAcquireOptions): void {
+function validateBlobOverlayOptions(options: SandboxBlobOverlayOptions): void {
+  validateBlobVolumeOptions(options, "overlay");
+}
+
+function validateBlobVolumeOptions(
+  options: SandboxBlobOverlayOptions,
+  role: "block" | "overlay",
+): void {
   if (options === null || typeof options !== "object") {
-    throw new Error("invalid blob block acquisition: options are required");
+    throw new Error(`invalid blob ${role} declaration: options are required`);
   }
   if (
     typeof options.volume !== "string"
@@ -372,29 +365,21 @@ function validateBlobBlockAcquireOptions(options: SandboxBlobBlockAcquireOptions
     || options.volume.length > 128
     || !/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(options.volume)
   ) {
-    throw new Error("invalid blob block acquisition: volume must be 1-128 letters, digits, '.', '_', or '-'");
+    throw new Error(`invalid blob ${role} declaration: volume must be 1-128 letters, digits, '.', '_', or '-'`);
   }
-  if (
-    typeof options.sizeBytes !== "bigint"
-    || options.sizeBytes < 8n * 1024n * 1024n
-    || options.sizeBytes % 4096n !== 0n
-    || options.sizeBytes > 18_446_744_073_709_551_615n
-  ) {
-    throw new Error("invalid blob block acquisition: sizeBytes must be a 4096-byte multiple between 8 MiB and u64::MAX");
-  }
-  validateBlobBlockProvider(options.provider);
+  validateBlobProvider(options.provider);
 }
 
-function validateBlobBlockProvider(provider: SandboxBlobBlockProvider): void {
+function validateBlobProvider(provider: SandboxBlobStorageProvider): void {
   if (provider === null || typeof provider !== "object") {
-    throw new Error("invalid blob block acquisition: provider is required");
+    throw new Error("invalid blob storage declaration: provider is required");
   }
   validateBlobPrefix(provider.prefix);
   switch (provider.kind) {
     case "local":
       requireBlobString(provider.path, "provider.path");
       if (!isAbsolute(provider.path)) {
-        throw new Error("invalid blob block acquisition: provider.path must be absolute");
+        throw new Error("invalid blob storage declaration: provider.path must be absolute");
       }
       return;
     case "s3":
@@ -414,7 +399,7 @@ function validateBlobBlockProvider(provider: SandboxBlobBlockProvider): void {
       validateAzureAuth(provider.auth);
       return;
     default:
-      throw new Error("invalid blob block acquisition: unsupported provider.kind");
+      throw new Error("invalid blob storage declaration: unsupported provider.kind");
   }
 }
 
@@ -430,7 +415,7 @@ function validateBlobPrefix(prefix: string | undefined): void {
     || prefix.endsWith("/")
     || prefix.split("/").some((part) => part.length === 0 || part === "." || part === "..")
   ) {
-    throw new Error("invalid blob block acquisition: provider.prefix must be a non-empty relative object path");
+    throw new Error("invalid blob storage declaration: provider.prefix must be a non-empty relative object path");
   }
 }
 
@@ -443,22 +428,22 @@ function validateBlobEndpoint(endpoint: string | undefined): void {
   try {
     url = new URL(endpoint);
   } catch {
-    throw new Error("invalid blob block acquisition: provider.endpoint must be an HTTP(S) URL");
+    throw new Error("invalid blob storage declaration: provider.endpoint must be an HTTP(S) URL");
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error("invalid blob block acquisition: provider.endpoint must be an HTTP(S) URL");
+    throw new Error("invalid blob storage declaration: provider.endpoint must be an HTTP(S) URL");
   }
 }
 
-function validateS3Auth(auth: Extract<SandboxBlobBlockProvider, { kind: "s3" }>["auth"]): void {
+function validateS3Auth(auth: Extract<SandboxBlobStorageProvider, { kind: "s3" }>["auth"]): void {
   if (auth === null || typeof auth !== "object") {
-    throw new Error("invalid blob block acquisition: provider.auth is required");
+    throw new Error("invalid blob storage declaration: provider.auth is required");
   }
   if (auth.kind === "environment") {
     return;
   }
   if (auth.kind !== "access-key") {
-    throw new Error("invalid blob block acquisition: unsupported S3 auth.kind");
+    throw new Error("invalid blob storage declaration: unsupported S3 auth.kind");
   }
   requireBlobString(auth.accessKeyId, "provider.auth.accessKeyId");
   requireBlobString(auth.secretAccessKey, "provider.auth.secretAccessKey");
@@ -467,9 +452,9 @@ function validateS3Auth(auth: Extract<SandboxBlobBlockProvider, { kind: "s3" }>[
   }
 }
 
-function validateGcsAuth(auth: Extract<SandboxBlobBlockProvider, { kind: "gcs" }>["auth"]): void {
+function validateGcsAuth(auth: Extract<SandboxBlobStorageProvider, { kind: "gcs" }>["auth"]): void {
   if (auth === null || typeof auth !== "object") {
-    throw new Error("invalid blob block acquisition: provider.auth is required");
+    throw new Error("invalid blob storage declaration: provider.auth is required");
   }
   switch (auth.kind) {
     case "environment":
@@ -481,13 +466,13 @@ function validateGcsAuth(auth: Extract<SandboxBlobBlockProvider, { kind: "gcs" }
       requireBlobString(auth.token, "provider.auth.token");
       return;
     default:
-      throw new Error("invalid blob block acquisition: unsupported GCS auth.kind");
+      throw new Error("invalid blob storage declaration: unsupported GCS auth.kind");
   }
 }
 
-function validateAzureAuth(auth: Extract<SandboxBlobBlockProvider, { kind: "azure" }>["auth"]): void {
+function validateAzureAuth(auth: Extract<SandboxBlobStorageProvider, { kind: "azure" }>["auth"]): void {
   if (auth === null || typeof auth !== "object") {
-    throw new Error("invalid blob block acquisition: provider.auth is required");
+    throw new Error("invalid blob storage declaration: provider.auth is required");
   }
   switch (auth.kind) {
     case "environment":
@@ -504,13 +489,13 @@ function validateAzureAuth(auth: Extract<SandboxBlobBlockProvider, { kind: "azur
       requireBlobString(auth.tenantId, "provider.auth.tenantId");
       return;
     default:
-      throw new Error("invalid blob block acquisition: unsupported Azure auth.kind");
+      throw new Error("invalid blob storage declaration: unsupported Azure auth.kind");
   }
 }
 
 function requireBlobString(value: string, field: string): void {
   if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
-    throw new Error(`invalid blob block acquisition: ${field} must be a non-empty string without NUL bytes`);
+    throw new Error(`invalid blob storage declaration: ${field} must be a non-empty string without NUL bytes`);
   }
 }
 
@@ -1029,7 +1014,7 @@ interface SandboxDiagnostics {
 export const rootfs = {
   compose(options: {
     readonly base: RootfsImageConfig;
-    readonly overlay: SandboxBlockStore;
+    readonly overlay: SandboxBlockStore | SandboxBlobOverlay;
   }): ComposedRootfsConfig {
     return composeRootfs(options);
   },
@@ -1038,7 +1023,7 @@ export const rootfs = {
     readonly maxDirtyBytes?: number;
   } | {
     readonly base: RootfsImageConfig;
-    readonly writable: SandboxBlockStore;
+    readonly writable: SandboxBlockStore | SandboxBlobOverlay;
     readonly maxDirtyBytes?: number;
   }): Rootfs {
     const source = "source" in options
@@ -1094,7 +1079,10 @@ export const rootfs = {
       throw new Error("invalid rootfs source: base must be a rootfs image descriptor");
     }
     validateRootfsImage(source.base, "rootfs source image");
-    validateBlockStore(source.overlay);
+    if (blobOverlays.has(source.overlay as SandboxBlobOverlay)) {
+      throw new Error("invalid rootfs flatten options: blob overlays cannot be flattened directly");
+    }
+    validateBlockStore(source.overlay as SandboxBlockStore);
     const destContext = {
       base: `rootfs-image:qcow2:${randomUUID()}`,
     };
@@ -1103,7 +1091,7 @@ export const rootfs = {
     }
     const result = await HostProcessSandboxVm.flattenQcow2({
       basePath: source.base.path,
-      overlay: source.overlay,
+      overlay: source.overlay as SandboxBlockStore,
       overlayContext: {
         base: rootfsImageIdentity(source.base),
       },
@@ -1168,7 +1156,7 @@ export const rootfs = {
 
 function composeRootfs(options: {
   readonly base: RootfsImageConfig;
-  readonly overlay: SandboxBlockStore;
+  readonly overlay: SandboxBlockStore | SandboxBlobOverlay;
 }): ComposedRootfsConfig {
   return {
     kind: "composed-rootfs",
@@ -1503,63 +1491,21 @@ class DefinedSandbox implements SandboxDefinition {
 
   async boot(options: SandboxBootOptions = {}): Promise<SandboxInstance> {
     validateSandboxBootOptions(options);
-    const blockDeviceLifecycle = Object.values(options.mounts ?? {})
-      .find((source) => source.kind === "block-device")
-      ?.getLifecycle?.();
-    try {
-      const networkPolicy = this.#options.network === undefined
+    const networkPolicy = this.#options.network === undefined
         ? undefined
         : createNetworkPolicyHookRegistration(this.#options.network);
-      const configEnvironmentFacts = environmentFactsForDefinition(this.#options);
-      const launchOptions = await toInternalSandboxOptions(
-        this.#options,
-        options,
-        networkPolicy?.network,
-      );
-      validateInternalSandboxOptions(launchOptions);
-      const hostOptions = toHostSpawnOptions(launchOptions, networkPolicy?.hooks ?? []);
-      const requestHeaderHooks = new Map(
-        (networkPolicy?.hooks ?? []).map((hook) => [hook.id, hook]),
-      );
-      const blockMount = launchOptions.mounts?.find((mount) => mount.kind === "block-device");
-      const acquiredHost = blockMount === undefined
-        ? undefined
-        : blockDeviceHosts.get(blockMount.device);
-      const hostVm = acquiredHost === undefined
-        ? await HostProcessSandboxVm.spawn(
-          launchOptions,
-          hostOptions,
-          requestHeaderHooks,
-          networkPolicy?.connectionHook,
-        )
-        : await acquiredHost.attach(
-          launchOptions,
-          hostOptions,
-          requestHeaderHooks,
-          networkPolicy?.connectionHook,
-        );
-      return new HostBackedSandboxVm(
-        hostVm,
-        launchOptions,
-        configEnvironmentFacts,
-        blockDeviceLifecycle,
-      );
-    } catch (error) {
-      try {
-        await blockDeviceLifecycle?.close();
-      } catch (cleanupError) {
-        if (error instanceof Error && error.cause === undefined) {
-          error.cause = cleanupError;
-          throw error;
-        }
-        throw new AggregateError(
-          [error, cleanupError],
-          "sandbox boot failed and block device cleanup also failed",
-          { cause: error },
-        );
-      }
-      throw error;
-    }
+    const configEnvironmentFacts = environmentFactsForDefinition(this.#options);
+    const launchOptions = await toInternalSandboxOptions(this.#options, options, networkPolicy?.network);
+    validateInternalSandboxOptions(launchOptions);
+    const hostOptions = toHostSpawnOptions(launchOptions, networkPolicy?.hooks ?? []);
+    const requestHeaderHooks = new Map((networkPolicy?.hooks ?? []).map((hook) => [hook.id, hook]));
+    const hostVm = await HostProcessSandboxVm.spawn(
+      launchOptions,
+      hostOptions,
+      requestHeaderHooks,
+      networkPolicy?.connectionHook,
+    );
+    return new HostBackedSandboxVm(hostVm, launchOptions, configEnvironmentFacts);
   }
 }
 
@@ -1572,7 +1518,6 @@ class HostBackedSandboxVm implements SandboxVm {
   readonly #fetch: GuestFetch;
   readonly #options: InternalSandboxOptions;
   readonly #configEnvironmentFacts: readonly SandboxEnvironmentFact[];
-  readonly #blockDeviceLifecycle?: SandboxBlockDeviceLifecycle;
 
   readonly #hostVm: {
     readonly hasControlSocket: boolean;
@@ -1595,12 +1540,10 @@ class HostBackedSandboxVm implements SandboxVm {
     },
     options: InternalSandboxOptions,
     configEnvironmentFacts: readonly SandboxEnvironmentFact[],
-    blockDeviceLifecycle?: SandboxBlockDeviceLifecycle,
   ) {
     this.#hostVm = hostVm;
     this.#options = options;
     this.#configEnvironmentFacts = configEnvironmentFacts;
-    this.#blockDeviceLifecycle = blockDeviceLifecycle;
     this.control = new HostControlTransport({
       connected: hostVm.hasControlSocket,
       channel: hostVm,
@@ -1675,18 +1618,14 @@ class HostBackedSandboxVm implements SandboxVm {
     } catch (error) {
       closeError ??= error;
     }
-    let lifecycleError: unknown;
+    let hostError: unknown;
     try {
-      if (this.#blockDeviceLifecycle === undefined) {
-        await this.#hostVm.close();
-      } else {
-        await this.#blockDeviceLifecycle.close();
-      }
+      await this.#hostVm.close();
     } catch (error) {
-      lifecycleError = error;
+      hostError = error;
     }
-    if (lifecycleError !== undefined) {
-      throw lifecycleError;
+    if (hostError !== undefined) {
+      throw hostError;
     }
     if (closeError !== undefined) {
       throw closeError;
@@ -2050,12 +1989,17 @@ function lowerInternalMount(path: string, source: SandboxMountSource): InternalM
         access: source.access,
         mask: lowerHostDirectoryMask(source.mask),
       };
-    case "block-device":
+    case "blob-block-device": {
+      const blob = blobBlockDevices.get(source);
+      if (blob === undefined) {
+        throw new Error("invalid sandbox boot options: blob block device must be created with storage.blob.block(...)");
+      }
       return {
         kind: "block-device",
         path,
-        device: source,
+        blob,
       };
+    }
   }
 }
 
@@ -2278,18 +2222,33 @@ async function lowerRootfs(rootfs: Rootfs): Promise<InternalSandboxOptions["root
 
 function lowerCowRootfs(
   base: RootfsImageConfig,
-  writable: SandboxBlockStore,
+  writable: SandboxBlockStore | SandboxBlobOverlay,
   maxDirtyBytes: number,
 ): InternalSandboxOptions["rootfs"] {
+  const blob = blobOverlays.get(writable as SandboxBlobOverlay);
+  if (blob !== undefined) {
+    return {
+      path: base.path,
+      readonly: false,
+      format: "qcow2",
+      storage: {
+        kind: "blob-cow",
+        blockSize: 4096,
+        maxDirtyBytes,
+        blob,
+        baseIdentity: rootfsImageIdentity(base),
+      },
+    };
+  }
   return {
     path: base.path,
     readonly: false,
     format: "qcow2",
     storage: {
       kind: "cow-block-store",
-      blockSize: writable.blockSize,
+      blockSize: (writable as SandboxBlockStore).blockSize,
       maxDirtyBytes,
-      blockStore: writable,
+      blockStore: writable as SandboxBlockStore,
       context: {
         base: rootfsImageIdentity(base),
       },
@@ -2371,7 +2330,11 @@ function validateRootfs(rootfs: Rootfs): void {
         throw new Error("invalid sandbox definition: rootfs.cow base must be a rootfs image descriptor");
       }
       validateRootfsImage(rootfs.source.base, "rootfs.cow base");
-      validateBlockStore(rootfs.source.overlay);
+      if (blobOverlays.has(rootfs.source.overlay as SandboxBlobOverlay)) {
+        validateBlobOverlayOptions(blobOverlays.get(rootfs.source.overlay as SandboxBlobOverlay)!);
+      } else {
+        validateBlockStore(rootfs.source.overlay as SandboxBlockStore);
+      }
       validateCowMaxDirtyBytes(rootfs);
       return;
     case "ephemeral-rootfs":
@@ -2627,7 +2590,10 @@ function validateCowMaxDirtyBytes(rootfs: CowRootfsConfig): void {
   if (!Number.isSafeInteger(rootfs.maxDirtyBytes) || rootfs.maxDirtyBytes <= 0) {
     throw new Error("invalid sandbox definition: rootfs COW maxDirtyBytes must be a positive safe integer");
   }
-  if (rootfs.maxDirtyBytes < rootfs.source.overlay.blockSize) {
+  const blockSize = blobOverlays.has(rootfs.source.overlay as SandboxBlobOverlay)
+    ? 4096
+    : (rootfs.source.overlay as SandboxBlockStore).blockSize;
+  if (rootfs.maxDirtyBytes < blockSize) {
     throw new Error("invalid sandbox definition: rootfs COW maxDirtyBytes must be at least the COW block size");
   }
 }
@@ -2644,11 +2610,14 @@ function validateEphemeralRootfs(rootfs: EphemeralRootfsConfig): void {
   }
 }
 
-function resolveCowMaxDirtyBytes(blockStore: SandboxBlockStore, maxDirtyBytes?: number): number {
+function resolveCowMaxDirtyBytes(blockStore: SandboxBlockStore | SandboxBlobOverlay, maxDirtyBytes?: number): number {
+  const blockSize = blobOverlays.has(blockStore as SandboxBlobOverlay)
+    ? 4096
+    : (blockStore as SandboxBlockStore).blockSize;
   if (maxDirtyBytes !== undefined) {
     return maxDirtyBytes;
   }
-  return Math.ceil(DEFAULT_COW_MAX_DIRTY_BYTES / blockStore.blockSize) * blockStore.blockSize;
+  return Math.ceil(DEFAULT_COW_MAX_DIRTY_BYTES / blockSize) * blockSize;
 }
 
 function validateSandboxDefinitionOptions(options: SandboxDefinitionOptions): void {
@@ -2730,7 +2699,7 @@ function validateSandboxBootOptions(options: SandboxBootOptions): void {
     validateHostname(options.hostname, "hostname");
   }
   const mountPaths = new Set<string>();
-  let blockDevice: SandboxBlockDevice | undefined;
+  let blockDevice: SandboxBlobBlockDevice | undefined;
   let blockDevicePath: string | undefined;
   for (const [path, source] of Object.entries(options.mounts ?? {})) {
     validateGuestPath(path, "mount.path");
@@ -2749,9 +2718,12 @@ function validateSandboxBootOptions(options: SandboxBootOptions): void {
     if (source.kind === "host-directory") {
       validateHostDirectorySource(source);
     }
-    if (source.kind === "block-device") {
+    if (source.kind === "blob-block-device") {
       if (blockDevice !== undefined) {
         throw new Error("invalid sandbox boot options: only one block device is supported");
+      }
+      if (!blobBlockDevices.has(source)) {
+        throw new Error("invalid sandbox boot options: blob block device must be created with storage.blob.block(...)");
       }
       blockDevice = source;
       blockDevicePath = path;
@@ -2768,9 +2740,6 @@ function validateSandboxBootOptions(options: SandboxBootOptions): void {
     ));
     if (parent !== undefined) {
       throw new Error(`invalid sandbox boot options: block device mount must not be nested beneath another mount: ${blockDevicePath}`);
-    }
-    if (!blockDeviceHosts.has(blockDevice)) {
-      throw new Error("invalid sandbox boot options: block device was not acquired by this runtime");
     }
   }
   if (options.cwd !== undefined && !options.cwd.startsWith("/")) {

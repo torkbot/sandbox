@@ -5,6 +5,7 @@ import {
   fs,
   network,
   rootfs,
+  storage,
   type SandboxFileSystem,
   type SandboxBlockStore,
   type SandboxEnvironmentFact,
@@ -202,6 +203,23 @@ test("rootfs.cow accepts a composed rootfs source", () => {
   assert.deepEqual(rootfs.cow({ source }), {
     kind: "cow-rootfs",
     source,
+  });
+});
+
+test("blob storage factories declare opaque overlay and block references", () => {
+  const provider = { kind: "local" as const, path: "/tmp/sandbox-objects" };
+  const overlay = storage.blob.overlay({ provider, volume: "agent-overlay" });
+  const disk = storage.blob.block({
+    provider,
+    volume: "agent-workspace",
+    sizeBytes: 64n * 1024n * 1024n,
+  });
+
+  assert.deepEqual(overlay, { kind: "blob-overlay" });
+  assert.deepEqual(disk, { kind: "blob-block-device" });
+  assert.deepEqual(rootfs.cow({ base: testRootfs, writable: overlay }), {
+    kind: "cow-rootfs",
+    source: { kind: "composed-rootfs", base: testRootfs, overlay },
   });
 });
 
