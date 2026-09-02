@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, lstat, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -846,6 +846,46 @@ test("failed declarative blob mount boot releases its lease", async (t) => {
   });
   const result = await retry.exec("/bin/sh", ["-lc", "test -d /workspace"]);
   assert.equal(result.exitCode, 0, result.stderr);
+});
+
+test("blob store opening failures preserve their public error code", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+
+  const objectStore = await mkdtemp(join(tmpdir(), "sandbox-blob-open-error-"));
+  t.after(async () => {
+    await rm(objectStore, { recursive: true, force: true });
+  });
+  const disk = storage.blob.block({
+    provider: { kind: "local" as const, path: objectStore },
+    volume: "agent-state",
+    sizeBytes: 64n * 1024n * 1024n,
+  });
+  const first = await defineSandbox({ rootfs: testRootfs }).boot({
+    mounts: { "/workspace": disk },
+  });
+  await first.close();
+
+  const metadata = JSON.parse(
+    await readFile(join(objectStore, "volumes", "agent-state", "metadata.json"), "utf8"),
+  ) as { generation: string };
+  await unlink(
+    join(objectStore, "volumes", "agent-state", "data", metadata.generation, "manifest.json"),
+  );
+
+  await assert.rejects(
+    defineSandbox({ rootfs: testRootfs }).boot({
+      mounts: { "/workspace": disk },
+    }),
+    (error) => {
+      assert.ok(error instanceof SandboxBlobStorageError);
+      assert.equal(error.code, "storage-error");
+      assert.match(error.message, /missing blob block manifest for provisioned volume/);
+      return true;
+    },
+  );
 });
 
 test("timed out declarative blob boot terminates a stuck host", async (t) => {

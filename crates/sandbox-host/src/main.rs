@@ -252,7 +252,7 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
         http: http_intercept_runtime(&spec, bridge.clone())?,
         network_policy: network_policy_runtime(&spec, bridge.clone()),
         root_storage: match root_blob_volume.as_mut() {
-            Some(volume) => Some(volume.cow_store().map_err(io::Error::other)?),
+            Some(volume) => Some(report_blob_block_result(&bridge, volume.cow_store())?),
             None => spec
                 .rootfs
                 .storage
@@ -271,7 +271,7 @@ fn run_stdio_inner() -> Result<(), Box<dyn std::error::Error>> {
         },
         block_device: blob_volume
             .as_mut()
-            .map(blob_block::BlobBlockVolume::service)
+            .map(|volume| report_blob_block_result(&bridge, volume.service()))
             .transpose()?,
     };
     let mut vm = sandbox::runtime::KrunVm::create_with_services(&spec, virtual_fs, services)?;
@@ -399,6 +399,13 @@ fn report_blob_block_failure(bridge: &HostIoBridge, failure: &blob_block::BlobBl
     if let Ok(packet) = encode_document_packet(&notification) {
         let _ = bridge.write_raw_packet(&packet);
     }
+}
+
+fn report_blob_block_result<T>(
+    bridge: &HostIoBridge,
+    result: Result<T, blob_block::BlobBlockFailure>,
+) -> Result<T, blob_block::BlobBlockFailure> {
+    result.inspect_err(|failure| report_blob_block_failure(bridge, failure))
 }
 
 fn monitor_blob_block_failure(
