@@ -726,6 +726,133 @@ test("declarative blob storage persists an agent overlay and mounted workspace",
   assert.equal(read.stdout, "machineworkspace");
 });
 
+test("blob overlays preserve zeroed base-image blocks across reopen", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+  const directory = await mkdtemp(join(tmpdir(), "sandbox-blob-zero-overlay-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const definition = defineSandbox({
+    rootfs: rootfs.cow({
+      base: testRootfs,
+      writable: storage.blob.overlay({
+        provider: { kind: "local", path: directory },
+        volume: "zero-overlay",
+      }),
+    }),
+  });
+  await using first = await definition.boot();
+  const write = await first.exec("/bin/sh", ["-lc", [
+    "set -eu",
+    "test -s /usr/bin/node",
+    "dd if=/dev/zero of=/usr/bin/node bs=4096 count=2 conv=notrunc",
+    "sync",
+  ].join("\n")]);
+  assert.equal(write.exitCode, 0, write.stderr);
+  await first.close();
+
+  await using second = await definition.boot();
+  const read = await second.exec("/bin/sh", ["-lc", [
+    "set -eu",
+    "dd if=/dev/zero of=/tmp/expected-zero bs=4096 count=2",
+    "head -c 8192 /usr/bin/node | cmp - /tmp/expected-zero",
+  ].join("\n")]);
+  assert.equal(read.exitCode, 0, read.stderr);
+});
+
+test("blob close freezes filesystems with active writers before reopening", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) {
+    return;
+  }
+  const directory = await mkdtemp(join(tmpdir(), "sandbox-blob-close-writer-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const provider = { kind: "local" as const, path: directory };
+  const definition = defineSandbox({
+    rootfs: rootfs.cow({
+      base: testRootfs,
+      writable: storage.blob.overlay({ provider, volume: "root" }),
+    }),
+  });
+  const mounts = { "/workspace": storage.blob.block({
+    provider, volume: "workspace", sizeBytes: 64n * 1024n * 1024n,
+  }) };
+  await using first = await definition.boot({ mounts });
+  const write = await first.exec("/bin/sh", ["-lc", [
+    "set -eu",
+    "printf persisted > /root/close-marker",
+    "printf persisted > /workspace/close-marker",
+    "(while :; do echo writing >> /root/busy; echo writing >> /workspace/busy; done) >/dev/null 2>&1 &",
+  ].join("\n")]);
+  assert.equal(write.exitCode, 0, write.stderr);
+  await first.close();
+  await using second = await definition.boot({ mounts });
+  const read = await second.exec("/bin/sh", ["-lc", "cat /root/close-marker /workspace/close-marker"]);
+  assert.equal(read.exitCode, 0, read.stderr);
+  assert.equal(read.stdout, "persistedpersisted");
+});
+
+test("blob close freezes the original disk after its mount path is covered", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
+  const directory = await mkdtemp(join(tmpdir(), "sandbox-blob-covered-mount-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const definition = defineSandbox({ rootfs: rootfs.ephemeral({ base: testRootfs }) });
+  const mounts = { "/workspace": storage.blob.block({
+    provider: { kind: "local", path: directory }, volume: "workspace", sizeBytes: 64n * 1024n * 1024n,
+  }) };
+  const first = await definition.boot({ mounts });
+  try {
+    const write = await first.exec("/bin/sh", ["-c", [
+      "set -eu",
+      "mkdir /alias",
+      "mount --bind /workspace /alias",
+      "mount -t tmpfs tmpfs /workspace",
+      "printf persisted > /alias/close-marker",
+      "(while :; do echo writing >> /alias/busy; done) >/dev/null 2>&1 &",
+    ].join("\n")]);
+    assert.equal(write.exitCode, 0, write.stderr);
+  } finally {
+    await first.close();
+  }
+  await using second = await definition.boot({ mounts });
+  const read = await second.exec("/bin/cat", ["/workspace/close-marker"]);
+  assert.equal(read.exitCode, 0, read.stderr);
+  assert.equal(read.stdout, "persisted");
+});
+
+test("blob close cannot resolve its freeze operation through a shadowed proc mount", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
+  for (const replacement of [false, true]) {
+    const directory = await mkdtemp(join(tmpdir(), "sandbox-blob-proc-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const proc = join(directory, "proc");
+    await mkdir(join(proc, "1"), { recursive: true });
+    if (replacement) {
+      await writeFile(join(proc, "1/exe"), "#!/bin/sh\nprintf invoked > /root/fake-freeze\nexit 0\n");
+      await chmod(join(proc, "1/exe"), 0o755);
+    }
+    const provider = { kind: "local" as const, path: join(directory, "objects") };
+    await mkdir(provider.path);
+    const definition = defineSandbox({ rootfs: rootfs.cow({
+      base: testRootfs, writable: storage.blob.overlay({ provider, volume: "root" }),
+    }) });
+    const first = await definition.boot({ mounts: { "/proc": fs.bind({ source: proc, access: "ro" }) } });
+    try {
+      const result = await first.exec("/bin/sh", ["-c", "printf persisted > /root/close-marker"]);
+      assert.equal(result.exitCode, 0, result.stderr);
+    } finally {
+      await first.close();
+    }
+    await using second = await definition.boot();
+    const result = await second.exec("/bin/sh", ["-c", "test ! -e /root/fake-freeze && cat /root/close-marker"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(result.stdout, "persisted");
+  }
+});
+
 test("clean blob overlay close does not keep a short-lived process alive", async (t) => {
   const testRootfs = await testRootfsForVmTest(t);
   if (testRootfs === undefined) {

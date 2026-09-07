@@ -131,6 +131,15 @@ test("control command codec encodes guest filesystem commands", () => {
 
   assert.deepEqual(
     BSON.deserialize(encodeControlCommand({
+      type: "guest.fs.freeze",
+      id: "freeze",
+      path: "/",
+    }).subarray(4)),
+    { type: "guest.fs.freeze", id: "freeze", path: "/" },
+  );
+
+  assert.deepEqual(
+    BSON.deserialize(encodeControlCommand({
       type: "guest.fs.rename",
       id: "rename",
       from: "/tmp/source",
