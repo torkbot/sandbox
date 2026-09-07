@@ -793,6 +793,37 @@ test("blob close freezes filesystems with active writers before reopening", asyn
   assert.equal(read.stdout, "persistedpersisted");
 });
 
+test("blob close cannot resolve its freeze operation through a shadowed proc mount", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
+  for (const replacement of [false, true]) {
+    const directory = await mkdtemp(join(tmpdir(), "sandbox-blob-proc-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const proc = join(directory, "proc");
+    await mkdir(join(proc, "1"), { recursive: true });
+    if (replacement) {
+      await writeFile(join(proc, "1/exe"), "#!/bin/sh\nprintf invoked > /root/fake-freeze\nexit 0\n");
+      await chmod(join(proc, "1/exe"), 0o755);
+    }
+    const provider = { kind: "local" as const, path: join(directory, "objects") };
+    await mkdir(provider.path);
+    const definition = defineSandbox({ rootfs: rootfs.cow({
+      base: testRootfs, writable: storage.blob.overlay({ provider, volume: "root" }),
+    }) });
+    const first = await definition.boot({ mounts: { "/proc": fs.bind({ source: proc, access: "ro" }) } });
+    try {
+      const result = await first.exec("/bin/sh", ["-c", "printf persisted > /root/close-marker"]);
+      assert.equal(result.exitCode, 0, result.stderr);
+    } finally {
+      await first.close();
+    }
+    await using second = await definition.boot();
+    const result = await second.exec("/bin/sh", ["-c", "test ! -e /root/fake-freeze && cat /root/close-marker"]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(result.stdout, "persisted");
+  }
+});
+
 test("clean blob overlay close does not keep a short-lived process alive", async (t) => {
   const testRootfs = await testRootfsForVmTest(t);
   if (testRootfs === undefined) {

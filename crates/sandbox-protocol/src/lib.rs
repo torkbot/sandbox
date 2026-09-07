@@ -130,6 +130,10 @@ pub enum ControlFrame {
         recursive: bool,
         force: bool,
     },
+    GuestFsFreeze {
+        id: String,
+        path: String,
+    },
     GuestFsRename {
         id: String,
         from: String,
@@ -495,6 +499,11 @@ impl ControlFrame {
                 "recursive": *recursive,
                 "force": *force,
             },
+            Self::GuestFsFreeze { id, path } => bson::doc! {
+                "type": "guest.fs.freeze",
+                "id": id,
+                "path": path,
+            },
             Self::GuestFsRename { id, from, to } => bson::doc! {
                 "type": "guest.fs.rename",
                 "id": id,
@@ -851,6 +860,10 @@ impl ControlFrame {
                 force: document
                     .get_bool("force")
                     .map_err(|_| ControlFrameError::new("guest.fs.remove missing force"))?,
+            }),
+            "guest.fs.freeze" => Ok(Self::GuestFsFreeze {
+                id: read_required_string(&document, "id", "guest.fs.freeze id")?,
+                path: read_required_string(&document, "path", "guest.fs.freeze path")?,
             }),
             "guest.fs.rename" => Ok(Self::GuestFsRename {
                 id: read_required_string(&document, "id", "guest.fs.rename id")?,
@@ -1596,6 +1609,10 @@ mod tests {
                 path: "/tmp/dir".to_string(),
                 recursive: true,
                 force: true,
+            },
+            ControlFrame::GuestFsFreeze {
+                id: "fs".to_string(),
+                path: "/".to_string(),
             },
             ControlFrame::GuestFsRename {
                 id: "fs".to_string(),

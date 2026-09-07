@@ -1605,9 +1605,11 @@ class HostBackedSandboxVm implements SandboxVm {
     }
     if (paths.length > 0) {
       try {
-        const result = await this.#rootExec.exec("/proc/1/exe", ["--freeze-filesystems", ...paths]);
-        if (result.exitCode !== 0) {
-          throw new Error(`sandbox close storage freeze failed with exit code ${result.exitCode}: ${result.stderr}`);
+        for (const path of paths) {
+          const response = await this.control.requestFileSystem({ type: "guest.fs.freeze", path });
+          if (!response.result.ok) {
+            throw new Error(`sandbox close storage freeze failed: ${response.result.error.message}`);
+          }
         }
       } catch (error) {
         syncError = error;

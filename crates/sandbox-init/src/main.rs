@@ -21,13 +21,6 @@ const GUEST_FS_RESPONSE_PAYLOAD_LIMIT: u64 = 60 * 1024 * 1024;
 const GUEST_FS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("--freeze-filesystems") {
-        if let Err(error) = freeze_filesystems(std::env::args().skip(2)) {
-            eprintln!("sandbox storage freeze failed: {error}");
-            std::process::exit(1);
-        }
-        return;
-    }
     if let Err(error) = run() {
         report_init_failure(&error);
         eprintln!("sandbox-init failed: {error}");
@@ -36,29 +29,24 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
-fn freeze_filesystems(paths: impl Iterator<Item = String>) -> std::io::Result<()> {
-    for path in paths {
-        if !std::path::Path::new(&path).is_absolute() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "freeze path must be absolute",
-            ));
-        }
-        let file = std::fs::File::open(&path)?;
-        // Linux UAPI: FIFREEZE = _IOWR('X', 119, int). Freezing drains writes and
-        // keeps new writes blocked until the VM exits; no thaw is needed on close.
-        if unsafe { libc::ioctl(file.as_raw_fd(), 0xc004_5877_u32 as libc::Ioctl, 0) } < 0 {
-            return Err(std::io::Error::other(format!(
-                "freeze {path}: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
+fn freeze_filesystem(path: &str) -> std::io::Result<()> {
+    if !std::path::Path::new(path).is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "freeze path must be absolute",
+        ));
+    }
+    let file = std::fs::File::open(path)?;
+    // Linux UAPI: FIFREEZE = _IOWR('X', 119, int). Freezing drains writes and
+    // keeps new writes blocked until the VM exits; no thaw is needed on close.
+    if unsafe { libc::ioctl(file.as_raw_fd(), 0xc004_5877_u32 as libc::Ioctl, 0) } < 0 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn freeze_filesystems(_paths: impl Iterator<Item = String>) -> std::io::Result<()> {
+fn freeze_filesystem(_path: &str) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "filesystem freeze requires Linux",
@@ -1508,7 +1496,8 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
             | ControlFrame::GuestFsWriteFile { .. }
             | ControlFrame::GuestFsMkdir { .. }
             | ControlFrame::GuestFsRemove { .. }
-            | ControlFrame::GuestFsRename { .. }) => {
+            | ControlFrame::GuestFsRename { .. }
+            | ControlFrame::GuestFsFreeze { .. }) => {
                 let writer = writer.clone();
                 std::thread::spawn(move || {
                     let _ = send_control_frame(&writer, handle_guest_fs_request(request));
@@ -1621,6 +1610,12 @@ fn handle_guest_fs_request(request: ControlFrame) -> ControlFrame {
         ControlFrame::GuestFsRename { id, from, to } => {
             let result = std::fs::rename(&from, &to)
                 .map_err(|error| fs_io_error(format!("rename {from} -> {to}"), error))
+                .map(|()| GuestFsResponseResult::Empty);
+            (id, result)
+        }
+        ControlFrame::GuestFsFreeze { id, path } => {
+            let result = freeze_filesystem(&path)
+                .map_err(|error| fs_io_error(format!("freeze {path}"), error))
                 .map(|()| GuestFsResponseResult::Empty);
             (id, result)
         }

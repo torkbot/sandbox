@@ -131,6 +131,11 @@ export type SandboxControlFsCommand =
       readonly force: boolean;
     }
   | {
+      readonly type: "guest.fs.freeze";
+      readonly id: string;
+      readonly path: string;
+    }
+  | {
       readonly type: "guest.fs.rename";
       readonly id: string;
       readonly from: string;
@@ -361,6 +366,12 @@ export function encodeControlCommand(command: SandboxControlCommand): Uint8Array
         path: command.path,
         recursive: command.recursive,
         force: command.force,
+      });
+    case "guest.fs.freeze":
+      return encodePacket({
+        type: "guest.fs.freeze",
+        id: command.id,
+        path: command.path,
       });
     case "guest.fs.rename":
       return encodePacket({
