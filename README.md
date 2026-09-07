@@ -812,6 +812,10 @@ tokens are not refreshed by Sandbox.
 
 Writes are durable after a successful filesystem flush or clean device close.
 An abnormal close may lose writes that the guest had not flushed.
+Closing freezes the guest's persistent disk filesystems before releasing storage,
+so background writers cannot race the final flush. Remote flushes confirm lease
+ownership after publishing their data; losing ownership makes the flush fail.
+The local provider syncs object files and their parent directories to disk.
 
 The role-tagged metadata is a hard format break: volumes created through the
 earlier acquisition API are intentionally not inferred or migrated. The

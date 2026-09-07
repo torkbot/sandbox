@@ -303,15 +303,19 @@ impl BlobBlockVolume {
                     ))
                     .map_err(|error| BlobBlockFailure::new("storage-error", error))?;
             }
-            let store = Arc::new(PackedObjectBlockStore::new(
+            let mut store = PackedObjectBlockStore::new(
                 self.runtime.clone(),
                 self.provider.clone(),
                 generation_root,
                 self.volume_root.clone().join("objects"),
                 manifest,
-                self.size,
+                &active_metadata,
                 self.config.clone(),
-            ));
+            );
+            if let VolumeLease::Object(lease) = &self.lease {
+                store.lease_state = Some(lease.state.clone());
+            }
+            let store = Arc::new(store);
             if matches!(self.metadata.role, VolumeRole::GuestBlockDevice)
                 && !self.provisioned
                 && let Err(error) =
@@ -590,7 +594,7 @@ impl ProviderStore {
     fn build(provider: &Provider, runtime: &Runtime) -> Result<Self, Box<dyn std::error::Error>> {
         let (store, local_root): (Arc<dyn ObjectStore>, Option<PathBuf>) = match provider {
             Provider::Local { path, .. } => (
-                Arc::new(LocalFileSystem::new_with_prefix(path)?),
+                Arc::new(LocalFileSystem::new_with_prefix(path)?.with_fsync(true)),
                 Some(PathBuf::from(path)),
             ),
             Provider::S3 {
@@ -804,6 +808,7 @@ struct ObjectLeaseState {
     owner: String,
     record: tokio::sync::Mutex<ObjectLeaseRecord>,
     failure: Mutex<Option<BlobBlockFailure>>,
+    failure_tx: mpsc::SyncSender<BlobBlockFailure>,
     config: BlobBlockConfig,
 }
 
@@ -888,16 +893,17 @@ impl ObjectLease {
             }
             Err(error) => return Err(provider_failure(error)),
         };
+        let (failure_tx, failure_rx) = mpsc::sync_channel(1);
         let state = Arc::new(ObjectLeaseState {
             store,
             path,
             owner,
             record: tokio::sync::Mutex::new(ObjectLeaseRecord { version, metadata }),
             failure: Mutex::new(None),
+            failure_tx,
             config: config.clone(),
         });
         let (stop, mut stopped) = watch::channel(false);
-        let (failure_tx, failure_rx) = mpsc::sync_channel(1);
         let renewal_state = state.clone();
         let task = runtime.spawn(async move {
             loop {
@@ -908,8 +914,7 @@ impl ObjectLease {
                             Ok(Err(error)) => error,
                             Err(_) => BlobBlockFailure::lease_provider_error("renewal request timed out", config.lease_duration),
                         };
-                        *renewal_state.failure.lock().expect("lease failure lock poisoned") = Some(failure.clone());
-                        let _ = failure_tx.send(failure);
+                        renewal_state.fail(failure);
                         return;
                         }
                     changed = stopped.changed() => {
@@ -994,6 +999,29 @@ fn lease_retry_after_ms(
 }
 
 impl ObjectLeaseState {
+    fn fail(&self, failure: BlobBlockFailure) {
+        *self.failure.lock().expect("lease failure lock poisoned") = Some(failure.clone());
+        let _ = self.failure_tx.try_send(failure);
+    }
+
+    async fn confirm_ownership(&self) -> Result<(), BlobBlockFailure> {
+        if let Some(failure) = self.failure() {
+            return Err(failure);
+        }
+        let result = tokio::time::timeout(self.config.lease_request_timeout, self.renew())
+            .await
+            .unwrap_or_else(|_| {
+                Err(BlobBlockFailure::lease_provider_error(
+                    "flush lease confirmation timed out",
+                    self.config.lease_duration,
+                ))
+            });
+        if let Err(failure) = &result {
+            self.fail(failure.clone());
+        }
+        result
+    }
+
     fn failure(&self) -> Option<BlobBlockFailure> {
         self.failure
             .lock()
@@ -1173,6 +1201,8 @@ struct PackedObjectBlockStore {
     flushing: Mutex<()>,
     upload_permits: Arc<Semaphore>,
     size: u64,
+    zero_is_hole: bool,
+    lease_state: Option<Arc<ObjectLeaseState>>,
     config: BlobBlockConfig,
 }
 
@@ -1202,7 +1232,7 @@ impl PackedObjectBlockStore {
         generation_root: Path,
         object_root: Path,
         manifest: BlockManifest,
-        size: u64,
+        metadata: &VolumeMetadata,
         config: BlobBlockConfig,
     ) -> Self {
         Self {
@@ -1215,7 +1245,9 @@ impl PackedObjectBlockStore {
             cache: Mutex::new(BlockCache::new(config.max_cached_bytes)),
             flushing: Mutex::new(()),
             upload_permits: Arc::new(Semaphore::new(config.object_concurrency)),
-            size,
+            size: metadata.size_bytes,
+            zero_is_hole: matches!(metadata.role, VolumeRole::GuestBlockDevice),
+            lease_state: None,
             config,
         }
     }
@@ -1280,6 +1312,9 @@ impl PackedObjectBlockStore {
             .flushing
             .lock()
             .expect("blob block flush lock poisoned");
+        if let Some(failure) = self.lease_state.as_ref().and_then(|lease| lease.failure()) {
+            return Err(io::Error::other(failure));
+        }
         self.schedule_uploads(true);
         let (dirty, pending) = {
             let mut staging = self
@@ -1292,6 +1327,7 @@ impl PackedObjectBlockStore {
             return Ok(());
         }
         let provider = self.provider.clone();
+        let lease_state = self.lease_state.clone();
         let generation_root = self.generation_root.clone();
         let mut manifest = self
             .manifest
@@ -1339,6 +1375,11 @@ impl PackedObjectBlockStore {
                     )
                     .await
                     .map_err(io::Error::other)?;
+                // Fence the acknowledgement after publication: a replacement owner must
+                // either observe this manifest or make this conditional renewal fail.
+                if let Some(lease) = lease_state {
+                    lease.confirm_ownership().await.map_err(io::Error::other)?;
+                }
                 Ok(manifest)
             };
             match timeout {
@@ -1614,7 +1655,8 @@ impl CowBlockStore for PackedObjectBlockStore {
                 .ok_or_else(|| io::Error::other("blob block write sequence overflow"))?;
             let block = DirtyBlock {
                 sequence: staging.next_sequence,
-                data: (!data.iter().all(|byte| *byte == 0)).then_some(data),
+                // An overlay hole inherits base data, so explicit zeroes must survive reopen.
+                data: (!(self.zero_is_hole && data.iter().all(|byte| *byte == 0))).then_some(data),
             };
             staging.dirty.insert(index, block);
         }
@@ -1872,6 +1914,66 @@ mod tests {
 
     fn config() -> BlobBlockConfig {
         crate::blob_block_config()
+    }
+
+    #[test]
+    fn flush_cannot_acknowledge_after_lease_takeover() {
+        let runtime = Arc::new(Runtime::new().unwrap());
+        let provider = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let lease_path = ObjectPath::from("volumes/workspace/lease.json");
+        let mut lease = runtime
+            .block_on(ObjectLease::acquire(
+                runtime.clone(),
+                provider.clone(),
+                lease_path.clone(),
+                "workspace".into(),
+                config(),
+            ))
+            .unwrap();
+        lease.stop.send(true).unwrap();
+        runtime.block_on(lease.task.take().unwrap()).unwrap();
+        let mut store = PackedObjectBlockStore::new(
+            runtime.clone(),
+            provider.clone(),
+            ObjectPath::from("volumes/workspace/data/old"),
+            ObjectPath::from("volumes/workspace/objects"),
+            BlockManifest::default(),
+            &VolumeMetadata::new(TEST_SIZE, VolumeRole::GuestBlockDevice),
+            config(),
+        );
+        store.lease_state = Some(lease.state.clone());
+        store.write_blocks(vec![(7, vec![42; 4096])]).unwrap();
+        store
+            .flush()
+            .expect("held lease acknowledges durable writes");
+        runtime
+            .block_on(
+                provider.put(
+                    &lease_path,
+                    serde_json::to_vec(&LeaseDocument {
+                        owner: "replacement".into(),
+                        released: false,
+                        metadata: None,
+                    })
+                    .unwrap()
+                    .into(),
+                ),
+            )
+            .unwrap();
+        store.write_blocks(vec![(7, vec![43; 4096])]).unwrap();
+        assert!(
+            store
+                .flush()
+                .unwrap_err()
+                .to_string()
+                .contains("lease ownership was lost")
+        );
+        assert!(store.close().is_err());
+        assert_eq!(lease.state.failure().unwrap().code, "lease-lost");
+        assert_eq!(
+            lease.failure_rx.as_ref().unwrap().try_recv().unwrap().code,
+            "lease-lost"
+        );
     }
 
     #[test]
@@ -2252,7 +2354,7 @@ mod tests {
             generation_root.clone(),
             ObjectPath::from("volumes/workspace/objects"),
             BlockManifest::default(),
-            TEST_SIZE,
+            &VolumeMetadata::new(TEST_SIZE, VolumeRole::GuestBlockDevice),
             config,
         );
         store
@@ -2298,7 +2400,7 @@ mod tests {
             path.clone(),
             ObjectPath::from("volumes/workspace/objects"),
             BlockManifest::default(),
-            TEST_SIZE,
+            &VolumeMetadata::new(TEST_SIZE, VolumeRole::GuestBlockDevice),
             block_config.clone(),
         );
 
@@ -2325,7 +2427,7 @@ mod tests {
             path,
             ObjectPath::from("volumes/workspace/objects"),
             manifest,
-            TEST_SIZE,
+            &VolumeMetadata::new(TEST_SIZE, VolumeRole::GuestBlockDevice),
             block_config,
         );
         assert_eq!(
@@ -2350,7 +2452,7 @@ mod tests {
             path.clone(),
             object_root.clone(),
             BlockManifest::default(),
-            TEST_SIZE,
+            &VolumeMetadata::new(TEST_SIZE, VolumeRole::GuestBlockDevice),
             config(),
         );
         seed.write_blocks(vec![(7, vec![41; 4096]), (8, vec![80; 4096])])
@@ -2371,7 +2473,7 @@ mod tests {
             path,
             object_root,
             manifest,
-            TEST_SIZE,
+            &VolumeMetadata::new(TEST_SIZE, VolumeRole::GuestBlockDevice),
             block_config,
         ));
         throttled.config_mut(|config| {
@@ -2418,7 +2520,7 @@ mod tests {
             path.clone(),
             ObjectPath::from("volumes/workspace/objects"),
             BlockManifest::default(),
-            TEST_SIZE,
+            &VolumeMetadata::new(TEST_SIZE, VolumeRole::GuestBlockDevice),
             block_config,
         );
 
@@ -2455,7 +2557,7 @@ mod tests {
             path.clone(),
             ObjectPath::from("volumes/workspace/objects"),
             BlockManifest::default(),
-            TEST_SIZE,
+            &VolumeMetadata::new(TEST_SIZE, VolumeRole::GuestBlockDevice),
             config(),
         );
         store
@@ -2527,7 +2629,7 @@ mod tests {
             path,
             ObjectPath::from("volumes/workspace/objects"),
             manifest,
-            TEST_SIZE,
+            &VolumeMetadata::new(TEST_SIZE, VolumeRole::GuestBlockDevice),
             config(),
         );
         assert_eq!(
@@ -2591,7 +2693,7 @@ mod tests {
             source_path.clone(),
             object_root.clone(),
             BlockManifest::default(),
-            TEST_SIZE,
+            &VolumeMetadata::new(TEST_SIZE, VolumeRole::GuestBlockDevice),
             config(),
         );
         source
@@ -2632,7 +2734,7 @@ mod tests {
             active_path.clone(),
             object_root.clone(),
             active_manifest,
-            TEST_SIZE,
+            &VolumeMetadata::new(TEST_SIZE, VolumeRole::GuestBlockDevice),
             config(),
         );
         let stale = PackedObjectBlockStore::new(
@@ -2641,7 +2743,7 @@ mod tests {
             stale_path.clone(),
             object_root,
             stale_manifest,
-            TEST_SIZE,
+            &VolumeMetadata::new(TEST_SIZE, VolumeRole::GuestBlockDevice),
             config(),
         );
         stale

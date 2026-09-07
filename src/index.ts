@@ -1595,19 +1595,19 @@ class HostBackedSandboxVm implements SandboxVm {
       closeError = error;
     }
     let syncError: unknown;
+    const paths = this.#options.mounts?.filter((mount) => mount.kind === "block-device")
+      .map((mount) => mount.path) ?? [];
     if (
       this.#options.rootfs.storage !== undefined
-      || this.#options.mounts?.some((mount) => mount.kind === "block-device") === true
+      && this.#options.rootfs.storage.kind !== "ephemeral-cow"
     ) {
+      paths.push("/");
+    }
+    if (paths.length > 0) {
       try {
-        for (let attempt = 0; attempt < 2; attempt += 1) {
-          const result = await this.#rootExec.exec("/bin/sync", []);
-          if (result.exitCode !== 0) {
-            throw new Error(`sandbox close sync failed with exit code ${result.exitCode}: ${result.stderr}`);
-          }
-          if (attempt === 0) {
-            await delay(100);
-          }
+        const result = await this.#rootExec.exec("/proc/1/exe", ["--freeze-filesystems", ...paths]);
+        if (result.exitCode !== 0) {
+          throw new Error(`sandbox close storage freeze failed with exit code ${result.exitCode}: ${result.stderr}`);
         }
       } catch (error) {
         syncError = error;
@@ -3204,10 +3204,6 @@ function parseIpv4Address(address: string): number | null {
     value = ((value << 8) | octet) >>> 0;
   }
   return value;
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function parseIpv6Address(address: string): bigint | null {
