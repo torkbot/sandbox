@@ -793,6 +793,35 @@ test("blob close freezes filesystems with active writers before reopening", asyn
   assert.equal(read.stdout, "persistedpersisted");
 });
 
+test("blob close freezes the original disk after its mount path is covered", async (t) => {
+  const testRootfs = await testRootfsForVmTest(t);
+  if (testRootfs === undefined) return;
+  const directory = await mkdtemp(join(tmpdir(), "sandbox-blob-covered-mount-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const definition = defineSandbox({ rootfs: rootfs.ephemeral({ base: testRootfs }) });
+  const mounts = { "/workspace": storage.blob.block({
+    provider: { kind: "local", path: directory }, volume: "workspace", sizeBytes: 64n * 1024n * 1024n,
+  }) };
+  const first = await definition.boot({ mounts });
+  try {
+    const write = await first.exec("/bin/sh", ["-c", [
+      "set -eu",
+      "mkdir /alias",
+      "mount --bind /workspace /alias",
+      "mount -t tmpfs tmpfs /workspace",
+      "printf persisted > /alias/close-marker",
+      "(while :; do echo writing >> /alias/busy; done) >/dev/null 2>&1 &",
+    ].join("\n")]);
+    assert.equal(write.exitCode, 0, write.stderr);
+  } finally {
+    await first.close();
+  }
+  await using second = await definition.boot({ mounts });
+  const read = await second.exec("/bin/cat", ["/workspace/close-marker"]);
+  assert.equal(read.exitCode, 0, read.stderr);
+  assert.equal(read.stdout, "persisted");
+});
+
 test("blob close cannot resolve its freeze operation through a shadowed proc mount", async (t) => {
   const testRootfs = await testRootfsForVmTest(t);
   if (testRootfs === undefined) return;

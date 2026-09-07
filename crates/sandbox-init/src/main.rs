@@ -29,14 +29,7 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
-fn freeze_filesystem(path: &str) -> std::io::Result<()> {
-    if !std::path::Path::new(path).is_absolute() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "freeze path must be absolute",
-        ));
-    }
-    let file = std::fs::File::open(path)?;
+fn freeze_filesystem(file: &std::fs::File) -> std::io::Result<()> {
     // Linux UAPI: FIFREEZE = _IOWR('X', 119, int). Freezing drains writes and
     // keeps new writes blocked until the VM exits; no thaw is needed on close.
     if unsafe { libc::ioctl(file.as_raw_fd(), 0xc004_5877_u32 as libc::Ioctl, 0) } < 0 {
@@ -46,7 +39,7 @@ fn freeze_filesystem(path: &str) -> std::io::Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn freeze_filesystem(_path: &str) -> std::io::Result<()> {
+fn freeze_filesystem(_file: &std::fs::File) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "filesystem freeze requires Linux",
@@ -91,11 +84,18 @@ fn run() -> Result<(), InitError> {
         std::env::args().skip(1),
         std::env::var("SANDBOX_VIRTIOFS_MOUNTS").ok(),
     )?;
+    // Capture mount handles before guest-controlled mounts or commands can cover them.
+    let mut freeze_targets = HashMap::from([(
+        "/".to_string(),
+        std::fs::File::open("/")
+            .map_err(|error| InitError(format!("open root filesystem: {error}")))?,
+    )]);
     let mut mounted_virtual_paths = Vec::new();
     mount_configured_block(
         std::env::args().skip(1),
         std::env::var("SANDBOX_BLOCK_MOUNT").ok(),
         &mut mounted_virtual_paths,
+        &mut freeze_targets,
         false,
     )?;
     mount_internal_http_ca(&mounts, &mut mounted_virtual_paths)?;
@@ -105,13 +105,14 @@ fn run() -> Result<(), InitError> {
         std::env::args().skip(1),
         std::env::var("SANDBOX_BLOCK_MOUNT").ok(),
         &mut mounted_virtual_paths,
+        &mut freeze_targets,
         true,
     )?;
     mount_virtual_filesystems_after_http_ca(&mounts, &mut mounted_virtual_paths)?;
     let packet = init_ready_packet(root_readonly)?;
     let mut control = connect_control()?;
     send_init_ready(&mut control, &packet)?;
-    run_control_loop(&mut control)?;
+    run_control_loop(&mut control, Arc::new(freeze_targets))?;
     Ok(())
 }
 
@@ -1082,6 +1083,7 @@ fn mount_configured_block(
     args: impl Iterator<Item = String>,
     env_mount: Option<String>,
     mounted_paths: &mut Vec<std::path::PathBuf>,
+    freeze_targets: &mut HashMap<String, std::fs::File>,
     after_http_ca: bool,
 ) -> Result<(), InitError> {
     let Some(path) = configured_block_mount(args, env_mount)? else {
@@ -1092,6 +1094,9 @@ fn mount_configured_block(
     }
     ensure_mount_point(&path)?;
     mount_block_device(&path)?;
+    let file = std::fs::File::open(&path)
+        .map_err(|error| InitError(format!("open mounted block filesystem {path}: {error}")))?;
+    freeze_targets.insert(path.clone(), file);
     mounted_paths.push(std::path::PathBuf::from(path));
     Ok(())
 }
@@ -1243,6 +1248,7 @@ fn mount_configured_block(
     _args: impl Iterator<Item = String>,
     _env_mount: Option<String>,
     _mounted_paths: &mut Vec<std::path::PathBuf>,
+    _freeze_targets: &mut HashMap<String, std::fs::File>,
     _after_http_ca: bool,
 ) -> Result<(), InitError> {
     Ok(())
@@ -1365,7 +1371,10 @@ fn send_init_ready(control: &mut std::fs::File, packet: &[u8]) -> Result<(), Ini
         .map_err(|error| InitError(format!("write init.ready: {error}")))
 }
 
-fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
+fn run_control_loop(
+    control: &mut std::fs::File,
+    freeze_targets: Arc<HashMap<String, std::fs::File>>,
+) -> Result<(), InitError> {
     let write_lock = Arc::new(Mutex::new(()));
     let writer = Arc::new(ControlWriter::new(
         control
@@ -1499,8 +1508,12 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
             | ControlFrame::GuestFsRename { .. }
             | ControlFrame::GuestFsFreeze { .. }) => {
                 let writer = writer.clone();
+                let freeze_targets = freeze_targets.clone();
                 std::thread::spawn(move || {
-                    let _ = send_control_frame(&writer, handle_guest_fs_request(request));
+                    let _ = send_control_frame(
+                        &writer,
+                        handle_guest_fs_request(request, &freeze_targets),
+                    );
                 });
             }
             ControlFrame::GuestConnectionOpen {
@@ -1565,7 +1578,10 @@ fn run_control_loop(control: &mut std::fs::File) -> Result<(), InitError> {
     }
 }
 
-fn handle_guest_fs_request(request: ControlFrame) -> ControlFrame {
+fn handle_guest_fs_request(
+    request: ControlFrame,
+    freeze_targets: &HashMap<String, std::fs::File>,
+) -> ControlFrame {
     let (id, result) = match request {
         ControlFrame::GuestFsStat { id, path } => {
             let result = guest_fs_stat(&path).map(GuestFsResponseResult::Stat);
@@ -1614,7 +1630,15 @@ fn handle_guest_fs_request(request: ControlFrame) -> ControlFrame {
             (id, result)
         }
         ControlFrame::GuestFsFreeze { id, path } => {
-            let result = freeze_filesystem(&path)
+            let result = freeze_targets
+                .get(&path)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "filesystem was not retained at boot",
+                    )
+                })
+                .and_then(freeze_filesystem)
                 .map_err(|error| fs_io_error(format!("freeze {path}"), error))
                 .map(|()| GuestFsResponseResult::Empty);
             (id, result)
